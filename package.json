@@ -1,0 +1,15 @@
+{
+  "name": "alpha-capital",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alpha Capital - private quantitative trading application",
+  "scripts": {
+    "install:all": "npm install && cd server && npm install && cd ../client && npm install",
+    "dev": "concurrently -n server,client -c blue,green \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
