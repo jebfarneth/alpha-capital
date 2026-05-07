@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Alpha Capital — Dashboard Mockup</title>
+<style>
+  body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: #f0eee7; }
+  .ac { max-width: 1200px; margin: 0 auto; border-radius: 12px; border: 0.5px solid rgba(0,0,0,0.10); overflow: hidden; min-height: 720px; }
+  .ac[data-th="light"] { background: #ffffff; color: #1a1a2e; }
+  .ac[data-th="dark"] { background: #0d0f12; color: #e8e6df; }
+  .ac[data-th="light"] .bdr { border-color: #e5e3de !important; }
+  .ac[data-th="dark"] .bdr { border-color: rgba(232,230,223,0.10) !important; }
+  .ac[data-th="light"] .surf { background: #f7f6f3; }
+  .ac[data-th="dark"] .surf { background: #14171c; }
+  .ac[data-th="light"] .muted { color: #6b7280; }
+  .ac[data-th="dark"] .muted { color: rgba(232,230,223,0.55); }
+  .ac[data-th="light"] .faint { color: #9ca3af; }
+  .ac[data-th="dark"] .faint { color: rgba(232,230,223,0.35); }
+  .ac[data-th="light"] .brand-a { color: #14532d; }
+  .ac[data-th="dark"] .brand-a { color: #4a8a5e; }
+  .ac[data-th="light"] .brand-c { color: #0a0a0a; }
+  .ac[data-th="dark"] .brand-c { color: #f0eee7; }
+  .ac .nav-item { cursor: pointer; padding: 8px 12px; border-radius: 8px; font-size: 13px; display: flex; align-items: center; gap: 10px; }
+  .ac[data-th="light"] .nav-item { color: #6b7280; }
+  .ac[data-th="dark"] .nav-item { color: rgba(232,230,223,0.55); }
+  .ac[data-th="light"] .nav-item.on { background: #f7f6f3; color: #1a1a2e; }
+  .ac[data-th="dark"] .nav-item.on { background: rgba(74,138,94,0.16); color: #e8e6df; }
+  .ac .tab { cursor: pointer; padding: 6px 14px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; border-bottom: 1.5px solid transparent; }
+  .ac[data-th="light"] .tab { color: #6b7280; }
+  .ac[data-th="dark"] .tab { color: rgba(232,230,223,0.5); }
+  .ac[data-th="light"] .tab.on { color: #1a1a2e; border-bottom-color: #14532d; }
+  .ac[data-th="dark"] .tab.on { color: #e8e6df; border-bottom-color: #4a8a5e; }
+  .ac .pillbtn { cursor: pointer; padding: 4px 10px; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; border-radius: 8px; background: transparent; }
+  .ac[data-th="light"] .pillbtn { border: 0.5px solid #d1d5db; color: #6b7280; }
+  .ac[data-th="dark"] .pillbtn { border: 0.5px solid rgba(232,230,223,0.20); color: rgba(232,230,223,0.55); }
+  .ac[data-th="light"] .pillbtn.on { background: #f7f6f3; color: #1a1a2e; border-color: #d1d5db; }
+  .ac[data-th="dark"] .pillbtn.on { background: rgba(232,230,223,0.10); color: #e8e6df; }
+  .ac .view { display: none; padding: 16px 20px 20px; }
+  .ac .view.on { display: block; }
+  .ac .num { font-family: 'Times New Roman', Times, serif; }
+  .ac .lbl { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; font-weight: 500; }
+  .ac[data-th="light"] .lbl { color: #6b7280; }
+  .ac[data-th="dark"] .lbl { color: rgba(232,230,223,0.55); }
+  .ac[data-th="light"] .pos { color: #15803d; }
+  .ac[data-th="dark"] .pos { color: #5dcaa5; }
+  .ac[data-th="light"] .neg { color: #b91c1c; }
+  .ac[data-th="dark"] .neg { color: #e57373; }
+  .ac .gnd-pill { display: inline-block; padding: 2px 7px; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; border-radius: 3px; }
+  .ac[data-th="light"] .gnd-yes { background: rgba(20,83,45,0.10); color: #14532d; }
+  .ac[data-th="dark"] .gnd-yes { background: rgba(74,138,94,0.18); color: #4a8a5e; }
+  .ac[data-th="light"] .gnd-no { background: rgba(180,140,40,0.10); color: #92670d; }
+  .ac[data-th="dark"] .gnd-no { background: rgba(234,179,8,0.14); color: #facc15; }
+  button { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<div class="ac" data-th="light" id="ac">
+
+  <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 0.5px solid #e5e3de;" class="bdr">
+    <div style="display: flex; align-items: baseline; gap: 0.18em;">
+      <span class="brand-a" style="font-family: 'Times New Roman', Times, serif; font-size: 26px; font-weight: 400; letter-spacing: 0;">Alpha</span>
+      <span class="brand-c" style="font-family: 'Times New Roman', Times, serif; font-size: 26px; font-weight: 400; letter-spacing: 0;">Capital</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div class="surf" style="display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-radius: 8px; font-size: 11px;">
+        <span class="lbl">regime</span>
+        <span class="num" style="font-size: 13px; font-weight: 500;">0.74</span>
+        <span class="faint">·</span>
+        <span class="lbl">mult</span>
+        <span class="num" style="font-size: 13px; font-weight: 500;">0.90</span>
+      </div>
+      <div style="display: flex; gap: 4px;">
+        <button class="pillbtn" data-set="light">Light</button>
+        <button class="pillbtn on" data-set="dark">Dark</button>
+        <button class="pillbtn" data-set="auto">Auto</button>
+      </div>
+    </div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: 200px 1fr;">
+
+    <div style="padding: 16px 12px; border-right: 0.5px solid #e5e3de; display: flex; flex-direction: column; gap: 2px; min-height: 600px;" class="bdr">
+      <div class="nav-item on" data-go="performance"><span class="num faint" style="font-size: 11px;">01</span>Performance</div>
+      <div class="nav-item" data-go="picks"><span class="num faint" style="font-size: 11px;">02</span>Picks</div>
+      <div class="nav-item" data-go="positions"><span class="num faint" style="font-size: 11px;">03</span>Positions</div>
+      <div class="nav-item" data-go="patterns"><span class="num faint" style="font-size: 11px;">04</span>Patterns</div>
+      <div style="margin-top: auto; padding-top: 16px; border-top: 0.5px solid #e5e3de;" class="bdr">
+        <div class="lbl" style="margin-bottom: 6px;">capital</div>
+        <div class="num" style="font-size: 18px; font-weight: 500;">$192,418</div>
+        <div class="faint" style="font-size: 11px;"><span class="pos">+$418</span> · 0.22%</div>
+      </div>
+    </div>
+
+    <div>
+
+      <div class="view on" data-vw="performance">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px;">
+          <div>
+            <div style="font-size: 18px; font-weight: 500;">May 2026</div>
+            <div class="faint" style="font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;">self-tracking · all picks · all surfaces</div>
+          </div>
+          <div style="display: flex; gap: 4px;">
+            <button class="pillbtn on">All</button>
+            <button class="pillbtn">Multi-day</button>
+            <button class="pillbtn">Intraday</button>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 18px;">
+          <div class="surf" style="padding: 10px 12px; border-radius: 8px;"><div class="lbl">picks generated</div><div class="num" style="font-size: 22px; font-weight: 500; margin-top: 4px;">37</div></div>
+          <div class="surf" style="padding: 10px 12px; border-radius: 8px;"><div class="lbl">resolved</div><div class="num" style="font-size: 22px; font-weight: 500; margin-top: 4px;">14</div><div class="faint" style="font-size: 10px;">23 open</div></div>
+          <div class="surf" style="padding: 10px 12px; border-radius: 8px;"><div class="lbl">win rate</div><div class="num" style="font-size: 22px; font-weight: 500; margin-top: 4px;">—</div><div class="faint" style="font-size: 10px;">90d threshold pending</div></div>
+          <div class="surf" style="padding: 10px 12px; border-radius: 8px;"><div class="lbl">realized p&amp;l</div><div class="num pos" style="font-size: 22px; font-weight: 500; margin-top: 4px;">+$2,847</div></div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 1px; border: 0.5px solid #e5e3de; border-radius: 8px; overflow: hidden;" class="bdr" id="cal"></div>
+      </div>
+
+      <div class="view" data-vw="picks">
+        <div style="display: flex; gap: 0; border-bottom: 0.5px solid #e5e3de; margin-bottom: 16px;" class="bdr">
+          <div class="tab on">Multi-day · 5</div>
+          <div class="tab">Intraday · 7</div>
+        </div>
+        <div id="picks"></div>
+      </div>
+
+      <div class="view" data-vw="positions">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px;">
+          <div style="font-size: 18px; font-weight: 500;">Open positions · 8</div>
+          <div class="faint" style="font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;">via alpaca · live</div>
+        </div>
+        <div id="pos"></div>
+      </div>
+
+      <div class="view" data-vw="patterns">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 18px;">
+          <div style="font-size: 18px; font-weight: 500;">Patterns</div>
+          <div class="faint" style="font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;">17 total · 4 provisional</div>
+        </div>
+
+        <div class="lbl" style="margin: 4px 0 8px;">Multi-day surface</div>
+        <div id="pm" style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 18px;"></div>
+
+        <div class="lbl" style="margin: 4px 0 8px;">Intraday surface</div>
+        <div id="pi" style="display: flex; flex-direction: column; gap: 4px;"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var root = document.getElementById('ac');
+
+  function setTheme(mode){
+    root.querySelectorAll('[data-set]').forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-set') === mode); });
+    var resolved = mode;
+    if (mode === 'auto') {
+      resolved = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    root.setAttribute('data-th', resolved);
+  }
+  root.querySelectorAll('[data-set]').forEach(function(b){ b.addEventListener('click', function(){ setTheme(b.getAttribute('data-set')); }); });
+
+  function setView(name){
+    root.querySelectorAll('[data-go]').forEach(function(n){ n.classList.toggle('on', n.getAttribute('data-go') === name); });
+    root.querySelectorAll('.view').forEach(function(v){ v.classList.toggle('on', v.getAttribute('data-vw') === name); });
+  }
+  root.querySelectorAll('[data-go]').forEach(function(n){ n.addEventListener('click', function(){ setView(n.getAttribute('data-go')); }); });
+
+  var dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var calRoot = document.getElementById('cal');
+  var headerHTML = '';
+  dow.forEach(function(d){ headerHTML += '<div style="padding: 6px 8px; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;" class="surf faint">' + d + '</div>'; });
+  calRoot.innerHTML = headerHTML;
+  var firstDayOffset = 5;
+  for (var i = 0; i < firstDayOffset; i++) { calRoot.innerHTML += '<div style="min-height: 60px;" class="surf"></div>'; }
+  var dayData = {1:{p:4,t:1,s:0,n:142},2:{p:3,t:0,s:1,n:-88},5:{p:6,t:2,s:0,n:521},6:{p:4,t:1,s:1,n:73},7:{p:5,t:2,s:0,n:487},8:{p:3,t:0,s:0,n:0},9:{p:7,t:1,s:1,n:312},12:{p:4,t:1,s:0,n:198},13:{p:5,t:0,s:2,n:-245},14:{p:3,t:0,s:0,n:0},15:{p:6,t:2,s:0,n:663},16:{p:4,t:1,s:0,n:184},19:{p:5,t:0,s:0,n:0},20:{p:7,t:0,s:1,n:-73},21:{p:4,t:1,s:0,n:287},22:{p:6,t:0,s:0,n:0},23:{p:0,t:0,s:0,n:0}};
+  for (var d = 1; d <= 31; d++) {
+    var data = dayData[d];
+    var weekDay = (firstDayOffset + d - 1) % 7;
+    var isWeekend = (weekDay === 0 || weekDay === 6);
+    var content;
+    if (data && data.p > 0) {
+      var tint = '';
+      if (data.n > 200) tint = 'background: rgba(20,83,45,0.10);';
+      else if (data.n > 0) tint = 'background: rgba(20,83,45,0.04);';
+      else if (data.n < 0) tint = 'background: rgba(185,28,28,0.06);';
+      content = '<div style="' + tint + ' min-height: 60px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px;">' +
+                '<div class="num" style="font-size: 11px; font-weight: 500;">' + d + '</div>' +
+                '<div class="faint" style="font-size: 10px;">' + data.p + 'p · ' + data.t + 't2 · ' + data.s + 's</div>' +
+                (data.n !== 0 ? '<div class="num ' + (data.n > 0 ? 'pos' : 'neg') + '" style="font-size: 11px; margin-top: auto;">' + (data.n > 0 ? '+' : '') + '$' + Math.abs(data.n) + '</div>' : '<div class="faint" style="font-size: 10px; margin-top: auto;">open</div>') +
+                '</div>';
+    } else {
+      content = '<div style="min-height: 60px; padding: 6px 8px;" class="' + (isWeekend ? 'surf' : '') + '"><div class="num faint" style="font-size: 11px;">' + d + '</div></div>';
+    }
+    calRoot.innerHTML += content;
+  }
+
+  var picks = [
+    { ticker: 'OPRX', pattern: 'Insider cluster', code: 'M2', score: 84, entry: '$8.42', t1: '+15%', t2: '+30%', stop: '-8%', horizon: '14d', day: 'd2 of 14', state: 'open' },
+    { ticker: 'CRSR', pattern: 'Post-earnings drift', code: 'M1', score: 79, entry: '$11.84', t1: '+15%', t2: '+30%', stop: '-8%', horizon: '10d', day: 'd5 of 10', state: 'trailing' },
+    { ticker: 'DRIO', pattern: '52-week high breakout', code: 'M4', score: 76, entry: '$4.12', t1: '+15%', t2: '+30%', stop: '-8%', horizon: '10d', day: 'd1 of 10', state: 'pending entry' },
+    { ticker: 'BHAT', pattern: 'Failed breakdown reversal', code: 'M5', score: 71, entry: '$5.87', t1: '+15%', t2: '+25%', stop: '-7%', horizon: '5d', day: 'd3 of 5', state: 'open' },
+    { ticker: 'PRPL', pattern: 'Multi-day consolidation', code: 'M6', score: 68, entry: '$3.91', t1: '+15%', t2: '+30%', stop: '-8%', horizon: '8d', day: 'd1 of 8', state: 'pending entry' }
+  ];
+  document.getElementById('picks').innerHTML = picks.map(function(p){
+    return '<div class="bdr" style="display: grid; grid-template-columns: 70px 1fr 60px 100px 60px 60px 90px; gap: 12px; align-items: center; padding: 10px 12px; border: 0.5px solid #e5e3de; border-radius: 8px; margin-bottom: 6px;">' +
+      '<div><div class="num" style="font-size: 16px; font-weight: 500;">' + p.ticker + '</div><div class="faint" style="font-size: 10px;">' + p.entry + '</div></div>' +
+      '<div><div style="font-size: 13px;">' + p.pattern + '</div><div class="faint" style="font-size: 10px;">' + p.day + ' · ' + p.state + '</div></div>' +
+      '<div><div class="lbl">score</div><div class="num" style="font-size: 18px; font-weight: 500;">' + p.score + '</div></div>' +
+      '<div><div class="lbl">t1 / t2</div><div class="num pos" style="font-size: 12px;">' + p.t1 + ' / ' + p.t2 + '</div></div>' +
+      '<div><div class="lbl">stop</div><div class="num neg" style="font-size: 12px;">' + p.stop + '</div></div>' +
+      '<div><div class="lbl">horiz</div><div class="num" style="font-size: 12px;">' + p.horizon + '</div></div>' +
+      '<div><button class="pillbtn" style="font-size: 10px; padding: 5px 10px;">Execute</button></div>' +
+      '</div>';
+  }).join('');
+
+  var positions = [
+    { ticker: 'CRSR', shares: 168, avg: '$11.84', last: '$13.61', pnl: 297, pct: 14.95, state: 'trailing · T1 hit d3', stop: '$12.25' },
+    { ticker: 'OPRX', shares: 237, avg: '$8.42', last: '$8.71', pnl: 69, pct: 3.44, state: 'open · d2 of 14', stop: '$7.75' },
+    { ticker: 'BHAT', shares: 341, avg: '$5.87', last: '$5.69', pnl: -61, pct: -3.07, state: 'open · d3 of 5', stop: '$5.46' },
+    { ticker: 'TLRY', shares: 187, avg: '$10.71', last: '$11.04', pnl: 62, pct: 3.08, state: 'open · d6 of 14', stop: '$9.85' },
+    { ticker: 'INVZ', shares: 412, avg: '$4.86', last: '$5.42', pnl: 231, pct: 11.52, state: 'trailing · T1 hit d1', stop: '$4.98' },
+    { ticker: 'KOPN', shares: 593, avg: '$3.37', last: '$3.41', pnl: 24, pct: 1.19, state: 'open · d4 of 10', stop: '$3.10' },
+    { ticker: 'DRIO', shares: 486, avg: '$4.12', last: '$4.08', pnl: -19, pct: -0.97, state: 'open · d1 of 10', stop: '$3.79' },
+    { ticker: 'GOEV', shares: 273, avg: '$7.32', last: '$7.61', pnl: 79, pct: 3.96, state: 'open · d8 of 14', stop: '$6.74' }
+  ];
+  var posRoot = document.getElementById('pos');
+  var headerRow = '<div class="bdr" style="display: grid; grid-template-columns: 70px 60px 80px 80px 110px 1fr 90px; gap: 12px; padding: 8px 12px; border-bottom: 0.5px solid #e5e3de;">' +
+    ['ticker','shares','avg','last','p&l','state','stop'].map(function(h){ return '<div class="lbl">' + h + '</div>'; }).join('') + '</div>';
+  posRoot.innerHTML = headerRow + positions.map(function(p){
+    var c = p.pnl >= 0 ? 'pos' : 'neg';
+    var s = p.pnl >= 0 ? '+' : '';
+    return '<div class="bdr" style="display: grid; grid-template-columns: 70px 60px 80px 80px 110px 1fr 90px; gap: 12px; padding: 10px 12px; border-bottom: 0.5px solid #e5e3de; align-items: center; font-size: 13px;">' +
+      '<div class="num" style="font-weight: 500;">' + p.ticker + '</div>' +
+      '<div class="num">' + p.shares + '</div>' +
+      '<div class="num">' + p.avg + '</div>' +
+      '<div class="num">' + p.last + '</div>' +
+      '<div class="num ' + c + '">' + s + '$' + Math.abs(p.pnl) + '<span class="faint" style="font-size: 10px; margin-left: 4px;">' + s + p.pct.toFixed(2) + '%</span></div>' +
+      '<div class="faint" style="font-size: 11px;">' + p.state + '</div>' +
+      '<div class="num">' + p.stop + '</div>' +
+      '</div>';
+  }).join('');
+
+  var multiPats = [
+    { code:'M1', name:'Post-earnings drift', t1t2:'+15 / +30', stop:'-8', horiz:'5-15d', active:true },
+    { code:'M2', name:'Insider cluster', t1t2:'+15 / +30', stop:'-8', horiz:'5-20d', active:true },
+    { code:'M3', name:'Sector rotation beneficiary', t1t2:'+12 / +25', stop:'-8', horiz:'5-15d', active:true },
+    { code:'M4', name:'52-week high breakout', t1t2:'+15 / +30', stop:'-8', horiz:'5-15d', active:true },
+    { code:'M5', name:'Failed breakdown reversal', t1t2:'+15 / +25', stop:'-7', horiz:'3-7d', active:true },
+    { code:'M6', name:'Multi-day consolidation breakout', t1t2:'+15 / +30', stop:'-8', horiz:'5-12d', active:true },
+    { code:'M7', name:'Pure technical multi-day', t1t2:'+15 / +30', stop:'-8', horiz:'5-10d', active:false }
+  ];
+  var intraPats = [
+    { code:'I1', name:'Gap and go', t1t2:'+20 / +50', stop:'-8', horiz:'1-3d', active:true },
+    { code:'I2', name:'FDA catalyst', t1t2:'+25 / +60', stop:'none', horiz:'1-3d', active:false },
+    { code:'I3', name:'Short squeeze', t1t2:'+25 / +75', stop:'-10', horiz:'1-5d', active:true },
+    { code:'I4', name:'Halt and resume', t1t2:'+30 / +80', stop:'none', horiz:'1-2d', active:true },
+    { code:'I5', name:'Earnings whisper', t1t2:'+20 / +45', stop:'-8', horiz:'1-3d', active:true },
+    { code:'I6', name:'Contract announcement', t1t2:'+20 / +50', stop:'-8', horiz:'1-3d', active:true },
+    { code:'I7', name:'News sympathy fast', t1t2:'+15 / +35', stop:'-8', horiz:'1-2d', active:true },
+    { code:'I8', name:'Opening range breakout', t1t2:'+15 / +30', stop:'-7', horiz:'1-3d', active:true },
+    { code:'I9', name:'ATR expansion breakout', t1t2:'+18 / +35', stop:'-7', horiz:'1-3d', active:false },
+    { code:'I10', name:'Pure technical intraday', t1t2:'+15 / +35', stop:'-8', horiz:'1-3d', active:false }
+  ];
+
+  function rowPattern(p){
+    var pill = p.active ? '<span class="gnd-pill gnd-yes">active</span>' : '<span class="gnd-pill gnd-no">provisional</span>';
+    return '<div class="bdr" style="display: grid; grid-template-columns: 40px 1fr 90px 60px 70px 100px; gap: 12px; align-items: center; padding: 8px 12px; border: 0.5px solid #e5e3de; border-radius: 8px; font-size: 13px;">' +
+      '<div class="num" style="font-weight: 500; font-size: 14px;">' + p.code + '</div>' +
+      '<div>' + p.name + '</div>' +
+      '<div><div class="lbl">t1 / t2 %</div><div class="num pos" style="font-size: 12px;">' + p.t1t2 + '</div></div>' +
+      '<div><div class="lbl">stop</div><div class="num neg" style="font-size: 12px;">' + p.stop + '</div></div>' +
+      '<div><div class="lbl">horizon</div><div class="num" style="font-size: 12px;">' + p.horiz + '</div></div>' +
+      '<div style="text-align: right;">' + pill + '</div>' +
+      '</div>';
+  }
+  document.getElementById('pm').innerHTML = multiPats.map(rowPattern).join('');
+  document.getElementById('pi').innerHTML = intraPats.map(rowPattern).join('');
+
+})();
+</script>
+</body>
+</html>
