@@ -122,17 +122,30 @@ def record_data_lineage(
     provider: str,
     endpoint: str,
     asof_timestamp: datetime,
-    raw_payload: Any,
+    raw_payload: Any | None = None,
+    raw_payload_hash: str | None = None,
+    request_timestamp: datetime | None = None,
+    freshness_seconds: float | None = None,
+    source_authority: str | None = None,
+    data_quality_flags: dict | None = None,
     job_run_id: str | None = None,
     dataset_id: str | None = None,
 ) -> DataLineage:
+    if raw_payload_hash is None:
+        raw_payload_hash = _hash(raw_payload)
+
     lineage = DataLineage(
         data_lineage_id=_uid(),
         provider=provider,
         endpoint=endpoint,
-        request_timestamp=_now(),
+        request_timestamp=request_timestamp or _now(),
         asof_timestamp=asof_timestamp,
-        raw_payload_hash=_hash(raw_payload),
+        raw_payload_hash=raw_payload_hash,
+        freshness_seconds=freshness_seconds,
+        source_authority=source_authority,
+        data_quality_flags=(
+            json.dumps(data_quality_flags) if data_quality_flags is not None else None
+        ),
         job_run_id=job_run_id,
         dataset_id=dataset_id,
     )
