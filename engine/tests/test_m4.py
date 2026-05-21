@@ -8,7 +8,7 @@ Vault contract verification:
   - No signal below 52-week high
   - Feature snapshot written even without signal
   - raw_expected_edge = X_M4 * lambda_M4_15td (deterministic)
-  - Fidelity degrades on short history
+  - Short history is flagged for validation without downgrading FULL fidelity
   - Evidence bridge writes with correct FK chain
   - Point-in-time and lineage guards produce warnings
 """
@@ -239,6 +239,124 @@ class TestM4Firing:
         assert priors["tier"] in {"default", "high_conviction"}
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
 
+    def test_optional_validation_source_features_logged(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 11.50,
+                "high_52w": 10.00,
+                "cohort_extensions": _cohort_extensions(30, 0.15),
+                "D1_decile": 8,
+                "R_6_12m_skip": 0.234,
+                "hamilton_regime_prob": 0.72,
+                "hazard_score_at_signal": 22,
+            },
+            fundamental_data={
+                "market_cap": 95_400_000,
+                "sector": "Technology",
+                "industry": "Software - Application",
+                "analyst_count": 2,
+            },
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        features = result.features.features
+        assert features["D1_decile"] == 8
+        assert features["R_6_12m_skip"] == 0.234
+        assert features["analyst_count"] == 2
+        assert features["hamilton_regime_prob"] == 0.72
+        assert features["hazard_score_at_signal"] == 22
+        assert features["filing_veto_status"] == "clear"
+        assert features["sector"] == "Technology"
+        assert features["industry"] == "Software - Application"
+
+    def test_tie_break_uses_liquidity_timestamp_ticker(self):
+        cohort = [
+            {"ticker": "ZZZ", "breakout_extension": 0.10, "median_dollar_volume_20d": 1_000, "signal_timestamp": "2026-05-20T20:05:00Z"},
+            {"ticker": "ACME", "breakout_extension": 0.10, "median_dollar_volume_20d": 2_000, "signal_timestamp": "2026-05-20T20:04:00Z"},
+            {"ticker": "BETA", "breakout_extension": 0.10, "median_dollar_volume_20d": 1_500, "signal_timestamp": "2026-05-20T20:03:00Z"},
+            {"ticker": "LOW1", "breakout_extension": 0.01},
+            {"ticker": "LOW2", "breakout_extension": 0.02},
+            {"ticker": "LOW3", "breakout_extension": 0.03},
+            {"ticker": "LOW4", "breakout_extension": 0.04},
+            {"ticker": "LOW5", "breakout_extension": 0.05},
+            {"ticker": "LOW6", "breakout_extension": 0.06},
+            {"ticker": "LOW7", "breakout_extension": 0.07},
+        ]
+        result = apply_cohort_gate(0.10, cohort, ticker="ACME")
+        assert result["cohort_gate_passed"] is True
+        assert result["breakout_cohort_rank"] == 1
+
+
+class TestM4FreshBreakout:
+    def test_fresh_watchlist_signal_near_high(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation",
+                "activation_state": "watchlist",
+                "price": 9.80,
+                "high_52w": 10.00,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        assert result.signals[0].signal_status == "watchlist"
+        assert result.signals[0].raw_expected_edge == 0.0
+        assert result.features.features["watchlist_passed"] is True
+
+    def test_fresh_activation_signal(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation",
+                "activation_state": "activated",
+                "price": 9.90,
+                "last_price": 10.50,
+                "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25,
+                "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        assert result.signals[0].signal_status == "active"
+        assert result.features.features["activation_passed"] is True
+        assert result.features.features["fresh_breakout_extension"] == 0.05
+        assert result.signals[0].raw_expected_edge > 0
+
+    def test_fresh_activation_spread_failure_no_signal(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation",
+                "activation_state": "activated",
+                "price": 9.90,
+                "last_price": 10.50,
+                "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25,
+                "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.02,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.features.features["activation_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "spread_too_wide"
+
 
 # -----------------------------------------------------------------------
 # Detector: no-signal cases
@@ -340,7 +458,7 @@ class TestM4Fidelity:
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-        assert result.features.fidelity_tier == FidelityTier.LITE
+        assert result.features.fidelity_tier == FidelityTier.FULL
         assert result.features.features["short_history_flag"] is True
 
     def test_full_history_is_full(self):
@@ -359,7 +477,7 @@ class TestM4Fidelity:
         result = det.detect(inp)
         assert result.features.fidelity_tier == FidelityTier.FULL
 
-    def test_short_history_reduces_data_confidence(self):
+    def test_short_history_does_not_reduce_data_confidence(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
@@ -373,7 +491,23 @@ class TestM4Fidelity:
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-        assert result.signals[0].data_confidence < 1.0
+        assert result.signals[0].data_confidence == 1.0
+
+    def test_field_confidence_product_reduces_data_confidence(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 11.00,
+                "high_52w": 10.00,
+                "cohort_extensions": [0.10],
+                "field_confidence": {"adj_close": 0.95, "high_52w": 0.90},
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.signals[0].data_confidence == 0.855
 
 
 # -----------------------------------------------------------------------

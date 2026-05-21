@@ -22,12 +22,14 @@ Eligibility gate (EXPOSURE.md):
   2. Top-3-decile breakout_extension within same-day breakout cohort
   3. breakout_extension > 0 (exact-high crossings excluded)
 
-This detector implements the base_daily lane only. Fresh-breakout
-activation requires live intraday data and is deferred to runtime.
+This detector supports both vault-defined lanes:
+  - base_daily close-confirmed breakouts
+  - fresh_breakout_activation watchlist / activation rows
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List
 
 from alpha.data.contracts import stable_hash
@@ -59,6 +61,11 @@ LAMBDA_M4_15TD = LAMBDA_M4_MONTHLY * 15.0 / 21.0  # ~0.00786
 SIGNAL_HORIZON = "15d"
 BREAKOUT_COHORT_PERCENTILE = 0.70  # top-3-decile gate
 SMALL_COHORT_THRESHOLD = 10
+ENTRY_LANE_BASE = "base_daily"
+ENTRY_LANE_FRESH = "fresh_breakout_activation"
+ACTIVATION_STATE_WATCHLIST = "watchlist"
+ACTIVATION_STATE_ACTIVATED = "activated"
+FRESH_SPREAD_CAP = 0.01
 
 
 def compute_m4_features(
@@ -96,6 +103,8 @@ def compute_m4_features(
 def apply_cohort_gate(
     breakout_extension: float,
     cohort_extensions: List[float],
+    *,
+    ticker: str | None = None,
 ) -> Dict[str, Any]:
     """
     Apply the top-3-decile breakout_extension cohort gate.
@@ -118,7 +127,7 @@ def apply_cohort_gate(
         }
 
     # Compute 70th percentile threshold (linear interpolation)
-    sorted_ext = sorted(cohort_extensions)
+    sorted_ext = sorted(_cohort_extension_value(item) for item in cohort_extensions)
     idx = BREAKOUT_COHORT_PERCENTILE * (cohort_size - 1)
     lower = int(idx)
     frac = idx - lower
@@ -127,11 +136,24 @@ def apply_cohort_gate(
     else:
         threshold = sorted_ext[lower]
 
-    passed = breakout_extension >= threshold and breakout_extension > 0
-
-    # Rank (1 = highest extension)
-    rank = sum(1 for e in cohort_extensions if e > breakout_extension) + 1
+    # Rank (1 = highest extension), with optional vault tie-break fields:
+    # higher 20d median dollar volume, earlier signal_timestamp, ticker.
+    ranked = sorted(
+        (_cohort_sort_record(item) for item in cohort_extensions),
+        key=lambda r: (
+            -r["extension"],
+            -r["median_dollar_volume_20d"],
+            r["signal_timestamp"],
+            r["ticker"],
+        ),
+    )
+    rank = _rank_for_candidate(ranked, breakout_extension, ticker)
     decile = min(10, max(1, int((rank - 1) / cohort_size * 10) + 1))
+    top_count = max(1, math.ceil((1.0 - BREAKOUT_COHORT_PERCENTILE) * cohort_size))
+    passed = (
+        breakout_extension > threshold
+        or (breakout_extension == threshold and rank <= top_count)
+    ) and breakout_extension > 0
 
     return {
         "cohort_gate_passed": passed,
@@ -140,6 +162,61 @@ def apply_cohort_gate(
         "breakout_cohort_decile": decile,
         "percentile_threshold": round(threshold, 6),
         "small_cohort_warning": False,
+    }
+
+
+def _cohort_extension_value(item: Any) -> float:
+    if isinstance(item, dict):
+        return float(item.get("breakout_extension", item.get("extension", 0.0)))
+    return float(item)
+
+
+def _cohort_sort_record(item: Any) -> Dict[str, Any]:
+    if isinstance(item, dict):
+        return {
+            "ticker": str(item.get("ticker", "")),
+            "extension": _cohort_extension_value(item),
+            "median_dollar_volume_20d": float(item.get("median_dollar_volume_20d", 0.0)),
+            "signal_timestamp": str(item.get("signal_timestamp", "")),
+        }
+    return {
+        "ticker": "",
+        "extension": float(item),
+        "median_dollar_volume_20d": 0.0,
+        "signal_timestamp": "",
+    }
+
+
+def _rank_for_candidate(
+    ranked: List[Dict[str, Any]], breakout_extension: float, ticker: str | None
+) -> int:
+    if ticker:
+        for idx, record in enumerate(ranked, start=1):
+            if record["ticker"] == ticker:
+                return idx
+    return sum(1 for record in ranked if record["extension"] > breakout_extension) + 1
+
+
+def compute_m4_fresh_features(
+    *,
+    last_price: float,
+    high_52w: float,
+    intraday_range_confirmation: float,
+    intraday_volume_confirmation: float,
+) -> Dict[str, Any]:
+    if high_52w <= 0:
+        fresh_extension = 0.0
+    else:
+        fresh_extension = min(max((last_price / high_52w) - 1.0, 0.0), 0.50)
+    x_fresh = min(
+        1.0 + fresh_extension * intraday_range_confirmation * intraday_volume_confirmation,
+        X_M4_CAP,
+    )
+    return {
+        "fresh_breakout_extension": round(fresh_extension, 6),
+        "intraday_range_confirmation": intraday_range_confirmation,
+        "intraday_volume_confirmation": intraday_volume_confirmation,
+        "x_m4_fresh": round(x_fresh, 6),
     }
 
 
@@ -164,6 +241,7 @@ class M4Detector(BasePatternDetector):
         price = inp.market_data.get("price")
         high_52w = inp.market_data.get("high_52w")
         cohort_extensions = inp.market_data.get("cohort_extensions")
+        entry_lane = inp.market_data.get("entry_lane", ENTRY_LANE_BASE)
 
         if price is None or high_52w is None:
             warnings.append("missing required price or high_52w")
@@ -203,7 +281,19 @@ class M4Detector(BasePatternDetector):
             feat_dict["sector"] = inp.fundamental_data["sector"]
         if "industry" in inp.fundamental_data:
             feat_dict["industry"] = inp.fundamental_data["industry"]
-        feat_dict["entry_lane"] = "base_daily"
+        for source in (inp.market_data, inp.fundamental_data, inp.event_data):
+            for key in (
+                "D1_decile",
+                "R_6_12m_skip",
+                "analyst_count",
+                "hamilton_regime_prob",
+                "hazard_score_at_signal",
+                "filing_veto_status",
+            ):
+                if key in source:
+                    feat_dict[key] = source[key]
+        feat_dict.setdefault("filing_veto_status", "clear")
+        feat_dict["entry_lane"] = entry_lane
 
         # Determine fidelity
         n_sessions = inp.market_data.get("n_sessions_in_window")
@@ -212,9 +302,14 @@ class M4Detector(BasePatternDetector):
 
         has_primary = price > 0 and high_52w > 0
         pit_passed = quality_flags.get("point_in_time_passed") is not False
+        if inp.market_data.get("operating_universe_inclusion") is False:
+            quality_flags["not_operating_universe_member"] = True
+            warnings.append("ticker is not marked as operating-universe eligible")
+        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
+            warnings.append("operating-universe membership not provided to M4 detector")
         fidelity = classify_fidelity(
             has_primary_data=has_primary,
-            has_secondary_data=not short_history,
+            has_secondary_data=True,
             point_in_time_passed=pit_passed,
             lookahead_guard_passed=True,
         )
@@ -233,7 +328,11 @@ class M4Detector(BasePatternDetector):
 
         signals: List[PatternSignal] = []
 
-        if breakout and extension > 0:
+        if entry_lane == ENTRY_LANE_FRESH:
+            self._apply_fresh_lane(inp, feat_dict, warnings, quality_flags, signals)
+        elif quality_flags.get("not_operating_universe_member"):
+            feat_dict["cohort_gate_passed"] = False
+        elif breakout and extension > 0:
             # Cohort gate
             if cohort_extensions is None:
                 # M4's top-3-decile breakout-extension cohort gate is part
@@ -250,7 +349,9 @@ class M4Detector(BasePatternDetector):
                 }
                 warnings.append("missing breakout cohort data — no M4 signal emitted")
             else:
-                cohort_meta = apply_cohort_gate(extension, cohort_extensions)
+                cohort_meta = apply_cohort_gate(
+                    extension, cohort_extensions, ticker=inp.ticker
+                )
 
             feat_dict.update(cohort_meta)
 
@@ -265,13 +366,7 @@ class M4Detector(BasePatternDetector):
                 tier = "high_conviction" if extension >= p75 else "default"
                 feat_dict["tier_classification"] = tier
 
-                # Data confidence: product of input confidence flags
-                # All FMP fields default c_f = 1.0 per DATA.md
-                data_conf = 1.0
-                if short_history:
-                    data_conf *= 0.9
-                if quality_flags.get("missing_lineage"):
-                    data_conf *= 0.9
+                data_conf = _data_confidence(inp)
 
                 gross_bps = round(raw_expected_edge * 10_000, 2)
                 feat_dict["expected_return_priors"] = {
@@ -326,3 +421,112 @@ class M4Detector(BasePatternDetector):
             input_hashes={"market_data": input_hash},
             output_hashes={"features": output_hash},
         )
+
+    def _apply_fresh_lane(
+        self,
+        inp: PatternInput,
+        feat_dict: Dict[str, Any],
+        warnings: List[str],
+        quality_flags: Dict[str, Any],
+        signals: List[PatternSignal],
+    ) -> None:
+        activation_state = inp.market_data.get("activation_state", ACTIVATION_STATE_WATCHLIST)
+        feat_dict["activation_state"] = activation_state
+
+        base_nearness = feat_dict["base_nearness"]
+        if activation_state == ACTIVATION_STATE_WATCHLIST:
+            watchlist_passed = base_nearness >= 0.97 and not inp.market_data.get(
+                "already_base_daily_fired", False
+            )
+            feat_dict["watchlist_passed"] = watchlist_passed
+            if watchlist_passed:
+                signals.append(
+                    PatternSignal(
+                        direction=SignalDirection.LONG,
+                        raw_signal_strength=round(base_nearness, 6),
+                        raw_expected_edge=0.0,
+                        signal_horizon=SIGNAL_HORIZON,
+                        signal_status="watchlist",
+                        data_confidence=_data_confidence(inp),
+                    )
+                )
+            return
+
+        last_price = float(inp.market_data.get("last_price", inp.market_data.get("price", 0.0)))
+        range_confirmation = float(inp.market_data.get("intraday_range_confirmation", 0.0))
+        volume_confirmation = float(inp.market_data.get("intraday_volume_confirmation", 0.0))
+        spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
+        spread_passed = (
+            bool(inp.market_data.get("spread_discipline_passed"))
+            if "spread_discipline_passed" in inp.market_data
+            else spread_pct is not None and float(spread_pct) <= FRESH_SPREAD_CAP
+        )
+        freshness_passed = bool(inp.market_data.get("signal_freshness_passed", True))
+
+        fresh_features = compute_m4_fresh_features(
+            last_price=last_price,
+            high_52w=feat_dict["H_52w"],
+            intraday_range_confirmation=range_confirmation,
+            intraday_volume_confirmation=volume_confirmation,
+        )
+        feat_dict.update(fresh_features)
+        feat_dict["last_price"] = last_price
+        feat_dict["fresh_high_break_passed"] = last_price > feat_dict["H_52w"]
+        feat_dict["range_confirmation_passed"] = range_confirmation >= 1.0
+        feat_dict["volume_confirmation_passed"] = volume_confirmation >= 1.0
+        feat_dict["spread_discipline_passed"] = spread_passed
+        feat_dict["signal_freshness_passed"] = freshness_passed
+
+        activation_passed = (
+            feat_dict["fresh_high_break_passed"]
+            and fresh_features["fresh_breakout_extension"] > 0
+            and feat_dict["range_confirmation_passed"]
+            and feat_dict["volume_confirmation_passed"]
+            and spread_passed
+            and freshness_passed
+        )
+        feat_dict["activation_passed"] = activation_passed
+        if not activation_passed:
+            feat_dict["activation_failure_reason"] = _fresh_activation_failure_reason(feat_dict)
+            warnings.append(f"fresh activation failed: {feat_dict['activation_failure_reason']}")
+            return
+
+        x_fresh = fresh_features["x_m4_fresh"]
+        raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
+        feat_dict["expected_return_priors"] = {
+            "tier": "fresh_breakout_activation",
+            "gross_bps": round(raw_expected_edge * 10_000, 2),
+        }
+        signals.append(
+            PatternSignal(
+                direction=SignalDirection.LONG,
+                raw_signal_strength=round(min(x_fresh / X_M4_CAP, 1.0), 6),
+                raw_expected_edge=raw_expected_edge,
+                signal_horizon=SIGNAL_HORIZON,
+                data_confidence=_data_confidence(inp),
+            )
+        )
+
+
+def _data_confidence(inp: PatternInput) -> float:
+    confidence = 1.0
+    for source in (inp.market_data, inp.fundamental_data, inp.event_data):
+        field_confidence = source.get("field_confidence")
+        if isinstance(field_confidence, dict):
+            for value in field_confidence.values():
+                confidence *= float(value)
+    return round(confidence, 4)
+
+
+def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
+    if not feat["fresh_high_break_passed"]:
+        return "fresh_high_break_failed"
+    if not feat["range_confirmation_passed"]:
+        return "range_confirmation_failed"
+    if not feat["volume_confirmation_passed"]:
+        return "volume_confirmation_failed"
+    if not feat["spread_discipline_passed"]:
+        return "spread_too_wide"
+    if not feat["signal_freshness_passed"]:
+        return "signal_expired"
+    return "unknown"
