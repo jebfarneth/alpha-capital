@@ -232,12 +232,46 @@ def _enrich_m6_activation(
 
     # Early-gap diagnostics
     open_price = inp.market_data.get("open_price")
+    prior_close = inp.market_data.get("prior_close")
     minutes_since_open = inp.market_data.get("minutes_since_open")
 
     early_session_flag = minutes_since_open is not None and float(minutes_since_open) <= EARLY_GAP_WINDOW_MINUTES
     gap_breakout_flag = open_price is not None and float(open_price) > compression_high
     gap_brk_ext = compute_breakout_extension(float(open_price), compression_high, sigma_20d) if open_price is not None else 0.0
 
+    # Gap expansion proxy: ln(open / prior_close) / sqrt(gk_avg_5d).
+    # Long-only: only positive gaps get expansion credit.
+    gap_exp_proxy = None
+    gap_exp_proxy_available = False
+    gap_exp_proxy_reason = None
+    if early_session_flag and gap_breakout_flag:
+        if prior_close is None:
+            gap_exp_proxy_reason = "missing_prior_close"
+            quality_flags["missing_prior_close"] = True
+            warnings.append("missing prior_close for gap expansion proxy; falling back conservatively")
+        elif float(prior_close) <= 0:
+            gap_exp_proxy_reason = "invalid_prior_close"
+            quality_flags["invalid_prior_close"] = True
+            warnings.append("invalid prior_close for gap expansion proxy; falling back conservatively")
+        elif gk_avg_5d is None:
+            gap_exp_proxy_reason = "missing_gk_avg_5d"
+            quality_flags["missing_gk_avg_5d_for_gap_proxy"] = True
+            warnings.append("missing gk_avg_5d for gap expansion proxy; falling back conservatively")
+        elif float(gk_avg_5d) <= 0:
+            gap_exp_proxy_reason = "invalid_gk_avg_5d"
+            quality_flags["invalid_gk_avg_5d_for_gap_proxy"] = True
+            warnings.append("invalid gk_avg_5d for gap expansion proxy; falling back conservatively")
+        elif float(open_price) <= float(prior_close):
+            gap_exp_proxy_reason = "non_positive_open_gap"
+        else:
+            gap_exp_proxy = math.log(float(open_price) / float(prior_close)) / math.sqrt(float(gk_avg_5d))
+            gap_exp_proxy_available = True
+            gap_exp_proxy_reason = "valid"
+
+    feat_dict["prior_close"] = float(prior_close) if prior_close is not None else None
+    feat_dict["gap_expansion_proxy"] = round(gap_exp_proxy, 6) if gap_exp_proxy is not None else None
+    feat_dict["gap_expansion_proxy_available"] = gap_exp_proxy_available
+    feat_dict["gap_expansion_proxy_reason"] = gap_exp_proxy_reason
     feat_dict["early_session_flag"] = early_session_flag
     feat_dict["gap_breakout_flag"] = gap_breakout_flag
     feat_dict["gap_breakout_extension"] = round(gap_brk_ext, 6)
@@ -277,10 +311,17 @@ def _enrich_m6_activation(
     if standard_passed:
         effective_exp_conf = exp_conf
     elif early_gap_passed:
-        # Early-gap: use normal expansion if range passed, else neutral 1.0
         if feat_dict["range_expansion_passed"]:
             effective_exp_conf = exp_conf
+        elif gap_exp_proxy_available:
+            # Use gap-derived expansion proxy through the standard tier function
+            effective_exp_conf = compute_expansion_confirmation(gap_exp_proxy)
+            feat_dict["early_gap_expansion_confirmation"] = effective_exp_conf
+        elif gap_exp_proxy_reason == "non_positive_open_gap":
+            effective_exp_conf = 0.5
+            feat_dict["early_gap_expansion_confirmation"] = 0.5
         else:
+            # No gap proxy data — conservative neutral fallback
             effective_exp_conf = 1.0
             feat_dict["early_gap_expansion_confirmation"] = 1.0
     else:

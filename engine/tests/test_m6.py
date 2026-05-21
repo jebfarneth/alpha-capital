@@ -71,7 +71,7 @@ def _firing_market_data():
 
 
 def _early_gap_market_data():
-    """Deep compression + open gap breakout, early session, no range expansion data."""
+    """Deep compression + open gap breakout, early session, strong gap, no range expansion data."""
     return {
         "compression_ratio": 0.55,
         "gk_vol_5d": 0.018,
@@ -80,6 +80,8 @@ def _early_gap_market_data():
         "sigma_20d": 0.028,
         "price": 5.15,
         "open_price": 5.10,
+        "prior_close": 4.83,
+        "gk_avg_5d": 0.0003,
         "minutes_since_open": 12,
         "latest_5m_volume_ratio": 3.0,
         "spread_pct_vs_eval_quote": 0.005,
@@ -256,19 +258,98 @@ class TestM6EarlyGapActivation:
         assert f["early_session_flag"] is True
         assert f["gap_breakout_flag"] is True
         assert f["gap_breakout_extension"] > 0
-        assert f["early_gap_expansion_confirmation"] == 1.0
-        assert f["range_expansion_passed"] is False  # range data missing, not faked
+        assert f["gap_expansion_proxy_available"] is True
+        assert f["gap_expansion_proxy_reason"] == "valid"
+        assert f["gap_expansion_proxy"] is not None
+        assert f["prior_close"] == 4.83
+        assert f["range_expansion_passed"] is False
 
-    def test_edge_uses_neutral_expansion(self):
+    def test_strong_gap_gets_1_5_expansion(self):
+        """Strong positive gap -> gap_expansion_proxy >= 2.0 -> tier 1.5."""
+        det = M6Detector()
+        data = _early_gap_market_data()
+        # open=5.10, prior_close=4.83 -> ln(5.10/4.83)=0.0544, / sqrt(0.0003)=0.01732 -> ~3.14
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert f["gap_expansion_proxy"] > 2.0
+        assert f["early_gap_expansion_confirmation"] == 1.5
+
+    def test_strong_gap_increases_x_m6_vs_neutral(self):
+        """With gap proxy, X_M6_activation uses 1.5 not 1.0 -> higher edge."""
         det = M6Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_early_gap_market_data(), lineage_hashes=["h"]))
         f = result.features.features
-        # expansion confirmation = 1.0 (neutral) for early gap
         depth = f["compression_depth"]
         brk_ext = f["intraday_breakout_extension"]
         vol_conf = f["intraday_volume_confirmation"]
-        expected_x = min(depth * brk_ext * 1.0 * vol_conf, X_M6_CAP)
+        exp_conf = f["early_gap_expansion_confirmation"]
+        expected_x = min(depth * brk_ext * exp_conf * vol_conf, X_M6_CAP)
         assert f["X_M6_activation"] == round(expected_x, 6)
+        # Should be higher than the neutral 1.0 case
+        neutral_x = min(depth * brk_ext * 1.0 * vol_conf, X_M6_CAP)
+        assert f["X_M6_activation"] >= neutral_x
+
+    def test_moderate_gap_gets_1_25(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        # Target proxy in [1.5, 2.0): ln(4.93/4.84)=0.01844 / sqrt(0.00012)=0.01095 -> 1.684
+        data["prior_close"] = 4.84
+        data["open_price"] = 4.93
+        data["gk_avg_5d"] = 0.00012
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert f["gap_expansion_proxy_available"] is True
+        assert 1.5 <= f["gap_expansion_proxy"] < 2.0
+        assert f["early_gap_expansion_confirmation"] == 1.25
+
+    def test_weak_gap_gets_0_5(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        # Tiny gap: open barely above prior_close
+        data["prior_close"] = 5.09
+        data["open_price"] = 5.10
+        # ln(5.10/5.09)=0.001963 / sqrt(0.0003)=0.01732 -> 0.113 -> tier 0.5
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert f["gap_expansion_proxy_available"] is True
+        assert f["gap_expansion_proxy"] < 1.0
+        assert f["early_gap_expansion_confirmation"] == 0.5
+
+    def test_down_gap_no_expansion_credit(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        data["prior_close"] = 5.20  # open 5.10 < prior_close 5.20 -> down gap
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert f["gap_expansion_proxy_available"] is False
+        assert f["gap_expansion_proxy_reason"] == "non_positive_open_gap"
+        assert f["gap_expansion_proxy"] is None
+        assert f["early_gap_expansion_confirmation"] == 0.5
+
+    def test_missing_prior_close_fallback(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        del data["prior_close"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal  # still fires — early gap candidate with fallback
+        f = result.features.features
+        assert f["gap_expansion_proxy_available"] is False
+        assert f["gap_expansion_proxy_reason"] == "missing_prior_close"
+        assert f["early_gap_expansion_confirmation"] == 1.0  # conservative fallback
+        assert result.quality_flags.get("missing_prior_close") is True
+        assert any("prior_close" in w for w in result.warnings)
+
+    def test_missing_gk_avg_fallback_reason(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        del data["gk_avg_5d"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["gap_expansion_proxy_available"] is False
+        assert f["gap_expansion_proxy_reason"] == "missing_gk_avg_5d"
+        assert f["early_gap_expansion_confirmation"] == 1.0
+        assert result.quality_flags.get("missing_gk_avg_5d_for_gap_proxy") is True
 
     def test_fails_after_30_minutes(self):
         det = M6Detector()
@@ -319,6 +400,7 @@ class TestM6EarlyGapActivation:
         det = M6Detector()
         data = _firing_market_data()
         data["open_price"] = 5.10
+        data["prior_close"] = 4.83
         data["minutes_since_open"] = 15
         data["latest_5m_volume_ratio"] = 3.0
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
