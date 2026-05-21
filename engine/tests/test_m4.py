@@ -333,6 +333,11 @@ class TestM4FreshBreakout:
         assert result.signals[0].signal_status == "active"
         assert result.features.features["activation_passed"] is True
         assert result.features.features["fresh_breakout_extension"] == 0.05
+        assert result.features.features["expected_return_priors"]["tier"] == "default"
+        assert (
+            result.features.features["expected_return_priors"]["entry_lane"]
+            == "fresh_breakout_activation"
+        )
         assert result.signals[0].raw_expected_edge > 0
 
     def test_fresh_activation_spread_failure_no_signal(self):
@@ -421,6 +426,25 @@ class TestM4NoSignal:
         result = det.detect(inp)
         assert not result.has_signal
         assert result.features is not None
+
+    def test_not_operating_universe_member_no_signal(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 11.00,
+                "high_52w": 10.00,
+                "cohort_extensions": [0.10],
+                "operating_universe_inclusion": False,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.quality_flags["not_operating_universe_member"] is True
+        assert result.features.features["cohort_gate_passed"] is False
+        assert any("operating-universe" in w for w in result.warnings)
 
     def test_missing_cohort_data_no_signal(self):
         """M4 cohort gate is signal-generation logic, not a downstream gate."""

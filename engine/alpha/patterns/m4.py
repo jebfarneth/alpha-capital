@@ -494,7 +494,8 @@ class M4Detector(BasePatternDetector):
         x_fresh = fresh_features["x_m4_fresh"]
         raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
         feat_dict["expected_return_priors"] = {
-            "tier": "fresh_breakout_activation",
+            "tier": "default",
+            "entry_lane": ENTRY_LANE_FRESH,
             "gross_bps": round(raw_expected_edge * 10_000, 2),
         }
         signals.append(
