@@ -158,6 +158,24 @@ class TestFormulas:
         assert compute_range_quality(0.8) == 1.0
         assert compute_range_quality(0.5) == 0.75
 
+    def test_compressed_range_confirmed_boost(self):
+        assert compute_range_quality(
+            0.5, breakout_strength=1.2, volume_quality=1.25, spread_quality=1.0,
+        ) == 1.25
+
+    def test_compressed_range_confirmed_neutral(self):
+        assert compute_range_quality(
+            0.5, breakout_strength=0.7, volume_quality=1.0, spread_quality=1.0,
+        ) == 1.0
+
+    def test_compressed_range_penalized_when_unconfirmed(self):
+        assert compute_range_quality(
+            0.5, breakout_strength=1.2, volume_quality=0.5, spread_quality=1.0,
+        ) == 0.75
+        assert compute_range_quality(
+            0.5, breakout_strength=1.2, volume_quality=1.25, spread_quality=0.75,
+        ) == 0.75
+
     def test_spread_quality_tiers(self):
         assert compute_spread_quality(60, 75) == 1.25  # 0.8x normal -> tight
         assert compute_spread_quality(90, 75) == 1.0   # 1.2x normal
@@ -211,6 +229,8 @@ class TestI8Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         priors = result.features.features["expected_return_priors"]
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
+        assert priors["lambda_i8_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert result.features.features["validated_or_shadow_lambda_I8_3td"] == LAMBDA_I8_3TD_DEFAULT
 
     def test_marginal_breakout_fires(self):
         det = I8Detector()
@@ -223,6 +243,48 @@ class TestI8Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         x_i8 = result.features.features["x_i8"]
         assert result.signals[0].raw_expected_edge == round(x_i8 * 0.005, 6)
+        assert result.features.features["validated_or_shadow_lambda_I8_3td"] == 0.005
+        assert result.features.features["expected_return_priors"]["lambda_i8_3td"] == 0.005
+
+    def test_compressed_range_with_strong_confirmation_gets_boost(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["avg_range_30min_20d"] = 0.50  # opening range 0.23 -> compressed ratio 0.46
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["compressed_range_flag"] is True
+        assert f["base_range_quality"] == 0.75
+        assert f["range_quality"] == 1.25
+        assert f["compressed_range_treatment"] == "compressed_confirmed_boost"
+
+    def test_compressed_range_with_adequate_confirmation_gets_neutral(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["avg_range_30min_20d"] = 0.50
+        data["volume_30min"] = 100000
+        data["avg_volume_30min_20d"] = 100000
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["compressed_range_flag"] is True
+        assert f["volume_quality"] == 1.0
+        assert f["range_quality"] == 1.0
+        assert f["compressed_range_treatment"] == "compressed_confirmed_neutral"
+
+    def test_compressed_range_with_weak_volume_stays_penalized(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["avg_range_30min_20d"] = 0.50
+        data["volume_30min"] = 80000
+        data["avg_volume_30min_20d"] = 100000
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["compressed_range_flag"] is True
+        assert f["volume_quality"] == 0.5
+        assert f["range_quality"] == 0.75
+        assert f["compressed_range_treatment"] == "compressed_penalized"
 
 
 # -----------------------------------------------------------------------
@@ -253,6 +315,8 @@ class TestI8NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "spread_too_wide"
+        assert "range_quality" in result.features.features
+        assert "compressed_range_treatment" in result.features.features
 
     def test_missing_breakout_price(self):
         det = I8Detector()

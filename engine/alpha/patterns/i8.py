@@ -81,15 +81,38 @@ def compute_volume_quality(volume_ratio: float) -> float:
     return 0.5
 
 
-def compute_range_quality(range_ratio: float) -> float:
-    """Per EXPOSURE.md tiered weighting."""
+def compute_range_quality(
+    range_ratio: float,
+    *,
+    breakout_strength: Optional[float] = None,
+    volume_quality: Optional[float] = None,
+    spread_quality: Optional[float] = None,
+) -> float:
+    """Per EXPOSURE.md tiered weighting with confirmed-compression treatment."""
     if range_ratio >= 1.5:
         return 1.5
     if range_ratio >= 1.0:
         return 1.25
     if range_ratio >= 0.7:
         return 1.0
-    return 0.75
+
+    if breakout_strength is None or volume_quality is None or spread_quality is None:
+        return 0.75
+    if volume_quality < 1.0 or spread_quality < 1.0:
+        return 0.75
+    if breakout_strength >= 1.0 and volume_quality >= 1.25 and spread_quality >= 1.0:
+        return 1.25
+    return 1.0
+
+
+def _compressed_range_treatment(range_ratio: float, range_quality: float) -> str:
+    if range_ratio >= 0.7:
+        return "not_compressed"
+    if range_quality >= 1.25:
+        return "compressed_confirmed_boost"
+    if range_quality >= 1.0:
+        return "compressed_confirmed_neutral"
+    return "compressed_penalized"
 
 
 def compute_spread_quality(spread_at_eval_bps: float, normal_spread_20d_bps: float) -> float:
@@ -246,10 +269,9 @@ def _enrich_i8_signal(
     else:
         range_ratio = opening_range_size / float(avg_range_30min_20d) if float(avg_range_30min_20d) > 0 else 1.0
 
-    rng_qual = compute_range_quality(range_ratio)
     feat_dict["avg_range_30min_20d"] = float(avg_range_30min_20d) if avg_range_30min_20d is not None else None
     feat_dict["range_ratio"] = round(range_ratio, 6)
-    feat_dict["range_quality"] = rng_qual
+    feat_dict["base_range_quality"] = compute_range_quality(range_ratio)
 
     # Spread quality
     spread_at_eval = md.get("spread_at_eval_bps")
@@ -271,6 +293,16 @@ def _enrich_i8_signal(
     feat_dict["normal_spread_20d_bps"] = float(normal_spread) if normal_spread is not None else None
     feat_dict["spread_quality"] = sprd_qual
 
+    rng_qual = compute_range_quality(
+        range_ratio,
+        breakout_strength=brk_str,
+        volume_quality=vol_qual,
+        spread_quality=sprd_qual,
+    )
+    feat_dict["range_quality"] = rng_qual
+    feat_dict["compressed_range_flag"] = range_ratio < 0.7
+    feat_dict["compressed_range_treatment"] = _compressed_range_treatment(range_ratio, rng_qual)
+
     if sprd_qual == 0.0:
         feat_dict["rejection_reason"] = "spread_too_wide"
         feat_dict["signal_generated"] = False
@@ -285,7 +317,11 @@ def _enrich_i8_signal(
     # Expected-return priors
     raw_expected_edge = round(x_i8 * lambda_i8_3td, 6)
     signal_strength = round(min(x_i8 / X_I8_STRENGTH_DIVISOR, 1.0), 6)
-    feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
+    feat_dict["validated_or_shadow_lambda_I8_3td"] = lambda_i8_3td
+    feat_dict["expected_return_priors"] = {
+        "gross_bps": round(raw_expected_edge * 10_000, 2),
+        "lambda_i8_3td": lambda_i8_3td,
+    }
 
     return PatternSignal(
         direction=SignalDirection.LONG,
