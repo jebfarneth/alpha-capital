@@ -320,7 +320,6 @@ def _enrich_i8_signal(
     feat_dict["validated_or_shadow_lambda_I8_3td"] = lambda_i8_3td
     feat_dict["expected_return_priors"] = {
         "gross_bps": round(raw_expected_edge * 10_000, 2),
-        "lambda_i8_3td": lambda_i8_3td,
     }
 
     return PatternSignal(

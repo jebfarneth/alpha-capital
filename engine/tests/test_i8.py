@@ -229,7 +229,7 @@ class TestI8Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         priors = result.features.features["expected_return_priors"]
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
-        assert priors["lambda_i8_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert "lambda_i8_3td" not in priors
         assert result.features.features["validated_or_shadow_lambda_I8_3td"] == LAMBDA_I8_3TD_DEFAULT
 
     def test_marginal_breakout_fires(self):
@@ -244,7 +244,7 @@ class TestI8Firing:
         x_i8 = result.features.features["x_i8"]
         assert result.signals[0].raw_expected_edge == round(x_i8 * 0.005, 6)
         assert result.features.features["validated_or_shadow_lambda_I8_3td"] == 0.005
-        assert result.features.features["expected_return_priors"]["lambda_i8_3td"] == 0.005
+        assert "lambda_i8_3td" not in result.features.features["expected_return_priors"]
 
     def test_compressed_range_with_strong_confirmation_gets_boost(self):
         det = I8Detector()
