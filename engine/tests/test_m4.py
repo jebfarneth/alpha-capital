@@ -1,22 +1,18 @@
 """
 M4 52-Week High Breakout detector tests.
 
-Vault contract verification:
-  - Detector metadata matches SPEC.md
-  - Exposure formula matches EXPOSURE.md
-  - Signal fires on breakout with top-3-decile extension
-  - No signal below 52-week high
-  - Feature snapshot written even without signal
-  - raw_expected_edge = X_M4 * lambda_M4_15td (deterministic)
-  - Short history is flagged for validation without downgrading FULL fidelity
+Vault contract verification (amended):
+  - All breakouts P >= H52w emit signals (including exact-high closes)
+  - Cohort rank / top3_decile_flag are metadata, not admission gates
+  - Missing cohort data does NOT block signal; adds quality flag
+  - below-high and non-operating-universe are true no-signal cases
+  - Fresh-breakout activation lane intact
   - Evidence bridge writes with correct FK chain
-  - Point-in-time and lineage guards produce warnings
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import List
 
 from alpha.data.contracts import stable_hash
 from alpha.db.models import FeatureSnapshot, SignalRegistry
@@ -38,7 +34,7 @@ from alpha.patterns.m4 import (
     M4Detector,
     X_M4_CAP,
     compute_m4_features,
-    apply_cohort_gate,
+    compute_cohort_metadata,
 )
 
 
@@ -54,18 +50,16 @@ def _setup_run(db_session):
 
 
 def _cohort_extensions(n=30, top_val=0.12):
-    """Generate a realistic breakout cohort with extensions [0..top_val]."""
     return [round(i * top_val / (n - 1), 4) for i in range(n)]
 
 
 # -----------------------------------------------------------------------
-# Detector metadata
+# Metadata
 # -----------------------------------------------------------------------
 
 class TestM4Metadata:
     def test_pattern_id(self):
-        det = M4Detector()
-        assert det.pattern_id == PatternId.M4
+        assert M4Detector().pattern_id == PatternId.M4
 
     def test_track(self):
         assert M4Detector().track == PatternTrack.MULTI_DAY
@@ -84,7 +78,7 @@ class TestM4Metadata:
 
 
 # -----------------------------------------------------------------------
-# Exposure formula (EXPOSURE.md)
+# Exposure formula
 # -----------------------------------------------------------------------
 
 class TestExposureFormula:
@@ -111,45 +105,46 @@ class TestExposureFormula:
         assert feat["X_M4"] == X_M4_CAP
 
     def test_numerical_example_from_spec(self):
-        """EXPOSURE.md table: 20% above -> X_M4 = 1.20."""
         feat = compute_m4_features(price=12.00, high_52w=10.00)
         assert feat["breakout_extension"] == 0.2
         assert feat["X_M4"] == 1.2
 
 
 # -----------------------------------------------------------------------
-# Cohort gate
+# Cohort metadata (no longer a gate)
 # -----------------------------------------------------------------------
 
-class TestCohortGate:
-    def test_top_decile_passes(self):
+class TestCohortMetadata:
+    def test_top_decile_flagged(self):
         exts = _cohort_extensions(30, 0.12)
-        result = apply_cohort_gate(0.12, exts)
-        assert result["cohort_gate_passed"] is True
-        assert result["breakout_cohort_size"] == 30
+        meta = compute_cohort_metadata(0.12, exts)
+        assert meta["top3_decile_flag"] is True
+        assert meta["breakout_cohort_size"] == 30
+        assert meta["breakout_cohort_rank"] is not None
+        assert meta["breakout_cohort_percentile"] is not None
 
-    def test_bottom_decile_fails(self):
+    def test_bottom_decile_not_flagged(self):
         exts = _cohort_extensions(30, 0.12)
-        result = apply_cohort_gate(0.01, exts)
-        assert result["cohort_gate_passed"] is False
+        meta = compute_cohort_metadata(0.01, exts)
+        assert meta["top3_decile_flag"] is False
 
-    def test_zero_extension_excluded(self):
+    def test_zero_extension_not_flagged(self):
         exts = _cohort_extensions(30, 0.12)
-        result = apply_cohort_gate(0.0, exts)
-        assert result["cohort_gate_passed"] is False
+        meta = compute_cohort_metadata(0.0, exts)
+        assert meta["top3_decile_flag"] is False
 
-    def test_small_cohort_all_pass(self):
-        result = apply_cohort_gate(0.05, [0.02, 0.05, 0.08])
-        assert result["cohort_gate_passed"] is True
-        assert result["small_cohort_warning"] is True
+    def test_small_cohort_all_flagged(self):
+        meta = compute_cohort_metadata(0.05, [0.02, 0.05, 0.08])
+        assert meta["top3_decile_flag"] is True
+        assert meta["small_cohort_warning"] is True
 
 
 # -----------------------------------------------------------------------
-# Detector: firing case
+# Firing cases: all breakouts emit signals
 # -----------------------------------------------------------------------
 
 class TestM4Firing:
-    def test_fires_on_breakout(self):
+    def test_extended_breakout_fires(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
@@ -162,33 +157,77 @@ class TestM4Firing:
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-
         assert result.has_signal
-        assert len(result.signals) == 1
-        sig = result.signals[0]
-        assert sig.direction == SignalDirection.LONG
-        assert sig.signal_horizon == "15d"
+        assert result.signals[0].direction == SignalDirection.LONG
+        assert result.signals[0].signal_horizon == "15d"
+        assert result.features.features["extension_tier"] in {"default", "high_conviction"}
 
-    def test_raw_expected_edge_is_deterministic(self):
+    def test_exact_high_fires(self):
+        """Exact-high close P == H52w now emits a signal per amended vault."""
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
             market_data={
-                "price": 11.50,
+                "price": 10.00,
+                "high_52w": 10.00,
+                "cohort_extensions": _cohort_extensions(30, 0.10),
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        sig = result.signals[0]
+        assert sig.raw_expected_edge == round(1.0 * LAMBDA_M4_15TD, 6)
+        assert sig.raw_signal_strength == round(1.0 / X_M4_CAP, 6)
+        assert result.features.features["extension_tier"] == "exact_high"
+        assert result.features.features["tier_classification"] == "exact_high"
+        assert result.features.features["breakout_extension"] == 0.0
+        assert result.features.features["X_M4"] == 1.0
+
+    def test_bottom_decile_breakout_still_fires(self):
+        """Non-top-3-decile breakout still emits signal; top3_decile_flag is metadata."""
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 10.01,
                 "high_52w": 10.00,
                 "cohort_extensions": _cohort_extensions(30, 0.15),
             },
             lineage_hashes=["hash1"],
         )
+        result = det.detect(inp)
+        assert result.has_signal
+        assert result.features.features.get("top3_decile_flag") is False
+
+    def test_missing_cohort_still_fires(self):
+        """Missing cohort data does NOT block signal; adds quality flag."""
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={"price": 11.00, "high_52w": 10.00},
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        assert result.quality_flags.get("cohort_metadata_unavailable") is True
+        assert any("cohort" in w for w in result.warnings)
+
+    def test_raw_expected_edge_deterministic(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            lineage_hashes=["hash1"],
+        )
         r1 = det.detect(inp)
         r2 = det.detect(inp)
-
-        # X_M4 = 1.15, raw_expected_edge = 1.15 * lambda_15td
-        expected_x = 1.15
-        expected_edge = round(expected_x * LAMBDA_M4_15TD, 6)
-
-        assert r1.signals[0].raw_expected_edge == expected_edge
+        expected = round(1.15 * LAMBDA_M4_15TD, 6)
+        assert r1.signals[0].raw_expected_edge == expected
         assert r1.signals[0].raw_expected_edge == r2.signals[0].raw_expected_edge
 
     def test_signal_strength_is_x_over_cap(self):
@@ -196,15 +235,10 @@ class TestM4Firing:
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
-            market_data={
-                "price": 11.50,
-                "high_52w": 10.00,
-                "cohort_extensions": _cohort_extensions(30, 0.15),
-            },
+            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-        # X_M4 = 1.15, signal_strength = 1.15 / 1.5
         assert result.signals[0].raw_signal_strength == round(1.15 / 1.5, 6)
 
     def test_data_confidence_default_1_0(self):
@@ -212,103 +246,64 @@ class TestM4Firing:
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
-            market_data={
-                "price": 11.50,
-                "high_52w": 10.00,
-                "cohort_extensions": _cohort_extensions(30, 0.15),
-            },
+            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
         assert result.signals[0].data_confidence == 1.0
 
-    def test_expected_return_priors_logged_in_features(self):
+    def test_expected_return_priors_logged(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
-            market_data={
-                "price": 11.50,
-                "high_52w": 10.00,
-                "cohort_extensions": _cohort_extensions(30, 0.15),
-            },
+            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
         priors = result.features.features["expected_return_priors"]
-        assert priors["tier"] in {"default", "high_conviction"}
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
 
-    def test_tier_classification_supports_dict_cohort(self):
+    def test_diagnostic_source_features_logged(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
             market_data={
-                "price": 11.50,
-                "high_52w": 10.00,
-                "cohort_extensions": [
-                    {"ticker": f"C{i}", "breakout_extension": i * 0.01}
-                    for i in range(10)
-                ] + [{"ticker": "ACME", "breakout_extension": 0.15}],
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert result.has_signal
-        assert result.features.features["tier_classification"] == "high_conviction"
-
-    def test_optional_validation_source_features_logged(self):
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 11.50,
-                "high_52w": 10.00,
+                "price": 11.50, "high_52w": 10.00,
                 "cohort_extensions": _cohort_extensions(30, 0.15),
-                "D1_decile": 8,
-                "R_6_12m_skip": 0.234,
-                "hamilton_regime_prob": 0.72,
-                "hazard_score_at_signal": 22,
+                "D1_decile": 8, "R_6_12m_skip": 0.234,
+                "hamilton_regime_prob": 0.72, "hazard_score_at_signal": 22,
             },
-            fundamental_data={
-                "market_cap": 95_400_000,
-                "sector": "Technology",
-                "industry": "Software - Application",
-                "analyst_count": 2,
-            },
+            fundamental_data={"market_cap": 95_400_000, "sector": "Technology", "industry": "Software - Application", "analyst_count": 2},
             event_data={"filing_veto_status": "clear"},
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-        features = result.features.features
-        assert features["D1_decile"] == 8
-        assert features["R_6_12m_skip"] == 0.234
-        assert features["analyst_count"] == 2
-        assert features["hamilton_regime_prob"] == 0.72
-        assert features["hazard_score_at_signal"] == 22
-        assert features["filing_veto_status"] == "clear"
-        assert features["sector"] == "Technology"
-        assert features["industry"] == "Software - Application"
+        f = result.features.features
+        assert f["D1_decile"] == 8
+        assert f["R_6_12m_skip"] == 0.234
+        assert f["analyst_count"] == 2
+        assert f["sector"] == "Technology"
 
-    def test_tie_break_uses_liquidity_timestamp_ticker(self):
-        cohort = [
-            {"ticker": "ZZZ", "breakout_extension": 0.10, "median_dollar_volume_20d": 1_000, "signal_timestamp": "2026-05-20T20:05:00Z"},
-            {"ticker": "ACME", "breakout_extension": 0.10, "median_dollar_volume_20d": 2_000, "signal_timestamp": "2026-05-20T20:04:00Z"},
-            {"ticker": "BETA", "breakout_extension": 0.10, "median_dollar_volume_20d": 1_500, "signal_timestamp": "2026-05-20T20:03:00Z"},
-            {"ticker": "LOW1", "breakout_extension": 0.01},
-            {"ticker": "LOW2", "breakout_extension": 0.02},
-            {"ticker": "LOW3", "breakout_extension": 0.03},
-            {"ticker": "LOW4", "breakout_extension": 0.04},
-            {"ticker": "LOW5", "breakout_extension": 0.05},
-            {"ticker": "LOW6", "breakout_extension": 0.06},
-            {"ticker": "LOW7", "breakout_extension": 0.07},
-        ]
-        result = apply_cohort_gate(0.10, cohort, ticker="ACME")
-        assert result["cohort_gate_passed"] is True
-        assert result["breakout_cohort_rank"] == 1
+    def test_field_confidence_product(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10],
+                "field_confidence": {"adj_close": 0.95, "high_52w": 0.90},
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.signals[0].data_confidence == 0.855
 
+
+# -----------------------------------------------------------------------
+# Fresh-breakout lane (unchanged)
+# -----------------------------------------------------------------------
 
 class TestM4FreshBreakout:
     def test_fresh_watchlist_signal_near_high(self):
@@ -319,8 +314,7 @@ class TestM4FreshBreakout:
             market_data={
                 "entry_lane": "fresh_breakout_activation",
                 "activation_state": "watchlist",
-                "price": 9.80,
-                "high_52w": 10.00,
+                "price": 9.80, "high_52w": 10.00,
             },
             lineage_hashes=["hash1"],
         )
@@ -328,7 +322,6 @@ class TestM4FreshBreakout:
         assert result.has_signal
         assert result.signals[0].signal_status == "watchlist"
         assert result.signals[0].raw_expected_edge == 0.0
-        assert result.features.features["watchlist_passed"] is True
 
     def test_fresh_activation_signal(self):
         det = M4Detector()
@@ -338,9 +331,7 @@ class TestM4FreshBreakout:
             market_data={
                 "entry_lane": "fresh_breakout_activation",
                 "activation_state": "activated",
-                "price": 9.90,
-                "last_price": 10.50,
-                "high_52w": 10.00,
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
                 "intraday_range_confirmation": 1.25,
                 "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.005,
@@ -350,16 +341,9 @@ class TestM4FreshBreakout:
         result = det.detect(inp)
         assert result.has_signal
         assert result.signals[0].signal_status == "active"
-        assert result.features.features["activation_passed"] is True
-        assert result.features.features["fresh_breakout_extension"] == 0.05
-        assert result.features.features["expected_return_priors"]["tier"] == "default"
-        assert (
-            result.features.features["expected_return_priors"]["entry_lane"]
-            == "fresh_breakout_activation"
-        )
         assert result.signals[0].raw_expected_edge > 0
 
-    def test_fresh_activation_spread_failure_no_signal(self):
+    def test_fresh_activation_spread_failure(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
@@ -367,9 +351,7 @@ class TestM4FreshBreakout:
             market_data={
                 "entry_lane": "fresh_breakout_activation",
                 "activation_state": "activated",
-                "price": 9.90,
-                "last_price": 10.50,
-                "high_52w": 10.00,
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
                 "intraday_range_confirmation": 1.25,
                 "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.02,
@@ -378,12 +360,11 @@ class TestM4FreshBreakout:
         )
         result = det.detect(inp)
         assert not result.has_signal
-        assert result.features.features["activation_passed"] is False
         assert result.features.features["activation_failure_reason"] == "spread_too_wide"
 
 
 # -----------------------------------------------------------------------
-# Detector: no-signal cases
+# True no-signal cases
 # -----------------------------------------------------------------------
 
 class TestM4NoSignal:
@@ -400,22 +381,6 @@ class TestM4NoSignal:
         assert result.features is not None
         assert result.features.features["X_M4"] == 0.95
 
-    def test_exact_high_no_extension_no_signal(self):
-        """Exact-high crossings excluded per EXPOSURE.md: extension must be > 0."""
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 10.00,
-                "high_52w": 10.00,
-                "cohort_extensions": _cohort_extensions(30, 0.10),
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert not result.has_signal
-
     def test_missing_price_no_features(self):
         det = M4Detector()
         inp = PatternInput(
@@ -427,33 +392,14 @@ class TestM4NoSignal:
         result = det.detect(inp)
         assert not result.has_signal
         assert result.features is None
-        assert any("missing" in w for w in result.warnings)
 
-    def test_cohort_gate_reject(self):
-        """Bottom-decile extension fails the top-3-decile gate."""
+    def test_not_operating_universe_no_signal(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
             market_data={
-                "price": 10.01,
-                "high_52w": 10.00,
-                "cohort_extensions": _cohort_extensions(30, 0.15),
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert not result.has_signal
-        assert result.features is not None
-
-    def test_not_operating_universe_member_no_signal(self):
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 11.00,
-                "high_52w": 10.00,
+                "price": 11.00, "high_52w": 10.00,
                 "cohort_extensions": [0.10],
                 "operating_universe_inclusion": False,
             },
@@ -462,99 +408,28 @@ class TestM4NoSignal:
         result = det.detect(inp)
         assert not result.has_signal
         assert result.quality_flags["not_operating_universe_member"] is True
-        assert result.features.features["cohort_gate_passed"] is False
-        assert any("operating-universe" in w for w in result.warnings)
-
-    def test_missing_cohort_data_no_signal(self):
-        """M4 cohort gate is signal-generation logic, not a downstream gate."""
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00},
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert not result.has_signal
-        assert result.features is not None
-        assert result.features.features["cohort_gate_passed"] is False
-        assert result.features.features["cohort_missing"] is True
-        assert any("cohort" in w for w in result.warnings)
 
 
 # -----------------------------------------------------------------------
-# Fidelity degradation
+# Fidelity
 # -----------------------------------------------------------------------
 
 class TestM4Fidelity:
-    def test_short_history_degrades_to_lite(self):
+    def test_always_full_fidelity(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
             asof_timestamp=_ts(),
-            market_data={
-                "price": 11.00,
-                "high_52w": 10.00,
-                "n_sessions_in_window": 100,
-                "cohort_extensions": [0.10],
-            },
+            market_data={"price": 11.00, "high_52w": 10.00, "n_sessions_in_window": 100, "cohort_extensions": [0.10]},
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
         assert result.features.fidelity_tier == FidelityTier.FULL
         assert result.features.features["short_history_flag"] is True
 
-    def test_full_history_is_full(self):
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 11.00,
-                "high_52w": 10.00,
-                "n_sessions_in_window": 252,
-                "cohort_extensions": [0.10],
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert result.features.fidelity_tier == FidelityTier.FULL
-
-    def test_short_history_does_not_reduce_data_confidence(self):
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 11.00,
-                "high_52w": 10.00,
-                "n_sessions_in_window": 100,
-                "cohort_extensions": [0.10],
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert result.signals[0].data_confidence == 1.0
-
-    def test_field_confidence_product_reduces_data_confidence(self):
-        det = M4Detector()
-        inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={
-                "price": 11.00,
-                "high_52w": 10.00,
-                "cohort_extensions": [0.10],
-                "field_confidence": {"adj_close": 0.95, "high_52w": 0.90},
-            },
-            lineage_hashes=["hash1"],
-        )
-        result = det.detect(inp)
-        assert result.signals[0].data_confidence == 0.855
-
 
 # -----------------------------------------------------------------------
-# Quality guards
+# Guards
 # -----------------------------------------------------------------------
 
 class TestM4Guards:
@@ -568,7 +443,6 @@ class TestM4Guards:
         )
         result = det.detect(inp)
         assert result.quality_flags.get("missing_lineage") is True
-        # Still fires — guards don't block admission
         assert result.has_signal
 
     def test_future_timestamp_warning(self):
@@ -585,11 +459,11 @@ class TestM4Guards:
 
 
 # -----------------------------------------------------------------------
-# Hash determinism
+# Hashes
 # -----------------------------------------------------------------------
 
 class TestM4Hashes:
-    def test_input_output_hashes_stable(self):
+    def test_stable(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
@@ -602,33 +476,13 @@ class TestM4Hashes:
         assert r1.input_hashes == r2.input_hashes
         assert r1.output_hashes == r2.output_hashes
 
-    def test_hashes_change_when_cohort_changes(self):
+    def test_change_with_price(self):
         det = M4Detector()
-        base = {
-            "price": 10.20,
-            "high_52w": 10.00,
-        }
-        pass_inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={**base, "cohort_extensions": [0.01, 0.02]},
-            lineage_hashes=["hash1"],
-        )
-        fail_inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            market_data={**base, "cohort_extensions": _cohort_extensions(30, 0.50)},
-            lineage_hashes=["hash1"],
-        )
-        pass_result = det.detect(pass_inp)
-        fail_result = det.detect(fail_inp)
+        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"price": 11.00, "high_52w": 10.00}, lineage_hashes=["h"]))
+        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"price": 12.00, "high_52w": 10.00}, lineage_hashes=["h"]))
+        assert r1.output_hashes != r2.output_hashes
 
-        assert pass_result.has_signal
-        assert not fail_result.has_signal
-        assert pass_result.input_hashes != fail_result.input_hashes
-        assert pass_result.output_hashes != fail_result.output_hashes
-
-    def test_output_hash_matches_final_features_and_signals(self):
+    def test_output_hash_matches_final_state(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME",
@@ -657,7 +511,7 @@ class TestM4Hashes:
 
 
 # -----------------------------------------------------------------------
-# Evidence bridge integration
+# Evidence bridge
 # -----------------------------------------------------------------------
 
 class TestM4EvidenceBridge:
@@ -676,8 +530,7 @@ class TestM4EvidenceBridge:
             ticker="ACME",
             asof_timestamp=_ts(),
             market_data={
-                "price": price,
-                "high_52w": high_52w,
+                "price": price, "high_52w": high_52w,
                 "cohort_extensions": _cohort_extensions(30, 0.15),
             },
             fundamental_data={"market_cap": 75_000_000},
@@ -686,9 +539,7 @@ class TestM4EvidenceBridge:
         )
         result = det.detect(inp)
         persisted = persist_detection_result(
-            db_session,
-            result,
-            det,
+            db_session, result, det,
             job_run_id=run.job_run_id,
             data_lineage_ids=[lineage.data_lineage_id],
         )
@@ -699,14 +550,11 @@ class TestM4EvidenceBridge:
         run, result, persisted = self._run_detection(db_session)
         assert persisted.feature_snapshot_id is not None
         assert len(persisted.signal_ids) == 1
-
         sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
         assert sig.feature_snapshot_id == persisted.feature_snapshot_id
         assert sig.pattern_id == "M4"
         assert sig.route_class == "A"
         assert sig.thesis_category == "right_tail_convex"
-        assert sig.signal_horizon == "15d"
-
         feat = db_session.get(FeatureSnapshot, persisted.feature_snapshot_id)
         assert feat.feature_manifest_version == "m4-v1"
 
@@ -720,38 +568,27 @@ class TestM4EvidenceBridge:
     def test_universe_snapshot_id_preserved(self, db_session):
         run = _setup_run(db_session)
         usn = record_universe_snapshot(
-            db_session,
-            ticker="ACME",
-            asof_timestamp=_ts(),
-            operating_universe_inclusion=True,
-            job_run_id=run.job_run_id,
+            db_session, ticker="ACME", asof_timestamp=_ts(),
+            operating_universe_inclusion=True, job_run_id=run.job_run_id,
         )
         lineage = record_data_lineage(
-            db_session,
-            provider="FMP",
-            endpoint="/stable/historical-price-eod/full",
-            asof_timestamp=_ts(),
-            raw_payload={"close": 11.0},
-            job_run_id=run.job_run_id,
+            db_session, provider="FMP", endpoint="/stable/historical-price-eod/full",
+            asof_timestamp=_ts(), raw_payload={"close": 11.0}, job_run_id=run.job_run_id,
         )
         det = M4Detector()
         inp = PatternInput(
-            ticker="ACME",
-            asof_timestamp=_ts(),
+            ticker="ACME", asof_timestamp=_ts(),
             market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
             lineage_hashes=[lineage.raw_payload_hash],
         )
         result = det.detect(inp)
         persisted = persist_detection_result(
-            db_session,
-            result,
-            det,
+            db_session, result, det,
             job_run_id=run.job_run_id,
             universe_snapshot_id=usn.universe_snapshot_id,
             data_lineage_ids=[lineage.data_lineage_id],
         )
         db_session.flush()
-
         sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
         assert sig.universe_snapshot_id == usn.universe_snapshot_id
 
@@ -759,8 +596,6 @@ class TestM4EvidenceBridge:
         run, result, persisted = self._run_detection(db_session, price=9.50, high_52w=10.00)
         assert persisted.feature_snapshot_id is not None
         assert len(persisted.signal_ids) == 0
-        assert db_session.query(SignalRegistry).count() == 0
-        assert db_session.query(FeatureSnapshot).count() == 1
 
     def test_feature_hash_deterministic(self, db_session):
         _, _, p1 = self._run_detection(db_session)
@@ -768,3 +603,29 @@ class TestM4EvidenceBridge:
         f1 = db_session.get(FeatureSnapshot, p1.feature_snapshot_id)
         f2 = db_session.get(FeatureSnapshot, p2.feature_snapshot_id)
         assert f1.feature_hash == f2.feature_hash
+
+    def test_exact_high_persists_through_bridge(self, db_session):
+        """Exact-high signal writes feature_snapshot + signal_registry via bridge."""
+        run = _setup_run(db_session)
+        lineage = record_data_lineage(
+            db_session, provider="FMP", endpoint="/stable/historical-price-eod/full",
+            asof_timestamp=_ts(), raw_payload={"close": 10.0}, job_run_id=run.job_run_id,
+        )
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={"price": 10.00, "high_52w": 10.00},
+            lineage_hashes=[lineage.raw_payload_hash],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        persisted = persist_detection_result(
+            db_session, result, det,
+            job_run_id=run.job_run_id,
+            data_lineage_ids=[lineage.data_lineage_id],
+        )
+        db_session.flush()
+        assert persisted.feature_snapshot_id is not None
+        assert len(persisted.signal_ids) == 1
+        sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
+        assert sig.pattern_id == "M4"

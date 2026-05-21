@@ -17,10 +17,11 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
   lambda_M4_15td = lambda_monthly * 15/21 = ~0.786%
   raw_expected_edge = X_M4 * lambda_M4_15td
 
-Eligibility gate (EXPOSURE.md):
-  1. P >= H52w (breakout event)
-  2. Top-3-decile breakout_extension within same-day breakout cohort
-  3. breakout_extension > 0 (exact-high crossings excluded)
+Signal admission (EXPOSURE.md amended):
+  1. P >= H52w (breakout event, including exact-high closes)
+  2. Operating-universe membership
+  Cohort rank and top-3-decile flag are metadata for KOTH/TCB/validation,
+  not signal-generation gates.
 
 This detector supports both vault-defined lanes:
   - base_daily close-confirmed breakouts
@@ -35,7 +36,6 @@ from typing import Any, Dict, List
 from alpha.data.contracts import stable_hash
 from alpha.patterns.contracts import (
     BasePatternDetector,
-    FidelityTier,
     PatternDetectionResult,
     PatternFeatures,
     PatternInput,
@@ -59,7 +59,7 @@ X_M4_CAP = 1.5
 LAMBDA_M4_MONTHLY = 0.011  # 1.1% per month (J&T 6/6 conservative)
 LAMBDA_M4_15TD = LAMBDA_M4_MONTHLY * 15.0 / 21.0  # ~0.00786
 SIGNAL_HORIZON = "15d"
-BREAKOUT_COHORT_PERCENTILE = 0.70  # top-3-decile gate
+BREAKOUT_COHORT_PERCENTILE = 0.70  # 70th pctl threshold for top3_decile_flag
 SMALL_COHORT_THRESHOLD = 10
 ENTRY_LANE_BASE = "base_daily"
 ENTRY_LANE_FRESH = "fresh_breakout_activation"
@@ -108,35 +108,34 @@ def compute_m4_features(
     }
 
 
-def apply_cohort_gate(
+def compute_cohort_metadata(
     breakout_extension: float,
-    cohort_extensions: List[float],
+    cohort_extensions: List[Any],
     *,
     ticker: str | None = None,
 ) -> Dict[str, Any]:
     """
-    Apply the top-3-decile breakout_extension cohort gate.
+    Compute breakout-cohort ranking metadata per EXPOSURE.md.
 
-    Returns gate metadata: passed, cohort_size, rank, decile,
-    percentile_threshold, small_cohort_warning.
+    This is METADATA for KOTH ranking, TCB attribution, and validation.
+    It does NOT suppress signal generation.
     """
     cohort_size = len(cohort_extensions)
 
-    # Small-cohort handling: all pass per EXPOSURE.md
     if cohort_size < SMALL_COHORT_THRESHOLD:
-        passed = breakout_extension > 0
         return {
-            "cohort_gate_passed": passed,
             "breakout_cohort_size": cohort_size,
             "breakout_cohort_rank": None,
+            "breakout_cohort_percentile": None,
             "breakout_cohort_decile": None,
-            "percentile_threshold": 0.0,
+            "cohort_threshold_70p": 0.0,
+            "top3_decile_flag": True,
             "small_cohort_warning": True,
         }
 
     cohort_records = _cohort_records(cohort_extensions)
 
-    # Compute 70th percentile threshold (linear interpolation)
+    # 70th percentile threshold (linear interpolation per EXPOSURE.md)
     sorted_ext = sorted(record["extension"] for record in cohort_records)
     idx = BREAKOUT_COHORT_PERCENTILE * (cohort_size - 1)
     lower = int(idx)
@@ -148,18 +147,20 @@ def apply_cohort_gate(
 
     rank = _cohort_rank(cohort_records, breakout_extension, ticker)
     decile = min(10, max(1, int((rank - 1) / cohort_size * 10) + 1))
+    percentile = round(1.0 - (rank - 1) / cohort_size, 4)
     top_count = max(1, math.ceil((1.0 - BREAKOUT_COHORT_PERCENTILE) * cohort_size))
-    passed = (
+    top3_flag = (
         breakout_extension > threshold
         or (breakout_extension == threshold and rank <= top_count)
-    ) and breakout_extension > 0
+    )
 
     return {
-        "cohort_gate_passed": passed,
         "breakout_cohort_size": cohort_size,
         "breakout_cohort_rank": rank,
+        "breakout_cohort_percentile": percentile,
         "breakout_cohort_decile": decile,
-        "percentile_threshold": round(threshold, 6),
+        "cohort_threshold_70p": round(threshold, 6),
+        "top3_decile_flag": top3_flag,
         "small_cohort_warning": False,
     }
 
@@ -199,8 +200,6 @@ def _cohort_records(cohort_extensions: List[Any]) -> List[Dict[str, Any]]:
 def _cohort_rank(
     cohort_records: List[Dict[str, Any]], breakout_extension: float, ticker: str | None
 ) -> int:
-    # Vault tie-break order at the 70th percentile threshold:
-    # higher 20d median dollar volume, earlier signal_timestamp, ticker.
     ranked = sorted(
         cohort_records,
         key=lambda record: (
@@ -269,8 +268,28 @@ def build_m4_source_features(
     return features
 
 
+def _classify_extension_tier(
+    extension: float,
+    cohort_extensions: List[Any] | None,
+) -> str:
+    """
+    Classify extension tier per SPEC.md:
+      exact_high: extension == 0 (P == H52w)
+      high_conviction: top quartile of cohort extensions
+      default: all other extended breakouts
+    """
+    if extension == 0:
+        return "exact_high"
+    if cohort_extensions:
+        p75_values = sorted(_cohort_extension_value(item) for item in cohort_extensions)
+        p75 = p75_values[int(0.75 * (len(p75_values) - 1))]
+        if extension >= p75:
+            return "high_conviction"
+    return "default"
+
+
 class M4Detector(BasePatternDetector):
-    """M4 52-Week High Breakout detector (base_daily lane)."""
+    """M4 52-Week High Breakout detector."""
 
     pattern_id = PatternId.M4
     track = PatternTrack.MULTI_DAY
@@ -346,7 +365,7 @@ class M4Detector(BasePatternDetector):
             lookahead_guard_passed=True,
         )
 
-        # Signal eligibility: breakout event
+        # Signal eligibility: breakout event (P >= H52w)
         breakout = price >= high_52w
         extension = feat_dict["breakout_extension"]
 
@@ -355,59 +374,44 @@ class M4Detector(BasePatternDetector):
         if entry_lane == ENTRY_LANE_FRESH:
             self._apply_fresh_lane(inp, feat_dict, warnings, quality_flags, signals)
         elif quality_flags.get("not_operating_universe_member"):
-            feat_dict["cohort_gate_passed"] = False
-        elif breakout and extension > 0:
-            # Cohort gate
-            if cohort_extensions is None:
-                # M4's top-3-decile breakout-extension cohort gate is part
-                # of signal generation. Without the same-day cohort, preserve
-                # features for audit but do not emit a signal.
-                cohort_meta = {
-                    "cohort_gate_passed": False,
-                    "breakout_cohort_size": None,
-                    "breakout_cohort_rank": None,
-                    "breakout_cohort_decile": None,
-                    "percentile_threshold": None,
-                    "small_cohort_warning": False,
-                    "cohort_missing": True,
-                }
-                warnings.append("missing breakout cohort data — no M4 signal emitted")
-            else:
-                cohort_meta = apply_cohort_gate(
+            pass  # no signal for non-universe tickers
+        elif breakout:
+            # Cohort metadata (ranking, not admission)
+            if cohort_extensions is not None:
+                cohort_meta = compute_cohort_metadata(
                     extension, cohort_extensions, ticker=inp.ticker
                 )
+                feat_dict.update(cohort_meta)
+            else:
+                quality_flags["cohort_metadata_unavailable"] = True
+                warnings.append("breakout cohort data unavailable — cohort metadata missing")
 
-            feat_dict.update(cohort_meta)
+            # Extension tier and signal
+            x_m4 = feat_dict["X_M4"]
+            raw_expected_edge = round(x_m4 * LAMBDA_M4_15TD, 6)
+            signal_strength = round(x_m4 / X_M4_CAP, 6)
 
-            if cohort_meta["cohort_gate_passed"]:
-                x_m4 = feat_dict["X_M4"]
-                raw_expected_edge = round(x_m4 * LAMBDA_M4_15TD, 6)
-                signal_strength = round(x_m4 / X_M4_CAP, 6)
+            tier = _classify_extension_tier(extension, cohort_extensions)
+            feat_dict["extension_tier"] = tier
+            feat_dict["tier_classification"] = tier
 
-                # Tier classification (audit metadata, per SPEC.md)
-                cohort_exts = cohort_extensions or [extension]
-                p75_values = sorted(_cohort_extension_value(item) for item in cohort_exts)
-                p75 = p75_values[int(0.75 * (len(p75_values) - 1))]
-                tier = "high_conviction" if extension >= p75 else "default"
-                feat_dict["tier_classification"] = tier
+            data_conf = _data_confidence(inp)
 
-                data_conf = _data_confidence(inp)
+            gross_bps = round(raw_expected_edge * 10_000, 2)
+            feat_dict["expected_return_priors"] = {
+                "tier": tier,
+                "gross_bps": gross_bps,
+            }
 
-                gross_bps = round(raw_expected_edge * 10_000, 2)
-                feat_dict["expected_return_priors"] = {
-                    "tier": tier,
-                    "gross_bps": gross_bps,
-                }
-
-                signals.append(
-                    PatternSignal(
-                        direction=SignalDirection.LONG,
-                        raw_signal_strength=signal_strength,
-                        raw_expected_edge=raw_expected_edge,
-                        signal_horizon=SIGNAL_HORIZON,
-                        data_confidence=round(data_conf, 4),
-                    )
+            signals.append(
+                PatternSignal(
+                    direction=SignalDirection.LONG,
+                    raw_signal_strength=signal_strength,
+                    raw_expected_edge=raw_expected_edge,
+                    signal_horizon=SIGNAL_HORIZON,
+                    data_confidence=round(data_conf, 4),
                 )
+            )
 
         input_hash = stable_hash({
             "ticker": inp.ticker,
