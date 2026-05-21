@@ -171,19 +171,16 @@ def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]
     return None
 
 
-# ---------------------------------------------------------------------------
-# Activation enrichment
-# ---------------------------------------------------------------------------
+def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
+    feat_dict["rejection_reason"] = reason
+    feat_dict["signal_generated"] = False
+    feat_dict["x_i8"] = 0.0
 
-def _enrich_i8_signal(
+
+def _copy_opening_range_features(
     feat_dict: Dict[str, Any],
-    inp: PatternInput,
-    warnings: List[str],
-    quality_flags: Dict[str, Any],
-    lambda_i8_3td: float,
-) -> Optional[PatternSignal]:
-    """Compute opening-range breakout features and return signal if gates pass."""
-    md = inp.market_data
+    md: Dict[str, Any],
+) -> tuple[float, float, float, float]:
     opening_range_high = float(md["opening_range_high"])
     opening_range_low = float(md["opening_range_low"])
     sigma_20d = float(md["sigma_20d"])
@@ -194,52 +191,50 @@ def _enrich_i8_signal(
     feat_dict["opening_range_size"] = round(opening_range_size, 6)
     feat_dict["sigma_20d"] = sigma_20d
     _copy_diagnostic_fields(feat_dict, md)
+    return opening_range_high, opening_range_low, sigma_20d, opening_range_size
 
-    # Pre-signal rejection
-    pre_rej = _pre_signal_rejection(feat_dict, md)
-    if pre_rej is not None:
-        feat_dict["rejection_reason"] = pre_rej
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
-        return None
 
-    # Breakout price
+def _compute_i8_breakout_quality(
+    feat_dict: Dict[str, Any],
+    md: Dict[str, Any],
+    opening_range_high: float,
+    sigma_20d: float,
+) -> Optional[float]:
     breakout_price = md.get("breakout_price")
     if breakout_price is None:
-        feat_dict["rejection_reason"] = "no_upside_breakout"
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
+        _reject_signal(feat_dict, "no_upside_breakout")
         return None
 
     breakout_price = float(breakout_price)
     feat_dict["breakout_price"] = breakout_price
 
-    # Breakout strength
-    brk_str = compute_breakout_strength(breakout_price, opening_range_high, sigma_20d)
-    feat_dict["breakout_strength"] = round(brk_str, 6)
+    breakout_strength = compute_breakout_strength(breakout_price, opening_range_high, sigma_20d)
+    feat_dict["breakout_strength"] = round(breakout_strength, 6)
 
     if breakout_price <= opening_range_high:
-        feat_dict["rejection_reason"] = "no_upside_breakout"
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
+        _reject_signal(feat_dict, "no_upside_breakout")
         return None
 
-    if brk_str < MIN_BREAKOUT_STRENGTH:
-        feat_dict["rejection_reason"] = "breakout_below_threshold"
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
+    if breakout_strength < MIN_BREAKOUT_STRENGTH:
+        _reject_signal(feat_dict, "breakout_below_threshold")
         return None
 
-    # Volume quality
+    return breakout_strength
+
+
+def _compute_i8_volume_quality(
+    feat_dict: Dict[str, Any],
+    md: Dict[str, Any],
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[float]:
     volume_30min = md.get("volume_30min")
     avg_volume_30min_20d = md.get("avg_volume_30min_20d")
     if volume_30min is None or float(volume_30min) <= 0:
         feat_dict["volume_30min"] = float(volume_30min) if volume_30min is not None else None
         feat_dict["volume_ratio"] = 0.0
         feat_dict["volume_quality"] = 0.0
-        feat_dict["rejection_reason"] = "volume_below_minimum"
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
+        _reject_signal(feat_dict, "volume_below_minimum")
         return None
 
     volume_30min = float(volume_30min)
@@ -252,69 +247,89 @@ def _enrich_i8_signal(
     else:
         avg_volume_30min_20d = float(avg_volume_30min_20d)
 
-    vol_ratio = volume_30min / avg_volume_30min_20d if avg_volume_30min_20d > 0 else 0.0
-    vol_qual = compute_volume_quality(vol_ratio)
+    volume_ratio = volume_30min / avg_volume_30min_20d if avg_volume_30min_20d > 0 else 0.0
+    volume_quality = compute_volume_quality(volume_ratio)
     feat_dict["volume_30min"] = volume_30min
     feat_dict["avg_volume_30min_20d"] = round(avg_volume_30min_20d, 2)
-    feat_dict["volume_ratio"] = round(vol_ratio, 6)
-    feat_dict["volume_quality"] = vol_qual
+    feat_dict["volume_ratio"] = round(volume_ratio, 6)
+    feat_dict["volume_quality"] = volume_quality
     feat_dict["baseline_volume_proxy"] = baseline_volume_proxy
+    return volume_quality
 
-    # Range quality
+
+def _compute_i8_range_ratio(
+    feat_dict: Dict[str, Any],
+    md: Dict[str, Any],
+    opening_range_size: float,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> float:
     avg_range_30min_20d = md.get("avg_range_30min_20d")
     if avg_range_30min_20d is None or float(avg_range_30min_20d) <= 0:
         range_ratio = 1.0
         quality_flags["baseline_range_proxy"] = True
         warnings.append("avg_range_30min_20d unavailable — assuming normal range")
     else:
-        range_ratio = opening_range_size / float(avg_range_30min_20d) if float(avg_range_30min_20d) > 0 else 1.0
+        range_ratio = opening_range_size / float(avg_range_30min_20d)
 
     feat_dict["avg_range_30min_20d"] = float(avg_range_30min_20d) if avg_range_30min_20d is not None else None
     feat_dict["range_ratio"] = round(range_ratio, 6)
     feat_dict["base_range_quality"] = compute_range_quality(range_ratio)
+    return range_ratio
 
-    # Spread quality
+
+def _compute_i8_spread_quality(
+    feat_dict: Dict[str, Any],
+    md: Dict[str, Any],
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> float:
     spread_at_eval = md.get("spread_at_eval_bps")
     normal_spread = md.get("normal_spread_20d_bps")
     if spread_at_eval is None:
-        sprd_qual = 0.75
+        spread_quality = 0.75
         quality_flags["baseline_spread_proxy"] = True
         warnings.append("spread_at_eval_bps unavailable — using conservative wide-spread proxy")
     else:
         if normal_spread is None or float(normal_spread) <= 0:
             quality_flags["baseline_spread_proxy"] = True
             warnings.append("normal_spread_20d_bps unavailable — using conservative wide-spread proxy")
-        sprd_qual = compute_spread_quality(
+        spread_quality = compute_spread_quality(
             float(spread_at_eval),
             float(normal_spread) if normal_spread is not None else 0.0,
         )
 
     feat_dict["spread_at_eval_bps"] = float(spread_at_eval) if spread_at_eval is not None else None
     feat_dict["normal_spread_20d_bps"] = float(normal_spread) if normal_spread is not None else None
-    feat_dict["spread_quality"] = sprd_qual
+    feat_dict["spread_quality"] = spread_quality
+    return spread_quality
 
-    rng_qual = compute_range_quality(
+
+def _compute_i8_final_range_quality(
+    feat_dict: Dict[str, Any],
+    range_ratio: float,
+    breakout_strength: float,
+    volume_quality: float,
+    spread_quality: float,
+) -> float:
+    range_quality = compute_range_quality(
         range_ratio,
-        breakout_strength=brk_str,
-        volume_quality=vol_qual,
-        spread_quality=sprd_qual,
+        breakout_strength=breakout_strength,
+        volume_quality=volume_quality,
+        spread_quality=spread_quality,
     )
-    feat_dict["range_quality"] = rng_qual
+    feat_dict["range_quality"] = range_quality
     feat_dict["compressed_range_flag"] = range_ratio < 0.7
-    feat_dict["compressed_range_treatment"] = _compressed_range_treatment(range_ratio, rng_qual)
+    feat_dict["compressed_range_treatment"] = _compressed_range_treatment(range_ratio, range_quality)
+    return range_quality
 
-    if sprd_qual == 0.0:
-        feat_dict["rejection_reason"] = "spread_too_wide"
-        feat_dict["signal_generated"] = False
-        feat_dict["x_i8"] = 0.0
-        return None
 
-    # Exposure
-    x_i8 = min(brk_str * vol_qual * rng_qual * sprd_qual, X_I8_CAP)
-    feat_dict["x_i8"] = round(x_i8, 6)
-    feat_dict["signal_generated"] = True
-
-    # Expected-return priors
+def _build_i8_signal(
+    feat_dict: Dict[str, Any],
+    x_i8: float,
+    lambda_i8_3td: float,
+    quality_flags: Dict[str, Any],
+) -> PatternSignal:
     raw_expected_edge = round(x_i8 * lambda_i8_3td, 6)
     signal_strength = round(min(x_i8 / X_I8_STRENGTH_DIVISOR, 1.0), 6)
     feat_dict["validated_or_shadow_lambda_I8_3td"] = lambda_i8_3td
@@ -329,6 +344,51 @@ def _enrich_i8_signal(
         signal_horizon=SIGNAL_HORIZON,
         data_confidence=_data_confidence(quality_flags),
     )
+
+
+# ---------------------------------------------------------------------------
+# Activation enrichment
+# ---------------------------------------------------------------------------
+
+def _enrich_i8_signal(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+    lambda_i8_3td: float,
+) -> Optional[PatternSignal]:
+    """Compute opening-range breakout features and return signal if gates pass."""
+    md = inp.market_data
+    opening_range_high, _, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, md)
+
+    pre_rej = _pre_signal_rejection(feat_dict, md)
+    if pre_rej is not None:
+        _reject_signal(feat_dict, pre_rej)
+        return None
+
+    breakout_strength = _compute_i8_breakout_quality(feat_dict, md, opening_range_high, sigma_20d)
+    if breakout_strength is None:
+        return None
+
+    volume_quality = _compute_i8_volume_quality(feat_dict, md, warnings, quality_flags)
+    if volume_quality is None:
+        return None
+
+    range_ratio = _compute_i8_range_ratio(feat_dict, md, opening_range_size, warnings, quality_flags)
+    spread_quality = _compute_i8_spread_quality(feat_dict, md, warnings, quality_flags)
+    range_quality = _compute_i8_final_range_quality(
+        feat_dict, range_ratio, breakout_strength, volume_quality, spread_quality,
+    )
+
+    if spread_quality == 0.0:
+        _reject_signal(feat_dict, "spread_too_wide")
+        return None
+
+    x_i8 = min(breakout_strength * volume_quality * range_quality * spread_quality, X_I8_CAP)
+    feat_dict["x_i8"] = round(x_i8, 6)
+    feat_dict["signal_generated"] = True
+
+    return _build_i8_signal(feat_dict, x_i8, lambda_i8_3td, quality_flags)
 
 
 def _compute_hashes(
@@ -391,27 +451,11 @@ class I8Detector(BasePatternDetector):
 
         if float(opening_range_high) <= float(opening_range_low):
             warnings.append("opening_range_high <= opening_range_low — invalid or zero-range bar")
-            feat_dict = {
-                "opening_range_high": float(opening_range_high),
-                "opening_range_low": float(opening_range_low),
-                "sigma_20d": float(sigma_20d),
-                "signal_generated": False,
-                "rejection_reason": "insufficient_bar_data",
-            }
-            pit_passed = quality_flags.get("point_in_time_passed") is not False
-            fidelity = classify_fidelity(
-                has_primary_data=True, has_secondary_data=True,
-                point_in_time_passed=pit_passed, lookahead_guard_passed=True,
-            )
-            features = PatternFeatures(
-                features=feat_dict, feature_manifest_version="i8-v1",
-                fidelity_tier=fidelity, point_in_time_passed=pit_passed, lookahead_guard_passed=True,
-            )
-            input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, [], warnings, quality_flags)
-            return PatternDetectionResult(
-                pattern_id=self.pattern_id, ticker=inp.ticker, asof_timestamp=asof,
-                features=features, signals=[], warnings=warnings, quality_flags=quality_flags,
-                input_hashes={"market_data": input_hash}, output_hashes={"features": output_hash},
+            return self._invalid_bar_result(
+                inp, asof, warnings, quality_flags,
+                opening_range_high=float(opening_range_high),
+                opening_range_low=float(opening_range_low),
+                sigma_20d=float(sigma_20d),
             )
 
         feat_dict: Dict[str, Any] = {}
@@ -453,4 +497,38 @@ class I8Detector(BasePatternDetector):
         return PatternDetectionResult(
             pattern_id=self.pattern_id, ticker=ticker, asof_timestamp=asof,
             features=None, warnings=warnings, quality_flags=quality_flags,
+        )
+
+    def _invalid_bar_result(
+        self,
+        inp: PatternInput,
+        asof,
+        warnings,
+        quality_flags,
+        *,
+        opening_range_high: float,
+        opening_range_low: float,
+        sigma_20d: float,
+    ) -> PatternDetectionResult:
+        feat_dict = {
+            "opening_range_high": opening_range_high,
+            "opening_range_low": opening_range_low,
+            "sigma_20d": sigma_20d,
+            "signal_generated": False,
+            "rejection_reason": "insufficient_bar_data",
+        }
+        pit_passed = quality_flags.get("point_in_time_passed") is not False
+        fidelity = classify_fidelity(
+            has_primary_data=True, has_secondary_data=True,
+            point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+        )
+        features = PatternFeatures(
+            features=feat_dict, feature_manifest_version="i8-v1",
+            fidelity_tier=fidelity, point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+        )
+        input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, [], warnings, quality_flags)
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id, ticker=inp.ticker, asof_timestamp=asof,
+            features=features, signals=[], warnings=warnings, quality_flags=quality_flags,
+            input_hashes={"market_data": input_hash}, output_hashes={"features": output_hash},
         )
