@@ -1,0 +1,367 @@
+"""
+I1 — Gap and Go Detector.
+
+Vault source: Engineering/Patterns/I1-GapAndGo/
+
+Thesis: right_tail_convex. Stocks that gap up >= 3% at the open AND
+confirm in the first 30 minutes (positive return + above-average volume)
+exhibit strong continuation over the following 3 trading days.
+
+Exposure formula (EXPOSURE.md):
+  gap_pct = (open - prev_close) / prev_close
+  gap_magnitude = clip(gap_pct / sigma_20d, 0.0, 5.0)
+  confirmation_gate = 1.0 if return_30min > 0 AND volume_30min > avg_volume_30min_20d else 0.0
+  volume_weight: tiered 1.0/1.25/1.5/2.0 by volume_ratio_30min
+  X_I1 = gap_magnitude * confirmation_gate * volume_weight
+
+Expected-return bridge (SPEC.md / EXPOSURE.md):
+  lambda_I1_monthly = 3.47% (LPS 2019 overnight alpha)
+  amplification = 1.75 (microcap)
+  lambda_I1_3td = 3.47% * 1.75 * (3/21) = ~0.867%
+  raw_expected_edge = X_I1 * lambda_I1_3td
+
+Signal admission:
+  1. Operating-universe membership
+  2. gap_pct >= 0.03 (minimum 3% gap)
+  3. confirmation_gate = 1.0 (positive 30-min return AND above-avg volume)
+  4. X_I1 > 0
+
+Signal fires intraday at ~10:00 AM ET after 30-min confirmation window.
+Routing: Class C (marketable limit, 120-second cancel).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from alpha.data.contracts import stable_hash
+from alpha.patterns.contracts import (
+    BasePatternDetector,
+    PatternDetectionResult,
+    PatternFeatures,
+    PatternInput,
+    PatternSignal,
+    PatternId,
+    PatternTrack,
+    RouteClass,
+    SignalDirection,
+    ThesisCategory,
+)
+from alpha.patterns.guards import (
+    classify_fidelity,
+    reject_future_timestamp,
+    require_asof_timestamp,
+    require_lineage_hash,
+)
+
+# Vault constants (EXPOSURE.md / SPEC.md)
+LAMBDA_I1_MONTHLY = 0.0347  # 3.47% per month (LPS 2019 overnight alpha)
+AMPLIFICATION = 1.75  # microcap amplification
+HOLD_DAYS = 3
+LAMBDA_I1_3TD = LAMBDA_I1_MONTHLY * AMPLIFICATION * (HOLD_DAYS / 21.0)  # ~0.00867
+X_I1_STRENGTH_DIVISOR = 10.0  # I-track exposure range wider than M-track
+SIGNAL_HORIZON = "3d"
+MIN_GAP_PCT = 0.03  # minimum 3% gap
+GAP_MAGNITUDE_CAP = 5.0
+VOLUME_WEIGHT_CAP = 2.0
+QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+
+
+# ---------------------------------------------------------------------------
+# Pure computation helpers
+# ---------------------------------------------------------------------------
+
+def compute_gap_magnitude(gap_pct: float, sigma_20d: float) -> float:
+    """Per EXPOSURE.md: clip(gap_pct / sigma_20d, 0.0, 5.0)."""
+    if sigma_20d <= 0 or gap_pct <= 0:
+        return 0.0
+    return max(0.0, min(gap_pct / sigma_20d, GAP_MAGNITUDE_CAP))
+
+
+def compute_confirmation_gate(return_30min: float, volume_30min: float, avg_volume_30min_20d: float) -> float:
+    """Per EXPOSURE.md: 1.0 if return > 0 AND volume > avg, else 0.0."""
+    if return_30min > 0 and volume_30min > avg_volume_30min_20d:
+        return 1.0
+    return 0.0
+
+
+def compute_volume_weight(volume_ratio_30min: float) -> float:
+    """Per EXPOSURE.md tiered weighting."""
+    if volume_ratio_30min >= 3.0:
+        return 2.0
+    if volume_ratio_30min >= 2.0:
+        return 1.5
+    if volume_ratio_30min >= 1.5:
+        return 1.25
+    if volume_ratio_30min >= 1.0:
+        return 1.0
+    return 0.0  # should not reach here if confirmation gate passed
+
+
+def _data_confidence(quality_flags: Dict[str, Any]) -> float:
+    conf = 1.0
+    if quality_flags.get("missing_lineage"):
+        conf *= 0.9
+    if quality_flags.get("baseline_volume_proxy"):
+        conf *= 0.95
+    return round(conf, 4)
+
+
+def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
+    for key in (
+        "evaluation_run_id", "data_cutoff_timestamp", "price_at_10am", "pre_market_price",
+        "gap_source", "candidate_eval_bid", "candidate_eval_ask",
+        "candidate_eval_quote_timestamp", "quote_age_ms", "quote_freshness_max_ms",
+        "effective_spread_bps", "evaluation_timestamp", "opening_auction_quality",
+        "halt_status", "corporate_action_filter_passed", "market_data_status",
+        "hazard_score_at_signal", "filing_veto_status", "m4_also_firing", "m2_also_firing",
+    ):
+        val = market_data.get(key)
+        if val is not None:
+            feat_dict[key] = val
+
+    feat_dict.setdefault("gap_source", "unknown")
+    feat_dict.setdefault("halt_status", "clear")
+    feat_dict.setdefault("corporate_action_filter_passed", True)
+    feat_dict.setdefault("market_data_status", "current")
+    feat_dict.setdefault("opening_auction_quality", "normal")
+    feat_dict.setdefault("filing_veto_status", "clear")
+
+
+def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> Optional[str]:
+    market_data_status = feat_dict.get("market_data_status")
+    if market_data_status in {"delayed", "partial_outage", "unavailable"}:
+        return "data_delay"
+
+    if feat_dict.get("halt_status") != "clear":
+        return "halt_during_confirmation"
+
+    if feat_dict.get("corporate_action_filter_passed") is False:
+        return "spurious_gap_corporate_action"
+
+    if feat_dict.get("opening_auction_quality") != "normal":
+        return "opening_auction_quality_failed"
+
+    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
+        return "quote_unavailable"
+
+    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
+        return "quote_unavailable"
+
+    quote_age_ms = int(market_data["quote_age_ms"])
+    if quote_age_ms < 0:
+        return "quote_unavailable"
+
+    max_age_ms = market_data.get("quote_freshness_max_ms")
+    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
+        return "quote_unavailable"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Activation enrichment
+# ---------------------------------------------------------------------------
+
+def _enrich_i1_signal(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[PatternSignal]:
+    """
+    Compute gap features, confirmation gate, exposure, and return
+    PatternSignal if all admission gates pass. All feature fields set here.
+    """
+    prev_close = float(inp.market_data["prev_close"])
+    open_price = float(inp.market_data["open_price"])
+    sigma_20d = float(inp.market_data["sigma_20d"])
+
+    # Gap computation
+    gap_pct = (open_price - prev_close) / prev_close
+    gap_mag = compute_gap_magnitude(gap_pct, sigma_20d)
+
+    feat_dict["prev_close"] = prev_close
+    feat_dict["open_price"] = open_price
+    feat_dict["sigma_20d"] = sigma_20d
+    feat_dict["gap_pct"] = round(gap_pct, 6)
+    feat_dict["gap_magnitude"] = round(gap_mag, 6)
+    _copy_diagnostic_fields(feat_dict, inp.market_data)
+
+    # Minimum gap gate
+    if gap_pct < MIN_GAP_PCT:
+        feat_dict["rejection_reason"] = "gap_below_minimum"
+        feat_dict["signal_generated"] = False
+        return None
+
+    pre_signal_rejection = _pre_signal_rejection_reason(feat_dict, inp.market_data)
+    if pre_signal_rejection is not None:
+        feat_dict["rejection_reason"] = pre_signal_rejection
+        feat_dict["signal_generated"] = False
+        feat_dict["confirmation_gate"] = 0.0
+        feat_dict["volume_weight"] = 0.0
+        feat_dict["X_I1"] = 0.0
+        return None
+
+    # Confirmation inputs
+    return_30min = inp.market_data.get("return_30min")
+    volume_30min = inp.market_data.get("volume_30min")
+    avg_volume_30min_20d = inp.market_data.get("avg_volume_30min_20d")
+
+    if return_30min is None or volume_30min is None:
+        feat_dict["rejection_reason"] = "missing_confirmation_data"
+        feat_dict["signal_generated"] = False
+        warnings.append("missing return_30min or volume_30min for confirmation")
+        return None
+
+    return_30min = float(return_30min)
+    volume_30min = float(volume_30min)
+
+    # Volume baseline
+    baseline_volume_proxy = False
+    if avg_volume_30min_20d is None or float(avg_volume_30min_20d) <= 0:
+        avg_volume_30min_20d = volume_30min * 0.5  # conservative per DATA.md edge case
+        baseline_volume_proxy = True
+        quality_flags["baseline_volume_proxy"] = True
+        warnings.append("avg_volume_30min_20d unavailable — using conservative proxy")
+    else:
+        avg_volume_30min_20d = float(avg_volume_30min_20d)
+
+    volume_ratio = volume_30min / avg_volume_30min_20d if avg_volume_30min_20d > 0 else 0.0
+
+    feat_dict["return_30min"] = round(return_30min, 6)
+    feat_dict["volume_30min"] = volume_30min
+    feat_dict["avg_volume_30min_20d"] = round(avg_volume_30min_20d, 2)
+    feat_dict["volume_ratio_30min"] = round(volume_ratio, 6)
+    feat_dict["baseline_volume_proxy"] = baseline_volume_proxy
+
+    # Confirmation gate
+    conf_gate = compute_confirmation_gate(return_30min, volume_30min, avg_volume_30min_20d)
+    feat_dict["confirmation_gate"] = conf_gate
+
+    if conf_gate == 0.0:
+        feat_dict["rejection_reason"] = "confirmation_failed"
+        feat_dict["signal_generated"] = False
+        return None
+
+    # Volume weight and exposure
+    vol_weight = compute_volume_weight(volume_ratio)
+    x_i1 = gap_mag * conf_gate * vol_weight
+
+    feat_dict["volume_weight"] = vol_weight
+    feat_dict["X_I1"] = round(x_i1, 6)
+    feat_dict["signal_generated"] = True
+
+    # Expected-return priors
+    raw_expected_edge = round(x_i1 * LAMBDA_I1_3TD, 6)
+    signal_strength = round(min(x_i1 / X_I1_STRENGTH_DIVISOR, 1.0), 6)
+    feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
+
+    return PatternSignal(
+        direction=SignalDirection.LONG,
+        raw_signal_strength=signal_strength,
+        raw_expected_edge=raw_expected_edge,
+        signal_horizon=SIGNAL_HORIZON,
+        data_confidence=_data_confidence(quality_flags),
+    )
+
+
+def _compute_hashes(
+    inp: PatternInput, asof: Any, feat_dict: Dict[str, Any],
+    signals: List[PatternSignal], warnings: List[str], quality_flags: Dict[str, Any],
+) -> tuple:
+    input_hash = stable_hash({
+        "ticker": inp.ticker, "asof_timestamp": asof,
+        "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
+    })
+    output_hash = stable_hash({
+        "features": feat_dict,
+        "signals": [
+            {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
+             "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
+             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+            for s in signals
+        ],
+        "warnings": warnings, "quality_flags": quality_flags,
+    })
+    return input_hash, output_hash
+
+
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+
+class I1Detector(BasePatternDetector):
+    """I1 Gap and Go detector."""
+
+    pattern_id = PatternId.I1
+    track = PatternTrack.INTRADAY
+    thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
+    route_class = RouteClass.C
+
+    def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        asof = require_asof_timestamp(inp.asof_timestamp)
+        warnings: List[str] = []
+        quality_flags: Dict[str, Any] = {}
+
+        reject_future_timestamp(asof, warnings, quality_flags)
+        require_lineage_hash(inp.lineage_hashes, warnings, quality_flags)
+
+        # Required inputs
+        prev_close = inp.market_data.get("prev_close")
+        open_price = inp.market_data.get("open_price")
+        sigma_20d = inp.market_data.get("sigma_20d")
+
+        if prev_close is None or open_price is None or sigma_20d is None:
+            warnings.append("missing required fields (prev_close, open_price, or sigma_20d)")
+            return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
+
+        if float(prev_close) <= 0 or float(open_price) <= 0 or float(sigma_20d) <= 0:
+            warnings.append("invalid prev_close, open_price, or sigma_20d")
+            return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
+
+        feat_dict: Dict[str, Any] = {}
+
+        # Universe check
+        if inp.market_data.get("operating_universe_inclusion") is False:
+            quality_flags["not_operating_universe_member"] = True
+            warnings.append("ticker is not marked as operating-universe eligible")
+        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
+            warnings.append("operating-universe membership not provided to I1 detector")
+
+        # Fidelity
+        pit_passed = quality_flags.get("point_in_time_passed") is not False
+        fidelity = classify_fidelity(
+            has_primary_data=True, has_secondary_data=True,
+            point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+        )
+
+        signals: List[PatternSignal] = []
+
+        if quality_flags.get("not_operating_universe_member"):
+            feat_dict["signal_generated"] = False
+            feat_dict["rejection_reason"] = "not_operating_universe"
+        else:
+            sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)
+            if sig is not None:
+                signals.append(sig)
+
+        features = PatternFeatures(
+            features=feat_dict, feature_manifest_version="i1-v1",
+            fidelity_tier=fidelity, point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+        )
+
+        input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, signals, warnings, quality_flags)
+
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id, ticker=inp.ticker, asof_timestamp=asof,
+            features=features, signals=signals, warnings=warnings, quality_flags=quality_flags,
+            input_hashes={"market_data": input_hash}, output_hashes={"features": output_hash},
+        )
+
+    def _no_features_result(self, ticker, asof, warnings, quality_flags):
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id, ticker=ticker, asof_timestamp=asof,
+            features=None, warnings=warnings, quality_flags=quality_flags,
+        )
