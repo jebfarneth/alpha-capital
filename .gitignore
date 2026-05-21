@@ -5,3 +5,14 @@ build/
 .env.local
 *.log
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+*.db
+.pytest_cache/
+.coverage
+htmlcov/
