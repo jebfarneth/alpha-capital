@@ -93,7 +93,7 @@ def compute_range_quality(range_ratio: float) -> float:
 def compute_spread_quality(spread_at_eval_bps: float, normal_spread_20d_bps: float) -> float:
     """Per EXPOSURE.md tiered weighting. Returns 0.0 if spread too wide (hard gate)."""
     if normal_spread_20d_bps <= 0:
-        return 1.0  # no baseline available — assume normal
+        return 0.75  # no baseline available — use conservative wide-spread proxy
     ratio = spread_at_eval_bps / normal_spread_20d_bps
     if ratio <= 1.0:
         return 1.25
@@ -266,6 +266,9 @@ def _enrich_i8_signal(
         quality_flags["baseline_spread_proxy"] = True
         warnings.append("spread_at_eval_bps unavailable — using conservative wide-spread proxy")
     else:
+        if normal_spread is None or float(normal_spread) <= 0:
+            quality_flags["baseline_spread_proxy"] = True
+            warnings.append("normal_spread_20d_bps unavailable — using conservative wide-spread proxy")
         sprd_qual = compute_spread_quality(
             float(spread_at_eval),
             float(normal_spread) if normal_spread is not None else 0.0,

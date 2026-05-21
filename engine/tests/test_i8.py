@@ -160,6 +160,7 @@ class TestFormulas:
         assert compute_spread_quality(90, 75) == 1.0   # 1.2x normal
         assert compute_spread_quality(150, 75) == 0.75  # 2.0x normal
         assert compute_spread_quality(200, 75) == 0.0   # 2.67x normal -> hard gate
+        assert compute_spread_quality(300, 0) == 0.75   # missing baseline -> conservative proxy
 
     def test_canonical_strong_from_spec(self):
         """EXPOSURE.md: 1.5 sigma, 2x vol, 1.5x range, tight spread -> 4.22."""
@@ -371,6 +372,17 @@ class TestI8Quality:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.features.features["spread_quality"] == 0.75
+        assert result.quality_flags["baseline_spread_proxy"] is True
+        assert result.signals[0].data_confidence < 1.0
+
+    def test_invalid_normal_spread_uses_conservative_proxy(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["normal_spread_20d_bps"] = 0
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["spread_quality"] == 0.75
+        assert result.features.features["normal_spread_20d_bps"] == 0.0
         assert result.quality_flags["baseline_spread_proxy"] is True
         assert result.signals[0].data_confidence < 1.0
 
