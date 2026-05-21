@@ -71,6 +71,7 @@ def _firing_market_data():
         "cumulative_volume": 250000,
         "expected_tod_volume": 120000,
         "gk_avg_5d": 0.0003,
+        "spread_pct_vs_eval_quote": 0.005,
     }
 
 
@@ -113,7 +114,7 @@ class TestM6Metadata:
         assert M6Detector().thesis_category == ThesisCategory.RIGHT_TAIL_CONVEX
 
     def test_route_class(self):
-        assert M6Detector().route_class == RouteClass.A
+        assert M6Detector().route_class == RouteClass.C
 
     def test_vault_constants(self):
         assert LAMBDA_M6_MONTHLY == 0.011
@@ -276,6 +277,8 @@ class TestM6NoSignal:
         assert not result.has_signal
         assert result.features is not None
         assert result.features.features["activation_state"] == "no_breakout"
+        assert result.features.features["activation_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "breakout_ignition_failed"
 
     def test_not_compressed_no_signal(self):
         det = M6Detector()
@@ -292,7 +295,7 @@ class TestM6NoSignal:
         assert result.features.features["activation_state"] == "not_compressed"
 
     def test_compressed_but_no_price_watchlist(self):
-        """Compressed without activation data → watchlist state, no signal."""
+        """Compressed without activation data -> watchlist signal."""
         det = M6Detector()
         data = {
             "compression_ratio": 0.55,
@@ -308,10 +311,15 @@ class TestM6NoSignal:
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
-        assert not result.has_signal
+        assert result.has_signal
         assert result.features is not None
         assert result.features.features["activation_state"] == "watchlist"
         assert result.features.features["compression_gate_passed"] is True
+        assert result.signals[0].signal_status == "watchlist"
+        assert result.signals[0].raw_expected_edge == 0.0
+        assert result.signals[0].raw_signal_strength == round(
+            min(result.features.features["X_M6_setup"] / X_M6_CAP, 1.0), 6
+        )
 
     def test_missing_compression_data_no_features(self):
         det = M6Detector()
@@ -324,6 +332,88 @@ class TestM6NoSignal:
         result = det.detect(inp)
         assert result.features is None
         assert any("missing" in w for w in result.warnings)
+
+    def test_weak_volume_activation_fails(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["cumulative_volume"] = 100000
+        data["expected_tod_volume"] = 120000
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=data,
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.features.features["activation_state"] == "activation_failed"
+        assert result.features.features["activation_failure_reason"] == "volume_ignition_failed"
+
+    def test_wide_spread_activation_fails(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["spread_pct_vs_eval_quote"] = 0.02
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=data,
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.features.features["activation_state"] == "activation_failed"
+        assert result.features.features["activation_failure_reason"] == "spread_too_wide"
+
+    def test_stale_activation_fails(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["signal_freshness_passed"] = False
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=data,
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.features.features["activation_state"] == "activation_failed"
+        assert result.features.features["activation_failure_reason"] == "signal_expired"
+
+    def test_operating_universe_exclusion_blocks_watchlist(self):
+        det = M6Detector()
+        data = {
+            "compression_ratio": 0.55,
+            "gk_vol_5d": 0.018,
+            "gk_vol_60d": 0.033,
+            "compression_high": 4.85,
+            "sigma_20d": 0.028,
+            "operating_universe_inclusion": False,
+        }
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=data,
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.quality_flags["not_operating_universe_member"] is True
+        assert result.features.features["activation_state"] == "not_operating_universe"
+
+    def test_operating_universe_exclusion_blocks_activation(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["operating_universe_inclusion"] = False
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=data,
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.quality_flags["not_operating_universe_member"] is True
+        assert result.features.features["activation_state"] == "not_operating_universe"
 
 
 # -----------------------------------------------------------------------
@@ -414,8 +504,9 @@ class TestM6Guards:
         )
         result = det.detect(inp)
         assert result.quality_flags.get("missing_expansion_data") is True
-        # Still fires — degraded but not blocked
-        assert result.has_signal
+        assert not result.has_signal
+        assert result.features.features["activation_state"] == "activation_failed"
+        assert result.features.features["activation_failure_reason"] == "range_expansion_failed"
 
 
 # -----------------------------------------------------------------------
@@ -522,7 +613,7 @@ class TestM6EvidenceBridge:
         sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
         assert sig.feature_snapshot_id == persisted.feature_snapshot_id
         assert sig.pattern_id == "M6"
-        assert sig.route_class == "A"
+        assert sig.route_class == "C"
         assert sig.thesis_category == "right_tail_convex"
         assert sig.signal_horizon == "12d"
 
