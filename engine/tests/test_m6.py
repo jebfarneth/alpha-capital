@@ -67,6 +67,12 @@ def _firing_market_data():
         "expected_tod_volume": 120000,
         "gk_avg_5d": 0.0003,
         "spread_pct_vs_eval_quote": 0.005,
+        "candidate_eval_bid": 5.18,
+        "candidate_eval_ask": 5.20,
+        "candidate_eval_quote_timestamp": "2026-05-20T15:00:00Z",
+        "quote_age_ms": 650,
+        "quote_freshness_max_ms": 1000,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -85,6 +91,12 @@ def _early_gap_market_data():
         "minutes_since_open": 12,
         "latest_5m_volume_ratio": 3.0,
         "spread_pct_vs_eval_quote": 0.005,
+        "candidate_eval_bid": 5.13,
+        "candidate_eval_ask": 5.15,
+        "candidate_eval_quote_timestamp": "2026-05-20T14:42:00Z",
+        "quote_age_ms": 600,
+        "quote_freshness_max_ms": 1000,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -96,6 +108,7 @@ def _no_breakout_market_data():
         "compression_high": 5.00,
         "sigma_20d": 0.030,
         "price": 4.90,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -107,6 +120,7 @@ def _not_compressed_market_data():
         "compression_high": 5.00,
         "sigma_20d": 0.030,
         "price": 5.20,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -217,6 +231,20 @@ class TestM6StandardActivation:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_market_data(), lineage_hashes=["h"]))
         x_m6 = result.features.features["X_M6_activation"]
         assert result.signals[0].raw_signal_strength == round(min(x_m6 / X_M6_CAP, 1.0), 6)
+
+    def test_latest_5m_volume_confirmation_feeds_exposure(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["cumulative_volume"] = 90000
+        data["expected_tod_volume"] = 120000
+        data["latest_5m_volume_ratio"] = 3.0
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["volume_ignition_passed"] is True
+        assert f["cumulative_volume_confirmation"] == 0.5
+        assert f["latest_5m_volume_confirmation"] == 1.5
+        assert f["intraday_volume_confirmation"] == 1.5
 
     def test_data_confidence_default(self):
         det = M6Detector()
@@ -379,6 +407,15 @@ class TestM6EarlyGapActivation:
         assert result.features.features["volume_ignition_passed"] is False
         assert result.features.features["activation_failure_reason"] == "volume_ignition_failed"
 
+    def test_missing_quote_rejected_before_class_c_activation(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["candidate_eval_ask"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["quote_capture_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "quote_unavailable"
+
     def test_fails_with_wide_spread(self):
         det = M6Detector()
         data = _early_gap_market_data()
@@ -429,7 +466,11 @@ class TestM6NoSignal:
 
     def test_watchlist(self):
         det = M6Detector()
-        data = {"compression_ratio": 0.55, "gk_vol_5d": 0.018, "gk_vol_60d": 0.033, "compression_high": 4.85, "sigma_20d": 0.028}
+        data = {
+            "compression_ratio": 0.55, "gk_vol_5d": 0.018, "gk_vol_60d": 0.033,
+            "compression_high": 4.85, "sigma_20d": 0.028,
+            "operating_universe_inclusion": True,
+        }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.signals[0].signal_status == "watchlist"

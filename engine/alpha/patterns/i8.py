@@ -37,6 +37,8 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.guards import (
     classify_fidelity,
+    compute_data_confidence,
+    operating_universe_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -105,16 +107,7 @@ def compute_spread_quality(spread_at_eval_bps: float, normal_spread_20d_bps: flo
 
 
 def _data_confidence(quality_flags: Dict[str, Any]) -> float:
-    conf = 1.0
-    if quality_flags.get("missing_lineage"):
-        conf *= 0.9
-    if quality_flags.get("baseline_volume_proxy"):
-        conf *= 0.95
-    if quality_flags.get("baseline_range_proxy"):
-        conf *= 0.95
-    if quality_flags.get("baseline_spread_proxy"):
-        conf *= 0.95
-    return round(conf, 4)
+    return compute_data_confidence(quality_flags)
 
 
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
@@ -367,11 +360,9 @@ class I8Detector(BasePatternDetector):
 
         feat_dict: Dict[str, Any] = {}
 
-        if md.get("operating_universe_inclusion") is False:
-            quality_flags["not_operating_universe_member"] = True
-            warnings.append("ticker is not marked as operating-universe eligible")
-        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in md:
-            warnings.append("operating-universe membership not provided to I8 detector")
+        universe_rejection = operating_universe_rejection(
+            md, warnings, quality_flags, pattern_id=self.pattern_id,
+        )
 
         pit_passed = quality_flags.get("point_in_time_passed") is not False
         fidelity = classify_fidelity(
@@ -381,9 +372,9 @@ class I8Detector(BasePatternDetector):
 
         signals: List[PatternSignal] = []
 
-        if quality_flags.get("not_operating_universe_member"):
+        if universe_rejection is not None:
             feat_dict["signal_generated"] = False
-            feat_dict["rejection_reason"] = "not_operating_universe"
+            feat_dict["rejection_reason"] = universe_rejection
         else:
             sig = _enrich_i8_signal(feat_dict, inp, warnings, quality_flags, self._lambda_i8_3td)
             if sig is not None:

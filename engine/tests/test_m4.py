@@ -33,6 +33,7 @@ from alpha.patterns.m4 import (
     LAMBDA_M4_MONTHLY,
     M4Detector,
     X_M4_CAP,
+    _classify_extension_tier,
     compute_m4_features,
     compute_cohort_metadata,
 )
@@ -51,6 +52,22 @@ def _setup_run(db_session):
 
 def _cohort_extensions(n=30, top_val=0.12):
     return [round(i * top_val / (n - 1), 4) for i in range(n)]
+
+
+def _m4_base_data(**overrides):
+    data = {"price": 11.00, "high_52w": 10.00, "operating_universe_inclusion": True}
+    data.update(overrides)
+    return data
+
+
+def _m4_fresh_quote_fields():
+    return {
+        "candidate_eval_bid": 10.48,
+        "candidate_eval_ask": 10.50,
+        "candidate_eval_quote_timestamp": "2026-05-20T15:00:00Z",
+        "quote_age_ms": 650,
+        "quote_freshness_max_ms": 1000,
+    }
 
 
 # -----------------------------------------------------------------------
@@ -142,6 +159,11 @@ class TestCohortMetadata:
         # index = 0.70 * 9 = 6.3 -> interp(0.06, 0.07, 0.3) = 0.063
         assert meta["cohort_threshold_70p"] == 0.063
 
+    def test_extension_tier_uses_interpolated_p75(self):
+        exts = [round(i * 0.01, 2) for i in range(10)]
+        assert _classify_extension_tier(0.065, exts) == "default"
+        assert _classify_extension_tier(0.068, exts) == "high_conviction"
+
     def test_dict_cohort_tie_break_ordering(self):
         """Vault tie-break: higher dollar volume, earlier timestamp, ticker."""
         cohort = [
@@ -163,7 +185,7 @@ class TestCohortMetadata:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 10.50, "high_52w": 10.00, "cohort_extensions": [0.05, 0.03]},
+            market_data=_m4_base_data(price=10.50, high_52w=10.00, cohort_extensions=[0.05, 0.03]),
             lineage_hashes=["h"],
         )
         result = det.detect(inp)
@@ -176,7 +198,7 @@ class TestCohortMetadata:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 10.01, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=10.01, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["h"],
         )
         result = det.detect(inp)
@@ -196,7 +218,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=11.50, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -209,7 +231,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 10.00, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.10)},
+            market_data=_m4_base_data(price=10.00, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.10)),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -227,7 +249,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -239,7 +261,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=11.50, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["hash1"],
         )
         r1 = det.detect(inp)
@@ -252,7 +274,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=11.50, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["hash1"],
         )
         assert det.detect(inp).signals[0].raw_signal_strength == round(1.15 / 1.5, 6)
@@ -261,7 +283,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=11.50, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["hash1"],
         )
         assert det.detect(inp).signals[0].data_confidence == 1.0
@@ -270,7 +292,7 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=11.50, high_52w=10.00, cohort_extensions=_cohort_extensions(30, 0.15)),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -283,6 +305,7 @@ class TestM4Firing:
             ticker="ACME", asof_timestamp=_ts(),
             market_data={
                 "price": 11.50, "high_52w": 10.00, "cohort_extensions": _cohort_extensions(30, 0.15),
+                "operating_universe_inclusion": True,
                 "D1_decile": 8, "R_6_12m_skip": 0.234,
                 "hamilton_regime_prob": 0.72, "hazard_score_at_signal": 22,
             },
@@ -300,8 +323,8 @@ class TestM4Firing:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10],
-                         "field_confidence": {"adj_close": 0.95, "high_52w": 0.90}},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10],
+                                      field_confidence={"adj_close": 0.95, "high_52w": 0.90}),
             lineage_hashes=["hash1"],
         )
         assert det.detect(inp).signals[0].data_confidence == 0.855
@@ -316,8 +339,8 @@ class TestM4FreshBreakout:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"entry_lane": "fresh_breakout_activation", "activation_state": "watchlist",
-                         "price": 9.80, "high_52w": 10.00},
+            market_data=_m4_base_data(entry_lane="fresh_breakout_activation", activation_state="watchlist",
+                                      price=9.80, high_52w=10.00),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -336,6 +359,8 @@ class TestM4FreshBreakout:
                 "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
                 "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_quote_fields(),
             },
             lineage_hashes=["hash1"],
         )
@@ -358,6 +383,8 @@ class TestM4FreshBreakout:
                 "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
                 "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.02,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_quote_fields(),
             },
             lineage_hashes=["hash1"],
         )
@@ -407,7 +434,7 @@ class TestM4NoSignal:
     def test_below_high(self):
         det = M4Detector()
         inp = PatternInput(ticker="ACME", asof_timestamp=_ts(),
-                           market_data={"price": 9.50, "high_52w": 10.00}, lineage_hashes=["h"])
+                           market_data=_m4_base_data(price=9.50, high_52w=10.00), lineage_hashes=["h"])
         result = det.detect(inp)
         assert not result.has_signal
         assert result.features is not None
@@ -433,6 +460,18 @@ class TestM4NoSignal:
         assert not result.has_signal
         assert result.quality_flags["not_operating_universe_member"] is True
 
+    def test_missing_operating_universe_fails_closed(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={"price": 11.00, "high_52w": 10.00},
+            lineage_hashes=["h"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.quality_flags["operating_universe_not_computed"] is True
+        assert result.features.features["rejection_reason"] == "missing_operating_universe"
+
 
 # -----------------------------------------------------------------------
 # Fidelity
@@ -443,7 +482,7 @@ class TestM4Fidelity:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "n_sessions_in_window": 100, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, n_sessions_in_window=100, cohort_extensions=[0.10]),
             lineage_hashes=["h"],
         )
         result = det.detect(inp)
@@ -460,7 +499,7 @@ class TestM4Guards:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10]),
             lineage_hashes=[],
         )
         result = det.detect(inp)
@@ -471,7 +510,7 @@ class TestM4Guards:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=datetime(2099, 1, 1, tzinfo=timezone.utc),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10]),
             lineage_hashes=["h"],
         )
         assert det.detect(inp).quality_flags.get("future_timestamp") is True
@@ -486,7 +525,7 @@ class TestM4Hashes:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10]),
             lineage_hashes=["hash1"],
         )
         r1, r2 = det.detect(inp), det.detect(inp)
@@ -495,15 +534,15 @@ class TestM4Hashes:
 
     def test_change_with_price(self):
         det = M4Detector()
-        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"price": 11.00, "high_52w": 10.00}, lineage_hashes=["h"]))
-        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"price": 12.00, "high_52w": 10.00}, lineage_hashes=["h"]))
+        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_m4_base_data(price=11.00, high_52w=10.00), lineage_hashes=["h"]))
+        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_m4_base_data(price=12.00, high_52w=10.00), lineage_hashes=["h"]))
         assert r1.output_hashes != r2.output_hashes
 
     def test_output_hash_matches_final_state(self):
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10]),
             lineage_hashes=["hash1"],
         )
         result = det.detect(inp)
@@ -533,7 +572,7 @@ class TestM4EvidenceBridge:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": price, "high_52w": high_52w, "cohort_extensions": _cohort_extensions(30, 0.15)},
+            market_data=_m4_base_data(price=price, high_52w=high_52w, cohort_extensions=_cohort_extensions(30, 0.15)),
             fundamental_data={"market_cap": 75_000_000},
             lineage_hashes=[lineage.raw_payload_hash], job_run_id=run.job_run_id,
         )
@@ -578,7 +617,7 @@ class TestM4EvidenceBridge:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 11.00, "high_52w": 10.00, "cohort_extensions": [0.10]},
+            market_data=_m4_base_data(price=11.00, high_52w=10.00, cohort_extensions=[0.10]),
             lineage_hashes=[lineage.raw_payload_hash],
         )
         persisted = persist_detection_result(
@@ -610,7 +649,7 @@ class TestM4EvidenceBridge:
         det = M4Detector()
         inp = PatternInput(
             ticker="ACME", asof_timestamp=_ts(),
-            market_data={"price": 10.00, "high_52w": 10.00},
+            market_data=_m4_base_data(price=10.00, high_52w=10.00),
             lineage_hashes=[lineage.raw_payload_hash],
         )
         result = det.detect(inp)

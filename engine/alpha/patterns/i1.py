@@ -49,6 +49,8 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.guards import (
     classify_fidelity,
+    compute_data_confidence,
+    operating_universe_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -65,6 +67,7 @@ MIN_GAP_PCT = 0.03  # minimum 3% gap
 GAP_MAGNITUDE_CAP = 5.0
 VOLUME_WEIGHT_CAP = 2.0
 QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+TIMESTAMP_FIELDS = ("evaluation_timestamp", "data_cutoff_timestamp")
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +102,7 @@ def compute_volume_weight(volume_ratio_30min: float) -> float:
 
 
 def _data_confidence(quality_flags: Dict[str, Any]) -> float:
-    conf = 1.0
-    if quality_flags.get("missing_lineage"):
-        conf *= 0.9
-    if quality_flags.get("baseline_volume_proxy"):
-        conf *= 0.95
-    return round(conf, 4)
+    return compute_data_confidence(quality_flags)
 
 
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
@@ -141,6 +139,9 @@ def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[st
 
     if feat_dict.get("opening_auction_quality") != "normal":
         return "opening_auction_quality_failed"
+
+    if any(market_data.get(field) is None for field in TIMESTAMP_FIELDS):
+        return "insufficient_timestamp_data"
 
     if any(market_data.get(field) is None for field in QUOTE_FIELDS):
         return "quote_unavailable"
@@ -324,11 +325,9 @@ class I1Detector(BasePatternDetector):
         feat_dict: Dict[str, Any] = {}
 
         # Universe check
-        if inp.market_data.get("operating_universe_inclusion") is False:
-            quality_flags["not_operating_universe_member"] = True
-            warnings.append("ticker is not marked as operating-universe eligible")
-        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
-            warnings.append("operating-universe membership not provided to I1 detector")
+        universe_rejection = operating_universe_rejection(
+            inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
+        )
 
         # Fidelity
         pit_passed = quality_flags.get("point_in_time_passed") is not False
@@ -339,9 +338,9 @@ class I1Detector(BasePatternDetector):
 
         signals: List[PatternSignal] = []
 
-        if quality_flags.get("not_operating_universe_member"):
+        if universe_rejection is not None:
             feat_dict["signal_generated"] = False
-            feat_dict["rejection_reason"] = "not_operating_universe"
+            feat_dict["rejection_reason"] = universe_rejection
         else:
             sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)
             if sig is not None:

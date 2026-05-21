@@ -75,6 +75,7 @@ def _firing_data():
         "opening_bar_close_timestamp": "2026-05-15T14:00:00Z",
         "breakout_eval_timestamp": "2026-05-15T14:18:00Z",
         "data_cutoff_timestamp": "2026-05-15T14:18:00Z",
+        "operating_universe_inclusion": True,
     }
 
 
@@ -100,6 +101,7 @@ def _marginal_data():
         "opening_bar_close_timestamp": "2026-05-15T14:00:00Z",
         "breakout_eval_timestamp": "2026-05-15T14:18:00Z",
         "data_cutoff_timestamp": "2026-05-15T14:18:00Z",
+        "operating_universe_inclusion": True,
     }
 
 
@@ -271,6 +273,15 @@ class TestI8NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.quality_flags["not_operating_universe_member"] is True
+
+    def test_missing_operating_universe_fails_closed(self):
+        det = I8Detector()
+        data = _firing_data()
+        del data["operating_universe_inclusion"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.quality_flags["operating_universe_not_computed"] is True
+        assert result.features.features["rejection_reason"] == "missing_operating_universe"
 
     def test_halted_during_opening(self):
         det = I8Detector()

@@ -63,6 +63,7 @@ def _confirmed_gap_data():
         "avg_volume_30min_20d": 92000,
         "price_at_10am": 4.35,
         "evaluation_run_id": "I1-20260515-100100",
+        "evaluation_timestamp": "2026-05-15T14:01:00Z",
         "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
         "candidate_eval_bid": 4.34,
         "candidate_eval_ask": 4.36,
@@ -73,6 +74,7 @@ def _confirmed_gap_data():
         "market_data_status": "current",
         "halt_status": "clear",
         "corporate_action_filter_passed": True,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -85,11 +87,14 @@ def _failed_confirmation_data():
         "return_30min": -0.01,
         "volume_30min": 185000,
         "avg_volume_30min_20d": 92000,
+        "evaluation_timestamp": "2026-05-15T14:01:00Z",
+        "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
         "candidate_eval_bid": 4.34,
         "candidate_eval_ask": 4.36,
         "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
         "quote_age_ms": 850,
         "quote_freshness_max_ms": 1000,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -102,10 +107,13 @@ def _small_gap_data():
         "return_30min": 0.02,
         "volume_30min": 100000,
         "avg_volume_30min_20d": 80000,
+        "evaluation_timestamp": "2026-05-15T14:01:00Z",
+        "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
         "candidate_eval_bid": 4.10,
         "candidate_eval_ask": 4.11,
         "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
         "quote_age_ms": 500,
+        "operating_universe_inclusion": True,
     }
 
 
@@ -225,6 +233,8 @@ class TestI1Firing:
             "return_30min": 0.05, "volume_30min": 400000, "avg_volume_30min_20d": 100000,
             "candidate_eval_bid": 4.34, "candidate_eval_ask": 4.36,
             "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z", "quote_age_ms": 700,
+            "evaluation_timestamp": "2026-05-15T14:01:00Z", "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
+            "operating_universe_inclusion": True,
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
@@ -270,6 +280,8 @@ class TestI1NoSignal:
             "prev_close": 4.01, "open_price": 4.22, "sigma_20d": 0.025,
             "candidate_eval_bid": 4.34, "candidate_eval_ask": 4.36,
             "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z", "quote_age_ms": 850,
+            "evaluation_timestamp": "2026-05-15T14:01:00Z", "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
+            "operating_universe_inclusion": True,
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
@@ -316,6 +328,14 @@ class TestI1NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "quote_unavailable"
 
+    def test_missing_timestamp_rejected_pre_signal(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        del data["data_cutoff_timestamp"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "insufficient_timestamp_data"
+
     def test_stale_quote_rejected_pre_signal(self):
         det = I1Detector()
         data = _confirmed_gap_data()
@@ -354,6 +374,15 @@ class TestI1Quality:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=[]))
         assert result.quality_flags.get("missing_lineage") is True
         assert result.has_signal
+
+    def test_missing_operating_universe_fails_closed(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        del data["operating_universe_inclusion"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.quality_flags["operating_universe_not_computed"] is True
+        assert result.features.features["rejection_reason"] == "missing_operating_universe"
 
     def test_future_timestamp_warns(self):
         det = I1Detector()

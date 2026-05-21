@@ -48,6 +48,8 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.guards import (
     classify_fidelity,
+    compute_data_confidence,
+    operating_universe_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -74,6 +76,9 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "hazard_score_at_signal",
     "filing_veto_status",
 )
+QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
+DATA_QUALITY_FIELDS = ("market_data_status", "halt_status", "corporate_action_filter_passed")
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +227,13 @@ def _classify_extension_tier(extension: float, cohort_extensions: List[Any] | No
         return "exact_high"
     if cohort_extensions:
         p75_values = sorted(_cohort_extension_value(item) for item in cohort_extensions)
-        p75 = p75_values[int(0.75 * (len(p75_values) - 1))]
+        idx = 0.75 * (len(p75_values) - 1)
+        lower = int(idx)
+        frac = idx - lower
+        p75 = (
+            p75_values[lower] + frac * (p75_values[lower + 1] - p75_values[lower])
+            if lower + 1 < len(p75_values) else p75_values[lower]
+        )
         if extension >= p75:
             return "high_conviction"
     return "default"
@@ -275,7 +286,7 @@ def _enrich_base_daily_breakout(
         raw_signal_strength=round(x_m4 / X_M4_CAP, 6),
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
-        data_confidence=round(_data_confidence(inp), 4),
+        data_confidence=_data_confidence(inp, quality_flags),
     )
 
 
@@ -304,6 +315,8 @@ def compute_m4_fresh_features(
 
 
 def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
+    if not feat.get("quote_capture_passed", True):
+        return "quote_unavailable"
     if not feat["fresh_high_break_passed"]:
         return "fresh_high_break_failed"
     if not feat["range_confirmation_passed"]:
@@ -321,14 +334,46 @@ def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _data_confidence(inp: PatternInput) -> float:
-    confidence = 1.0
-    for source in (inp.market_data, inp.fundamental_data, inp.event_data):
-        field_confidence = source.get("field_confidence")
-        if isinstance(field_confidence, dict):
-            for value in field_confidence.values():
-                confidence *= float(value)
-    return round(confidence, 4)
+def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
+    return compute_data_confidence(
+        quality_flags,
+        field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
+    )
+
+
+def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> str | None:
+    for key in DATA_QUALITY_FIELDS:
+        if key in market_data:
+            feat_dict[key] = market_data[key]
+    market_data_status = market_data.get("market_data_status")
+    if market_data_status in {"delayed", "partial_outage", "unavailable", "stale"}:
+        return "data_delay"
+    halt_status = market_data.get("halt_status")
+    if halt_status is not None and halt_status != "clear":
+        return "halted"
+    if market_data.get("corporate_action_filter_passed") is False:
+        return "spurious_corporate_action"
+    return None
+
+
+def _copy_quote_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
+    for key in FRESH_QUOTE_FIELDS:
+        if key in market_data:
+            feat_dict[key] = market_data[key]
+
+
+def _quote_rejection(market_data: Dict[str, Any]) -> str | None:
+    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
+        return "quote_unavailable"
+    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
+        return "quote_unavailable"
+    quote_age_ms = int(market_data["quote_age_ms"])
+    if quote_age_ms < 0:
+        return "quote_unavailable"
+    max_age_ms = market_data.get("quote_freshness_max_ms")
+    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
+        return "quote_unavailable"
+    return None
 
 
 def _compute_hashes(
@@ -390,11 +435,13 @@ class M4Detector(BasePatternDetector):
         feat_dict = build_m4_source_features(inp, price=price, high_52w=high_52w, entry_lane=entry_lane)
 
         pit_passed = quality_flags.get("point_in_time_passed") is not False
-        if inp.market_data.get("operating_universe_inclusion") is False:
-            quality_flags["not_operating_universe_member"] = True
-            warnings.append("ticker is not marked as operating-universe eligible")
-        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
-            warnings.append("operating-universe membership not provided to M4 detector")
+        universe_rejection = operating_universe_rejection(
+            inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
+        )
+        pre_signal_rejection = _pre_signal_rejection(feat_dict, inp.market_data)
+        if pre_signal_rejection is not None:
+            quality_flags["market_data_quality_rejected"] = True
+            feat_dict["rejection_reason"] = pre_signal_rejection
 
         fidelity = classify_fidelity(
             has_primary_data=True, has_secondary_data=True,
@@ -408,10 +455,13 @@ class M4Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
         breakout = price >= high_52w
 
-        if quality_flags.get("not_operating_universe_member"):
-            pass
+        if universe_rejection is not None:
+            feat_dict["rejection_reason"] = universe_rejection
+            feat_dict["signal_generated"] = False
+        elif pre_signal_rejection is not None:
+            feat_dict["signal_generated"] = False
         elif entry_lane == ENTRY_LANE_FRESH:
-            self._apply_fresh_lane(inp, feat_dict, warnings, signals)
+            self._apply_fresh_lane(inp, feat_dict, warnings, quality_flags, signals)
         elif breakout:
             sig = _enrich_base_daily_breakout(
                 feat_dict, inp, inp.market_data.get("cohort_extensions"), warnings, quality_flags,
@@ -434,10 +484,11 @@ class M4Detector(BasePatternDetector):
 
     def _apply_fresh_lane(
         self, inp: PatternInput, feat_dict: Dict[str, Any],
-        warnings: List[str], signals: List[PatternSignal],
+        warnings: List[str], quality_flags: Dict[str, Any], signals: List[PatternSignal],
     ) -> None:
         activation_state = inp.market_data.get("activation_state", ACTIVATION_STATE_WATCHLIST)
         feat_dict["activation_state"] = activation_state
+        _copy_quote_fields(feat_dict, inp.market_data)
 
         base_nearness = feat_dict["base_nearness"]
         if activation_state == ACTIVATION_STATE_WATCHLIST:
@@ -452,9 +503,12 @@ class M4Detector(BasePatternDetector):
                     raw_expected_edge=0.0,
                     signal_horizon=SIGNAL_HORIZON,
                     signal_status="watchlist",
-                    data_confidence=_data_confidence(inp),
+                    data_confidence=_data_confidence(inp, quality_flags),
                 ))
             return
+
+        quote_rejection = _quote_rejection(inp.market_data)
+        feat_dict["quote_capture_passed"] = quote_rejection is None
 
         last_price = float(inp.market_data.get("last_price", inp.market_data.get("price", 0.0)))
         range_conf = float(inp.market_data.get("intraday_range_confirmation", 0.0))
@@ -484,6 +538,7 @@ class M4Detector(BasePatternDetector):
             and fresh["fresh_breakout_extension"] > 0
             and feat_dict["range_confirmation_passed"]
             and feat_dict["volume_confirmation_passed"]
+            and feat_dict["quote_capture_passed"]
             and spread_passed and freshness_passed
         )
         feat_dict["activation_passed"] = activation_passed
@@ -503,5 +558,5 @@ class M4Detector(BasePatternDetector):
             raw_signal_strength=round(min(x_fresh / X_M4_CAP, 1.0), 6),
             raw_expected_edge=raw_expected_edge,
             signal_horizon=SIGNAL_HORIZON,
-            data_confidence=_data_confidence(inp),
+            data_confidence=_data_confidence(inp, quality_flags),
         ))

@@ -48,6 +48,8 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.guards import (
     classify_fidelity,
+    compute_data_confidence as compute_quality_confidence,
+    operating_universe_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -63,6 +65,9 @@ SIGNAL_HORIZON = "12d"
 MIN_COMPRESSION_DEPTH = 0.5
 SPREAD_CAP = 0.01
 EARLY_GAP_WINDOW_MINUTES = 30
+QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+QUOTE_DIAGNOSTIC_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
+DATA_QUALITY_FIELDS = ("market_data_status", "halt_status", "corporate_action_filter_passed")
 
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
@@ -116,16 +121,56 @@ def compute_expansion_ratio(
 
 
 def compute_data_confidence(gk_warning: bool, quality_flags: Dict[str, Any]) -> float:
-    conf = 1.0
+    flags = dict(quality_flags)
     if gk_warning:
-        conf *= 0.9
-    if quality_flags.get("missing_lineage"):
-        conf *= 0.9
-    if quality_flags.get("missing_expansion_data"):
-        conf *= 0.95
-    if quality_flags.get("missing_volume_data"):
-        conf *= 0.95
-    return round(conf, 4)
+        flags["gk_low_transaction_warning"] = True
+    return compute_quality_confidence(flags)
+
+
+def compute_effective_volume_confirmation(
+    volume_ratio: Optional[float], latest_5m_ratio: Optional[float],
+) -> float:
+    confirmations = []
+    if volume_ratio is not None:
+        confirmations.append(compute_volume_confirmation(volume_ratio))
+    if latest_5m_ratio is not None:
+        confirmations.append(compute_volume_confirmation(latest_5m_ratio))
+    return max(confirmations) if confirmations else 1.0
+
+
+def _copy_quote_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
+    for key in QUOTE_DIAGNOSTIC_FIELDS:
+        if key in market_data:
+            feat_dict[key] = market_data[key]
+
+
+def _quote_rejection(market_data: Dict[str, Any]) -> str | None:
+    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
+        return "quote_unavailable"
+    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
+        return "quote_unavailable"
+    quote_age_ms = int(market_data["quote_age_ms"])
+    if quote_age_ms < 0:
+        return "quote_unavailable"
+    max_age_ms = market_data.get("quote_freshness_max_ms")
+    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
+        return "quote_unavailable"
+    return None
+
+
+def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> str | None:
+    for key in DATA_QUALITY_FIELDS:
+        if key in market_data:
+            feat_dict[key] = market_data[key]
+    market_data_status = market_data.get("market_data_status")
+    if market_data_status in {"delayed", "partial_outage", "unavailable", "stale"}:
+        return "data_delay"
+    halt_status = market_data.get("halt_status")
+    if halt_status is not None and halt_status != "clear":
+        return "halted"
+    if market_data.get("corporate_action_filter_passed") is False:
+        return "spurious_corporate_action"
+    return None
 
 
 def _activation_failure_reason(feat: Dict[str, Any]) -> str:
@@ -135,8 +180,10 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
         return "range_expansion_failed"
     if not feat.get("volume_ignition_passed", False):
         return "volume_ignition_failed"
+    if not feat.get("quote_capture_passed", True):
+        return "quote_unavailable"
     if not feat.get("spread_discipline_passed", False):
-        return "spread_too_wide"
+        return "spread_unavailable" if feat.get("spread_pct_vs_eval_quote") is None else "spread_too_wide"
     if not feat.get("signal_freshness_passed", False):
         return "signal_expired"
     if not feat.get("range_expansion_passed", False):
@@ -165,6 +212,7 @@ def _enrich_m6_activation(
     """
     price = float(inp.market_data["price"])
     feat_dict["P_activation"] = price
+    _copy_quote_fields(feat_dict, inp.market_data)
 
     # Breakout extension
     brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
@@ -196,19 +244,23 @@ def _enrich_m6_activation(
     expected_tod_volume = inp.market_data.get("expected_tod_volume")
     latest_5m_volume_ratio = inp.market_data.get("latest_5m_volume_ratio")
 
-    vol_conf = 1.0
+    cumulative_vol_conf = None
     vol_ratio = None
     if cumulative_volume is not None and expected_tod_volume is not None:
         cv, ev = float(cumulative_volume), float(expected_tod_volume)
         if ev > 0:
             vol_ratio = cv / ev
-            vol_conf = compute_volume_confirmation(vol_ratio)
+            cumulative_vol_conf = compute_volume_confirmation(vol_ratio)
     else:
         quality_flags["missing_volume_data"] = True
         warnings.append("missing cumulative_volume/expected_tod_volume for volume confirmation")
 
     latest_5m_ratio = float(latest_5m_volume_ratio) if latest_5m_volume_ratio is not None else None
+    latest_5m_vol_conf = compute_volume_confirmation(latest_5m_ratio) if latest_5m_ratio is not None else None
+    vol_conf = compute_effective_volume_confirmation(vol_ratio, latest_5m_ratio)
     feat_dict["intraday_volume_ratio"] = round(vol_ratio, 6) if vol_ratio is not None else None
+    feat_dict["cumulative_volume_confirmation"] = cumulative_vol_conf
+    feat_dict["latest_5m_volume_confirmation"] = latest_5m_vol_conf
     feat_dict["intraday_volume_confirmation"] = vol_conf
     feat_dict["latest_5m_volume_ratio"] = round(latest_5m_ratio, 6) if latest_5m_ratio is not None else None
     feat_dict["volume_ignition_passed"] = (
@@ -217,6 +269,8 @@ def _enrich_m6_activation(
     )
 
     # Spread discipline
+    quote_rejection = _quote_rejection(inp.market_data)
+    feat_dict["quote_capture_passed"] = quote_rejection is None
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
     spread_passed = (
         bool(inp.market_data.get("spread_discipline_passed"))
@@ -283,6 +337,7 @@ def _enrich_m6_activation(
         feat_dict["breakout_ignition_passed"]
         and feat_dict["range_expansion_passed"]
         and feat_dict["volume_ignition_passed"]
+        and feat_dict["quote_capture_passed"]
         and spread_passed
         and signal_freshness_passed
     )
@@ -292,6 +347,7 @@ def _enrich_m6_activation(
     early_gap_passed = (
         early_gap_candidate
         and feat_dict["volume_ignition_passed"]
+        and feat_dict["quote_capture_passed"]
         and spread_passed
         and signal_freshness_passed
     )
@@ -449,11 +505,12 @@ class M6Detector(BasePatternDetector):
         if "sector" in inp.fundamental_data:
             feat_dict["sector"] = inp.fundamental_data["sector"]
 
-        if inp.market_data.get("operating_universe_inclusion") is False:
-            quality_flags["not_operating_universe_member"] = True
-            warnings.append("ticker is not marked as operating-universe eligible")
-        elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
-            warnings.append("operating-universe membership not provided to M6 detector")
+        universe_rejection = operating_universe_rejection(
+            inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
+        )
+        pre_signal_rejection = _pre_signal_rejection(feat_dict, inp.market_data)
+        if pre_signal_rejection is not None:
+            quality_flags["market_data_quality_rejected"] = True
 
         has_ohlcv = gk_vol_60d is not None and float(gk_vol_60d) > 0
         pit_passed = quality_flags.get("point_in_time_passed") is not False
@@ -467,8 +524,12 @@ class M6Detector(BasePatternDetector):
 
         signals: List[PatternSignal] = []
 
-        if quality_flags.get("not_operating_universe_member"):
-            feat_dict["activation_state"] = "not_operating_universe"
+        if universe_rejection is not None:
+            feat_dict["activation_state"] = universe_rejection
+            feat_dict["activation_failure_reason"] = universe_rejection
+        elif pre_signal_rejection is not None:
+            feat_dict["activation_state"] = pre_signal_rejection
+            feat_dict["activation_failure_reason"] = pre_signal_rejection
         elif compressed and inp.market_data.get("price") is not None:
             sig = _enrich_m6_activation(
                 feat_dict, inp, depth, compression_high, sigma_20d,
