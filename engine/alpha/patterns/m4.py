@@ -362,7 +362,8 @@ class M4Detector(BasePatternDetector):
 
                 # Tier classification (audit metadata, per SPEC.md)
                 cohort_exts = cohort_extensions or [extension]
-                p75 = sorted(cohort_exts)[int(0.75 * (len(cohort_exts) - 1))] if len(cohort_exts) > 1 else extension
+                p75_values = sorted(_cohort_extension_value(item) for item in cohort_exts)
+                p75 = p75_values[int(0.75 * (len(p75_values) - 1))]
                 tier = "high_conviction" if extension >= p75 else "default"
                 feat_dict["tier_classification"] = tier
 

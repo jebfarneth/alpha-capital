@@ -239,6 +239,25 @@ class TestM4Firing:
         assert priors["tier"] in {"default", "high_conviction"}
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
 
+    def test_tier_classification_supports_dict_cohort(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "price": 11.50,
+                "high_52w": 10.00,
+                "cohort_extensions": [
+                    {"ticker": f"C{i}", "breakout_extension": i * 0.01}
+                    for i in range(10)
+                ] + [{"ticker": "ACME", "breakout_extension": 0.15}],
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        assert result.features.features["tier_classification"] == "high_conviction"
+
     def test_optional_validation_source_features_logged(self):
         det = M4Detector()
         inp = PatternInput(
