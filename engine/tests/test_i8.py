@@ -35,6 +35,7 @@ from alpha.patterns.i8 import (
     X_I8_STRENGTH_DIVISOR,
     SIGNAL_HORIZON,
     I8Detector,
+    _pre_signal_rejection,
     compute_breakout_strength,
     compute_volume_quality,
     compute_range_quality,
@@ -348,7 +349,24 @@ class TestI8NoSignal:
         data["opening_range_high"] = 4.50
         data["opening_range_low"] = 4.85  # high < low
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
-        assert result.features is None
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "insufficient_bar_data"
+
+    def test_zero_range_bar_rejected(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["opening_range_high"] = 4.85
+        data["opening_range_low"] = 4.85
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["opening_range_high"] == 4.85
+        assert result.features.features["opening_range_low"] == 4.85
+        assert result.features.features["rejection_reason"] == "insufficient_bar_data"
+
+    def test_late_evaluation_rejection_reads_market_data(self):
+        data = _firing_data()
+        data["late_evaluation"] = True
+        assert _pre_signal_rejection({}, data) == "late_evaluation_stale"
 
 
 # -----------------------------------------------------------------------

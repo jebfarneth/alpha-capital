@@ -133,7 +133,7 @@ def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]
         return "insufficient_bar_data"
     if any(market_data.get(f) is None for f in TIMESTAMP_FIELDS):
         return "insufficient_bar_data"
-    if feat_dict.get("late_evaluation"):
+    if market_data.get("late_evaluation"):
         return "late_evaluation_stale"
     if any(market_data.get(f) is None for f in QUOTE_FIELDS):
         return "quote_unavailable"
@@ -354,9 +354,30 @@ class I8Detector(BasePatternDetector):
             warnings.append("invalid opening range or sigma_20d values")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        if float(opening_range_high) < float(opening_range_low):
-            warnings.append("opening_range_high < opening_range_low — invalid bar")
-            return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
+        if float(opening_range_high) <= float(opening_range_low):
+            warnings.append("opening_range_high <= opening_range_low — invalid or zero-range bar")
+            feat_dict = {
+                "opening_range_high": float(opening_range_high),
+                "opening_range_low": float(opening_range_low),
+                "sigma_20d": float(sigma_20d),
+                "signal_generated": False,
+                "rejection_reason": "insufficient_bar_data",
+            }
+            pit_passed = quality_flags.get("point_in_time_passed") is not False
+            fidelity = classify_fidelity(
+                has_primary_data=True, has_secondary_data=True,
+                point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+            )
+            features = PatternFeatures(
+                features=feat_dict, feature_manifest_version="i8-v1",
+                fidelity_tier=fidelity, point_in_time_passed=pit_passed, lookahead_guard_passed=True,
+            )
+            input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, [], warnings, quality_flags)
+            return PatternDetectionResult(
+                pattern_id=self.pattern_id, ticker=inp.ticker, asof_timestamp=asof,
+                features=features, signals=[], warnings=warnings, quality_flags=quality_flags,
+                input_hashes={"market_data": input_hash}, output_hashes={"features": output_hash},
+            )
 
         feat_dict: Dict[str, Any] = {}
 
