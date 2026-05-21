@@ -66,6 +66,14 @@ ENTRY_LANE_FRESH = "fresh_breakout_activation"
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
 FRESH_SPREAD_CAP = 0.01
+DIAGNOSTIC_SOURCE_KEYS = (
+    "D1_decile",
+    "R_6_12m_skip",
+    "analyst_count",
+    "hamilton_regime_prob",
+    "hazard_score_at_signal",
+    "filing_veto_status",
+)
 
 
 def compute_m4_features(
@@ -126,8 +134,10 @@ def apply_cohort_gate(
             "small_cohort_warning": True,
         }
 
+    cohort_records = _cohort_records(cohort_extensions)
+
     # Compute 70th percentile threshold (linear interpolation)
-    sorted_ext = sorted(_cohort_extension_value(item) for item in cohort_extensions)
+    sorted_ext = sorted(record["extension"] for record in cohort_records)
     idx = BREAKOUT_COHORT_PERCENTILE * (cohort_size - 1)
     lower = int(idx)
     frac = idx - lower
@@ -136,18 +146,7 @@ def apply_cohort_gate(
     else:
         threshold = sorted_ext[lower]
 
-    # Rank (1 = highest extension), with optional vault tie-break fields:
-    # higher 20d median dollar volume, earlier signal_timestamp, ticker.
-    ranked = sorted(
-        (_cohort_sort_record(item) for item in cohort_extensions),
-        key=lambda r: (
-            -r["extension"],
-            -r["median_dollar_volume_20d"],
-            r["signal_timestamp"],
-            r["ticker"],
-        ),
-    )
-    rank = _rank_for_candidate(ranked, breakout_extension, ticker)
+    rank = _cohort_rank(cohort_records, breakout_extension, ticker)
     decile = min(10, max(1, int((rank - 1) / cohort_size * 10) + 1))
     top_count = max(1, math.ceil((1.0 - BREAKOUT_COHORT_PERCENTILE) * cohort_size))
     passed = (
@@ -171,25 +170,46 @@ def _cohort_extension_value(item: Any) -> float:
     return float(item)
 
 
-def _cohort_sort_record(item: Any) -> Dict[str, Any]:
-    if isinstance(item, dict):
-        return {
-            "ticker": str(item.get("ticker", "")),
-            "extension": _cohort_extension_value(item),
-            "median_dollar_volume_20d": float(item.get("median_dollar_volume_20d", 0.0)),
-            "signal_timestamp": str(item.get("signal_timestamp", "")),
-        }
-    return {
-        "ticker": "",
-        "extension": float(item),
-        "median_dollar_volume_20d": 0.0,
-        "signal_timestamp": "",
-    }
+def _cohort_records(cohort_extensions: List[Any]) -> List[Dict[str, Any]]:
+    records = []
+    for item in cohort_extensions:
+        if isinstance(item, dict):
+            records.append(
+                {
+                    "ticker": str(item.get("ticker", "")),
+                    "extension": _cohort_extension_value(item),
+                    "median_dollar_volume_20d": float(
+                        item.get("median_dollar_volume_20d", 0.0)
+                    ),
+                    "signal_timestamp": str(item.get("signal_timestamp", "")),
+                }
+            )
+        else:
+            records.append(
+                {
+                    "ticker": "",
+                    "extension": float(item),
+                    "median_dollar_volume_20d": 0.0,
+                    "signal_timestamp": "",
+                }
+            )
+    return records
 
 
-def _rank_for_candidate(
-    ranked: List[Dict[str, Any]], breakout_extension: float, ticker: str | None
+def _cohort_rank(
+    cohort_records: List[Dict[str, Any]], breakout_extension: float, ticker: str | None
 ) -> int:
+    # Vault tie-break order at the 70th percentile threshold:
+    # higher 20d median dollar volume, earlier signal_timestamp, ticker.
+    ranked = sorted(
+        cohort_records,
+        key=lambda record: (
+            -record["extension"],
+            -record["median_dollar_volume_20d"],
+            record["signal_timestamp"],
+            record["ticker"],
+        ),
+    )
     if ticker:
         for idx, record in enumerate(ranked, start=1):
             if record["ticker"] == ticker:
@@ -218,6 +238,35 @@ def compute_m4_fresh_features(
         "intraday_volume_confirmation": intraday_volume_confirmation,
         "x_m4_fresh": round(x_fresh, 6),
     }
+
+
+def build_m4_source_features(
+    inp: PatternInput,
+    *,
+    price: float,
+    high_52w: float,
+    entry_lane: str,
+) -> Dict[str, Any]:
+    features = compute_m4_features(price, high_52w)
+
+    market_cap = inp.fundamental_data.get("market_cap")
+    if market_cap is not None:
+        features["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
+        features["sub_universe"] = "A" if float(market_cap) < 80_000_000 else "B"
+
+    for key in ("sector", "industry"):
+        if key in inp.fundamental_data:
+            features[key] = inp.fundamental_data[key]
+
+    for source in (inp.market_data, inp.fundamental_data, inp.event_data):
+        for key in DIAGNOSTIC_SOURCE_KEYS:
+            if key in source:
+                features[key] = source[key]
+
+    features.setdefault("filing_veto_status", "clear")
+    features["entry_lane"] = entry_lane
+    features["short_history_flag"] = _short_history_flag(inp)
+    return features
 
 
 class M4Detector(BasePatternDetector):
@@ -268,37 +317,12 @@ class M4Detector(BasePatternDetector):
                 quality_flags=quality_flags,
             )
 
-        # Compute features
-        feat_dict = compute_m4_features(price, high_52w)
-
-        # Optional enrichment fields (diagnostic, not load-bearing)
-        market_cap = inp.fundamental_data.get("market_cap")
-        if market_cap is not None:
-            feat_dict["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
-            sub = "A" if float(market_cap) < 80_000_000 else "B"
-            feat_dict["sub_universe"] = sub
-        if "sector" in inp.fundamental_data:
-            feat_dict["sector"] = inp.fundamental_data["sector"]
-        if "industry" in inp.fundamental_data:
-            feat_dict["industry"] = inp.fundamental_data["industry"]
-        for source in (inp.market_data, inp.fundamental_data, inp.event_data):
-            for key in (
-                "D1_decile",
-                "R_6_12m_skip",
-                "analyst_count",
-                "hamilton_regime_prob",
-                "hazard_score_at_signal",
-                "filing_veto_status",
-            ):
-                if key in source:
-                    feat_dict[key] = source[key]
-        feat_dict.setdefault("filing_veto_status", "clear")
-        feat_dict["entry_lane"] = entry_lane
-
-        # Determine fidelity
-        n_sessions = inp.market_data.get("n_sessions_in_window")
-        short_history = n_sessions is not None and int(n_sessions) < 252
-        feat_dict["short_history_flag"] = short_history
+        feat_dict = build_m4_source_features(
+            inp,
+            price=price,
+            high_52w=high_52w,
+            entry_lane=entry_lane,
+        )
 
         has_primary = price > 0 and high_52w > 0
         pit_passed = quality_flags.get("point_in_time_passed") is not False
@@ -518,6 +542,11 @@ def _data_confidence(inp: PatternInput) -> float:
             for value in field_confidence.values():
                 confidence *= float(value)
     return round(confidence, 4)
+
+
+def _short_history_flag(inp: PatternInput) -> bool:
+    n_sessions = inp.market_data.get("n_sessions_in_window")
+    return n_sessions is not None and int(n_sessions) < 252
 
 
 def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
