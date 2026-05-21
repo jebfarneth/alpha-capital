@@ -47,9 +47,13 @@ from alpha.patterns.contracts import (
     ThesisCategory,
 )
 from alpha.patterns.guards import (
+    DEFAULT_QUOTE_FIELDS,
+    copy_fields,
     classify_fidelity,
     compute_data_confidence as compute_quality_confidence,
+    market_data_quality_rejection,
     operating_universe_rejection,
+    quote_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -65,9 +69,8 @@ SIGNAL_HORIZON = "12d"
 MIN_COMPRESSION_DEPTH = 0.5
 SPREAD_CAP = 0.01
 EARLY_GAP_WINDOW_MINUTES = 30
-QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 QUOTE_DIAGNOSTIC_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
-DATA_QUALITY_FIELDS = ("market_data_status", "halt_status", "corporate_action_filter_passed")
 
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
@@ -120,7 +123,7 @@ def compute_expansion_ratio(
     return math.log(session_high / session_low) / math.sqrt(gk_avg_5d)
 
 
-def compute_data_confidence(gk_warning: bool, quality_flags: Dict[str, Any]) -> float:
+def compute_m6_data_confidence(gk_warning: bool, quality_flags: Dict[str, Any]) -> float:
     flags = dict(quality_flags)
     if gk_warning:
         flags["gk_low_transaction_warning"] = True
@@ -136,41 +139,6 @@ def compute_effective_volume_confirmation(
     if latest_5m_ratio is not None:
         confirmations.append(compute_volume_confirmation(latest_5m_ratio))
     return max(confirmations) if confirmations else 1.0
-
-
-def _copy_quote_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
-    for key in QUOTE_DIAGNOSTIC_FIELDS:
-        if key in market_data:
-            feat_dict[key] = market_data[key]
-
-
-def _quote_rejection(market_data: Dict[str, Any]) -> str | None:
-    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
-        return "quote_unavailable"
-    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
-        return "quote_unavailable"
-    quote_age_ms = int(market_data["quote_age_ms"])
-    if quote_age_ms < 0:
-        return "quote_unavailable"
-    max_age_ms = market_data.get("quote_freshness_max_ms")
-    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
-        return "quote_unavailable"
-    return None
-
-
-def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> str | None:
-    for key in DATA_QUALITY_FIELDS:
-        if key in market_data:
-            feat_dict[key] = market_data[key]
-    market_data_status = market_data.get("market_data_status")
-    if market_data_status in {"delayed", "partial_outage", "unavailable", "stale"}:
-        return "data_delay"
-    halt_status = market_data.get("halt_status")
-    if halt_status is not None and halt_status != "clear":
-        return "halted"
-    if market_data.get("corporate_action_filter_passed") is False:
-        return "spurious_corporate_action"
-    return None
 
 
 def _activation_failure_reason(feat: Dict[str, Any]) -> str:
@@ -212,7 +180,7 @@ def _enrich_m6_activation(
     """
     price = float(inp.market_data["price"])
     feat_dict["P_activation"] = price
-    _copy_quote_fields(feat_dict, inp.market_data)
+    copy_fields(feat_dict, inp.market_data, QUOTE_DIAGNOSTIC_FIELDS)
 
     # Breakout extension
     brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
@@ -269,8 +237,8 @@ def _enrich_m6_activation(
     )
 
     # Spread discipline
-    quote_rejection = _quote_rejection(inp.market_data)
-    feat_dict["quote_capture_passed"] = quote_rejection is None
+    quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
+    feat_dict["quote_capture_passed"] = quote_rej is None
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
     spread_passed = (
         bool(inp.market_data.get("spread_discipline_passed"))
@@ -404,7 +372,7 @@ def _enrich_m6_activation(
         raw_signal_strength=signal_strength,
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
-        data_confidence=compute_data_confidence(gk_warning, quality_flags),
+        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
     )
 
 
@@ -420,7 +388,7 @@ def _build_watchlist_signal(
         raw_expected_edge=0.0,
         signal_horizon=SIGNAL_HORIZON,
         signal_status="watchlist",
-        data_confidence=compute_data_confidence(gk_warning, quality_flags),
+        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
     )
 
 
@@ -508,7 +476,7 @@ class M6Detector(BasePatternDetector):
         universe_rejection = operating_universe_rejection(
             inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
         )
-        pre_signal_rejection = _pre_signal_rejection(feat_dict, inp.market_data)
+        pre_signal_rejection = market_data_quality_rejection(feat_dict, inp.market_data)
         if pre_signal_rejection is not None:
             quality_flags["market_data_quality_rejected"] = True
 
@@ -527,9 +495,13 @@ class M6Detector(BasePatternDetector):
         if universe_rejection is not None:
             feat_dict["activation_state"] = universe_rejection
             feat_dict["activation_failure_reason"] = universe_rejection
+            feat_dict["rejection_reason"] = universe_rejection
+            feat_dict["signal_generated"] = False
         elif pre_signal_rejection is not None:
             feat_dict["activation_state"] = pre_signal_rejection
             feat_dict["activation_failure_reason"] = pre_signal_rejection
+            feat_dict["rejection_reason"] = pre_signal_rejection
+            feat_dict["signal_generated"] = False
         elif compressed and inp.market_data.get("price") is not None:
             sig = _enrich_m6_activation(
                 feat_dict, inp, depth, compression_high, sigma_20d,

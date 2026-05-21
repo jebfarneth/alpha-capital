@@ -29,6 +29,10 @@ QUALITY_CONFIDENCE_MULTIPLIERS = {
     "missing_gk_avg_5d_for_gap_proxy": 0.95,
     "invalid_gk_avg_5d_for_gap_proxy": 0.95,
 }
+DEFAULT_QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+DEFAULT_QUOTE_DIAGNOSTIC_FIELDS = (*DEFAULT_QUOTE_FIELDS, "quote_freshness_max_ms")
+DATA_QUALITY_FIELDS = ("market_data_status", "halt_status", "corporate_action_filter_passed")
+BAD_MARKET_DATA_STATUSES = {"delayed", "partial_outage", "unavailable", "stale"}
 
 
 def require_asof_timestamp(
@@ -127,6 +131,79 @@ def operating_universe_rejection(
     quality_flags["operating_universe_not_computed"] = True
     warnings.append(f"{pattern_id}: operating-universe membership missing; failing closed")
     return "missing_operating_universe"
+
+
+def copy_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any], fields: Iterable[str]) -> None:
+    """Copy present market-data fields into feature evidence."""
+    for key in fields:
+        val = market_data.get(key)
+        if val is not None:
+            feat_dict[key] = val
+
+
+def market_data_quality_rejection(
+    feat_dict: Dict[str, Any],
+    market_data: Dict[str, Any],
+    *,
+    require_fields: bool = False,
+    missing_rejection: str = "missing_market_data_quality",
+    data_delay_rejection: str = "data_delay",
+    halt_rejection: str = "halted",
+    corporate_action_rejection: str = "spurious_corporate_action",
+) -> Optional[str]:
+    """
+    Canonical market-data quality guard.
+
+    Patterns may choose whether the status fields are required. Intraday
+    live-data detectors should require them; EOD lanes may treat absent fields
+    as unavailable diagnostics while still rejecting explicit bad values.
+    """
+    copy_fields(feat_dict, market_data, DATA_QUALITY_FIELDS)
+
+    if require_fields and any(market_data.get(field) is None for field in DATA_QUALITY_FIELDS):
+        return missing_rejection
+
+    if market_data.get("market_data_status") in BAD_MARKET_DATA_STATUSES:
+        return data_delay_rejection
+
+    halt_status = market_data.get("halt_status")
+    if halt_status is not None and halt_status != "clear":
+        return halt_rejection
+
+    if market_data.get("corporate_action_filter_passed") is False:
+        return corporate_action_rejection
+
+    return None
+
+
+def quote_rejection(
+    market_data: Dict[str, Any],
+    *,
+    quote_fields: Iterable[str] = DEFAULT_QUOTE_FIELDS,
+    quote_unavailable_rejection: str = "quote_unavailable",
+) -> Optional[str]:
+    """Canonical candidate-evaluation quote guard for Class C lanes."""
+    if any(market_data.get(field) is None for field in quote_fields):
+        return quote_unavailable_rejection
+    try:
+        bid = float(market_data["candidate_eval_bid"])
+        ask = float(market_data["candidate_eval_ask"])
+        quote_age_ms = int(market_data["quote_age_ms"])
+    except (TypeError, ValueError):
+        return quote_unavailable_rejection
+
+    if bid <= 0 or ask <= 0:
+        return quote_unavailable_rejection
+    if quote_age_ms < 0:
+        return quote_unavailable_rejection
+    max_age_ms = market_data.get("quote_freshness_max_ms")
+    if max_age_ms is not None:
+        try:
+            if quote_age_ms > int(max_age_ms):
+                return quote_unavailable_rejection
+        except (TypeError, ValueError):
+            return quote_unavailable_rejection
+    return None
 
 
 def compute_data_confidence(

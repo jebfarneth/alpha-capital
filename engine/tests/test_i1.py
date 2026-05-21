@@ -94,6 +94,9 @@ def _failed_confirmation_data():
         "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
         "quote_age_ms": 850,
         "quote_freshness_max_ms": 1000,
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         "operating_universe_inclusion": True,
     }
 
@@ -113,6 +116,10 @@ def _small_gap_data():
         "candidate_eval_ask": 4.11,
         "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
         "quote_age_ms": 500,
+        "quote_freshness_max_ms": 1000,
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         "operating_universe_inclusion": True,
     }
 
@@ -234,6 +241,7 @@ class TestI1Firing:
             "candidate_eval_bid": 4.34, "candidate_eval_ask": 4.36,
             "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z", "quote_age_ms": 700,
             "evaluation_timestamp": "2026-05-15T14:01:00Z", "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
+            "market_data_status": "current", "halt_status": "clear", "corporate_action_filter_passed": True,
             "operating_universe_inclusion": True,
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
@@ -281,6 +289,7 @@ class TestI1NoSignal:
             "candidate_eval_bid": 4.34, "candidate_eval_ask": 4.36,
             "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z", "quote_age_ms": 850,
             "evaluation_timestamp": "2026-05-15T14:01:00Z", "data_cutoff_timestamp": "2026-05-15T14:00:00Z",
+            "market_data_status": "current", "halt_status": "clear", "corporate_action_filter_passed": True,
             "operating_universe_inclusion": True,
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
@@ -319,6 +328,30 @@ class TestI1NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "spurious_gap_corporate_action"
+
+    def test_missing_market_data_quality_rejected_pre_signal(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        del data["market_data_status"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "missing_market_data_quality"
+
+    def test_missing_halt_status_rejected_pre_signal(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        del data["halt_status"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "missing_market_data_quality"
+
+    def test_missing_corporate_action_filter_rejected_pre_signal(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        del data["corporate_action_filter_passed"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "missing_market_data_quality"
 
     def test_missing_quote_rejected_pre_signal(self):
         det = I1Detector()

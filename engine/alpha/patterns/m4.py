@@ -47,9 +47,13 @@ from alpha.patterns.contracts import (
     ThesisCategory,
 )
 from alpha.patterns.guards import (
+    DEFAULT_QUOTE_FIELDS,
+    copy_fields,
     classify_fidelity,
     compute_data_confidence,
+    market_data_quality_rejection,
     operating_universe_rejection,
+    quote_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -76,9 +80,8 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "hazard_score_at_signal",
     "filing_veto_status",
 )
-QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
-DATA_QUALITY_FIELDS = ("market_data_status", "halt_status", "corporate_action_filter_passed")
 
 
 # ---------------------------------------------------------------------------
@@ -341,41 +344,6 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
     )
 
 
-def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> str | None:
-    for key in DATA_QUALITY_FIELDS:
-        if key in market_data:
-            feat_dict[key] = market_data[key]
-    market_data_status = market_data.get("market_data_status")
-    if market_data_status in {"delayed", "partial_outage", "unavailable", "stale"}:
-        return "data_delay"
-    halt_status = market_data.get("halt_status")
-    if halt_status is not None and halt_status != "clear":
-        return "halted"
-    if market_data.get("corporate_action_filter_passed") is False:
-        return "spurious_corporate_action"
-    return None
-
-
-def _copy_quote_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
-    for key in FRESH_QUOTE_FIELDS:
-        if key in market_data:
-            feat_dict[key] = market_data[key]
-
-
-def _quote_rejection(market_data: Dict[str, Any]) -> str | None:
-    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
-        return "quote_unavailable"
-    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
-        return "quote_unavailable"
-    quote_age_ms = int(market_data["quote_age_ms"])
-    if quote_age_ms < 0:
-        return "quote_unavailable"
-    max_age_ms = market_data.get("quote_freshness_max_ms")
-    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
-        return "quote_unavailable"
-    return None
-
-
 def _compute_hashes(
     inp: PatternInput, asof: Any, feat_dict: Dict[str, Any],
     signals: List[PatternSignal], warnings: List[str], quality_flags: Dict[str, Any],
@@ -438,7 +406,7 @@ class M4Detector(BasePatternDetector):
         universe_rejection = operating_universe_rejection(
             inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
         )
-        pre_signal_rejection = _pre_signal_rejection(feat_dict, inp.market_data)
+        pre_signal_rejection = market_data_quality_rejection(feat_dict, inp.market_data)
         if pre_signal_rejection is not None:
             quality_flags["market_data_quality_rejected"] = True
             feat_dict["rejection_reason"] = pre_signal_rejection
@@ -488,7 +456,7 @@ class M4Detector(BasePatternDetector):
     ) -> None:
         activation_state = inp.market_data.get("activation_state", ACTIVATION_STATE_WATCHLIST)
         feat_dict["activation_state"] = activation_state
-        _copy_quote_fields(feat_dict, inp.market_data)
+        copy_fields(feat_dict, inp.market_data, FRESH_QUOTE_FIELDS)
 
         base_nearness = feat_dict["base_nearness"]
         if activation_state == ACTIVATION_STATE_WATCHLIST:
@@ -507,8 +475,8 @@ class M4Detector(BasePatternDetector):
                 ))
             return
 
-        quote_rejection = _quote_rejection(inp.market_data)
-        feat_dict["quote_capture_passed"] = quote_rejection is None
+        quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
+        feat_dict["quote_capture_passed"] = quote_rej is None
 
         last_price = float(inp.market_data.get("last_price", inp.market_data.get("price", 0.0)))
         range_conf = float(inp.market_data.get("intraday_range_confirmation", 0.0))

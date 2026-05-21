@@ -33,6 +33,9 @@ from alpha.patterns.evidence_bridge import persist_detection_result
 from alpha.patterns.fixture_detector import FixtureDetector
 from alpha.patterns.guards import (
     classify_fidelity,
+    market_data_quality_rejection,
+    operating_universe_rejection,
+    quote_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -110,6 +113,94 @@ class TestGuards:
 
     def test_classify_fidelity_unavailable(self):
         assert classify_fidelity(has_primary_data=False) == FidelityTier.UNAVAILABLE
+
+    def test_operating_universe_missing_fails_closed(self):
+        warnings = []
+        flags = {}
+        reason = operating_universe_rejection({}, warnings, flags, pattern_id="TEST")
+        assert reason == "missing_operating_universe"
+        assert flags["operating_universe_not_computed"] is True
+        assert warnings
+
+    def test_operating_universe_excluded(self):
+        warnings = []
+        flags = {}
+        reason = operating_universe_rejection(
+            {"operating_universe_inclusion": False}, warnings, flags, pattern_id="TEST",
+        )
+        assert reason == "not_operating_universe"
+        assert flags["not_operating_universe_member"] is True
+
+    def test_operating_universe_included(self):
+        warnings = []
+        flags = {}
+        reason = operating_universe_rejection(
+            {"operating_universe_inclusion": True}, warnings, flags, pattern_id="TEST",
+        )
+        assert reason is None
+        assert flags == {}
+
+    def test_market_data_quality_requires_fields_when_requested(self):
+        feat = {}
+        reason = market_data_quality_rejection(feat, {}, require_fields=True)
+        assert reason == "missing_market_data_quality"
+        assert feat == {}
+
+    def test_market_data_quality_rejects_bad_values(self):
+        base = {
+            "market_data_status": "current",
+            "halt_status": "clear",
+            "corporate_action_filter_passed": True,
+        }
+        assert market_data_quality_rejection({}, base, require_fields=True) is None
+
+        delayed = dict(base, market_data_status="delayed")
+        assert market_data_quality_rejection({}, delayed, require_fields=True) == "data_delay"
+
+        halted = dict(base, halt_status="halted")
+        assert market_data_quality_rejection({}, halted, require_fields=True) == "halted"
+
+        corp_action = dict(base, corporate_action_filter_passed=False)
+        assert market_data_quality_rejection({}, corp_action, require_fields=True) == "spurious_corporate_action"
+
+    def test_market_data_quality_copies_diagnostics(self):
+        feat = {}
+        data = {
+            "market_data_status": "current",
+            "halt_status": "clear",
+            "corporate_action_filter_passed": True,
+        }
+        assert market_data_quality_rejection(feat, data) is None
+        assert feat == data
+
+    def test_quote_rejection_good_quote(self):
+        data = {
+            "candidate_eval_bid": 4.34,
+            "candidate_eval_ask": 4.36,
+            "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
+            "quote_age_ms": 850,
+            "quote_freshness_max_ms": 1000,
+        }
+        assert quote_rejection(data) is None
+
+    def test_quote_rejection_missing_invalid_or_stale(self):
+        data = {
+            "candidate_eval_bid": 4.34,
+            "candidate_eval_ask": 4.36,
+            "candidate_eval_quote_timestamp": "2026-05-15T14:01:00Z",
+            "quote_age_ms": 850,
+            "quote_freshness_max_ms": 1000,
+        }
+
+        missing = dict(data)
+        del missing["candidate_eval_ask"]
+        assert quote_rejection(missing) == "quote_unavailable"
+
+        invalid = dict(data, candidate_eval_bid="not-a-number")
+        assert quote_rejection(invalid) == "quote_unavailable"
+
+        stale = dict(data, quote_age_ms=1250)
+        assert quote_rejection(stale) == "quote_unavailable"
 
 
 # -----------------------------------------------------------------------

@@ -521,6 +521,15 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
 
+    def test_missing_operating_universe_fails_closed(self):
+        det = M6Detector()
+        data = _early_gap_market_data()
+        del data["operating_universe_inclusion"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.quality_flags["operating_universe_not_computed"] is True
+        assert result.features.features["rejection_reason"] == "missing_operating_universe"
+
 
 # -----------------------------------------------------------------------
 # Fidelity

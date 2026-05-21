@@ -48,9 +48,12 @@ from alpha.patterns.contracts import (
     ThesisCategory,
 )
 from alpha.patterns.guards import (
+    DEFAULT_QUOTE_FIELDS,
     classify_fidelity,
     compute_data_confidence,
+    market_data_quality_rejection,
     operating_universe_rejection,
+    quote_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -66,7 +69,7 @@ SIGNAL_HORIZON = "3d"
 MIN_GAP_PCT = 0.03  # minimum 3% gap
 GAP_MAGNITUDE_CAP = 5.0
 VOLUME_WEIGHT_CAP = 2.0
-QUOTE_FIELDS = ("candidate_eval_bid", "candidate_eval_ask", "candidate_eval_quote_timestamp", "quote_age_ms")
+QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 TIMESTAMP_FIELDS = ("evaluation_timestamp", "data_cutoff_timestamp")
 
 
@@ -119,23 +122,21 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, An
             feat_dict[key] = val
 
     feat_dict.setdefault("gap_source", "unknown")
-    feat_dict.setdefault("halt_status", "clear")
-    feat_dict.setdefault("corporate_action_filter_passed", True)
-    feat_dict.setdefault("market_data_status", "current")
     feat_dict.setdefault("opening_auction_quality", "normal")
     feat_dict.setdefault("filing_veto_status", "clear")
 
 
 def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> Optional[str]:
-    market_data_status = feat_dict.get("market_data_status")
-    if market_data_status in {"delayed", "partial_outage", "unavailable"}:
-        return "data_delay"
-
-    if feat_dict.get("halt_status") != "clear":
-        return "halt_during_confirmation"
-
-    if feat_dict.get("corporate_action_filter_passed") is False:
-        return "spurious_gap_corporate_action"
+    market_data_rejection = market_data_quality_rejection(
+        feat_dict,
+        market_data,
+        require_fields=True,
+        missing_rejection="missing_market_data_quality",
+        halt_rejection="halt_during_confirmation",
+        corporate_action_rejection="spurious_gap_corporate_action",
+    )
+    if market_data_rejection is not None:
+        return market_data_rejection
 
     if feat_dict.get("opening_auction_quality") != "normal":
         return "opening_auction_quality_failed"
@@ -143,19 +144,9 @@ def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[st
     if any(market_data.get(field) is None for field in TIMESTAMP_FIELDS):
         return "insufficient_timestamp_data"
 
-    if any(market_data.get(field) is None for field in QUOTE_FIELDS):
-        return "quote_unavailable"
-
-    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
-        return "quote_unavailable"
-
-    quote_age_ms = int(market_data["quote_age_ms"])
-    if quote_age_ms < 0:
-        return "quote_unavailable"
-
-    max_age_ms = market_data.get("quote_freshness_max_ms")
-    if max_age_ms is not None and quote_age_ms > int(max_age_ms):
-        return "quote_unavailable"
+    quote_rej = quote_rejection(market_data, quote_fields=QUOTE_FIELDS)
+    if quote_rej is not None:
+        return quote_rej
 
     return None
 
