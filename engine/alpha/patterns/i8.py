@@ -180,7 +180,7 @@ def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
 def _copy_opening_range_features(
     feat_dict: Dict[str, Any],
     md: Dict[str, Any],
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float]:
     opening_range_high = float(md["opening_range_high"])
     opening_range_low = float(md["opening_range_low"])
     sigma_20d = float(md["sigma_20d"])
@@ -191,7 +191,7 @@ def _copy_opening_range_features(
     feat_dict["opening_range_size"] = round(opening_range_size, 6)
     feat_dict["sigma_20d"] = sigma_20d
     _copy_diagnostic_fields(feat_dict, md)
-    return opening_range_high, opening_range_low, sigma_20d, opening_range_size
+    return opening_range_high, sigma_20d, opening_range_size
 
 
 def _compute_i8_breakout_quality(
@@ -359,7 +359,7 @@ def _enrich_i8_signal(
 ) -> Optional[PatternSignal]:
     """Compute opening-range breakout features and return signal if gates pass."""
     md = inp.market_data
-    opening_range_high, _, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, md)
+    opening_range_high, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, md)
 
     pre_rej = _pre_signal_rejection(feat_dict, md)
     if pre_rej is not None:
