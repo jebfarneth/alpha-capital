@@ -19,16 +19,13 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
   lambda_M6_12td = 1.1% * 1.45 * (12/21) = ~0.912%
   raw_expected_edge = X_M6_activation * lambda_M6_12td
 
-Signal eligibility:
-  1. compression_depth >= 0.5 (compression_ratio <= 0.80)
-  2. watchlist signal for compressed setup
-  3. executable active signal only after breakout + range/volume/spread/freshness activation
+Signal paths:
+  1. Watchlist: compressed setup, no activation data
+  2. Standard activation: breakout + range expansion + volume ignition + spread + freshness
+  3. Early-gap activation: first 30 min, open gaps above compression_high,
+     volume + spread + freshness required, range expansion not yet required
 
 Routing: Class C after activation (marketable limit, 120-second cancel).
-
-This detector accepts pre-computed compression features from the nightly
-scan pipeline. The GK estimator computation itself is a data-processing
-concern, not detector logic.
 """
 
 from __future__ import annotations
@@ -39,7 +36,6 @@ from typing import Any, Dict, List, Optional
 from alpha.data.contracts import stable_hash
 from alpha.patterns.contracts import (
     BasePatternDetector,
-    FidelityTier,
     PatternDetectionResult,
     PatternFeatures,
     PatternInput,
@@ -58,14 +54,16 @@ from alpha.patterns.guards import (
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
-LAMBDA_M6_MONTHLY = 0.011  # inherited from M4 (J&T 6/6)
-AMPLIFICATION = 1.45  # Cakici 2023 small-cap factor
+LAMBDA_M6_MONTHLY = 0.011
+AMPLIFICATION = 1.45
 HOLD_DAYS = 12
-LAMBDA_M6_12TD = LAMBDA_M6_MONTHLY * AMPLIFICATION * (HOLD_DAYS / 21.0)  # ~0.00912
+LAMBDA_M6_12TD = LAMBDA_M6_MONTHLY * AMPLIFICATION * (HOLD_DAYS / 21.0)
 X_M6_CAP = 3.0
 SIGNAL_HORIZON = "12d"
-MIN_COMPRESSION_DEPTH = 0.5  # compression_ratio <= 0.80
+MIN_COMPRESSION_DEPTH = 0.5
 SPREAD_CAP = 0.01
+EARLY_GAP_WINDOW_MINUTES = 30
+
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
 ACTIVATION_STATE_NOT_COMPRESSED = "not_compressed"
@@ -73,28 +71,21 @@ ACTIVATION_STATE_NO_BREAKOUT = "no_breakout"
 ACTIVATION_STATE_FAILED = "activation_failed"
 
 
+# ---------------------------------------------------------------------------
+# Pure computation helpers
+# ---------------------------------------------------------------------------
+
 def compute_compression_depth(compression_ratio: float) -> float:
-    """Per EXPOSURE.md: clip((1.0 - ratio) / 0.4, 0.0, 2.5)."""
     return max(0.0, min((1.0 - compression_ratio) / 0.4, 2.5))
 
 
-def compute_breakout_extension(
-    price: float,
-    compression_high: float,
-    sigma_20d: float,
-) -> float:
-    """
-    Per EXPOSURE.md: (price - compression_high) / compression_high / sigma_20d,
-    clipped to [0.0, 3.0]. Returns 0.0 if price <= compression_high.
-    """
+def compute_breakout_extension(price: float, compression_high: float, sigma_20d: float) -> float:
     if price <= compression_high or compression_high <= 0 or sigma_20d <= 0:
         return 0.0
-    raw = (price - compression_high) / compression_high / sigma_20d
-    return max(0.0, min(raw, 3.0))
+    return max(0.0, min((price - compression_high) / compression_high / sigma_20d, 3.0))
 
 
 def compute_expansion_confirmation(expansion_ratio: float) -> float:
-    """Per EXPOSURE.md tiered weighting of GK expansion ratio."""
     if expansion_ratio >= 2.0:
         return 1.5
     if expansion_ratio >= 1.5:
@@ -105,7 +96,6 @@ def compute_expansion_confirmation(expansion_ratio: float) -> float:
 
 
 def compute_volume_confirmation(volume_ratio: float) -> float:
-    """Per EXPOSURE.md tiered weighting of intraday volume ratio."""
     if volume_ratio >= 2.0:
         return 1.5
     if volume_ratio >= 1.5:
@@ -116,39 +106,32 @@ def compute_volume_confirmation(volume_ratio: float) -> float:
 
 
 def compute_expansion_ratio(
-    session_high: float,
-    session_low: float,
-    gk_avg_5d: float,
+    session_high: float, session_low: float, gk_avg_5d: float,
 ) -> Optional[float]:
-    """
-    Per EXPOSURE.md: intraday_range_proxy / sqrt(gk_avg_5d).
-    Returns None if inputs are invalid.
-    """
     if session_high <= 0 or session_low <= 0 or session_high <= session_low:
         return None
     if gk_avg_5d is None or gk_avg_5d <= 0:
         return None
-    range_proxy = math.log(session_high / session_low)
-    return range_proxy / math.sqrt(gk_avg_5d)
+    return math.log(session_high / session_low) / math.sqrt(gk_avg_5d)
 
 
 def compute_data_confidence(gk_warning: bool, quality_flags: Dict[str, Any]) -> float:
-    data_conf = 1.0
+    conf = 1.0
     if gk_warning:
-        data_conf *= 0.9
+        conf *= 0.9
     if quality_flags.get("missing_lineage"):
-        data_conf *= 0.9
+        conf *= 0.9
     if quality_flags.get("missing_expansion_data"):
-        data_conf *= 0.95
+        conf *= 0.95
     if quality_flags.get("missing_volume_data"):
-        data_conf *= 0.95
-    return round(data_conf, 4)
+        conf *= 0.95
+    return round(conf, 4)
 
 
-def activation_failure_reason(feat: Dict[str, Any]) -> str:
+def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat.get("breakout_ignition_passed", False):
         return "breakout_ignition_failed"
-    if not feat.get("range_expansion_passed", False):
+    if not feat.get("range_expansion_passed", False) and not feat.get("early_gap_candidate", False):
         return "range_expansion_failed"
     if not feat.get("volume_ignition_passed", False):
         return "volume_ignition_failed"
@@ -156,8 +139,219 @@ def activation_failure_reason(feat: Dict[str, Any]) -> str:
         return "spread_too_wide"
     if not feat.get("signal_freshness_passed", False):
         return "signal_expired"
+    if not feat.get("range_expansion_passed", False):
+        return "range_expansion_failed"
     return "unknown"
 
+
+# ---------------------------------------------------------------------------
+# Activation enrichment (extracted from detect for readability)
+# ---------------------------------------------------------------------------
+
+def _enrich_m6_activation(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    depth: float,
+    compression_high: float,
+    sigma_20d: float,
+    gk_warning: bool,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[PatternSignal]:
+    """
+    Compute all activation features and gates for a compressed breakout.
+    Returns a PatternSignal if activation passes, else None.
+    All activation fields are set on feat_dict here.
+    """
+    price = float(inp.market_data["price"])
+    feat_dict["P_activation"] = price
+
+    # Breakout extension
+    brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
+    feat_dict["intraday_breakout_extension"] = round(brk_ext, 6)
+    feat_dict["breakout_ignition_passed"] = brk_ext > 0
+
+    # Expansion confirmation
+    session_high = inp.market_data.get("session_high")
+    session_low = inp.market_data.get("session_low")
+    gk_avg_5d = inp.market_data.get("gk_avg_5d")
+
+    exp_ratio = None
+    exp_conf = 1.0
+    if session_high is not None and session_low is not None and gk_avg_5d is not None:
+        exp_ratio = compute_expansion_ratio(float(session_high), float(session_low), float(gk_avg_5d))
+        if exp_ratio is not None:
+            exp_conf = compute_expansion_confirmation(exp_ratio)
+    else:
+        exp_conf = 1.0
+        quality_flags["missing_expansion_data"] = True
+        warnings.append("missing session_high/session_low/gk_avg_5d for expansion confirmation")
+
+    feat_dict["intraday_expansion_ratio"] = round(exp_ratio, 6) if exp_ratio is not None else None
+    feat_dict["intraday_expansion_confirmation"] = exp_conf
+    feat_dict["range_expansion_passed"] = exp_ratio is not None and exp_ratio >= 1.0
+
+    # Volume confirmation
+    cumulative_volume = inp.market_data.get("cumulative_volume")
+    expected_tod_volume = inp.market_data.get("expected_tod_volume")
+    latest_5m_volume_ratio = inp.market_data.get("latest_5m_volume_ratio")
+
+    vol_conf = 1.0
+    vol_ratio = None
+    if cumulative_volume is not None and expected_tod_volume is not None:
+        cv, ev = float(cumulative_volume), float(expected_tod_volume)
+        if ev > 0:
+            vol_ratio = cv / ev
+            vol_conf = compute_volume_confirmation(vol_ratio)
+    else:
+        quality_flags["missing_volume_data"] = True
+        warnings.append("missing cumulative_volume/expected_tod_volume for volume confirmation")
+
+    latest_5m_ratio = float(latest_5m_volume_ratio) if latest_5m_volume_ratio is not None else None
+    feat_dict["intraday_volume_ratio"] = round(vol_ratio, 6) if vol_ratio is not None else None
+    feat_dict["intraday_volume_confirmation"] = vol_conf
+    feat_dict["latest_5m_volume_ratio"] = round(latest_5m_ratio, 6) if latest_5m_ratio is not None else None
+    feat_dict["volume_ignition_passed"] = (
+        (vol_ratio is not None and vol_ratio >= 1.5)
+        or (latest_5m_ratio is not None and latest_5m_ratio >= 2.0)
+    )
+
+    # Spread discipline
+    spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
+    spread_passed = (
+        bool(inp.market_data.get("spread_discipline_passed"))
+        if "spread_discipline_passed" in inp.market_data
+        else spread_pct is not None and float(spread_pct) <= SPREAD_CAP
+    )
+    feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
+    feat_dict["spread_discipline_passed"] = spread_passed
+
+    # Signal freshness
+    signal_freshness_passed = bool(inp.market_data.get("signal_freshness_passed", True))
+    feat_dict["signal_freshness_passed"] = signal_freshness_passed
+
+    # Early-gap diagnostics
+    open_price = inp.market_data.get("open_price")
+    minutes_since_open = inp.market_data.get("minutes_since_open")
+
+    early_session_flag = minutes_since_open is not None and float(minutes_since_open) <= EARLY_GAP_WINDOW_MINUTES
+    gap_breakout_flag = open_price is not None and float(open_price) > compression_high
+    gap_brk_ext = compute_breakout_extension(float(open_price), compression_high, sigma_20d) if open_price is not None else 0.0
+
+    feat_dict["early_session_flag"] = early_session_flag
+    feat_dict["gap_breakout_flag"] = gap_breakout_flag
+    feat_dict["gap_breakout_extension"] = round(gap_brk_ext, 6)
+    early_gap_candidate = early_session_flag and gap_breakout_flag and gap_brk_ext > 0 and brk_ext > 0
+    feat_dict["early_gap_candidate"] = early_gap_candidate
+
+    # Standard activation
+    standard_passed = (
+        feat_dict["breakout_ignition_passed"]
+        and feat_dict["range_expansion_passed"]
+        and feat_dict["volume_ignition_passed"]
+        and spread_passed
+        and signal_freshness_passed
+    )
+    feat_dict["standard_activation_passed"] = standard_passed
+
+    # Early-gap activation
+    early_gap_passed = (
+        early_gap_candidate
+        and feat_dict["volume_ignition_passed"]
+        and spread_passed
+        and signal_freshness_passed
+    )
+    feat_dict["early_gap_activation_passed"] = early_gap_passed
+
+    activation_passed = standard_passed or early_gap_passed
+    feat_dict["activation_passed"] = activation_passed
+
+    if standard_passed:
+        feat_dict["activation_path"] = "standard"
+    elif early_gap_passed:
+        feat_dict["activation_path"] = "early_gap_activation"
+    else:
+        feat_dict["activation_path"] = None
+
+    # Determine expansion confirmation for exposure calculation
+    if standard_passed:
+        effective_exp_conf = exp_conf
+    elif early_gap_passed:
+        # Early-gap: use normal expansion if range passed, else neutral 1.0
+        if feat_dict["range_expansion_passed"]:
+            effective_exp_conf = exp_conf
+        else:
+            effective_exp_conf = 1.0
+            feat_dict["early_gap_expansion_confirmation"] = 1.0
+    else:
+        effective_exp_conf = exp_conf
+
+    # Activation exposure (uses effective expansion confirmation)
+    x_m6_activation = min(depth * brk_ext * effective_exp_conf * vol_conf, X_M6_CAP)
+    feat_dict["X_M6_activation"] = round(x_m6_activation, 6)
+
+    if not activation_passed:
+        feat_dict["activation_state"] = ACTIVATION_STATE_FAILED if brk_ext > 0 else ACTIVATION_STATE_NO_BREAKOUT
+        feat_dict["activation_failure_reason"] = _activation_failure_reason(feat_dict)
+        return None
+
+    # Build signal
+    raw_expected_edge = round(x_m6_activation * LAMBDA_M6_12TD, 6)
+    signal_strength = round(min(x_m6_activation / X_M6_CAP, 1.0), 6)
+
+    feat_dict["activation_state"] = ACTIVATION_STATE_ACTIVATED
+    feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
+
+    return PatternSignal(
+        direction=SignalDirection.LONG,
+        raw_signal_strength=signal_strength,
+        raw_expected_edge=raw_expected_edge,
+        signal_horizon=SIGNAL_HORIZON,
+        data_confidence=compute_data_confidence(gk_warning, quality_flags),
+    )
+
+
+def _build_watchlist_signal(
+    feat_dict: Dict[str, Any], depth: float, gk_warning: bool, quality_flags: Dict[str, Any],
+) -> PatternSignal:
+    """Build a watchlist signal for a compressed setup without activation data."""
+    feat_dict["activation_state"] = ACTIVATION_STATE_WATCHLIST
+    feat_dict["expected_return_priors"] = {"gross_bps": 0.0}
+    return PatternSignal(
+        direction=SignalDirection.LONG,
+        raw_signal_strength=round(min(depth / X_M6_CAP, 1.0), 6),
+        raw_expected_edge=0.0,
+        signal_horizon=SIGNAL_HORIZON,
+        signal_status="watchlist",
+        data_confidence=compute_data_confidence(gk_warning, quality_flags),
+    )
+
+
+def _compute_hashes(
+    inp: PatternInput, asof: Any, feat_dict: Dict[str, Any],
+    signals: List[PatternSignal], warnings: List[str], quality_flags: Dict[str, Any],
+) -> tuple:
+    input_hash = stable_hash({
+        "ticker": inp.ticker, "asof_timestamp": asof,
+        "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
+    })
+    output_hash = stable_hash({
+        "features": feat_dict,
+        "signals": [
+            {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
+             "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
+             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+            for s in signals
+        ],
+        "warnings": warnings, "quality_flags": quality_flags,
+    })
+    return input_hash, output_hash
+
+
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
 
 class M6Detector(BasePatternDetector):
     """M6 Volatility-Compression Breakout detector."""
@@ -169,30 +363,19 @@ class M6Detector(BasePatternDetector):
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
-
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}
 
         reject_future_timestamp(asof, warnings, quality_flags)
         require_lineage_hash(inp.lineage_hashes, warnings, quality_flags)
 
-        # Required compression inputs (from nightly scan pipeline)
         compression_ratio = inp.market_data.get("compression_ratio")
-        gk_vol_5d = inp.market_data.get("gk_vol_5d")
-        gk_vol_60d = inp.market_data.get("gk_vol_60d")
         compression_high = inp.market_data.get("compression_high")
         sigma_20d = inp.market_data.get("sigma_20d")
 
         if compression_ratio is None or compression_high is None or sigma_20d is None:
-            warnings.append("missing required compression features (compression_ratio, compression_high, or sigma_20d)")
-            return PatternDetectionResult(
-                pattern_id=self.pattern_id,
-                ticker=inp.ticker,
-                asof_timestamp=asof,
-                features=None,
-                warnings=warnings,
-                quality_flags=quality_flags,
-            )
+            warnings.append("missing required compression features")
+            return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
         compression_ratio = float(compression_ratio)
         compression_high = float(compression_high)
@@ -200,19 +383,12 @@ class M6Detector(BasePatternDetector):
 
         if compression_high <= 0 or sigma_20d <= 0:
             warnings.append(f"invalid compression_high={compression_high} or sigma_20d={sigma_20d}")
-            return PatternDetectionResult(
-                pattern_id=self.pattern_id,
-                ticker=inp.ticker,
-                asof_timestamp=asof,
-                features=None,
-                warnings=warnings,
-                quality_flags=quality_flags,
-            )
+            return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        # Compute compression depth
         depth = compute_compression_depth(compression_ratio)
+        gk_vol_5d = inp.market_data.get("gk_vol_5d")
+        gk_vol_60d = inp.market_data.get("gk_vol_60d")
 
-        # Build features dict
         feat_dict: Dict[str, Any] = {
             "compression_ratio": round(compression_ratio, 6),
             "compression_depth": round(depth, 6),
@@ -223,201 +399,62 @@ class M6Detector(BasePatternDetector):
             "X_M6_setup": round(depth, 6),
         }
 
-        # GK quality flags
         gk_warning = inp.market_data.get("gk_low_transaction_warning", False)
         feat_dict["gk_low_transaction_warning"] = gk_warning
 
-        # Optional enrichment (diagnostic, per DATA.md)
         market_cap = inp.fundamental_data.get("market_cap")
         if market_cap is not None:
             feat_dict["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
         if "sector" in inp.fundamental_data:
             feat_dict["sector"] = inp.fundamental_data["sector"]
+
         if inp.market_data.get("operating_universe_inclusion") is False:
             quality_flags["not_operating_universe_member"] = True
             warnings.append("ticker is not marked as operating-universe eligible")
         elif inp.universe_snapshot_id is None and "operating_universe_inclusion" not in inp.market_data:
             warnings.append("operating-universe membership not provided to M6 detector")
 
-        # Fidelity
-        has_ohlcv_history = gk_vol_60d is not None and float(gk_vol_60d) > 0
+        has_ohlcv = gk_vol_60d is not None and float(gk_vol_60d) > 0
         pit_passed = quality_flags.get("point_in_time_passed") is not False
         fidelity = classify_fidelity(
-            has_primary_data=has_ohlcv_history,
-            has_secondary_data=not gk_warning,
-            point_in_time_passed=pit_passed,
-            lookahead_guard_passed=True,
+            has_primary_data=has_ohlcv, has_secondary_data=not gk_warning,
+            point_in_time_passed=pit_passed, lookahead_guard_passed=True,
         )
 
-        # Compression gate
         compressed = depth >= MIN_COMPRESSION_DEPTH
         feat_dict["compression_gate_passed"] = compressed
-
-        # Activation inputs (breakout data, may be absent for setup-only scans)
-        price = inp.market_data.get("price")
-        session_high = inp.market_data.get("session_high")
-        session_low = inp.market_data.get("session_low")
-        cumulative_volume = inp.market_data.get("cumulative_volume")
-        expected_tod_volume = inp.market_data.get("expected_tod_volume")
-        latest_5m_volume_ratio = inp.market_data.get("latest_5m_volume_ratio")
-        gk_avg_5d = inp.market_data.get("gk_avg_5d")
-        spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
-        signal_freshness_passed = bool(inp.market_data.get("signal_freshness_passed", True))
 
         signals: List[PatternSignal] = []
 
         if quality_flags.get("not_operating_universe_member"):
             feat_dict["activation_state"] = "not_operating_universe"
-        elif compressed and price is not None:
-            price = float(price)
-            feat_dict["P_activation"] = price
-
-            # Breakout extension
-            brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
-            feat_dict["intraday_breakout_extension"] = round(brk_ext, 6)
-
-            # Expansion confirmation
-            exp_ratio = None
-            exp_conf = 1.0  # default if session range data unavailable
-            if session_high is not None and session_low is not None and gk_avg_5d is not None:
-                exp_ratio = compute_expansion_ratio(
-                    float(session_high), float(session_low), float(gk_avg_5d)
-                )
-                if exp_ratio is not None:
-                    exp_conf = compute_expansion_confirmation(exp_ratio)
-            else:
-                # Missing expansion data degrades but does not block
-                exp_conf = 1.0
-                quality_flags["missing_expansion_data"] = True
-                warnings.append("missing session_high/session_low/gk_avg_5d for expansion confirmation")
-
-            feat_dict["intraday_expansion_ratio"] = round(exp_ratio, 6) if exp_ratio is not None else None
-            feat_dict["intraday_expansion_confirmation"] = exp_conf
-            feat_dict["range_expansion_passed"] = exp_ratio is not None and exp_ratio >= 1.0
-
-            # Volume confirmation
-            vol_conf = 1.0  # default if volume data unavailable
-            vol_ratio = None
-            if cumulative_volume is not None and expected_tod_volume is not None:
-                cv = float(cumulative_volume)
-                ev = float(expected_tod_volume)
-                if ev > 0:
-                    vol_ratio = cv / ev
-                    vol_conf = compute_volume_confirmation(vol_ratio)
-            else:
-                quality_flags["missing_volume_data"] = True
-                warnings.append("missing cumulative_volume/expected_tod_volume for volume confirmation")
-
-            feat_dict["intraday_volume_ratio"] = round(vol_ratio, 6) if vol_ratio is not None else None
-            feat_dict["intraday_volume_confirmation"] = vol_conf
-            latest_5m_ratio = float(latest_5m_volume_ratio) if latest_5m_volume_ratio is not None else None
-            feat_dict["latest_5m_volume_ratio"] = round(latest_5m_ratio, 6) if latest_5m_ratio is not None else None
-            feat_dict["volume_ignition_passed"] = (
-                (vol_ratio is not None and vol_ratio >= 1.5)
-                or (latest_5m_ratio is not None and latest_5m_ratio >= 2.0)
+        elif compressed and inp.market_data.get("price") is not None:
+            sig = _enrich_m6_activation(
+                feat_dict, inp, depth, compression_high, sigma_20d,
+                gk_warning, warnings, quality_flags,
             )
-
-            spread_passed = (
-                bool(inp.market_data.get("spread_discipline_passed"))
-                if "spread_discipline_passed" in inp.market_data
-                else spread_pct is not None and float(spread_pct) <= SPREAD_CAP
-            )
-            feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
-            feat_dict["spread_discipline_passed"] = spread_passed
-            feat_dict["signal_freshness_passed"] = signal_freshness_passed
-
-            # Activation exposure
-            x_m6_activation = min(depth * brk_ext * exp_conf * vol_conf, X_M6_CAP)
-            feat_dict["X_M6_activation"] = round(x_m6_activation, 6)
-            feat_dict["breakout_ignition_passed"] = brk_ext > 0
-            activation_passed = (
-                feat_dict["breakout_ignition_passed"]
-                and feat_dict["range_expansion_passed"]
-                and feat_dict["volume_ignition_passed"]
-                and spread_passed
-                and signal_freshness_passed
-            )
-            feat_dict["activation_passed"] = activation_passed
-
-            # Active executable signal fires only if all activation gates pass.
-            if activation_passed:
-                raw_expected_edge = round(x_m6_activation * LAMBDA_M6_12TD, 6)
-                signal_strength = round(min(x_m6_activation / X_M6_CAP, 1.0), 6)
-
-                feat_dict["activation_state"] = ACTIVATION_STATE_ACTIVATED
-
-                gross_bps = round(raw_expected_edge * 10_000, 2)
-                feat_dict["expected_return_priors"] = {"gross_bps": gross_bps}
-
-                signals.append(
-                    PatternSignal(
-                        direction=SignalDirection.LONG,
-                        raw_signal_strength=signal_strength,
-                        raw_expected_edge=raw_expected_edge,
-                        signal_horizon=SIGNAL_HORIZON,
-                        data_confidence=compute_data_confidence(gk_warning, quality_flags),
-                    )
-                )
-            else:
-                feat_dict["activation_state"] = ACTIVATION_STATE_FAILED if brk_ext > 0 else ACTIVATION_STATE_NO_BREAKOUT
-                feat_dict["activation_failure_reason"] = activation_failure_reason(feat_dict)
+            if sig is not None:
+                signals.append(sig)
         elif compressed:
-            feat_dict["activation_state"] = ACTIVATION_STATE_WATCHLIST
-            feat_dict["expected_return_priors"] = {"gross_bps": 0.0}
-            signals.append(
-                PatternSignal(
-                    direction=SignalDirection.LONG,
-                    raw_signal_strength=round(min(depth / X_M6_CAP, 1.0), 6),
-                    raw_expected_edge=0.0,
-                    signal_horizon=SIGNAL_HORIZON,
-                    signal_status="watchlist",
-                    data_confidence=compute_data_confidence(gk_warning, quality_flags),
-                )
-            )
+            signals.append(_build_watchlist_signal(feat_dict, depth, gk_warning, quality_flags))
         else:
             feat_dict["activation_state"] = ACTIVATION_STATE_NOT_COMPRESSED
 
         features = PatternFeatures(
-            features=feat_dict,
-            feature_manifest_version="m6-v1",
-            fidelity_tier=fidelity,
-            point_in_time_passed=pit_passed,
-            lookahead_guard_passed=True,
+            features=feat_dict, feature_manifest_version="m6-v1",
+            fidelity_tier=fidelity, point_in_time_passed=pit_passed, lookahead_guard_passed=True,
         )
 
-        input_hash = stable_hash({
-            "ticker": inp.ticker,
-            "asof_timestamp": asof,
-            "market_data": inp.market_data,
-            "fundamental_data": inp.fundamental_data,
-            "lineage_hashes": inp.lineage_hashes,
-            "universe_snapshot_id": inp.universe_snapshot_id,
-        })
-        output_hash = stable_hash({
-            "features": feat_dict,
-            "signals": [
-                {
-                    "direction": sig.direction,
-                    "raw_signal_strength": sig.raw_signal_strength,
-                    "raw_expected_edge": sig.raw_expected_edge,
-                    "signal_horizon": sig.signal_horizon,
-                    "signal_status": sig.signal_status,
-                    "data_confidence": sig.data_confidence,
-                }
-                for sig in signals
-            ],
-            "warnings": warnings,
-            "quality_flags": quality_flags,
-        })
+        input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, signals, warnings, quality_flags)
 
         return PatternDetectionResult(
-            pattern_id=self.pattern_id,
-            ticker=inp.ticker,
-            asof_timestamp=asof,
-            features=features,
-            signals=signals,
-            warnings=warnings,
-            quality_flags=quality_flags,
-            input_hashes={"market_data": input_hash},
-            output_hashes={"features": output_hash},
+            pattern_id=self.pattern_id, ticker=inp.ticker, asof_timestamp=asof,
+            features=features, signals=signals, warnings=warnings, quality_flags=quality_flags,
+            input_hashes={"market_data": input_hash}, output_hashes={"features": output_hash},
+        )
+
+    def _no_features_result(self, ticker, asof, warnings, quality_flags):
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id, ticker=ticker, asof_timestamp=asof,
+            features=None, warnings=warnings, quality_flags=quality_flags,
         )
