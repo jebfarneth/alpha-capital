@@ -1,0 +1,328 @@
+"""
+M4 — 52-Week High Breakout Detector.
+
+Vault source: Engineering/Patterns/M4-52WeekHigh/
+
+Thesis: right_tail_convex. Stocks closing at or above their prior
+252-session high exhibit positive expected excess returns over the
+following 15 trading days (J&T 1993 momentum premium).
+
+Exposure formula (EXPOSURE.md):
+  base_nearness = min(P / H52w, 1.0)
+  breakout_extension = max(P / H52w - 1.0, 0)
+  X_M4 = min(base_nearness + kappa * breakout_extension, 1.5)
+
+Expected-return bridge (SPEC.md / EXPOSURE.md):
+  lambda_M4_monthly = 1.1% (J&T 6/6 conservative)
+  lambda_M4_15td = lambda_monthly * 15/21 = ~0.786%
+  raw_expected_edge = X_M4 * lambda_M4_15td
+
+Eligibility gate (EXPOSURE.md):
+  1. P >= H52w (breakout event)
+  2. Top-3-decile breakout_extension within same-day breakout cohort
+  3. breakout_extension > 0 (exact-high crossings excluded)
+
+This detector implements the base_daily lane only. Fresh-breakout
+activation requires live intraday data and is deferred to runtime.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from alpha.data.contracts import stable_hash
+from alpha.patterns.contracts import (
+    BasePatternDetector,
+    FidelityTier,
+    PatternDetectionResult,
+    PatternFeatures,
+    PatternInput,
+    PatternSignal,
+    PatternId,
+    PatternTrack,
+    RouteClass,
+    SignalDirection,
+    ThesisCategory,
+)
+from alpha.patterns.guards import (
+    classify_fidelity,
+    reject_future_timestamp,
+    require_asof_timestamp,
+    require_lineage_hash,
+)
+
+# Vault constants (EXPOSURE.md / SPEC.md)
+KAPPA = 1.0
+X_M4_CAP = 1.5
+LAMBDA_M4_MONTHLY = 0.011  # 1.1% per month (J&T 6/6 conservative)
+LAMBDA_M4_15TD = LAMBDA_M4_MONTHLY * 15.0 / 21.0  # ~0.00786
+SIGNAL_HORIZON = "15d"
+BREAKOUT_COHORT_PERCENTILE = 0.70  # top-3-decile gate
+SMALL_COHORT_THRESHOLD = 10
+
+
+def compute_m4_features(
+    price: float,
+    high_52w: float,
+) -> Dict[str, Any]:
+    """Compute M4 exposure features per EXPOSURE.md formula."""
+    if high_52w <= 0:
+        return {
+            "base_nearness": 0.0,
+            "breakout_extension": 0.0,
+            "X_M4": 0.0,
+            "ratio_P_H": 0.0,
+            "kappa": KAPPA,
+            "H_52w": high_52w,
+            "P_close": price,
+        }
+
+    ratio = price / high_52w
+    base_nearness = min(ratio, 1.0)
+    breakout_extension = max(ratio - 1.0, 0.0)
+    x_m4 = min(base_nearness + KAPPA * breakout_extension, X_M4_CAP)
+
+    return {
+        "base_nearness": round(base_nearness, 6),
+        "breakout_extension": round(breakout_extension, 6),
+        "X_M4": round(x_m4, 6),
+        "ratio_P_H": round(ratio, 6),
+        "kappa": KAPPA,
+        "H_52w": high_52w,
+        "P_close": price,
+    }
+
+
+def apply_cohort_gate(
+    breakout_extension: float,
+    cohort_extensions: List[float],
+) -> Dict[str, Any]:
+    """
+    Apply the top-3-decile breakout_extension cohort gate.
+
+    Returns gate metadata: passed, cohort_size, rank, decile,
+    percentile_threshold, small_cohort_warning.
+    """
+    cohort_size = len(cohort_extensions)
+
+    # Small-cohort handling: all pass per EXPOSURE.md
+    if cohort_size < SMALL_COHORT_THRESHOLD:
+        passed = breakout_extension > 0
+        return {
+            "cohort_gate_passed": passed,
+            "breakout_cohort_size": cohort_size,
+            "breakout_cohort_rank": None,
+            "breakout_cohort_decile": None,
+            "percentile_threshold": 0.0,
+            "small_cohort_warning": True,
+        }
+
+    # Compute 70th percentile threshold (linear interpolation)
+    sorted_ext = sorted(cohort_extensions)
+    idx = BREAKOUT_COHORT_PERCENTILE * (cohort_size - 1)
+    lower = int(idx)
+    frac = idx - lower
+    if lower + 1 < cohort_size:
+        threshold = sorted_ext[lower] + frac * (sorted_ext[lower + 1] - sorted_ext[lower])
+    else:
+        threshold = sorted_ext[lower]
+
+    passed = breakout_extension >= threshold and breakout_extension > 0
+
+    # Rank (1 = highest extension)
+    rank = sum(1 for e in cohort_extensions if e > breakout_extension) + 1
+    decile = min(10, max(1, int((rank - 1) / cohort_size * 10) + 1))
+
+    return {
+        "cohort_gate_passed": passed,
+        "breakout_cohort_size": cohort_size,
+        "breakout_cohort_rank": rank,
+        "breakout_cohort_decile": decile,
+        "percentile_threshold": round(threshold, 6),
+        "small_cohort_warning": False,
+    }
+
+
+class M4Detector(BasePatternDetector):
+    """M4 52-Week High Breakout detector (base_daily lane)."""
+
+    pattern_id = PatternId.M4
+    track = PatternTrack.MULTI_DAY
+    thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
+    route_class = RouteClass.A
+
+    def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        asof = require_asof_timestamp(inp.asof_timestamp)
+
+        warnings: List[str] = []
+        quality_flags: Dict[str, Any] = {}
+
+        reject_future_timestamp(asof, warnings, quality_flags)
+        require_lineage_hash(inp.lineage_hashes, warnings, quality_flags)
+
+        # Required inputs
+        price = inp.market_data.get("price")
+        high_52w = inp.market_data.get("high_52w")
+        cohort_extensions = inp.market_data.get("cohort_extensions")
+
+        if price is None or high_52w is None:
+            warnings.append("missing required price or high_52w")
+            return PatternDetectionResult(
+                pattern_id=self.pattern_id,
+                ticker=inp.ticker,
+                asof_timestamp=asof,
+                features=None,
+                warnings=warnings,
+                quality_flags=quality_flags,
+            )
+
+        price = float(price)
+        high_52w = float(high_52w)
+
+        if high_52w <= 0 or price <= 0:
+            warnings.append(f"invalid price={price} or high_52w={high_52w}")
+            return PatternDetectionResult(
+                pattern_id=self.pattern_id,
+                ticker=inp.ticker,
+                asof_timestamp=asof,
+                features=None,
+                warnings=warnings,
+                quality_flags=quality_flags,
+            )
+
+        # Compute features
+        feat_dict = compute_m4_features(price, high_52w)
+
+        # Optional enrichment fields (diagnostic, not load-bearing)
+        market_cap = inp.fundamental_data.get("market_cap")
+        if market_cap is not None:
+            feat_dict["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
+            sub = "A" if float(market_cap) < 80_000_000 else "B"
+            feat_dict["sub_universe"] = sub
+        if "sector" in inp.fundamental_data:
+            feat_dict["sector"] = inp.fundamental_data["sector"]
+        if "industry" in inp.fundamental_data:
+            feat_dict["industry"] = inp.fundamental_data["industry"]
+        feat_dict["entry_lane"] = "base_daily"
+
+        # Determine fidelity
+        n_sessions = inp.market_data.get("n_sessions_in_window")
+        short_history = n_sessions is not None and int(n_sessions) < 252
+        feat_dict["short_history_flag"] = short_history
+
+        has_primary = price > 0 and high_52w > 0
+        pit_passed = quality_flags.get("point_in_time_passed") is not False
+        fidelity = classify_fidelity(
+            has_primary_data=has_primary,
+            has_secondary_data=not short_history,
+            point_in_time_passed=pit_passed,
+            lookahead_guard_passed=True,
+        )
+
+        features = PatternFeatures(
+            features=feat_dict,
+            feature_manifest_version="m4-v1",
+            fidelity_tier=fidelity,
+            point_in_time_passed=pit_passed,
+            lookahead_guard_passed=True,
+        )
+
+        # Signal eligibility: breakout event
+        breakout = price >= high_52w
+        extension = feat_dict["breakout_extension"]
+
+        signals: List[PatternSignal] = []
+
+        if breakout and extension > 0:
+            # Cohort gate
+            if cohort_extensions is None:
+                # M4's top-3-decile breakout-extension cohort gate is part
+                # of signal generation. Without the same-day cohort, preserve
+                # features for audit but do not emit a signal.
+                cohort_meta = {
+                    "cohort_gate_passed": False,
+                    "breakout_cohort_size": None,
+                    "breakout_cohort_rank": None,
+                    "breakout_cohort_decile": None,
+                    "percentile_threshold": None,
+                    "small_cohort_warning": False,
+                    "cohort_missing": True,
+                }
+                warnings.append("missing breakout cohort data — no M4 signal emitted")
+            else:
+                cohort_meta = apply_cohort_gate(extension, cohort_extensions)
+
+            feat_dict.update(cohort_meta)
+
+            if cohort_meta["cohort_gate_passed"]:
+                x_m4 = feat_dict["X_M4"]
+                raw_expected_edge = round(x_m4 * LAMBDA_M4_15TD, 6)
+                signal_strength = round(x_m4 / X_M4_CAP, 6)
+
+                # Tier classification (audit metadata, per SPEC.md)
+                cohort_exts = cohort_extensions or [extension]
+                p75 = sorted(cohort_exts)[int(0.75 * (len(cohort_exts) - 1))] if len(cohort_exts) > 1 else extension
+                tier = "high_conviction" if extension >= p75 else "default"
+                feat_dict["tier_classification"] = tier
+
+                # Data confidence: product of input confidence flags
+                # All FMP fields default c_f = 1.0 per DATA.md
+                data_conf = 1.0
+                if short_history:
+                    data_conf *= 0.9
+                if quality_flags.get("missing_lineage"):
+                    data_conf *= 0.9
+
+                gross_bps = round(raw_expected_edge * 10_000, 2)
+                feat_dict["expected_return_priors"] = {
+                    "tier": tier,
+                    "gross_bps": gross_bps,
+                }
+
+                signals.append(
+                    PatternSignal(
+                        direction=SignalDirection.LONG,
+                        raw_signal_strength=signal_strength,
+                        raw_expected_edge=raw_expected_edge,
+                        signal_horizon=SIGNAL_HORIZON,
+                        data_confidence=round(data_conf, 4),
+                    )
+                )
+
+        input_hash = stable_hash({
+            "ticker": inp.ticker,
+            "asof_timestamp": asof,
+            "market_data": inp.market_data,
+            "fundamental_data": inp.fundamental_data,
+            "event_data": inp.event_data,
+            "lineage_hashes": inp.lineage_hashes,
+            "universe_snapshot_id": inp.universe_snapshot_id,
+        })
+        output_hash = stable_hash({
+            "features": feat_dict,
+            "signals": [
+                {
+                    "direction": sig.direction,
+                    "raw_signal_strength": sig.raw_signal_strength,
+                    "raw_expected_edge": sig.raw_expected_edge,
+                    "signal_horizon": sig.signal_horizon,
+                    "signal_status": sig.signal_status,
+                    "data_confidence": sig.data_confidence,
+                }
+                for sig in signals
+            ],
+            "warnings": warnings,
+            "quality_flags": quality_flags,
+        })
+
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id,
+            ticker=inp.ticker,
+            asof_timestamp=asof,
+            features=features,
+            signals=signals,
+            warnings=warnings,
+            quality_flags=quality_flags,
+            input_hashes={"market_data": input_hash},
+            output_hashes={"features": output_hash},
+        )

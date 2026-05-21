@@ -68,6 +68,7 @@ def persist_detection_result(
         features=result.features.features,
         data_lineage_ids=data_lineage_ids or [],
         job_run_id=job_run_id,
+        feature_manifest_version=result.features.feature_manifest_version,
         code_commit_sha=code_commit_sha,
         fidelity_tier=result.features.fidelity_tier,
         point_in_time_passed=result.features.point_in_time_passed,

@@ -321,6 +321,7 @@ class TestEvidenceBridge:
 
         feat = db_session.get(FeatureSnapshot, persisted.feature_snapshot_id)
         assert feat.fidelity_tier == FidelityTier.FULL
+        assert feat.feature_manifest_version == "fixture-v1"
 
         sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
         assert sig.fidelity_tier == FidelityTier.FULL
