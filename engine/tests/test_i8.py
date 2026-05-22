@@ -219,6 +219,20 @@ class TestI8Firing:
         assert result.features.features["corporate_action_filter_passed"] is True
         assert result.features.features["filing_veto_status"] == "not_computed"
 
+    def test_diagnostics_forward_from_all_data_sources(self):
+        det = I8Detector()
+        result = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_data(),
+            fundamental_data={"hazard_score_at_signal": 23},
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        ))
+        assert result.has_signal
+        assert result.features.features["hazard_score_at_signal"] == 23
+        assert result.features.features["filing_veto_status"] == "clear"
+
     def test_edge_deterministic(self):
         det = I8Detector()
         inp = PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"])
@@ -352,9 +366,27 @@ class TestI8NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "no_upside_breakout"
 
+    def test_non_finite_breakout_price_rejected_without_nan_edge(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["breakout_price"] = float("nan")
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["breakout_price"] != result.features.features["breakout_price"]
+        assert result.features.features["rejection_reason"] == "no_upside_breakout"
+        assert result.features.features["x_i8"] == 0.0
+
     def test_missing_required_fields(self):
         det = I8Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"sigma_20d": 0.02}, lineage_hashes=["h"]))
+        assert result.features is None
+
+    def test_non_finite_opening_range_returns_no_features(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["opening_range_high"] = float("nan")
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
         assert result.features is None
 
     def test_not_operating_universe(self):
@@ -591,6 +623,27 @@ class TestI8Hashes:
         d2["breakout_price"] = 5.20
         r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d1, lineage_hashes=["h"]))
         r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d2, lineage_hashes=["h"]))
+        assert r1.output_hashes != r2.output_hashes
+
+    def test_input_hash_changes_with_event_data(self):
+        det = I8Detector()
+        base = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_data(),
+            event_data={"filing_veto_status": "not_computed"},
+            lineage_hashes=["h"],
+        )
+        changed = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_data(),
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        )
+        r1 = det.detect(base)
+        r2 = det.detect(changed)
+        assert r1.input_hashes != r2.input_hashes
         assert r1.output_hashes != r2.output_hashes
 
     def test_output_hash_matches(self):

@@ -40,6 +40,7 @@ distinguish the shadow prior from a validated override.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from alpha.data.contracts import stable_hash
@@ -87,6 +88,12 @@ def compute_breakout_strength(
     breakout_price: float, opening_range_high: float, sigma_20d: float,
 ) -> float:
     """Per EXPOSURE.md: clip((price - high) / (sigma * high), 0, 4)."""
+    if (
+        not math.isfinite(breakout_price)
+        or not math.isfinite(opening_range_high)
+        or not math.isfinite(sigma_20d)
+    ):
+        return 0.0
     if breakout_price <= opening_range_high or opening_range_high <= 0 or sigma_20d <= 0:
         return 0.0
     raw = (breakout_price - opening_range_high) / (sigma_20d * opening_range_high)
@@ -156,19 +163,20 @@ def _data_confidence(quality_flags: Dict[str, Any]) -> float:
     return compute_data_confidence(quality_flags)
 
 
-def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
-    for key in (
-        "run_id", "candidate_eval_id", "opening_bar_close_timestamp", "breakout_eval_timestamp",
-        "data_cutoff_timestamp", "candidate_eval_bid", "candidate_eval_ask",
-        "candidate_eval_quote_timestamp", "quote_age_ms", "quote_freshness_max_ms",
-        "hks_lag13_return", "i1_also_firing", "late_evaluation",
-        "halted_during_opening", "insufficient_bar_data",
-        "hazard_score_at_signal", "filing_veto_status",
-        *DATA_QUALITY_FIELDS,
-    ):
-        val = market_data.get(key)
-        if val is not None:
-            feat_dict[key] = val
+def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
+    for source in sources:
+        for key in (
+            "run_id", "candidate_eval_id", "opening_bar_close_timestamp", "breakout_eval_timestamp",
+            "data_cutoff_timestamp", "candidate_eval_bid", "candidate_eval_ask",
+            "candidate_eval_quote_timestamp", "quote_age_ms", "quote_freshness_max_ms",
+            "hks_lag13_return", "i1_also_firing", "late_evaluation",
+            "halted_during_opening", "insufficient_bar_data",
+            "hazard_score_at_signal", "filing_veto_status",
+            *DATA_QUALITY_FIELDS,
+        ):
+            val = source.get(key)
+            if val is not None:
+                feat_dict[key] = val
     feat_dict.setdefault("filing_veto_status", "not_computed")
     feat_dict.setdefault("late_evaluation", False)
 
@@ -208,8 +216,9 @@ def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
 
 def _copy_opening_range_features(
     feat_dict: Dict[str, Any],
-    md: Dict[str, Any],
+    inp: PatternInput,
 ) -> tuple[float, float, float]:
+    md = inp.market_data
     opening_range_high = float(md["opening_range_high"])
     opening_range_low = float(md["opening_range_low"])
     sigma_20d = float(md["sigma_20d"])
@@ -219,7 +228,7 @@ def _copy_opening_range_features(
     feat_dict["opening_range_low"] = opening_range_low
     feat_dict["opening_range_size"] = round(opening_range_size, 6)
     feat_dict["sigma_20d"] = sigma_20d
-    _copy_diagnostic_fields(feat_dict, md)
+    _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
     return opening_range_high, sigma_20d, opening_range_size
 
 
@@ -236,6 +245,9 @@ def _compute_i8_breakout_quality(
 
     breakout_price = float(breakout_price)
     feat_dict["breakout_price"] = breakout_price
+    if not math.isfinite(breakout_price):
+        _reject_signal(feat_dict, "no_upside_breakout")
+        return None
 
     breakout_strength = compute_breakout_strength(breakout_price, opening_range_high, sigma_20d)
     feat_dict["breakout_strength"] = round(breakout_strength, 6)
@@ -394,7 +406,7 @@ def _enrich_i8_signal(
 ) -> Optional[PatternSignal]:
     """Compute opening-range breakout features and return signal if gates pass."""
     md = inp.market_data
-    opening_range_high, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, md)
+    opening_range_high, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, inp)
 
     pre_rej = _pre_signal_rejection(feat_dict, md, quality_flags)
     if pre_rej is not None:
@@ -433,6 +445,7 @@ def _compute_hashes(
     input_hash = stable_hash({
         "ticker": inp.ticker, "asof_timestamp": asof,
         "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "event_data": inp.event_data,
         "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
     })
     output_hash = stable_hash({
@@ -481,17 +494,28 @@ class I8Detector(BasePatternDetector):
             warnings.append("missing required fields (opening_range_high, opening_range_low, or sigma_20d)")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        if float(opening_range_high) <= 0 or float(opening_range_low) <= 0 or float(sigma_20d) <= 0:
+        opening_range_high_f = float(opening_range_high)
+        opening_range_low_f = float(opening_range_low)
+        sigma_20d_f = float(sigma_20d)
+
+        if (
+            not math.isfinite(opening_range_high_f)
+            or not math.isfinite(opening_range_low_f)
+            or not math.isfinite(sigma_20d_f)
+            or opening_range_high_f <= 0
+            or opening_range_low_f <= 0
+            or sigma_20d_f <= 0
+        ):
             warnings.append("invalid opening range or sigma_20d values")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        if float(opening_range_high) <= float(opening_range_low):
+        if opening_range_high_f <= opening_range_low_f:
             warnings.append("opening_range_high <= opening_range_low — invalid or zero-range bar")
             return self._invalid_bar_result(
                 inp, asof, warnings, quality_flags,
-                opening_range_high=float(opening_range_high),
-                opening_range_low=float(opening_range_low),
-                sigma_20d=float(sigma_20d),
+                opening_range_high=opening_range_high_f,
+                opening_range_low=opening_range_low_f,
+                sigma_20d=sigma_20d_f,
             )
 
         feat_dict: Dict[str, Any] = {}
@@ -509,12 +533,12 @@ class I8Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
 
         if universe_rejection is not None:
-            opening_range_size = float(opening_range_high) - float(opening_range_low)
-            feat_dict["opening_range_high"] = float(opening_range_high)
-            feat_dict["opening_range_low"] = float(opening_range_low)
+            opening_range_size = opening_range_high_f - opening_range_low_f
+            feat_dict["opening_range_high"] = opening_range_high_f
+            feat_dict["opening_range_low"] = opening_range_low_f
             feat_dict["opening_range_size"] = round(opening_range_size, 6)
-            feat_dict["sigma_20d"] = float(sigma_20d)
-            _copy_diagnostic_fields(feat_dict, md)
+            feat_dict["sigma_20d"] = sigma_20d_f
+            _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
             feat_dict["signal_generated"] = False
             feat_dict["rejection_reason"] = universe_rejection
         else:
@@ -559,7 +583,7 @@ class I8Detector(BasePatternDetector):
             "signal_generated": False,
             "rejection_reason": "insufficient_bar_data",
         }
-        _copy_diagnostic_fields(feat_dict, inp.market_data)
+        _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
         pit_passed = quality_flags.get("point_in_time_passed") is not False
         fidelity = classify_fidelity(
             has_primary_data=True, has_secondary_data=True,
