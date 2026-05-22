@@ -76,6 +76,9 @@ def _firing_data():
         "opening_bar_close_timestamp": "2026-05-15T14:00:00Z",
         "breakout_eval_timestamp": "2026-05-15T14:18:00Z",
         "data_cutoff_timestamp": "2026-05-15T14:18:00Z",
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         "operating_universe_inclusion": True,
     }
 
@@ -102,6 +105,9 @@ def _marginal_data():
         "opening_bar_close_timestamp": "2026-05-15T14:00:00Z",
         "breakout_eval_timestamp": "2026-05-15T14:18:00Z",
         "data_cutoff_timestamp": "2026-05-15T14:18:00Z",
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         "operating_universe_inclusion": True,
     }
 
@@ -205,8 +211,13 @@ class TestI8Firing:
         assert result.has_signal
         assert result.signals[0].direction == SignalDirection.LONG
         assert result.signals[0].signal_horizon == "3d"
+        assert result.signals[0].route_class == RouteClass.C
         assert result.features.features["signal_generated"] is True
         assert result.features.features["x_i8"] > 0
+        assert result.features.features["market_data_status"] == "current"
+        assert result.features.features["halt_status"] == "clear"
+        assert result.features.features["corporate_action_filter_passed"] is True
+        assert result.features.features["filing_veto_status"] == "not_computed"
 
     def test_edge_deterministic(self):
         det = I8Detector()
@@ -231,6 +242,9 @@ class TestI8Firing:
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
         assert "lambda_i8_3td" not in priors
         assert result.features.features["validated_or_shadow_lambda_I8_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert result.features.features["lambda_I8_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert result.features.features["lambda_I8_default_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert result.features.features["lambda_I8_source"] == "shadow_prior"
 
     def test_marginal_breakout_fires(self):
         det = I8Detector()
@@ -244,6 +258,9 @@ class TestI8Firing:
         x_i8 = result.features.features["x_i8"]
         assert result.signals[0].raw_expected_edge == round(x_i8 * 0.005, 6)
         assert result.features.features["validated_or_shadow_lambda_I8_3td"] == 0.005
+        assert result.features.features["lambda_I8_3td"] == 0.005
+        assert result.features.features["lambda_I8_default_3td"] == LAMBDA_I8_3TD_DEFAULT
+        assert result.features.features["lambda_I8_source"] == "validated_or_injected"
         assert "lambda_i8_3td" not in result.features.features["expected_return_priors"]
 
     def test_compressed_range_with_strong_confirmation_gets_boost(self):
@@ -381,6 +398,15 @@ class TestI8NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "quote_unavailable"
 
+    def test_malformed_quote_rejected_without_crashing(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["candidate_eval_bid"] = "N/A"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "quote_unavailable"
+        assert result.features.features["signal_generated"] is False
+
     def test_missing_timestamp_rejected_as_insufficient_bar_data(self):
         det = I8Detector()
         data = _firing_data()
@@ -388,6 +414,42 @@ class TestI8NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "insufficient_bar_data"
+
+    def test_missing_market_data_quality_fails_closed(self):
+        det = I8Detector()
+        data = _firing_data()
+        del data["market_data_status"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "missing_market_data_quality"
+        assert result.quality_flags["market_data_quality_rejected"] is True
+
+    def test_delayed_market_data_rejected(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["market_data_status"] = "delayed"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "data_delay"
+        assert result.features.features["market_data_status"] == "delayed"
+
+    def test_non_clear_halt_status_rejected(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["halt_status"] = "pending"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "halted"
+        assert result.features.features["halt_status"] == "pending"
+
+    def test_corporate_action_filter_rejected(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["corporate_action_filter_passed"] = False
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "spurious_corporate_action"
+        assert result.features.features["corporate_action_filter_passed"] is False
 
     def test_missing_volume_rejected(self):
         det = I8Detector()
@@ -513,7 +575,8 @@ class TestI8Hashes:
             "features": result.features.features,
             "signals": [{"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
                          "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-                         "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+                         "signal_status": s.signal_status, "route_class": s.route_class,
+                         "data_confidence": s.data_confidence}
                         for s in result.signals],
             "warnings": result.warnings, "quality_flags": result.quality_flags,
         })

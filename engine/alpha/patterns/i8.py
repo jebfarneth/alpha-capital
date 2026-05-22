@@ -36,9 +36,12 @@ from alpha.patterns.contracts import (
     ThesisCategory,
 )
 from alpha.patterns.guards import (
+    DATA_QUALITY_FIELDS,
     classify_fidelity,
     compute_data_confidence,
+    market_data_quality_rejection,
     operating_universe_rejection,
+    quote_rejection,
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
@@ -141,15 +144,31 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, An
         "hks_lag13_return", "i1_also_firing", "late_evaluation",
         "halted_during_opening", "insufficient_bar_data",
         "hazard_score_at_signal", "filing_veto_status",
+        *DATA_QUALITY_FIELDS,
     ):
         val = market_data.get(key)
         if val is not None:
             feat_dict[key] = val
-    feat_dict.setdefault("filing_veto_status", "clear")
+    feat_dict.setdefault("filing_veto_status", "not_computed")
     feat_dict.setdefault("late_evaluation", False)
 
 
-def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> Optional[str]:
+def _pre_signal_rejection(
+    feat_dict: Dict[str, Any],
+    market_data: Dict[str, Any],
+    quality_flags: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    market_data_rejection = market_data_quality_rejection(
+        feat_dict,
+        market_data,
+        require_fields=True,
+        missing_rejection="missing_market_data_quality",
+    )
+    if market_data_rejection is not None:
+        if quality_flags is not None:
+            quality_flags["market_data_quality_rejected"] = True
+        return market_data_rejection
+
     if market_data.get("halted_during_opening"):
         return "halted_during_opening"
     if market_data.get("insufficient_bar_data"):
@@ -158,17 +177,7 @@ def _pre_signal_rejection(feat_dict: Dict[str, Any], market_data: Dict[str, Any]
         return "insufficient_bar_data"
     if market_data.get("late_evaluation"):
         return "late_evaluation_stale"
-    if any(market_data.get(f) is None for f in QUOTE_FIELDS):
-        return "quote_unavailable"
-    if float(market_data["candidate_eval_bid"]) <= 0 or float(market_data["candidate_eval_ask"]) <= 0:
-        return "quote_unavailable"
-    quote_age = int(market_data["quote_age_ms"])
-    if quote_age < 0:
-        return "quote_unavailable"
-    max_age = market_data.get("quote_freshness_max_ms")
-    if max_age is not None and quote_age > int(max_age):
-        return "quote_unavailable"
-    return None
+    return quote_rejection(market_data, quote_fields=QUOTE_FIELDS)
 
 
 def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
@@ -333,6 +342,11 @@ def _build_i8_signal(
     raw_expected_edge = round(x_i8 * lambda_i8_3td, 6)
     signal_strength = round(min(x_i8 / X_I8_STRENGTH_DIVISOR, 1.0), 6)
     feat_dict["validated_or_shadow_lambda_I8_3td"] = lambda_i8_3td
+    feat_dict["lambda_I8_3td"] = lambda_i8_3td
+    feat_dict["lambda_I8_default_3td"] = LAMBDA_I8_3TD_DEFAULT
+    feat_dict["lambda_I8_source"] = (
+        "shadow_prior" if lambda_i8_3td == LAMBDA_I8_3TD_DEFAULT else "validated_or_injected"
+    )
     feat_dict["expected_return_priors"] = {
         "gross_bps": round(raw_expected_edge * 10_000, 2),
     }
@@ -342,6 +356,7 @@ def _build_i8_signal(
         raw_signal_strength=signal_strength,
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
+        route_class=RouteClass.C,
         data_confidence=_data_confidence(quality_flags),
     )
 
@@ -361,7 +376,7 @@ def _enrich_i8_signal(
     md = inp.market_data
     opening_range_high, sigma_20d, opening_range_size = _copy_opening_range_features(feat_dict, md)
 
-    pre_rej = _pre_signal_rejection(feat_dict, md)
+    pre_rej = _pre_signal_rejection(feat_dict, md, quality_flags)
     if pre_rej is not None:
         _reject_signal(feat_dict, pre_rej)
         return None
@@ -405,7 +420,8 @@ def _compute_hashes(
         "signals": [
             {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
              "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+             "signal_status": s.signal_status, "route_class": s.route_class,
+             "data_confidence": s.data_confidence}
             for s in signals
         ],
         "warnings": warnings, "quality_flags": quality_flags,
