@@ -102,6 +102,13 @@ def _decline_only_data():
     return data
 
 
+def _missing_support_data():
+    """Deep decline with no support anchor available at setup time."""
+    data = _watchlist_data()
+    del data["support_level"]
+    return data
+
+
 def _activation_data():
     """Deep decline + support break + live reclaim with all gates passing."""
     return {
@@ -186,6 +193,12 @@ class TestFormulas:
 
     def test_support_break_exact(self):
         assert compute_support_break_attempt_weight(3.45, 3.45) == 1.0
+
+    def test_missing_support_gets_decline_only_weight(self):
+        assert compute_support_break_attempt_weight(3.40, None) == 1.0
+
+    def test_missing_low_gets_decline_only_weight(self):
+        assert compute_support_break_attempt_weight(None, 3.45) == 1.0
 
     def test_reclaim_extension(self):
         # (3.55 / 3.45 - 1.0) / 0.032 = 0.02899 / 0.032 = 0.906
@@ -282,6 +295,16 @@ class TestM5Watchlist:
         assert f["support_break_attempt_weight"] == 1.0
         assert f["x_m5_setup"] == 2.5
 
+    def test_missing_support_watchlist_fires_with_anchor_flag(self):
+        det = M5Detector()
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_missing_support_data(), lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["support_level"] is None
+        assert f["setup_path"] == "decline_only_missing_support"
+        assert f["support_break_attempt_weight"] == 1.0
+        assert f["x_m5_setup"] == 2.5
+
     def test_watchlist_data_confidence_default(self):
         det = M5Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_watchlist_data(), lineage_hashes=["h"]))
@@ -329,6 +352,31 @@ class TestM5Activation:
         f = result.features.features
         assert f["setup_path"] == "decline_only"
         assert f["support_break_attempt_weight"] == 1.0
+        assert f["activation_passed"] is True
+
+    def test_missing_support_activation_requires_reversal_anchor(self):
+        det = M5Detector()
+        data = _activation_data()
+        del data["support_level"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert not result.has_signal
+        assert f["setup_path"] == "decline_only_missing_support"
+        assert f["support_anchor_available"] is False
+        assert f["activation_failure_reason"] == "support_anchor_unavailable"
+        assert f["signal_generated"] is False
+
+    def test_missing_support_activation_fires_with_reversal_anchor(self):
+        det = M5Detector()
+        data = _activation_data()
+        del data["support_level"]
+        data["reversal_anchor_price"] = 3.45
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["setup_path"] == "decline_only_missing_support"
+        assert f["support_anchor_available"] is True
+        assert f["reversal_anchor_price"] == 3.45
         assert f["activation_passed"] is True
 
     def test_watchlist_age_2_decays_activation_edge(self):

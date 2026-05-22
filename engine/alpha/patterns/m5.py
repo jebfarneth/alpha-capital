@@ -4,13 +4,17 @@ M5 — Failed Breakdown Reversal Detector.
 Vault source: Engineering/Patterns/M5-FailedBreakdown/
 
 Thesis: mean_reversion. Stocks that dropped sharply over the trailing
-week and broke below recent support exhibit positive expected excess
-returns over the following 7 trading days when the broken support is
-reclaimed with stabilization and volume confirmation.
+week exhibit positive expected excess returns over the following 7 trading
+days when the selloff stabilizes and reclaims a valid reversal anchor.
+Structural support breaks receive a setup bonus, but support breaks are
+not a hard blocker because the Lehmann/Jegadeesh reversal effect is
+return-dislocation based.
 
 Exposure formula (EXPOSURE.md):
   decline_magnitude = clip(-R_5d / sigma_20d, 0, 4)
-  support_break_attempt_weight = 1.25 if P_low_5d < support_level else 1.0
+  support_break_attempt_weight =
+      1.25 if P_low_5d is available and P_low_5d < support_level
+      1.00 for decline_only and decline_only_missing_support paths
   X_M5_setup = min(decline_magnitude * support_break_attempt_weight, 3.0)
   X_M5_activation = min(decline_magnitude * reclaim_strength * stabilization
                         * vol_conf * watchlist_decay * spread_quality, 3.0)
@@ -28,10 +32,13 @@ Signal admission:
   4. X_M5_setup > 0
 
 Signal paths:
-  1. Watchlist: nightly setup qualified, no activation data
-  2. Activation: support reclaim + stabilization >= 1.0 + volume >= 1.0
+  1. Watchlist: nightly setup qualified, no activation data. Setup path is
+     support_break, decline_only, or decline_only_missing_support.
+  2. Activation: support/reversal-anchor reclaim + stabilization >= 1.0 + volume >= 1.0
      + activation identity + quote capture + spread discipline + watchlist
-     freshness proof
+     freshness proof. If support_level is unavailable, activation requires a
+     positive caller-provided reversal_anchor_price; otherwise it fails closed
+     with support_anchor_unavailable.
 
 Routing: Class B after activation (marketable limit at ask + 0.5%, 300s cancel).
 Mutex (M5 ⊥ M1/M4/M6) enforced at TCB, NOT at detector layer.
@@ -103,6 +110,8 @@ WATCHLIST_FRESHNESS_FIELDS = (
     "activation_session",
     "watchlist_age_sessions",
 )
+
+MISSING_SUPPORT_SETUP_PATH = "decline_only_missing_support"
 ACTIVATION_DIAGNOSTIC_FIELDS = (
     *ACTIVATION_IDENTITY_FIELDS,
     *WATCHLIST_FRESHNESS_FIELDS,
@@ -127,11 +136,15 @@ def compute_decline_magnitude(return_5d: float, sigma_20d: float) -> float:
 
 
 def compute_support_break_attempt_weight(
-    low_5d: float, support_level: float,
+    low_5d: Optional[float], support_level: Optional[float],
 ) -> float:
     """Per EXPOSURE.md: 1.25 support-break bonus; 1.0 decline-only path."""
-    if support_level is None or support_level <= 0:
+    if support_level is None:
+        return DECLINE_ONLY_SETUP_WEIGHT
+    if support_level <= 0:
         return 0.0
+    if low_5d is None:
+        return DECLINE_ONLY_SETUP_WEIGHT
     if low_5d < support_level:
         return SUPPORT_BREAK_SETUP_WEIGHT
     return DECLINE_ONLY_SETUP_WEIGHT
@@ -269,6 +282,8 @@ def _watchlist_freshness(market_data: Dict[str, Any]) -> tuple[bool, bool, bool,
 
 
 def _activation_failure_reason(feat: Dict[str, Any]) -> str:
+    if feat.get("support_anchor_available") is not True:
+        return "support_anchor_unavailable"
     if not feat.get("support_reclaim_passed", False):
         return "support_reclaim_failed"
     if not feat.get("stabilization_passed", False):
@@ -295,14 +310,28 @@ def _set_reclaim_features(
     intraday_vwap = float(intraday_vwap_raw) if intraday_vwap_raw is not None else None
     open_price_raw = inp.market_data.get("open_price")
     open_price = float(open_price_raw) if open_price_raw is not None else None
+    reversal_anchor_raw = inp.market_data.get("reversal_anchor_price")
+    anchor_price = (
+        float(reversal_anchor_raw)
+        if reversal_anchor_raw is not None
+        else support_level
+    )
+    support_anchor_available = anchor_price is not None and anchor_price > 0
 
-    reclaim_ext = compute_support_reclaim_extension(last_price, support_level, sigma_20d)
-    reclaim_strength = compute_support_reclaim_strength(reclaim_ext, last_price, support_level, intraday_vwap)
-    stabilization = compute_stabilization_confirmation(last_price, open_price, intraday_vwap, support_level)
+    if support_anchor_available:
+        reclaim_ext = compute_support_reclaim_extension(last_price, anchor_price, sigma_20d)
+        reclaim_strength = compute_support_reclaim_strength(reclaim_ext, last_price, anchor_price, intraday_vwap)
+        stabilization = compute_stabilization_confirmation(last_price, open_price, intraday_vwap, anchor_price)
+    else:
+        reclaim_ext = 0.0
+        reclaim_strength = 0.0
+        stabilization = 0.5
 
     feat_dict["last_price"] = last_price
     feat_dict["intraday_vwap"] = intraday_vwap
     feat_dict["open_price"] = open_price
+    feat_dict["reversal_anchor_price"] = anchor_price
+    feat_dict["support_anchor_available"] = support_anchor_available
     feat_dict["support_reclaim_extension"] = round(reclaim_ext, 6)
     feat_dict["support_reclaim_strength"] = reclaim_strength
     feat_dict["support_reclaim_passed"] = reclaim_strength > 0
@@ -341,7 +370,10 @@ def _set_volume_features(
 
 
 def _set_execution_gate_features(
-    feat_dict: Dict[str, Any], inp: PatternInput, pre_spread_x: float,
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    pre_spread_x: float,
+    freshness: tuple[bool, bool, bool, bool, float, Optional[int]],
 ) -> tuple[bool, bool, bool, float]:
     identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
@@ -358,7 +390,7 @@ def _set_execution_gate_features(
         freshness_passed,
         decay_weight,
         age_sessions,
-    ) = _watchlist_freshness(inp.market_data)
+    ) = freshness
 
     feat_dict["activation_identity_passed"] = identity_passed
     feat_dict["quote_capture_passed"] = quote_rej is None
@@ -383,18 +415,19 @@ def _enrich_m5_activation(
     feat_dict: Dict[str, Any],
     inp: PatternInput,
     decline_magnitude: float,
-    support_level: float,
+    support_level: Optional[float],
     sigma_20d: float,
     warnings: List[str],
     quality_flags: Dict[str, Any],
 ) -> Optional[PatternSignal]:
     """Compute all activation features. Returns PatternSignal if passes."""
-    copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
+    copy_fields(feat_dict, inp.market_data, (*ACTIVATION_DIAGNOSTIC_FIELDS, "reversal_anchor_price"))
 
     reclaim_strength, stabilization = _set_reclaim_features(
         feat_dict, inp, support_level, sigma_20d,
     )
     vol_conf = _set_volume_features(feat_dict, inp, quality_flags, warnings)
+    freshness = _watchlist_freshness(inp.market_data)
     (
         _source_freshness_passed,
         _watchlist_identity_passed,
@@ -402,7 +435,7 @@ def _enrich_m5_activation(
         _signal_freshness_passed,
         decay_weight,
         age_sessions,
-    ) = _watchlist_freshness(inp.market_data)
+    ) = freshness
     feat_dict["watchlist_age_sessions"] = age_sessions
     feat_dict["watchlist_decay_weight"] = decay_weight
     pre_spread_x = min(
@@ -411,7 +444,7 @@ def _enrich_m5_activation(
     )
     feat_dict["pre_spread_x_m5_at_activation"] = round(pre_spread_x, 6)
     identity_passed, spread_passed, freshness_passed, spread_quality = _set_execution_gate_features(
-        feat_dict, inp, pre_spread_x,
+        feat_dict, inp, pre_spread_x, freshness,
     )
 
     x_m5_activation = min(
@@ -542,14 +575,14 @@ class M5Detector(BasePatternDetector):
         low_5d = float(low_5d_raw) if low_5d_raw is not None else None
 
         decline_mag = compute_decline_magnitude(return_5d, sigma_20d)
-        support_break_weight = compute_support_break_attempt_weight(
-            low_5d, support_level,
-        ) if low_5d is not None and support_level is not None else 0.0
+        support_break_weight = compute_support_break_attempt_weight(low_5d, support_level)
         x_m5_setup = min(decline_mag * support_break_weight, X_M5_CAP)
         setup_path = (
             "support_break"
             if support_break_weight == SUPPORT_BREAK_SETUP_WEIGHT
             else "decline_only"
+            if support_break_weight == DECLINE_ONLY_SETUP_WEIGHT and support_level is not None
+            else MISSING_SUPPORT_SETUP_PATH
             if support_break_weight == DECLINE_ONLY_SETUP_WEIGHT
             else "no_setup"
         )
@@ -594,7 +627,7 @@ class M5Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
         activation_requested = inp.market_data.get("price") is not None
         if activation_requested:
-            copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
+            copy_fields(feat_dict, inp.market_data, (*ACTIVATION_DIAGNOSTIC_FIELDS, "reversal_anchor_price"))
 
         if universe_rejection is not None:
             feat_dict["activation_state"] = universe_rejection
