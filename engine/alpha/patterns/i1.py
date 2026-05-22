@@ -137,7 +137,7 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, An
 
     feat_dict.setdefault("gap_source", "unknown")
     feat_dict.setdefault("opening_auction_quality", "normal")
-    feat_dict.setdefault("filing_veto_status", "clear")
+    feat_dict.setdefault("filing_veto_status", "not_computed")
 
 
 def _parse_market_timestamp(value: Any) -> Optional[datetime]:
@@ -315,6 +315,7 @@ def _build_i1_signal(
         raw_signal_strength=signal_strength,
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
+        route_class=RouteClass.C,
         data_confidence=_data_confidence(quality_flags),
     )
 
@@ -376,7 +377,8 @@ def _compute_hashes(
         "signals": [
             {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
              "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+             "signal_status": s.signal_status, "data_confidence": s.data_confidence,
+             "route_class": s.route_class}
             for s in signals
         ],
         "warnings": warnings, "quality_flags": quality_flags,
@@ -434,6 +436,7 @@ class I1Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
 
         if universe_rejection is not None:
+            _copy_gap_features(feat_dict, inp.market_data)
             _reject_signal(feat_dict, universe_rejection)
         else:
             sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)

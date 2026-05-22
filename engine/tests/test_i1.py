@@ -207,6 +207,7 @@ class TestI1Firing:
         assert result.has_signal
         assert result.signals[0].direction == SignalDirection.LONG
         assert result.signals[0].signal_horizon == "3d"
+        assert result.signals[0].route_class == RouteClass.C
         assert result.features.features["confirmation_gate"] == 1.0
         assert result.features.features["signal_generated"] is True
         assert result.features.features["x_i1"] == result.features.features["X_I1"]
@@ -304,6 +305,14 @@ class TestI1NoSignal:
         assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "not_operating_universe"
+        assert result.features.features["prev_close"] == data["prev_close"]
+        assert result.features.features["open_price"] == data["open_price"]
+        assert result.features.features["sigma_20d"] == data["sigma_20d"]
+        assert result.features.features["gap_pct"] == round((data["open_price"] - data["prev_close"]) / data["prev_close"], 6)
+        assert result.features.features["gap_magnitude"] > 0
+        assert result.features.features["evaluation_run_id"] == data["evaluation_run_id"]
+        assert result.features.features["data_cutoff_timestamp"] == data["data_cutoff_timestamp"]
+        assert result.features.features["market_data_status"] == "current"
 
     def test_missing_confirmation_data(self):
         det = I1Detector()
@@ -507,6 +516,9 @@ class TestI1Quality:
         assert not result.has_signal
         assert result.quality_flags["operating_universe_not_computed"] is True
         assert result.features.features["rejection_reason"] == "missing_operating_universe"
+        assert result.features.features["prev_close"] == data["prev_close"]
+        assert result.features.features["open_price"] == data["open_price"]
+        assert result.features.features["gap_pct"] == round((data["open_price"] - data["prev_close"]) / data["prev_close"], 6)
 
     def test_future_timestamp_warns(self):
         det = I1Detector()
@@ -546,7 +558,7 @@ class TestI1Diagnostics:
         assert f["halt_status"] == "clear"
         assert f["corporate_action_filter_passed"] is True
         assert f["market_data_status"] == "current"
-        assert f["filing_veto_status"] == "clear"
+        assert f["filing_veto_status"] == "not_computed"
 
 
 # -----------------------------------------------------------------------
@@ -577,7 +589,8 @@ class TestI1Hashes:
             "features": result.features.features,
             "signals": [{"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
                          "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-                         "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+                         "signal_status": s.signal_status, "data_confidence": s.data_confidence,
+                         "route_class": s.route_class}
                         for s in result.signals],
             "warnings": result.warnings, "quality_flags": result.quality_flags,
         })
