@@ -30,6 +30,8 @@ Signal paths:
      range expansion not yet required
 
 Routing: Class C after activation (marketable limit, 120-second cancel).
+Evidence defaults filing_veto_status to "not_computed" when the caller
+does not supply a filing veto result.
 """
 
 from __future__ import annotations
@@ -621,6 +623,10 @@ class M6Detector(BasePatternDetector):
             "sigma_20d": sigma_20d,
             "X_M6_setup": round(depth, 6),
         }
+        for source in (inp.market_data, inp.fundamental_data, inp.event_data):
+            if "filing_veto_status" in source:
+                feat_dict["filing_veto_status"] = source["filing_veto_status"]
+        feat_dict.setdefault("filing_veto_status", "not_computed")
 
         gk_warning = inp.market_data.get("gk_low_transaction_warning", False)
         feat_dict["gk_low_transaction_warning"] = gk_warning

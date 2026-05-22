@@ -236,7 +236,20 @@ class TestM6StandardActivation:
         assert result.features.features["watchlist_signal_id"] == "m6-watchlist-ACME-20260519"
         assert result.features.features["watchlist_identity_passed"] is True
         assert result.features.features["watchlist_session_match"] is True
+        assert result.features.features["filing_veto_status"] == "not_computed"
         assert result.signals[0].route_class == RouteClass.C
+
+    def test_filing_veto_status_forwarded(self):
+        det = M6Detector()
+        result = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_market_data(),
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        ))
+        assert result.has_signal
+        assert result.features.features["filing_veto_status"] == "clear"
 
     def test_edge_deterministic(self):
         det = M6Detector()
