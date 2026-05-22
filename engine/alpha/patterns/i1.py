@@ -161,18 +161,15 @@ def _reject_signal(
     feat_dict: Dict[str, Any],
     reason: str,
     *,
-    confirmation_gate: Optional[float] = None,
-    volume_weight: Optional[float] = None,
-    x_i1: Optional[float] = None,
+    confirmation_gate: float = 0.0,
+    volume_weight: float = 0.0,
+    x_i1: float = 0.0,
 ) -> None:
     feat_dict["rejection_reason"] = reason
     feat_dict["signal_generated"] = False
-    if confirmation_gate is not None:
-        feat_dict["confirmation_gate"] = confirmation_gate
-    if volume_weight is not None:
-        feat_dict["volume_weight"] = volume_weight
-    if x_i1 is not None:
-        feat_dict["X_I1"] = x_i1
+    feat_dict["confirmation_gate"] = confirmation_gate
+    feat_dict["volume_weight"] = volume_weight
+    feat_dict["X_I1"] = x_i1
 
 
 def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> float:
@@ -386,8 +383,7 @@ class I1Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
 
         if universe_rejection is not None:
-            feat_dict["signal_generated"] = False
-            feat_dict["rejection_reason"] = universe_rejection
+            _reject_signal(feat_dict, universe_rejection)
         else:
             sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)
             if sig is not None:

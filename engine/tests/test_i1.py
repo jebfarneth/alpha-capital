@@ -266,12 +266,17 @@ class TestI1NoSignal:
         assert not result.has_signal
         assert result.features is not None
         assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["volume_weight"] == 0.0
+        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["rejection_reason"] == "confirmation_failed"
 
     def test_small_gap_no_signal(self):
         det = I1Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_small_gap_data(), lineage_hashes=["h"]))
         assert not result.has_signal
+        assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["volume_weight"] == 0.0
+        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["rejection_reason"] == "gap_below_minimum"
 
     def test_missing_price_no_features(self):
@@ -286,6 +291,9 @@ class TestI1NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.quality_flags["not_operating_universe_member"] is True
+        assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["volume_weight"] == 0.0
+        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["rejection_reason"] == "not_operating_universe"
 
     def test_missing_confirmation_data(self):
@@ -300,6 +308,9 @@ class TestI1NoSignal:
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
+        assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["volume_weight"] == 0.0
+        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["rejection_reason"] == "missing_confirmation_data"
 
     def test_low_volume_fails_confirmation(self):
