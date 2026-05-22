@@ -317,6 +317,15 @@ class TestI8NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "no_upside_breakout"
 
+    def test_exact_range_high_is_not_breakout(self):
+        det = I8Detector()
+        data = _firing_data()
+        data["breakout_price"] = data["opening_range_high"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["breakout_strength"] == 0.0
+        assert result.features.features["rejection_reason"] == "no_upside_breakout"
+
     def test_breakout_below_threshold(self):
         det = I8Detector()
         data = _firing_data()
@@ -355,6 +364,13 @@ class TestI8NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.quality_flags["not_operating_universe_member"] is True
+        assert result.features.features["opening_range_high"] == 4.85
+        assert result.features.features["opening_range_low"] == 4.62
+        assert result.features.features["sigma_20d"] == 0.025
+        assert result.features.features["candidate_eval_id"] == "I8-ACME-20260515-101800"
+        assert result.features.features["market_data_status"] == "current"
+        assert result.features.features["halt_status"] == "clear"
+        assert result.features.features["corporate_action_filter_passed"] is True
 
     def test_missing_operating_universe_fails_closed(self):
         det = I8Detector()

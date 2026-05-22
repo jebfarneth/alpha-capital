@@ -489,6 +489,12 @@ class I8Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
 
         if universe_rejection is not None:
+            opening_range_size = float(opening_range_high) - float(opening_range_low)
+            feat_dict["opening_range_high"] = float(opening_range_high)
+            feat_dict["opening_range_low"] = float(opening_range_low)
+            feat_dict["opening_range_size"] = round(opening_range_size, 6)
+            feat_dict["sigma_20d"] = float(sigma_20d)
+            _copy_diagnostic_fields(feat_dict, md)
             feat_dict["signal_generated"] = False
             feat_dict["rejection_reason"] = universe_rejection
         else:
