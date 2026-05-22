@@ -40,6 +40,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 from alpha.data.contracts import stable_hash
+from alpha.patterns.activation import required_fields_present, same_session_freshness
 from alpha.patterns.contracts import (
     BasePatternDetector,
     PatternDetectionResult,
@@ -179,41 +180,25 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     return "unknown"
 
 
-def _is_present(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    return bool(value)
-
-
 def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
     """Executable M6 activations must be joinable to m6_intraday_activation."""
-    return all(_is_present(market_data.get(field)) for field in ACTIVATION_IDENTITY_FIELDS)
+    return required_fields_present(market_data, ACTIVATION_IDENTITY_FIELDS)
 
 
 def _watchlist_freshness(
     market_data: Dict[str, Any],
 ) -> tuple[bool, bool, bool, bool]:
-    source_freshness_passed = market_data.get("signal_freshness_passed") is True
-    watchlist_identity_passed = all(
-        _is_present(market_data.get(field)) for field in WATCHLIST_FRESHNESS_FIELDS
-    )
-    watchlist_valid_session = market_data.get("watchlist_valid_session")
-    activation_session = market_data.get("activation_session")
-    watchlist_session_match = (
-        _is_present(watchlist_valid_session)
-        and _is_present(activation_session)
-        and str(watchlist_valid_session).strip() == str(activation_session).strip()
-    )
-    signal_freshness_passed = (
-        source_freshness_passed
-        and watchlist_identity_passed
-        and watchlist_session_match
+    freshness = same_session_freshness(
+        market_data,
+        identity_fields=WATCHLIST_FRESHNESS_FIELDS,
+        valid_session_field="watchlist_valid_session",
+        activation_session_field="activation_session",
     )
     return (
-        source_freshness_passed,
-        watchlist_identity_passed,
-        watchlist_session_match,
-        signal_freshness_passed,
+        freshness.source_freshness_passed,
+        freshness.watchlist_identity_passed,
+        freshness.watchlist_session_match,
+        freshness.signal_freshness_passed,
     )
 
 

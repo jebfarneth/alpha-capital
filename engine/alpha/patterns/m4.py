@@ -40,6 +40,7 @@ import math
 from typing import Any, Dict, List
 
 from alpha.data.contracts import stable_hash
+from alpha.patterns.activation import required_fields_present
 from alpha.patterns.contracts import (
     BasePatternDetector,
     PatternDetectionResult,
@@ -347,7 +348,7 @@ def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
 
 def _fresh_activation_identity_passed(market_data: Dict[str, Any]) -> bool:
     """Executable fresh activations must be joinable to m4_intraday_activation."""
-    return all(bool(market_data.get(field)) for field in FRESH_IDENTITY_FIELDS)
+    return required_fields_present(market_data, FRESH_IDENTITY_FIELDS)
 
 
 def _build_fresh_watchlist_signal(

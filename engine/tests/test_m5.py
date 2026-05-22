@@ -3,7 +3,7 @@ M5 Failed Breakdown Reversal detector tests.
 
 Vault contract verification:
   - Watchlist fires on decline >= 1.5 sigma via support-break or decline-only path
-  - Activation fires on support reclaim + stabilization + volume + identity + quote + spread + freshness
+  - Activation fires on support/reversal-anchor reclaim + stabilization + volume + identity + quote + spread + freshness
   - No signal on insufficient decline or non-universe
   - Rejected activation candidates preserved with rejection_reason
   - raw_expected_edge = X_M5_activation * amplified_lambda_M5_7td
@@ -379,6 +379,39 @@ class TestM5Activation:
         assert f["reversal_anchor_price"] == 3.45
         assert f["activation_passed"] is True
 
+    def test_support_level_takes_precedence_over_reversal_anchor(self):
+        det = M5Detector()
+        data = _activation_data()
+        data["reversal_anchor_price"] = 3.00
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["support_level"] == 3.45
+        assert result.features.features["reversal_anchor_price"] == 3.45
+
+    def test_setup_path_validation_fields_persist_on_activation(self):
+        det = M5Detector()
+        cases = [
+            (_activation_data(), "support_break"),
+            ({**_activation_data(), "low_5d": 3.46}, "decline_only"),
+            ({**_activation_data(), "reversal_anchor_price": 3.45}, "decline_only_missing_support"),
+        ]
+        del cases[2][0]["support_level"]
+
+        for data, expected_path in cases:
+            result = det.detect(PatternInput(
+                ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"],
+            ))
+            assert result.has_signal
+            f = result.features.features
+            assert f["setup_path"] == expected_path
+            assert "decline_magnitude" in f
+            assert "support_break_attempt_weight" in f
+            assert "watchlist_age_sessions" in f
+            assert "watchlist_decay_weight" in f
+            assert "support_anchor_available" in f
+            assert "pre_spread_x_m5_at_activation" in f
+            assert "x_m5_at_activation" in f
+
     def test_watchlist_age_2_decays_activation_edge(self):
         det = M5Detector()
         day1 = _activation_data()
@@ -684,6 +717,15 @@ class TestM5Quality:
         det = M5Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=datetime(2099, 1, 1, tzinfo=timezone.utc), market_data=_watchlist_data(), lineage_hashes=["h"]))
         assert result.quality_flags.get("future_timestamp") is True
+
+    def test_nan_sigma_rejected_before_feature_snapshot(self):
+        det = M5Detector()
+        data = _watchlist_data()
+        data["sigma_20d"] = float("nan")
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.features is None
+        assert not result.has_signal
+        assert any("invalid return_5d" in warning for warning in result.warnings)
 
     def test_filing_veto_status_default(self):
         det = M5Detector()

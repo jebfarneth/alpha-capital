@@ -50,10 +50,11 @@ can audit the thesis assumption.
 
 from __future__ import annotations
 
-from datetime import date
+import math
 from typing import Any, Dict, List, Optional
 
 from alpha.data.contracts import stable_hash
+from alpha.patterns.activation import expiring_watchlist_freshness, required_fields_present
 from alpha.patterns.contracts import (
     BasePatternDetector,
     PatternDetectionResult,
@@ -223,61 +224,30 @@ def _data_confidence(quality_flags: Dict[str, Any]) -> float:
     return compute_data_confidence(quality_flags)
 
 
-def _is_present(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    return bool(value)
-
-
-def _parse_session_date(value: Any) -> Optional[date]:
-    if not _is_present(value):
-        return None
-    try:
-        return date.fromisoformat(str(value).strip()[:10])
-    except ValueError:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Activation enrichment helpers
 # ---------------------------------------------------------------------------
 
 def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
-    return all(_is_present(market_data.get(field)) for field in ACTIVATION_IDENTITY_FIELDS)
+    return required_fields_present(market_data, ACTIVATION_IDENTITY_FIELDS)
 
 
 def _watchlist_freshness(market_data: Dict[str, Any]) -> tuple[bool, bool, bool, bool, float, Optional[int]]:
-    source_freshness_passed = market_data.get("signal_freshness_passed") is True
-    watchlist_identity_passed = all(
-        _is_present(market_data.get(field)) for field in WATCHLIST_FRESHNESS_FIELDS
-    )
-    watchlist_expiration_session = _parse_session_date(market_data.get("watchlist_expiration_session"))
-    activation_session_date = _parse_session_date(market_data.get("activation_session"))
-    age_sessions = None
-    try:
-        if market_data.get("watchlist_age_sessions") is not None:
-            age_sessions = int(market_data["watchlist_age_sessions"])
-    except (TypeError, ValueError):
-        age_sessions = None
-    decay_weight = compute_watchlist_decay(age_sessions) if age_sessions is not None else 0.0
-    watchlist_session_match = (
-        watchlist_expiration_session is not None
-        and activation_session_date is not None
-        and activation_session_date <= watchlist_expiration_session
-        and decay_weight > 0
-    )
-    signal_freshness_passed = (
-        source_freshness_passed
-        and watchlist_identity_passed
-        and watchlist_session_match
+    freshness = expiring_watchlist_freshness(
+        market_data,
+        identity_fields=WATCHLIST_FRESHNESS_FIELDS,
+        expiration_session_field="watchlist_expiration_session",
+        activation_session_field="activation_session",
+        age_field="watchlist_age_sessions",
+        decay_by_age=WATCHLIST_DECAY_BY_AGE,
     )
     return (
-        source_freshness_passed,
-        watchlist_identity_passed,
-        watchlist_session_match,
-        signal_freshness_passed,
-        decay_weight,
-        age_sessions,
+        freshness.source_freshness_passed,
+        freshness.watchlist_identity_passed,
+        freshness.watchlist_session_match,
+        freshness.signal_freshness_passed,
+        freshness.decay_weight,
+        freshness.age_sessions,
     )
 
 
@@ -303,7 +273,7 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
 
 def _set_reclaim_features(
     feat_dict: Dict[str, Any], inp: PatternInput,
-    support_level: float, sigma_20d: float,
+    support_level: Optional[float], sigma_20d: float,
 ) -> tuple[float, float]:
     last_price = float(inp.market_data["price"])
     intraday_vwap_raw = inp.market_data.get("intraday_vwap")
@@ -311,11 +281,12 @@ def _set_reclaim_features(
     open_price_raw = inp.market_data.get("open_price")
     open_price = float(open_price_raw) if open_price_raw is not None else None
     reversal_anchor_raw = inp.market_data.get("reversal_anchor_price")
-    anchor_price = (
-        float(reversal_anchor_raw)
-        if reversal_anchor_raw is not None
-        else support_level
-    )
+    if support_level is not None:
+        anchor_price = support_level
+    elif reversal_anchor_raw is not None:
+        anchor_price = float(reversal_anchor_raw)
+    else:
+        anchor_price = None
     support_anchor_available = anchor_price is not None and anchor_price > 0
 
     if support_anchor_available:
@@ -421,8 +392,6 @@ def _enrich_m5_activation(
     quality_flags: Dict[str, Any],
 ) -> Optional[PatternSignal]:
     """Compute all activation features. Returns PatternSignal if passes."""
-    copy_fields(feat_dict, inp.market_data, (*ACTIVATION_DIAGNOSTIC_FIELDS, "reversal_anchor_price"))
-
     reclaim_strength, stabilization = _set_reclaim_features(
         feat_dict, inp, support_level, sigma_20d,
     )
@@ -567,8 +536,8 @@ class M5Detector(BasePatternDetector):
 
         return_5d = float(return_5d)
         sigma_20d = float(sigma_20d)
-        if sigma_20d <= 0:
-            warnings.append(f"invalid sigma_20d={sigma_20d}")
+        if not math.isfinite(return_5d) or not math.isfinite(sigma_20d) or sigma_20d <= 0:
+            warnings.append(f"invalid return_5d={return_5d} or sigma_20d={sigma_20d}")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
         support_level = float(support_level_raw) if support_level_raw is not None else None
@@ -598,8 +567,6 @@ class M5Detector(BasePatternDetector):
             "support_break_attempt_weight": support_break_weight,
             "x_m5_setup": round(x_m5_setup, 6),
         }
-        feat_dict.setdefault("filing_veto_status", "not_computed")
-
         # Copy diagnostic fields from caller
         for source in (inp.market_data, inp.fundamental_data, inp.event_data):
             for key in ("hazard_score_at_signal", "filing_veto_status", "sector",
