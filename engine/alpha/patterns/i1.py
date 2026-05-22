@@ -27,7 +27,11 @@ Signal admission:
   4. X_I1 > 0
 
 Signal fires intraday at ~10:00 AM ET after 30-min confirmation window.
+Evaluation cutoff: 10:15 AM ET. Signals after cutoff rejected as data_delay.
 Routing: Class C (marketable limit, 120-second cancel).
+
+Evidence: each fired signal persists lambda_I1_monthly, microcap_amplification,
+and amplified_lambda_I1_3td so shadow validation can audit the thesis assumption.
 """
 
 from __future__ import annotations
