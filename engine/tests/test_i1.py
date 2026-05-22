@@ -310,6 +310,14 @@ class TestI1NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"sigma_20d": 0.02}, lineage_hashes=["h"]))
         assert result.features is None
 
+    def test_non_finite_prev_close_returns_no_features(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["prev_close"] = float("nan")
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features is None
+
     def test_not_operating_universe(self):
         det = I1Detector()
         data = _confirmed_gap_data()
@@ -565,6 +573,21 @@ class TestI1Diagnostics:
         assert f["hazard_score_at_signal"] == 14
         assert f["halt_status"] == "clear"
 
+    def test_diagnostic_fields_forwarded_from_all_data_sources(self):
+        det = I1Detector()
+        result = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_confirmed_gap_data(),
+            fundamental_data={"hazard_score_at_signal": 22},
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        ))
+        assert result.has_signal
+        f = result.features.features
+        assert f["hazard_score_at_signal"] == 22
+        assert f["filing_veto_status"] == "clear"
+
     def test_defaults_applied(self):
         det = I1Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=["h"]))
@@ -596,6 +619,27 @@ class TestI1Hashes:
         r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d2, lineage_hashes=["h"]))
         assert r1.output_hashes != r2.output_hashes
 
+    def test_input_hash_changes_with_event_data(self):
+        det = I1Detector()
+        base = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_confirmed_gap_data(),
+            event_data={"filing_veto_status": "not_computed"},
+            lineage_hashes=["h"],
+        )
+        changed = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_confirmed_gap_data(),
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        )
+        r1 = det.detect(base)
+        r2 = det.detect(changed)
+        assert r1.input_hashes != r2.input_hashes
+        assert r1.output_hashes != r2.output_hashes
+
     def test_output_hash_matches(self):
         det = I1Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=["h"]))
@@ -603,8 +647,8 @@ class TestI1Hashes:
             "features": result.features.features,
             "signals": [{"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
                          "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-                         "signal_status": s.signal_status, "data_confidence": s.data_confidence,
-                         "route_class": s.route_class}
+                         "signal_status": s.signal_status, "route_class": s.route_class,
+                         "data_confidence": s.data_confidence}
                         for s in result.signals],
             "warnings": result.warnings, "quality_flags": result.quality_flags,
         })

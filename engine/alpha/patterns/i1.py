@@ -40,6 +40,7 @@ Feature evidence uses canonical DATA.md key x_i1; X_I1 remains only formula nota
 from __future__ import annotations
 
 from datetime import datetime, time
+import math
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -90,6 +91,8 @@ EVALUATION_CUTOFF_ET = time(10, 15, 0)
 
 def compute_gap_magnitude(gap_pct: float, sigma_20d: float) -> float:
     """Per EXPOSURE.md: clip(gap_pct / sigma_20d, 0.0, 5.0)."""
+    if not math.isfinite(gap_pct) or not math.isfinite(sigma_20d):
+        return 0.0
     if sigma_20d <= 0 or gap_pct <= 0:
         return 0.0
     return max(0.0, min(gap_pct / sigma_20d, GAP_MAGNITUDE_CAP))
@@ -125,18 +128,19 @@ def _data_confidence(quality_flags: Dict[str, Any]) -> float:
     return compute_data_confidence(quality_flags)
 
 
-def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> None:
-    for key in (
-        "evaluation_run_id", "data_cutoff_timestamp", "price_at_10am", "pre_market_price",
-        "gap_source", "candidate_eval_bid", "candidate_eval_ask",
-        "candidate_eval_quote_timestamp", "quote_age_ms", "quote_freshness_max_ms",
-        "effective_spread_bps", "evaluation_timestamp", "opening_auction_quality",
-        "halt_status", "corporate_action_filter_passed", "market_data_status",
-        "hazard_score_at_signal", "filing_veto_status", "m4_also_firing", "m2_also_firing",
-    ):
-        val = market_data.get(key)
-        if val is not None:
-            feat_dict[key] = val
+def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
+    for source in sources:
+        for key in (
+            "evaluation_run_id", "data_cutoff_timestamp", "price_at_10am", "pre_market_price",
+            "gap_source", "candidate_eval_bid", "candidate_eval_ask",
+            "candidate_eval_quote_timestamp", "quote_age_ms", "quote_freshness_max_ms",
+            "effective_spread_bps", "evaluation_timestamp", "opening_auction_quality",
+            "halt_status", "corporate_action_filter_passed", "market_data_status",
+            "hazard_score_at_signal", "filing_veto_status", "m4_also_firing", "m2_also_firing",
+        ):
+            val = source.get(key)
+            if val is not None:
+                feat_dict[key] = val
 
     feat_dict.setdefault("gap_source", "unknown")
     feat_dict.setdefault("opening_auction_quality", "normal")
@@ -221,7 +225,8 @@ def _reject_signal(
     feat_dict["x_i1"] = x_i1
 
 
-def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> tuple[float, float]:
+def _copy_gap_features(feat_dict: Dict[str, Any], inp: PatternInput) -> tuple[float, float]:
+    market_data = inp.market_data
     prev_close = float(market_data["prev_close"])
     open_price = float(market_data["open_price"])
     sigma_20d = float(market_data["sigma_20d"])
@@ -234,7 +239,7 @@ def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -
     feat_dict["sigma_20d"] = sigma_20d
     feat_dict["gap_pct"] = round(gap_pct, 6)
     feat_dict["gap_magnitude"] = round(gap_mag, 6)
-    _copy_diagnostic_fields(feat_dict, market_data)
+    _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
     return gap_pct, gap_mag
 
 
@@ -335,7 +340,7 @@ def _enrich_i1_signal(
     Compute gap features, confirmation gate, exposure, and return
     PatternSignal if all admission gates pass. All feature fields set here.
     """
-    gap_pct, gap_mag = _copy_gap_features(feat_dict, inp.market_data)
+    gap_pct, gap_mag = _copy_gap_features(feat_dict, inp)
 
     # Minimum gap gate
     if gap_pct < MIN_GAP_PCT:
@@ -371,6 +376,7 @@ def _compute_hashes(
     input_hash = stable_hash({
         "ticker": inp.ticker, "asof_timestamp": asof,
         "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "event_data": inp.event_data,
         "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
     })
     output_hash = stable_hash({
@@ -378,8 +384,8 @@ def _compute_hashes(
         "signals": [
             {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
              "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-             "signal_status": s.signal_status, "data_confidence": s.data_confidence,
-             "route_class": s.route_class}
+             "signal_status": s.signal_status, "route_class": s.route_class,
+             "data_confidence": s.data_confidence}
             for s in signals
         ],
         "warnings": warnings, "quality_flags": quality_flags,
@@ -416,7 +422,18 @@ class I1Detector(BasePatternDetector):
             warnings.append("missing required fields (prev_close, open_price, or sigma_20d)")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        if float(prev_close) <= 0 or float(open_price) <= 0 or float(sigma_20d) <= 0:
+        prev_close_f = float(prev_close)
+        open_price_f = float(open_price)
+        sigma_20d_f = float(sigma_20d)
+
+        if (
+            not math.isfinite(prev_close_f)
+            or not math.isfinite(open_price_f)
+            or not math.isfinite(sigma_20d_f)
+            or prev_close_f <= 0
+            or open_price_f <= 0
+            or sigma_20d_f <= 0
+        ):
             warnings.append("invalid prev_close, open_price, or sigma_20d")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
@@ -437,7 +454,7 @@ class I1Detector(BasePatternDetector):
         signals: List[PatternSignal] = []
 
         if universe_rejection is not None:
-            _copy_gap_features(feat_dict, inp.market_data)
+            _copy_gap_features(feat_dict, inp)
             _reject_signal(feat_dict, universe_rejection)
         else:
             sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)
