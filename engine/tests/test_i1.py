@@ -210,13 +210,13 @@ class TestI1Firing:
         assert result.signals[0].route_class == RouteClass.C
         assert result.features.features["confirmation_gate"] == 1.0
         assert result.features.features["signal_generated"] is True
-        assert result.features.features["x_i1"] == result.features.features["X_I1"]
+        assert "X_I1" not in result.features.features
 
     def test_edge_deterministic(self):
         det = I1Detector()
         inp = PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=["h"])
         r1, r2 = det.detect(inp), det.detect(inp)
-        x_i1 = r1.features.features["X_I1"]
+        x_i1 = r1.features.features["x_i1"]
         expected = round(x_i1 * LAMBDA_I1_3TD, 6)
         assert r1.signals[0].raw_expected_edge == expected
         assert r1.signals[0].raw_expected_edge == r2.signals[0].raw_expected_edge
@@ -224,7 +224,7 @@ class TestI1Firing:
     def test_signal_strength_normalized_to_10(self):
         det = I1Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=["h"]))
-        x_i1 = result.features.features["X_I1"]
+        x_i1 = result.features.features["x_i1"]
         # Both rounded to 6dp independently — verify they match within tolerance
         expected = round(min(x_i1 / 10.0, 1.0), 6)
         assert abs(result.signals[0].raw_signal_strength - expected) < 1e-5
@@ -258,8 +258,27 @@ class TestI1Firing:
         }
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
-        assert result.features.features["X_I1"] == 8.0
         assert result.features.features["x_i1"] == 8.0
+
+    def test_exact_minimum_gap_boundary_fires(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["prev_close"] = 100.0
+        data["open_price"] = 103.0
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["gap_pct"] == 0.03
+
+    def test_raw_gap_below_minimum_rejected_even_if_rounded_to_boundary(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["prev_close"] = 100.0
+        data["open_price"] = 102.99996
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["gap_pct"] == 0.03
+        assert result.features.features["rejection_reason"] == "gap_below_minimum"
+        assert result.features.features["x_i1"] == 0.0
 
 
 # -----------------------------------------------------------------------
@@ -274,7 +293,6 @@ class TestI1NoSignal:
         assert result.features is not None
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
-        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "confirmation_failed"
 
@@ -284,7 +302,6 @@ class TestI1NoSignal:
         assert not result.has_signal
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
-        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "gap_below_minimum"
 
@@ -302,7 +319,6 @@ class TestI1NoSignal:
         assert result.quality_flags["not_operating_universe_member"] is True
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
-        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "not_operating_universe"
         assert result.features.features["prev_close"] == data["prev_close"]
@@ -328,7 +344,6 @@ class TestI1NoSignal:
         assert not result.has_signal
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
-        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "missing_confirmation_data"
 
@@ -393,7 +408,6 @@ class TestI1NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "data_delay"
-        assert result.features.features["X_I1"] == 0.0
         assert result.features.features["x_i1"] == 0.0
 
     def test_invalid_evaluation_timestamp_rejected(self):

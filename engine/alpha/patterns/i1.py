@@ -108,7 +108,7 @@ def compute_confirmation_gate(return_30min: float, volume_30min: float, avg_volu
 def compute_volume_weight(volume_ratio_30min: float) -> float:
     """Per EXPOSURE.md tiered weighting."""
     if volume_ratio_30min >= 3.0:
-        return 2.0
+        return VOLUME_WEIGHT_CAP
     if volume_ratio_30min >= 2.0:
         return 1.5
     if volume_ratio_30min >= 1.5:
@@ -215,11 +215,10 @@ def _reject_signal(
     feat_dict["signal_generated"] = False
     feat_dict["confirmation_gate"] = confirmation_gate
     feat_dict["volume_weight"] = volume_weight
-    feat_dict["X_I1"] = x_i1
     feat_dict["x_i1"] = x_i1
 
 
-def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> tuple[float, float]:
     prev_close = float(market_data["prev_close"])
     open_price = float(market_data["open_price"])
     sigma_20d = float(market_data["sigma_20d"])
@@ -233,7 +232,7 @@ def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -
     feat_dict["gap_pct"] = round(gap_pct, 6)
     feat_dict["gap_magnitude"] = round(gap_mag, 6)
     _copy_diagnostic_fields(feat_dict, market_data)
-    return gap_mag
+    return gap_pct, gap_mag
 
 
 def _copy_confirmation_inputs(
@@ -292,7 +291,6 @@ def _compute_i1_exposure(
     x_i1 = gap_magnitude * conf_gate * vol_weight
 
     feat_dict["volume_weight"] = vol_weight
-    feat_dict["X_I1"] = round(x_i1, 6)
     feat_dict["x_i1"] = round(x_i1, 6)
     feat_dict["signal_generated"] = True
     return x_i1
@@ -334,10 +332,10 @@ def _enrich_i1_signal(
     Compute gap features, confirmation gate, exposure, and return
     PatternSignal if all admission gates pass. All feature fields set here.
     """
-    gap_mag = _copy_gap_features(feat_dict, inp.market_data)
+    gap_pct, gap_mag = _copy_gap_features(feat_dict, inp.market_data)
 
     # Minimum gap gate
-    if feat_dict["gap_pct"] < MIN_GAP_PCT:
+    if gap_pct < MIN_GAP_PCT:
         _reject_signal(feat_dict, "gap_below_minimum")
         return None
 
