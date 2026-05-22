@@ -12,19 +12,21 @@ Exposure formula (EXPOSURE.md):
   gap_magnitude = clip(gap_pct / sigma_20d, 0.0, 5.0)
   confirmation_gate = 1.0 if return_30min > 0 AND volume_30min > avg_volume_30min_20d else 0.0
   volume_weight: tiered 1.0/1.25/1.5/2.0 by volume_ratio_30min
-  X_I1 = gap_magnitude * confirmation_gate * volume_weight
+  x_i1 = gap_magnitude * confirmation_gate * volume_weight
 
 Expected-return bridge (SPEC.md / EXPOSURE.md):
   lambda_I1_monthly = 3.47% (LPS 2019 overnight alpha)
   amplification = 1.75 (microcap)
   lambda_I1_3td = 3.47% * 1.75 * (3/21) = ~0.867%
-  raw_expected_edge = X_I1 * lambda_I1_3td
+  raw_expected_edge = x_i1 * lambda_I1_3td
 
 Signal admission:
-  1. Operating-universe membership
-  2. gap_pct >= 0.03 (minimum 3% gap)
-  3. confirmation_gate = 1.0 (positive 30-min return AND above-avg volume)
-  4. X_I1 > 0
+  1. Operating-universe membership (fail-closed)
+  2. Market data quality (market_data_status, halt_status, corporate_action_filter_passed required)
+  3. Normal opening auction, valid timestamps, and fresh executable quote
+  4. raw gap_pct >= 0.03 before source-feature rounding
+  5. confirmation_gate = 1.0 (positive 30-min return AND above-avg volume)
+  6. x_i1 > 0
 
 Signal fires intraday at ~10:00 AM ET after 30-min confirmation window.
 Evaluation cutoff: 10:15 AM ET. Signals after cutoff rejected as data_delay.
@@ -32,6 +34,7 @@ Routing: Class C (marketable limit, 120-second cancel).
 
 Evidence: each fired signal persists lambda_I1_monthly, microcap_amplification,
 and amplified_lambda_I1_3td so shadow validation can audit the thesis assumption.
+Feature evidence uses canonical DATA.md key x_i1; X_I1 remains only formula notation.
 """
 
 from __future__ import annotations
