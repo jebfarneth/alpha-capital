@@ -18,6 +18,8 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
   amplification = 1.45 (Cakici 2023 small-cap factor)
   lambda_M6_12td = 1.1% * 1.45 * (12/21) = ~0.912%
   raw_expected_edge = X_M6_activation * lambda_M6_12td
+  Activated signals persist lambda_M6_monthly, microcap_amplification,
+  and amplified_lambda_M6_12td for validation reconstruction.
 
 Signal paths:
   1. Watchlist: compressed setup, no activation data
@@ -71,6 +73,8 @@ SPREAD_CAP = 0.01
 EARLY_GAP_WINDOW_MINUTES = 30
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 QUOTE_DIAGNOSTIC_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
+ACTIVATION_IDENTITY_FIELDS = ("activation_id", "activation_timestamp")
+ACTIVATION_DIAGNOSTIC_FIELDS = (*ACTIVATION_IDENTITY_FIELDS, *QUOTE_DIAGNOSTIC_FIELDS)
 
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
@@ -148,7 +152,9 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
         return "range_expansion_failed"
     if not feat.get("volume_ignition_passed", False):
         return "volume_ignition_failed"
-    if not feat.get("quote_capture_passed", True):
+    if feat.get("activation_identity_passed") is not True:
+        return "activation_identity_missing"
+    if feat.get("quote_capture_passed") is not True:
         return "quote_unavailable"
     if not feat.get("spread_discipline_passed", False):
         return "spread_unavailable" if feat.get("spread_pct_vs_eval_quote") is None else "spread_too_wide"
@@ -157,6 +163,18 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat.get("range_expansion_passed", False):
         return "range_expansion_failed"
     return "unknown"
+
+
+def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
+    """Executable M6 activations must be joinable to m6_intraday_activation."""
+    for field in ACTIVATION_IDENTITY_FIELDS:
+        value = market_data.get(field)
+        if isinstance(value, str):
+            if not value.strip():
+                return False
+        elif not value:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +198,7 @@ def _enrich_m6_activation(
     """
     price = float(inp.market_data["price"])
     feat_dict["P_activation"] = price
-    copy_fields(feat_dict, inp.market_data, QUOTE_DIAGNOSTIC_FIELDS)
+    copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
 
     # Breakout extension
     brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
@@ -237,7 +255,9 @@ def _enrich_m6_activation(
     )
 
     # Spread discipline
+    identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
+    feat_dict["activation_identity_passed"] = identity_passed
     feat_dict["quote_capture_passed"] = quote_rej is None
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
     spread_passed = (
@@ -249,7 +269,7 @@ def _enrich_m6_activation(
     feat_dict["spread_discipline_passed"] = spread_passed
 
     # Signal freshness
-    signal_freshness_passed = bool(inp.market_data.get("signal_freshness_passed", True))
+    signal_freshness_passed = inp.market_data.get("signal_freshness_passed") is True
     feat_dict["signal_freshness_passed"] = signal_freshness_passed
 
     # Early-gap diagnostics
@@ -305,6 +325,7 @@ def _enrich_m6_activation(
         feat_dict["breakout_ignition_passed"]
         and feat_dict["range_expansion_passed"]
         and feat_dict["volume_ignition_passed"]
+        and identity_passed
         and feat_dict["quote_capture_passed"]
         and spread_passed
         and signal_freshness_passed
@@ -315,6 +336,7 @@ def _enrich_m6_activation(
     early_gap_passed = (
         early_gap_candidate
         and feat_dict["volume_ignition_passed"]
+        and identity_passed
         and feat_dict["quote_capture_passed"]
         and spread_passed
         and signal_freshness_passed
@@ -358,6 +380,8 @@ def _enrich_m6_activation(
     if not activation_passed:
         feat_dict["activation_state"] = ACTIVATION_STATE_FAILED if brk_ext > 0 else ACTIVATION_STATE_NO_BREAKOUT
         feat_dict["activation_failure_reason"] = _activation_failure_reason(feat_dict)
+        feat_dict["rejection_reason"] = feat_dict["activation_failure_reason"]
+        feat_dict["signal_generated"] = False
         return None
 
     # Build signal
@@ -365,6 +389,10 @@ def _enrich_m6_activation(
     signal_strength = round(min(x_m6_activation / X_M6_CAP, 1.0), 6)
 
     feat_dict["activation_state"] = ACTIVATION_STATE_ACTIVATED
+    feat_dict["signal_generated"] = True
+    feat_dict["lambda_M6_monthly"] = LAMBDA_M6_MONTHLY
+    feat_dict["microcap_amplification"] = AMPLIFICATION
+    feat_dict["amplified_lambda_M6_12td"] = round(LAMBDA_M6_12TD, 8)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
 
     return PatternSignal(
@@ -372,6 +400,7 @@ def _enrich_m6_activation(
         raw_signal_strength=signal_strength,
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
+        route_class=RouteClass.C,
         data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
     )
 
@@ -381,6 +410,7 @@ def _build_watchlist_signal(
 ) -> PatternSignal:
     """Build a watchlist signal for a compressed setup without activation data."""
     feat_dict["activation_state"] = ACTIVATION_STATE_WATCHLIST
+    feat_dict["signal_generated"] = True
     feat_dict["expected_return_priors"] = {"gross_bps": 0.0}
     return PatternSignal(
         direction=SignalDirection.LONG,
@@ -388,6 +418,7 @@ def _build_watchlist_signal(
         raw_expected_edge=0.0,
         signal_horizon=SIGNAL_HORIZON,
         signal_status="watchlist",
+        route_class=RouteClass.C,
         data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
     )
 
@@ -406,7 +437,8 @@ def _compute_hashes(
         "signals": [
             {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
              "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+             "signal_status": s.signal_status, "route_class": s.route_class,
+             "data_confidence": s.data_confidence}
             for s in signals
         ],
         "warnings": warnings, "quality_flags": quality_flags,
@@ -513,6 +545,8 @@ class M6Detector(BasePatternDetector):
             signals.append(_build_watchlist_signal(feat_dict, depth, gk_warning, quality_flags))
         else:
             feat_dict["activation_state"] = ACTIVATION_STATE_NOT_COMPRESSED
+            feat_dict["rejection_reason"] = "not_compressed"
+            feat_dict["signal_generated"] = False
 
         features = PatternFeatures(
             features=feat_dict, feature_manifest_version="m6-v1",

@@ -52,6 +52,14 @@ def _setup_run(db_session):
     return run
 
 
+def _activation_evidence_fields():
+    return {
+        "activation_id": "m6-act-ACME-20260520-150000",
+        "activation_timestamp": "2026-05-20T15:00:00Z",
+        "signal_freshness_passed": True,
+    }
+
+
 def _firing_market_data():
     """Deep compression + full standard activation data."""
     return {
@@ -72,6 +80,7 @@ def _firing_market_data():
         "candidate_eval_quote_timestamp": "2026-05-20T15:00:00Z",
         "quote_age_ms": 650,
         "quote_freshness_max_ms": 1000,
+        **_activation_evidence_fields(),
         "operating_universe_inclusion": True,
     }
 
@@ -96,6 +105,7 @@ def _early_gap_market_data():
         "candidate_eval_quote_timestamp": "2026-05-20T14:42:00Z",
         "quote_age_ms": 600,
         "quote_freshness_max_ms": 1000,
+        **_activation_evidence_fields(),
         "operating_universe_inclusion": True,
     }
 
@@ -216,6 +226,10 @@ class TestM6StandardActivation:
         assert result.features.features["activation_state"] == "activated"
         assert result.features.features["activation_path"] == "standard"
         assert result.features.features["standard_activation_passed"] is True
+        assert result.features.features["signal_generated"] is True
+        assert result.features.features["activation_identity_passed"] is True
+        assert result.features.features["activation_id"] == "m6-act-ACME-20260520-150000"
+        assert result.signals[0].route_class == RouteClass.C
 
     def test_edge_deterministic(self):
         det = M6Detector()
@@ -256,6 +270,9 @@ class TestM6StandardActivation:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_market_data(), lineage_hashes=["h"]))
         priors = result.features.features["expected_return_priors"]
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
+        assert result.features.features["lambda_M6_monthly"] == LAMBDA_M6_MONTHLY
+        assert result.features.features["microcap_amplification"] == AMPLIFICATION
+        assert result.features.features["amplified_lambda_M6_12td"] == round(LAMBDA_M6_12TD, 8)
 
     def test_fails_without_range_expansion_and_no_early_gap(self):
         det = M6Detector()
@@ -268,6 +285,8 @@ class TestM6StandardActivation:
         assert result.features.features["activation_state"] == "activation_failed"
         assert result.features.features["standard_activation_passed"] is False
         assert result.features.features["early_gap_activation_passed"] is False
+        assert result.features.features["rejection_reason"] == "range_expansion_failed"
+        assert result.features.features["signal_generated"] is False
 
 
 # -----------------------------------------------------------------------
@@ -283,6 +302,8 @@ class TestM6EarlyGapActivation:
         assert f["activation_state"] == "activated"
         assert f["activation_path"] == "early_gap_activation"
         assert f["early_gap_activation_passed"] is True
+        assert f["signal_generated"] is True
+        assert f["activation_identity_passed"] is True
         assert f["early_session_flag"] is True
         assert f["gap_breakout_flag"] is True
         assert f["gap_breakout_extension"] > 0
@@ -388,6 +409,8 @@ class TestM6EarlyGapActivation:
         assert result.features.features["early_session_flag"] is False
         assert result.features.features["early_gap_activation_passed"] is False
         assert result.features.features["activation_failure_reason"] == "range_expansion_failed"
+        assert result.features.features["rejection_reason"] == "range_expansion_failed"
+        assert result.features.features["signal_generated"] is False
 
     def test_fails_if_open_below_compression_high(self):
         det = M6Detector()
@@ -397,6 +420,7 @@ class TestM6EarlyGapActivation:
         assert not result.has_signal
         assert result.features.features["gap_breakout_flag"] is False
         assert result.features.features["activation_failure_reason"] == "range_expansion_failed"
+        assert result.features.features["signal_generated"] is False
 
     def test_fails_without_volume_ignition(self):
         det = M6Detector()
@@ -406,6 +430,8 @@ class TestM6EarlyGapActivation:
         assert not result.has_signal
         assert result.features.features["volume_ignition_passed"] is False
         assert result.features.features["activation_failure_reason"] == "volume_ignition_failed"
+        assert result.features.features["rejection_reason"] == "volume_ignition_failed"
+        assert result.features.features["signal_generated"] is False
 
     def test_missing_quote_rejected_before_class_c_activation(self):
         det = M6Detector()
@@ -415,6 +441,8 @@ class TestM6EarlyGapActivation:
         assert not result.has_signal
         assert result.features.features["quote_capture_passed"] is False
         assert result.features.features["activation_failure_reason"] == "quote_unavailable"
+        assert result.features.features["rejection_reason"] == "quote_unavailable"
+        assert result.features.features["signal_generated"] is False
 
     def test_fails_with_wide_spread(self):
         det = M6Detector()
@@ -424,6 +452,8 @@ class TestM6EarlyGapActivation:
         assert not result.has_signal
         assert result.features.features["spread_discipline_passed"] is False
         assert result.features.features["activation_failure_reason"] == "spread_too_wide"
+        assert result.features.features["rejection_reason"] == "spread_too_wide"
+        assert result.features.features["signal_generated"] is False
 
     def test_fails_if_not_operating_universe(self):
         det = M6Detector()
@@ -457,12 +487,16 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_no_breakout_market_data(), lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["activation_state"] == "no_breakout"
+        assert result.features.features["rejection_reason"] == "breakout_ignition_failed"
+        assert result.features.features["signal_generated"] is False
 
     def test_not_compressed(self):
         det = M6Detector()
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_not_compressed_market_data(), lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["activation_state"] == "not_compressed"
+        assert result.features.features["rejection_reason"] == "not_compressed"
+        assert result.features.features["signal_generated"] is False
 
     def test_watchlist(self):
         det = M6Detector()
@@ -474,8 +508,10 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.signals[0].signal_status == "watchlist"
+        assert result.signals[0].route_class == RouteClass.C
         assert result.signals[0].raw_expected_edge == 0.0
         assert result.features.features["activation_state"] == "watchlist"
+        assert result.features.features["signal_generated"] is True
 
     def test_missing_compression(self):
         det = M6Detector()
@@ -490,6 +526,8 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["activation_failure_reason"] == "volume_ignition_failed"
+        assert result.features.features["rejection_reason"] == "volume_ignition_failed"
+        assert result.features.features["signal_generated"] is False
 
     def test_wide_spread(self):
         det = M6Detector()
@@ -498,6 +536,8 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["activation_failure_reason"] == "spread_too_wide"
+        assert result.features.features["rejection_reason"] == "spread_too_wide"
+        assert result.features.features["signal_generated"] is False
 
     def test_stale_signal(self):
         det = M6Detector()
@@ -506,6 +546,49 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["activation_failure_reason"] == "signal_expired"
+        assert result.features.features["rejection_reason"] == "signal_expired"
+        assert result.features.features["signal_generated"] is False
+
+    def test_missing_freshness_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["signal_freshness_passed"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["signal_freshness_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "signal_expired"
+        assert result.features.features["signal_generated"] is False
+
+    def test_truthy_string_freshness_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["signal_freshness_passed"] = "true"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["signal_freshness_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "signal_expired"
+        assert result.features.features["signal_generated"] is False
+
+    def test_missing_activation_identity_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["activation_id"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["activation_identity_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "activation_identity_missing"
+        assert result.features.features["rejection_reason"] == "activation_identity_missing"
+        assert result.features.features["signal_generated"] is False
+
+    def test_blank_activation_identity_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["activation_id"] = " "
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["activation_identity_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "activation_identity_missing"
+        assert result.features.features["signal_generated"] is False
 
     def test_universe_exclusion_watchlist(self):
         det = M6Detector()
@@ -603,7 +686,8 @@ class TestM6Hashes:
             "features": result.features.features,
             "signals": [{"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
                          "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-                         "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+                         "signal_status": s.signal_status, "route_class": s.route_class,
+                         "data_confidence": s.data_confidence}
                         for s in result.signals],
             "warnings": result.warnings, "quality_flags": result.quality_flags,
         })
