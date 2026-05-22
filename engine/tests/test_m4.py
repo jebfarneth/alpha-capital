@@ -235,6 +235,7 @@ class TestM4Firing:
         assert result.has_signal
         assert result.signals[0].direction == SignalDirection.LONG
         assert result.signals[0].signal_horizon == "15d"
+        assert result.signals[0].route_class == RouteClass.A
         assert result.features.features["extension_tier"] in {"default", "high_conviction"}
 
     def test_exact_high_fires(self):
@@ -251,7 +252,7 @@ class TestM4Firing:
         assert sig.raw_signal_strength == round(1.0 / X_M4_CAP, 6)
         f = result.features.features
         assert f["extension_tier"] == "exact_high"
-        assert f["tier_classification"] == "exact_high"
+        assert "tier_classification" not in f
         assert f["breakout_extension"] == 0.0
         assert f["X_M4"] == 1.0
 

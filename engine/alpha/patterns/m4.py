@@ -134,7 +134,7 @@ def build_m4_source_features(
         for key in DIAGNOSTIC_SOURCE_KEYS:
             if key in source:
                 features[key] = source[key]
-    features.setdefault("filing_veto_status", "clear")
+    features.setdefault("filing_veto_status", "not_computed")
     features["entry_lane"] = entry_lane
     n_sessions = inp.market_data.get("n_sessions_in_window")
     features["short_history_flag"] = n_sessions is not None and int(n_sessions) < 252
@@ -282,7 +282,6 @@ def _enrich_base_daily_breakout(
     # Extension tier
     tier = _classify_extension_tier(extension, cohort_extensions)
     feat_dict["extension_tier"] = tier
-    feat_dict["tier_classification"] = tier
 
     # Expected-return priors
     x_m4 = feat_dict["X_M4"]
@@ -299,6 +298,7 @@ def _enrich_base_daily_breakout(
         raw_signal_strength=round(x_m4 / X_M4_CAP, 6),
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
+        route_class=RouteClass.A,
         data_confidence=_data_confidence(inp, quality_flags),
     )
 
