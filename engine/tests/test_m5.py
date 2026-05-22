@@ -2,9 +2,9 @@
 M5 Failed Breakdown Reversal detector tests.
 
 Vault contract verification:
-  - Watchlist fires on decline >= 1.5 sigma + support break
+  - Watchlist fires on decline >= 1.5 sigma via support-break or decline-only path
   - Activation fires on support reclaim + stabilization + volume + identity + quote + spread + freshness
-  - No signal on insufficient decline, no support break, or non-universe
+  - No signal on insufficient decline or non-universe
   - Rejected activation candidates preserved with rejection_reason
   - raw_expected_edge = X_M5_activation * amplified_lambda_M5_7td
   - signal_strength = X_M5 / 3.0
@@ -34,14 +34,19 @@ from alpha.patterns.m5 import (
     LAMBDA_M5_7TD,
     LAMBDA_M5_WEEKLY,
     MIN_DECLINE_MAGNITUDE,
+    SPREAD_CAP,
+    WIDE_SPREAD_CAP,
+    WIDE_SPREAD_QUALITY,
     X_M5_CAP,
     M5Detector,
     compute_decline_magnitude,
+    compute_spread_quality,
     compute_support_break_attempt_weight,
     compute_support_reclaim_extension,
     compute_support_reclaim_strength,
     compute_stabilization_confirmation,
     compute_volume_confirmation,
+    compute_watchlist_decay,
 )
 
 
@@ -62,8 +67,9 @@ def _activation_fields():
         "activation_timestamp": "2026-05-20T15:00:00Z",
         "watchlist_signal_id": "m5-watchlist-ACME-20260519",
         "watchlist_scan_date": "2026-05-19",
-        "watchlist_valid_session": "2026-05-20",
+        "watchlist_expiration_session": "2026-05-22",
         "activation_session": "2026-05-20",
+        "watchlist_age_sessions": 1,
         "signal_freshness_passed": True,
     }
 
@@ -87,6 +93,13 @@ def _watchlist_data():
         "low_5d": 3.40,
         "operating_universe_inclusion": True,
     }
+
+
+def _decline_only_data():
+    """Deep decline without a support break; broader Lehmann path."""
+    data = _watchlist_data()
+    data["low_5d"] = 3.46
+    return data
 
 
 def _activation_data():
@@ -169,10 +182,10 @@ class TestFormulas:
         assert compute_support_break_attempt_weight(3.40, 3.45) == 1.25
 
     def test_support_break_above(self):
-        assert compute_support_break_attempt_weight(3.50, 3.45) == 0.0
+        assert compute_support_break_attempt_weight(3.50, 3.45) == 1.0
 
     def test_support_break_exact(self):
-        assert compute_support_break_attempt_weight(3.45, 3.45) == 0.0
+        assert compute_support_break_attempt_weight(3.45, 3.45) == 1.0
 
     def test_reclaim_extension(self):
         # (3.55 / 3.45 - 1.0) / 0.032 = 0.02899 / 0.032 = 0.906
@@ -215,6 +228,18 @@ class TestFormulas:
         assert compute_volume_confirmation(0.8) == 1.0
         assert compute_volume_confirmation(0.5) == 0.5
 
+    def test_watchlist_decay_tiers(self):
+        assert compute_watchlist_decay(1) == 1.0
+        assert compute_watchlist_decay(2) == 0.85
+        assert compute_watchlist_decay(3) == 0.70
+        assert compute_watchlist_decay(4) == 0.0
+
+    def test_spread_quality_tiers(self):
+        assert compute_spread_quality(SPREAD_CAP, 1.0) == 1.0
+        assert compute_spread_quality(0.0075, 2.0) == WIDE_SPREAD_QUALITY
+        assert compute_spread_quality(0.0075, 1.9) == 0.0
+        assert compute_spread_quality(WIDE_SPREAD_CAP + 0.0001, 3.0) == 0.0
+
     def test_canonical_setup_from_spec(self):
         """EXPOSURE.md: deep dislocation with support break -> X_M5_setup = 3.0 (capped)."""
         x = min(2.5 * 1.25, X_M5_CAP)
@@ -241,7 +266,21 @@ class TestM5Watchlist:
         assert f["signal_generated"] is True
         assert f["decline_magnitude"] == 2.5
         assert f["support_break_attempted"] is True
+        assert f["setup_path"] == "support_break"
+        assert f["support_break_attempt_weight"] == 1.25
         assert f["x_m5_setup"] > 0
+
+    def test_decline_only_watchlist_fires(self):
+        det = M5Detector()
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_decline_only_data(), lineage_hashes=["h"]))
+        assert result.has_signal
+        sig = result.signals[0]
+        assert sig.signal_status == "watchlist"
+        f = result.features.features
+        assert f["setup_path"] == "decline_only"
+        assert f["support_break_attempted"] is False
+        assert f["support_break_attempt_weight"] == 1.0
+        assert f["x_m5_setup"] == 2.5
 
     def test_watchlist_data_confidence_default(self):
         det = M5Detector()
@@ -272,11 +311,43 @@ class TestM5Activation:
         assert f["watchlist_identity_passed"] is True
         assert f["watchlist_session_match"] is True
         assert f["signal_freshness_source_passed"] is True
+        assert f["watchlist_age_sessions"] == 1
+        assert f["watchlist_decay_weight"] == 1.0
         assert f["support_reclaim_passed"] is True
         assert f["stabilization_passed"] is True
         assert f["volume_confirmation_passed"] is True
+        assert f["spread_quality"] == 1.0
         assert f["x_m5_at_activation"] > 0
         assert "x_m5_activation" not in f
+
+    def test_decline_only_activation_fires(self):
+        det = M5Detector()
+        data = _activation_data()
+        data["low_5d"] = 3.46
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["setup_path"] == "decline_only"
+        assert f["support_break_attempt_weight"] == 1.0
+        assert f["activation_passed"] is True
+
+    def test_watchlist_age_2_decays_activation_edge(self):
+        det = M5Detector()
+        day1 = _activation_data()
+        day2 = _activation_data()
+        for data in (day1, day2):
+            data["price"] = 3.47
+            data["open_price"] = 3.60
+            data["intraday_vwap"] = 3.60
+            data["cumulative_session_volume"] = 80000
+        day2["activation_session"] = "2026-05-21"
+        day2["watchlist_age_sessions"] = 2
+        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=day1, lineage_hashes=["h"]))
+        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=day2, lineage_hashes=["h"]))
+        assert r1.has_signal and r2.has_signal
+        assert r1.features.features["watchlist_decay_weight"] == 1.0
+        assert r2.features.features["watchlist_decay_weight"] == 0.85
+        assert r2.features.features["x_m5_at_activation"] < r1.features.features["x_m5_at_activation"]
 
     def test_edge_deterministic(self):
         det = M5Detector()
@@ -423,15 +494,44 @@ class TestM5NoSignal:
         assert result.features.features["activation_failure_reason"] == "quote_unavailable"
         assert result.features.features["signal_generated"] is False
 
-    def test_wide_spread_rejected(self):
+    def test_wide_spread_strong_candidate_passes_with_haircut(self):
         det = M5Detector()
         data = _activation_data()
-        data["spread_pct_vs_eval_quote"] = 0.01  # > 0.5% cap
+        data["spread_pct_vs_eval_quote"] = 0.0075
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        f = result.features.features
+        assert f["spread_discipline_passed"] is True
+        assert f["wide_spread_exception_passed"] is True
+        assert f["spread_quality"] == WIDE_SPREAD_QUALITY
+        assert f["x_m5_at_activation"] == round(f["pre_spread_x_m5_at_activation"] * WIDE_SPREAD_QUALITY, 6)
+
+    def test_wide_spread_weak_candidate_rejected(self):
+        det = M5Detector()
+        data = _activation_data()
+        data["return_5d"] = -0.05  # 1.5625 sigma decline; valid but not strong enough for wide spread
+        data["price"] = 3.47
+        data["open_price"] = 3.60
+        data["intraday_vwap"] = 3.60
+        data["cumulative_session_volume"] = 80000
+        data["spread_pct_vs_eval_quote"] = 0.0075
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert not result.has_signal
+        assert f["pre_spread_x_m5_at_activation"] < 2.0
+        assert f["spread_quality"] == 0.0
+        assert f["spread_discipline_passed"] is False
+        assert f["activation_failure_reason"] == "spread_too_wide"
+
+    def test_excessive_spread_rejected(self):
+        det = M5Detector()
+        data = _activation_data()
+        data["spread_pct_vs_eval_quote"] = 0.012
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
+        assert result.features.features["spread_quality"] == 0.0
         assert result.features.features["spread_discipline_passed"] is False
         assert result.features.features["activation_failure_reason"] == "spread_too_wide"
-        assert result.features.features["signal_generated"] is False
 
     def test_stale_signal_rejected(self):
         det = M5Detector()
@@ -473,11 +573,23 @@ class TestM5NoSignal:
     def test_watchlist_session_mismatch_fails_closed(self):
         det = M5Detector()
         data = _activation_data()
-        data["watchlist_valid_session"] = "2026-05-19"
+        data["watchlist_expiration_session"] = "2026-05-19"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         f = result.features.features
         assert not result.has_signal
         assert f["watchlist_session_match"] is False
+        assert f["signal_freshness_passed"] is False
+        assert f["activation_failure_reason"] == "signal_expired"
+
+    def test_watchlist_age_4_fails_closed(self):
+        det = M5Detector()
+        data = _activation_data()
+        data["activation_session"] = "2026-05-23"
+        data["watchlist_age_sessions"] = 4
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert not result.has_signal
+        assert f["watchlist_decay_weight"] == 0.0
         assert f["signal_freshness_passed"] is False
         assert f["activation_failure_reason"] == "signal_expired"
 
@@ -494,14 +606,14 @@ class TestM5NoSignal:
         assert f["activation_id"] == "m5-act-ACME-20260520-150000"
         assert f["watchlist_signal_id"] == "m5-watchlist-ACME-20260519"
 
-    def test_no_support_break_no_setup(self):
+    def test_no_support_break_uses_decline_only_path(self):
         det = M5Detector()
         data = _watchlist_data()
         data["low_5d"] = 3.50  # above support — no break
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
-        assert not result.has_signal
+        assert result.has_signal
         assert result.features.features["support_break_attempted"] is False
-        assert result.features.features["rejection_reason"] == "no_setup"
+        assert result.features.features["setup_path"] == "decline_only"
 
 
 # -----------------------------------------------------------------------

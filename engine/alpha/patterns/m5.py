@@ -10,9 +10,10 @@ reclaimed with stabilization and volume confirmation.
 
 Exposure formula (EXPOSURE.md):
   decline_magnitude = clip(-R_5d / sigma_20d, 0, 4)
-  support_break_attempt_weight = 1.25 if P_low_5d < support_level else 0.0
+  support_break_attempt_weight = 1.25 if P_low_5d < support_level else 1.0
   X_M5_setup = min(decline_magnitude * support_break_attempt_weight, 3.0)
-  X_M5_activation = min(decline_magnitude * reclaim_strength * stabilization * vol_conf, 3.0)
+  X_M5_activation = min(decline_magnitude * reclaim_strength * stabilization
+                        * vol_conf * watchlist_decay * spread_quality, 3.0)
 
 Expected-return bridge (SPEC.md / EXPOSURE.md):
   lambda_M5_weekly = 1.05% (Lehmann midpoint)
@@ -23,7 +24,7 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
 Signal admission:
   1. Operating-universe membership (fail-closed)
   2. decline_magnitude >= 1.5 (minimum 1.5-sigma 5-day decline)
-  3. support_break_attempt_weight > 0 (price broke below support)
+  3. support_break_attempt_weight > 0 (support-break bonus or decline-only path)
   4. X_M5_setup > 0
 
 Signal paths:
@@ -42,6 +43,7 @@ can audit the thesis assumption.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from alpha.data.contracts import stable_hash
@@ -78,15 +80,28 @@ X_M5_CAP = 3.0
 SIGNAL_HORIZON = "7d"
 MIN_DECLINE_MAGNITUDE = 1.5
 DECLINE_MAGNITUDE_CAP = 4.0
-SPREAD_CAP = 0.005  # 0.5% per EXECUTION.md Class B-style
+DECLINE_ONLY_SETUP_WEIGHT = 1.0
+SUPPORT_BREAK_SETUP_WEIGHT = 1.25
+SPREAD_CAP = 0.005  # Normal Class B-style spread cap.
+WIDE_SPREAD_CAP = 0.010  # Strong dislocations can pass up to 1.0% with haircut.
+WIDE_SPREAD_MIN_PRE_SPREAD_X = 2.0
+TIGHT_SPREAD_QUALITY = 1.0
+WIDE_SPREAD_QUALITY = 0.75
+WATCHLIST_MAX_AGE_SESSIONS = 3
+WATCHLIST_DECAY_BY_AGE = {
+    1: 1.0,
+    2: 0.85,
+    3: 0.70,
+}
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 QUOTE_DIAGNOSTIC_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
 ACTIVATION_IDENTITY_FIELDS = ("activation_id", "activation_timestamp")
 WATCHLIST_FRESHNESS_FIELDS = (
     "watchlist_signal_id",
     "watchlist_scan_date",
-    "watchlist_valid_session",
+    "watchlist_expiration_session",
     "activation_session",
+    "watchlist_age_sessions",
 )
 ACTIVATION_DIAGNOSTIC_FIELDS = (
     *ACTIVATION_IDENTITY_FIELDS,
@@ -114,12 +129,12 @@ def compute_decline_magnitude(return_5d: float, sigma_20d: float) -> float:
 def compute_support_break_attempt_weight(
     low_5d: float, support_level: float,
 ) -> float:
-    """Per EXPOSURE.md: 1.25 if low_5d < support_level, else 0.0."""
+    """Per EXPOSURE.md: 1.25 support-break bonus; 1.0 decline-only path."""
     if support_level is None or support_level <= 0:
         return 0.0
     if low_5d < support_level:
-        return 1.25
-    return 0.0
+        return SUPPORT_BREAK_SETUP_WEIGHT
+    return DECLINE_ONLY_SETUP_WEIGHT
 
 
 def compute_support_reclaim_extension(
@@ -175,6 +190,22 @@ def compute_volume_confirmation(volume_ratio: float) -> float:
     return 0.5
 
 
+def compute_watchlist_decay(age_sessions: int) -> float:
+    """Multi-session M5 watchlists decay but remain valid through session 3."""
+    return WATCHLIST_DECAY_BY_AGE.get(age_sessions, 0.0)
+
+
+def compute_spread_quality(spread_pct: Optional[float], pre_spread_x: float) -> float:
+    """Cost-aware spread tier: normal pass, strong-candidate wide pass, or reject."""
+    if spread_pct is None:
+        return 0.0
+    if spread_pct <= SPREAD_CAP:
+        return TIGHT_SPREAD_QUALITY
+    if spread_pct <= WIDE_SPREAD_CAP and pre_spread_x >= WIDE_SPREAD_MIN_PRE_SPREAD_X:
+        return WIDE_SPREAD_QUALITY
+    return 0.0
+
+
 def _data_confidence(quality_flags: Dict[str, Any]) -> float:
     return compute_data_confidence(quality_flags)
 
@@ -185,6 +216,15 @@ def _is_present(value: Any) -> bool:
     return bool(value)
 
 
+def _parse_session_date(value: Any) -> Optional[date]:
+    if not _is_present(value):
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Activation enrichment helpers
 # ---------------------------------------------------------------------------
@@ -193,17 +233,25 @@ def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
     return all(_is_present(market_data.get(field)) for field in ACTIVATION_IDENTITY_FIELDS)
 
 
-def _watchlist_freshness(market_data: Dict[str, Any]) -> tuple[bool, bool, bool, bool]:
+def _watchlist_freshness(market_data: Dict[str, Any]) -> tuple[bool, bool, bool, bool, float, Optional[int]]:
     source_freshness_passed = market_data.get("signal_freshness_passed") is True
     watchlist_identity_passed = all(
         _is_present(market_data.get(field)) for field in WATCHLIST_FRESHNESS_FIELDS
     )
-    watchlist_valid_session = market_data.get("watchlist_valid_session")
-    activation_session = market_data.get("activation_session")
+    watchlist_expiration_session = _parse_session_date(market_data.get("watchlist_expiration_session"))
+    activation_session_date = _parse_session_date(market_data.get("activation_session"))
+    age_sessions = None
+    try:
+        if market_data.get("watchlist_age_sessions") is not None:
+            age_sessions = int(market_data["watchlist_age_sessions"])
+    except (TypeError, ValueError):
+        age_sessions = None
+    decay_weight = compute_watchlist_decay(age_sessions) if age_sessions is not None else 0.0
     watchlist_session_match = (
-        _is_present(watchlist_valid_session)
-        and _is_present(activation_session)
-        and str(watchlist_valid_session).strip() == str(activation_session).strip()
+        watchlist_expiration_session is not None
+        and activation_session_date is not None
+        and activation_session_date <= watchlist_expiration_session
+        and decay_weight > 0
     )
     signal_freshness_passed = (
         source_freshness_passed
@@ -215,6 +263,8 @@ def _watchlist_freshness(market_data: Dict[str, Any]) -> tuple[bool, bool, bool,
         watchlist_identity_passed,
         watchlist_session_match,
         signal_freshness_passed,
+        decay_weight,
+        age_sessions,
     )
 
 
@@ -291,32 +341,42 @@ def _set_volume_features(
 
 
 def _set_execution_gate_features(
-    feat_dict: Dict[str, Any], inp: PatternInput,
-) -> tuple[bool, bool, bool]:
+    feat_dict: Dict[str, Any], inp: PatternInput, pre_spread_x: float,
+) -> tuple[bool, bool, bool, float]:
     identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
-    spread_passed = (
-        inp.market_data.get("spread_discipline_passed") is True
-        if "spread_discipline_passed" in inp.market_data
-        else spread_pct is not None and float(spread_pct) <= SPREAD_CAP
-    )
+    spread_pct_float = float(spread_pct) if spread_pct is not None else None
+    spread_quality = compute_spread_quality(spread_pct_float, pre_spread_x)
+    if "spread_discipline_passed" in inp.market_data and inp.market_data.get("spread_discipline_passed") is not True:
+        spread_quality = 0.0
+    spread_passed = spread_quality > 0
     (
         source_freshness_passed,
         watchlist_identity_passed,
         watchlist_session_match,
         freshness_passed,
+        decay_weight,
+        age_sessions,
     ) = _watchlist_freshness(inp.market_data)
 
     feat_dict["activation_identity_passed"] = identity_passed
     feat_dict["quote_capture_passed"] = quote_rej is None
-    feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
+    feat_dict["spread_pct_vs_eval_quote"] = spread_pct_float
+    feat_dict["spread_quality"] = spread_quality
+    feat_dict["wide_spread_exception_passed"] = (
+        spread_pct_float is not None
+        and SPREAD_CAP < spread_pct_float <= WIDE_SPREAD_CAP
+        and spread_quality > 0
+    )
     feat_dict["spread_discipline_passed"] = spread_passed
     feat_dict["signal_freshness_source_passed"] = source_freshness_passed
     feat_dict["watchlist_identity_passed"] = watchlist_identity_passed
     feat_dict["watchlist_session_match"] = watchlist_session_match
+    feat_dict["watchlist_age_sessions"] = age_sessions
+    feat_dict["watchlist_decay_weight"] = decay_weight
     feat_dict["signal_freshness_passed"] = freshness_passed
-    return identity_passed, spread_passed, freshness_passed
+    return identity_passed, spread_passed, freshness_passed, spread_quality
 
 
 def _enrich_m5_activation(
@@ -335,10 +395,27 @@ def _enrich_m5_activation(
         feat_dict, inp, support_level, sigma_20d,
     )
     vol_conf = _set_volume_features(feat_dict, inp, quality_flags, warnings)
-    identity_passed, spread_passed, freshness_passed = _set_execution_gate_features(feat_dict, inp)
+    (
+        _source_freshness_passed,
+        _watchlist_identity_passed,
+        _watchlist_session_match,
+        _signal_freshness_passed,
+        decay_weight,
+        age_sessions,
+    ) = _watchlist_freshness(inp.market_data)
+    feat_dict["watchlist_age_sessions"] = age_sessions
+    feat_dict["watchlist_decay_weight"] = decay_weight
+    pre_spread_x = min(
+        decline_magnitude * reclaim_strength * stabilization * vol_conf * decay_weight,
+        X_M5_CAP,
+    )
+    feat_dict["pre_spread_x_m5_at_activation"] = round(pre_spread_x, 6)
+    identity_passed, spread_passed, freshness_passed, spread_quality = _set_execution_gate_features(
+        feat_dict, inp, pre_spread_x,
+    )
 
     x_m5_activation = min(
-        decline_magnitude * reclaim_strength * stabilization * vol_conf,
+        pre_spread_x * spread_quality,
         X_M5_CAP,
     )
     feat_dict["x_m5_at_activation"] = round(x_m5_activation, 6)
@@ -409,6 +486,7 @@ def _compute_hashes(
     input_hash = stable_hash({
         "ticker": inp.ticker, "asof_timestamp": asof,
         "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "event_data": inp.event_data,
         "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
     })
     output_hash = stable_hash({
@@ -468,6 +546,13 @@ class M5Detector(BasePatternDetector):
             low_5d, support_level,
         ) if low_5d is not None and support_level is not None else 0.0
         x_m5_setup = min(decline_mag * support_break_weight, X_M5_CAP)
+        setup_path = (
+            "support_break"
+            if support_break_weight == SUPPORT_BREAK_SETUP_WEIGHT
+            else "decline_only"
+            if support_break_weight == DECLINE_ONLY_SETUP_WEIGHT
+            else "no_setup"
+        )
 
         feat_dict: Dict[str, Any] = {
             "return_5d": round(return_5d, 6),
@@ -475,7 +560,8 @@ class M5Detector(BasePatternDetector):
             "decline_magnitude": round(decline_mag, 6),
             "support_level": support_level,
             "low_5d": low_5d,
-            "support_break_attempted": support_break_weight > 0,
+            "support_break_attempted": support_break_weight == SUPPORT_BREAK_SETUP_WEIGHT,
+            "setup_path": setup_path,
             "support_break_attempt_weight": support_break_weight,
             "x_m5_setup": round(x_m5_setup, 6),
         }
