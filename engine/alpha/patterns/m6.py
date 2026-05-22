@@ -23,9 +23,11 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
 
 Signal paths:
   1. Watchlist: compressed setup, no activation data
-  2. Standard activation: breakout + range expansion + volume ignition + spread + freshness
+  2. Standard activation: breakout + range expansion + volume ignition + activation identity
+     + quote capture + spread + watchlist freshness
   3. Early-gap activation: first 30 min, open gaps above compression_high,
-     volume + spread + freshness required, range expansion not yet required
+     volume + activation identity + quote capture + spread + watchlist freshness required,
+     range expansion not yet required
 
 Routing: Class C after activation (marketable limit, 120-second cancel).
 """
@@ -74,7 +76,17 @@ EARLY_GAP_WINDOW_MINUTES = 30
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 QUOTE_DIAGNOSTIC_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
 ACTIVATION_IDENTITY_FIELDS = ("activation_id", "activation_timestamp")
-ACTIVATION_DIAGNOSTIC_FIELDS = (*ACTIVATION_IDENTITY_FIELDS, *QUOTE_DIAGNOSTIC_FIELDS)
+WATCHLIST_FRESHNESS_FIELDS = (
+    "watchlist_signal_id",
+    "watchlist_scan_date",
+    "watchlist_valid_session",
+    "activation_session",
+)
+ACTIVATION_DIAGNOSTIC_FIELDS = (
+    *ACTIVATION_IDENTITY_FIELDS,
+    *WATCHLIST_FRESHNESS_FIELDS,
+    *QUOTE_DIAGNOSTIC_FIELDS,
+)
 
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
@@ -165,47 +177,63 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def _is_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
 def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
     """Executable M6 activations must be joinable to m6_intraday_activation."""
-    for field in ACTIVATION_IDENTITY_FIELDS:
-        value = market_data.get(field)
-        if isinstance(value, str):
-            if not value.strip():
-                return False
-        elif not value:
-            return False
-    return True
+    return all(_is_present(market_data.get(field)) for field in ACTIVATION_IDENTITY_FIELDS)
+
+
+def _watchlist_freshness(
+    market_data: Dict[str, Any],
+) -> tuple[bool, bool, bool, bool]:
+    source_freshness_passed = market_data.get("signal_freshness_passed") is True
+    watchlist_identity_passed = all(
+        _is_present(market_data.get(field)) for field in WATCHLIST_FRESHNESS_FIELDS
+    )
+    watchlist_valid_session = market_data.get("watchlist_valid_session")
+    activation_session = market_data.get("activation_session")
+    watchlist_session_match = (
+        _is_present(watchlist_valid_session)
+        and _is_present(activation_session)
+        and str(watchlist_valid_session).strip() == str(activation_session).strip()
+    )
+    signal_freshness_passed = (
+        source_freshness_passed
+        and watchlist_identity_passed
+        and watchlist_session_match
+    )
+    return (
+        source_freshness_passed,
+        watchlist_identity_passed,
+        watchlist_session_match,
+        signal_freshness_passed,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Activation enrichment (extracted from detect for readability)
 # ---------------------------------------------------------------------------
 
-def _enrich_m6_activation(
-    feat_dict: Dict[str, Any],
-    inp: PatternInput,
-    depth: float,
-    compression_high: float,
-    sigma_20d: float,
-    gk_warning: bool,
-    warnings: List[str],
-    quality_flags: Dict[str, Any],
-) -> Optional[PatternSignal]:
-    """
-    Compute all activation features and gates for a compressed breakout.
-    Returns a PatternSignal if activation passes, else None.
-    All activation fields are set on feat_dict here.
-    """
-    price = float(inp.market_data["price"])
-    feat_dict["P_activation"] = price
-    copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
-
-    # Breakout extension
+def _set_breakout_features(
+    feat_dict: Dict[str, Any], price: float, compression_high: float, sigma_20d: float,
+) -> float:
     brk_ext = compute_breakout_extension(price, compression_high, sigma_20d)
     feat_dict["intraday_breakout_extension"] = round(brk_ext, 6)
     feat_dict["breakout_ignition_passed"] = brk_ext > 0
+    return brk_ext
 
-    # Expansion confirmation
+
+def _set_expansion_features(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    quality_flags: Dict[str, Any],
+    warnings: List[str],
+) -> float:
     session_high = inp.market_data.get("session_high")
     session_low = inp.market_data.get("session_low")
     gk_avg_5d = inp.market_data.get("gk_avg_5d")
@@ -217,15 +245,21 @@ def _enrich_m6_activation(
         if exp_ratio is not None:
             exp_conf = compute_expansion_confirmation(exp_ratio)
     else:
-        exp_conf = 1.0
         quality_flags["missing_expansion_data"] = True
         warnings.append("missing session_high/session_low/gk_avg_5d for expansion confirmation")
 
     feat_dict["intraday_expansion_ratio"] = round(exp_ratio, 6) if exp_ratio is not None else None
     feat_dict["intraday_expansion_confirmation"] = exp_conf
     feat_dict["range_expansion_passed"] = exp_ratio is not None and exp_ratio >= 1.0
+    return exp_conf
 
-    # Volume confirmation
+
+def _set_volume_features(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    quality_flags: Dict[str, Any],
+    warnings: List[str],
+) -> float:
     cumulative_volume = inp.market_data.get("cumulative_volume")
     expected_tod_volume = inp.market_data.get("expected_tod_volume")
     latest_5m_volume_ratio = inp.market_data.get("latest_5m_volume_ratio")
@@ -253,36 +287,56 @@ def _enrich_m6_activation(
         (vol_ratio is not None and vol_ratio >= 1.5)
         or (latest_5m_ratio is not None and latest_5m_ratio >= 2.0)
     )
+    return vol_conf
 
-    # Spread discipline
+
+def _set_execution_gate_features(
+    feat_dict: Dict[str, Any], inp: PatternInput,
+) -> tuple[bool, bool, bool]:
     identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
-    feat_dict["activation_identity_passed"] = identity_passed
-    feat_dict["quote_capture_passed"] = quote_rej is None
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
     spread_passed = (
-        bool(inp.market_data.get("spread_discipline_passed"))
+        inp.market_data.get("spread_discipline_passed") is True
         if "spread_discipline_passed" in inp.market_data
         else spread_pct is not None and float(spread_pct) <= SPREAD_CAP
     )
+    (
+        source_freshness_passed,
+        watchlist_identity_passed,
+        watchlist_session_match,
+        signal_freshness_passed,
+    ) = _watchlist_freshness(inp.market_data)
+
+    feat_dict["activation_identity_passed"] = identity_passed
+    feat_dict["quote_capture_passed"] = quote_rej is None
     feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
     feat_dict["spread_discipline_passed"] = spread_passed
-
-    # Signal freshness
-    signal_freshness_passed = inp.market_data.get("signal_freshness_passed") is True
+    feat_dict["signal_freshness_source_passed"] = source_freshness_passed
+    feat_dict["watchlist_identity_passed"] = watchlist_identity_passed
+    feat_dict["watchlist_session_match"] = watchlist_session_match
     feat_dict["signal_freshness_passed"] = signal_freshness_passed
+    return identity_passed, spread_passed, signal_freshness_passed
 
-    # Early-gap diagnostics
+
+def _set_early_gap_features(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    compression_high: float,
+    sigma_20d: float,
+    brk_ext: float,
+    quality_flags: Dict[str, Any],
+    warnings: List[str],
+) -> tuple[bool, bool, Optional[str], Optional[float]]:
     open_price = inp.market_data.get("open_price")
     prior_close = inp.market_data.get("prior_close")
     minutes_since_open = inp.market_data.get("minutes_since_open")
+    gk_avg_5d = inp.market_data.get("gk_avg_5d")
 
     early_session_flag = minutes_since_open is not None and float(minutes_since_open) <= EARLY_GAP_WINDOW_MINUTES
     gap_breakout_flag = open_price is not None and float(open_price) > compression_high
     gap_brk_ext = compute_breakout_extension(float(open_price), compression_high, sigma_20d) if open_price is not None else 0.0
 
-    # Gap expansion proxy: ln(open / prior_close) / sqrt(gk_avg_5d).
-    # Long-only: only positive gaps get expansion credit.
     gap_exp_proxy = None
     gap_exp_proxy_available = False
     gap_exp_proxy_reason = None
@@ -319,8 +373,17 @@ def _enrich_m6_activation(
     feat_dict["gap_breakout_extension"] = round(gap_brk_ext, 6)
     early_gap_candidate = early_session_flag and gap_breakout_flag and gap_brk_ext > 0 and brk_ext > 0
     feat_dict["early_gap_candidate"] = early_gap_candidate
+    return early_gap_candidate, gap_exp_proxy_available, gap_exp_proxy_reason, gap_exp_proxy
 
-    # Standard activation
+
+def _set_activation_path_features(
+    feat_dict: Dict[str, Any],
+    *,
+    identity_passed: bool,
+    spread_passed: bool,
+    signal_freshness_passed: bool,
+    early_gap_candidate: bool,
+) -> tuple[bool, bool, bool]:
     standard_passed = (
         feat_dict["breakout_ignition_passed"]
         and feat_dict["range_expansion_passed"]
@@ -330,9 +393,6 @@ def _enrich_m6_activation(
         and spread_passed
         and signal_freshness_passed
     )
-    feat_dict["standard_activation_passed"] = standard_passed
-
-    # Early-gap activation
     early_gap_passed = (
         early_gap_candidate
         and feat_dict["volume_ignition_passed"]
@@ -341,50 +401,59 @@ def _enrich_m6_activation(
         and spread_passed
         and signal_freshness_passed
     )
-    feat_dict["early_gap_activation_passed"] = early_gap_passed
-
     activation_passed = standard_passed or early_gap_passed
-    feat_dict["activation_passed"] = activation_passed
 
+    feat_dict["standard_activation_passed"] = standard_passed
+    feat_dict["early_gap_activation_passed"] = early_gap_passed
+    feat_dict["activation_passed"] = activation_passed
     if standard_passed:
         feat_dict["activation_path"] = "standard"
     elif early_gap_passed:
         feat_dict["activation_path"] = "early_gap_activation"
     else:
         feat_dict["activation_path"] = None
+    return activation_passed, standard_passed, early_gap_passed
 
-    # Determine expansion confirmation for exposure calculation
+
+def _effective_expansion_confirmation(
+    feat_dict: Dict[str, Any],
+    *,
+    standard_passed: bool,
+    early_gap_passed: bool,
+    exp_conf: float,
+    gap_exp_proxy_available: bool,
+    gap_exp_proxy_reason: Optional[str],
+    gap_exp_proxy: Optional[float],
+) -> float:
     if standard_passed:
-        effective_exp_conf = exp_conf
-    elif early_gap_passed:
-        if feat_dict["range_expansion_passed"]:
-            effective_exp_conf = exp_conf
-        elif gap_exp_proxy_available:
-            # Use gap-derived expansion proxy through the standard tier function
-            effective_exp_conf = compute_expansion_confirmation(gap_exp_proxy)
-            feat_dict["early_gap_expansion_confirmation"] = effective_exp_conf
-        elif gap_exp_proxy_reason == "non_positive_open_gap":
-            effective_exp_conf = 0.5
-            feat_dict["early_gap_expansion_confirmation"] = 0.5
-        else:
-            # No gap proxy data — conservative neutral fallback
-            effective_exp_conf = 1.0
-            feat_dict["early_gap_expansion_confirmation"] = 1.0
+        return exp_conf
+    if not early_gap_passed:
+        return exp_conf
+    if feat_dict["range_expansion_passed"]:
+        return exp_conf
+    if gap_exp_proxy_available and gap_exp_proxy is not None:
+        effective_exp_conf = compute_expansion_confirmation(gap_exp_proxy)
+    elif gap_exp_proxy_reason == "non_positive_open_gap":
+        effective_exp_conf = 0.5
     else:
-        effective_exp_conf = exp_conf
+        effective_exp_conf = 1.0
+    feat_dict["early_gap_expansion_confirmation"] = effective_exp_conf
+    return effective_exp_conf
 
-    # Activation exposure (uses effective expansion confirmation)
-    x_m6_activation = min(depth * brk_ext * effective_exp_conf * vol_conf, X_M6_CAP)
-    feat_dict["X_M6_activation"] = round(x_m6_activation, 6)
 
-    if not activation_passed:
-        feat_dict["activation_state"] = ACTIVATION_STATE_FAILED if brk_ext > 0 else ACTIVATION_STATE_NO_BREAKOUT
-        feat_dict["activation_failure_reason"] = _activation_failure_reason(feat_dict)
-        feat_dict["rejection_reason"] = feat_dict["activation_failure_reason"]
-        feat_dict["signal_generated"] = False
-        return None
+def _set_activation_rejection(feat_dict: Dict[str, Any], brk_ext: float) -> None:
+    feat_dict["activation_state"] = ACTIVATION_STATE_FAILED if brk_ext > 0 else ACTIVATION_STATE_NO_BREAKOUT
+    feat_dict["activation_failure_reason"] = _activation_failure_reason(feat_dict)
+    feat_dict["rejection_reason"] = feat_dict["activation_failure_reason"]
+    feat_dict["signal_generated"] = False
 
-    # Build signal
+
+def _build_activation_signal(
+    feat_dict: Dict[str, Any],
+    x_m6_activation: float,
+    gk_warning: bool,
+    quality_flags: Dict[str, Any],
+) -> PatternSignal:
     raw_expected_edge = round(x_m6_activation * LAMBDA_M6_12TD, 6)
     signal_strength = round(min(x_m6_activation / X_M6_CAP, 1.0), 6)
 
@@ -403,6 +472,63 @@ def _enrich_m6_activation(
         route_class=RouteClass.C,
         data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
     )
+
+
+def _enrich_m6_activation(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    depth: float,
+    compression_high: float,
+    sigma_20d: float,
+    gk_warning: bool,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[PatternSignal]:
+    """
+    Compute all activation features and gates for a compressed breakout.
+    Returns a PatternSignal if activation passes, else None.
+    All activation fields are set on feat_dict here.
+    """
+    price = float(inp.market_data["price"])
+    feat_dict["P_activation"] = price
+    copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
+
+    brk_ext = _set_breakout_features(feat_dict, price, compression_high, sigma_20d)
+    exp_conf = _set_expansion_features(feat_dict, inp, quality_flags, warnings)
+    vol_conf = _set_volume_features(feat_dict, inp, quality_flags, warnings)
+    identity_passed, spread_passed, signal_freshness_passed = _set_execution_gate_features(feat_dict, inp)
+    (
+        early_gap_candidate,
+        gap_exp_proxy_available,
+        gap_exp_proxy_reason,
+        gap_exp_proxy,
+    ) = _set_early_gap_features(
+        feat_dict, inp, compression_high, sigma_20d, brk_ext, quality_flags, warnings,
+    )
+    activation_passed, standard_passed, early_gap_passed = _set_activation_path_features(
+        feat_dict,
+        identity_passed=identity_passed,
+        spread_passed=spread_passed,
+        signal_freshness_passed=signal_freshness_passed,
+        early_gap_candidate=early_gap_candidate,
+    )
+    effective_exp_conf = _effective_expansion_confirmation(
+        feat_dict,
+        standard_passed=standard_passed,
+        early_gap_passed=early_gap_passed,
+        exp_conf=exp_conf,
+        gap_exp_proxy_available=gap_exp_proxy_available,
+        gap_exp_proxy_reason=gap_exp_proxy_reason,
+        gap_exp_proxy=gap_exp_proxy,
+    )
+    x_m6_activation = min(depth * brk_ext * effective_exp_conf * vol_conf, X_M6_CAP)
+    feat_dict["X_M6_activation"] = round(x_m6_activation, 6)
+
+    if not activation_passed:
+        _set_activation_rejection(feat_dict, brk_ext)
+        return None
+
+    return _build_activation_signal(feat_dict, x_m6_activation, gk_warning, quality_flags)
 
 
 def _build_watchlist_signal(

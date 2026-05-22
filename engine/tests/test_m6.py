@@ -56,6 +56,10 @@ def _activation_evidence_fields():
     return {
         "activation_id": "m6-act-ACME-20260520-150000",
         "activation_timestamp": "2026-05-20T15:00:00Z",
+        "watchlist_signal_id": "m6-watchlist-ACME-20260519",
+        "watchlist_scan_date": "2026-05-19",
+        "watchlist_valid_session": "2026-05-20",
+        "activation_session": "2026-05-20",
         "signal_freshness_passed": True,
     }
 
@@ -229,6 +233,9 @@ class TestM6StandardActivation:
         assert result.features.features["signal_generated"] is True
         assert result.features.features["activation_identity_passed"] is True
         assert result.features.features["activation_id"] == "m6-act-ACME-20260520-150000"
+        assert result.features.features["watchlist_signal_id"] == "m6-watchlist-ACME-20260519"
+        assert result.features.features["watchlist_identity_passed"] is True
+        assert result.features.features["watchlist_session_match"] is True
         assert result.signals[0].route_class == RouteClass.C
 
     def test_edge_deterministic(self):
@@ -555,6 +562,7 @@ class TestM6NoSignal:
         del data["signal_freshness_passed"]
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
+        assert result.features.features["signal_freshness_source_passed"] is False
         assert result.features.features["signal_freshness_passed"] is False
         assert result.features.features["activation_failure_reason"] == "signal_expired"
         assert result.features.features["signal_generated"] is False
@@ -565,7 +573,30 @@ class TestM6NoSignal:
         data["signal_freshness_passed"] = "true"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
+        assert result.features.features["signal_freshness_source_passed"] is False
         assert result.features.features["signal_freshness_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "signal_expired"
+        assert result.features.features["signal_generated"] is False
+
+    def test_missing_watchlist_signal_id_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["watchlist_signal_id"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["watchlist_identity_passed"] is False
+        assert result.features.features["signal_freshness_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "signal_expired"
+        assert result.features.features["signal_generated"] is False
+
+    def test_watchlist_session_mismatch_fails_closed(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["watchlist_valid_session"] = "2026-05-19"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["watchlist_identity_passed"] is True
+        assert result.features.features["watchlist_session_match"] is False
         assert result.features.features["activation_failure_reason"] == "signal_expired"
         assert result.features.features["signal_generated"] is False
 
