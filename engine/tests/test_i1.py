@@ -175,6 +175,12 @@ class TestFormulas:
     def test_confirmation_gate_fails_low_volume(self):
         assert compute_confirmation_gate(0.01, 80000, 90000) == 0.0
 
+    def test_confirmation_gate_fails_flat_return_boundary(self):
+        assert compute_confirmation_gate(0.0, 100000, 90000) == 0.0
+
+    def test_confirmation_gate_fails_exact_average_volume_boundary(self):
+        assert compute_confirmation_gate(0.01, 90000, 90000) == 0.0
+
     def test_volume_weight_tiers(self):
         assert compute_volume_weight(3.5) == 2.0
         assert compute_volume_weight(2.5) == 1.5
@@ -303,6 +309,24 @@ class TestI1NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features.features["confirmation_gate"] == 0.0
+
+    def test_flat_30min_return_fails_confirmation(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["return_30min"] = 0.0
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["rejection_reason"] == "confirmation_failed"
+
+    def test_exact_average_volume_fails_confirmation(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["volume_30min"] = data["avg_volume_30min_20d"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["confirmation_gate"] == 0.0
+        assert result.features.features["rejection_reason"] == "confirmation_failed"
 
     def test_delayed_market_data_rejected_pre_signal(self):
         det = I1Detector()

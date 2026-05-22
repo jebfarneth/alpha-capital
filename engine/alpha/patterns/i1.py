@@ -85,7 +85,13 @@ def compute_gap_magnitude(gap_pct: float, sigma_20d: float) -> float:
 
 
 def compute_confirmation_gate(return_30min: float, volume_30min: float, avg_volume_30min_20d: float) -> float:
-    """Per EXPOSURE.md: 1.0 if return > 0 AND volume > avg, else 0.0."""
+    """
+    Per EXPOSURE.md: 1.0 if return > 0 AND volume > avg, else 0.0.
+
+    The strict boundary is intentional: a flat first 30 minutes is a
+    stalled gap, not "go" confirmation, and exactly average volume is not
+    above-average participation.
+    """
     if return_30min > 0 and volume_30min > avg_volume_30min_20d:
         return 1.0
     return 0.0
@@ -151,25 +157,29 @@ def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[st
     return None
 
 
-# ---------------------------------------------------------------------------
-# Activation enrichment
-# ---------------------------------------------------------------------------
-
-def _enrich_i1_signal(
+def _reject_signal(
     feat_dict: Dict[str, Any],
-    inp: PatternInput,
-    warnings: List[str],
-    quality_flags: Dict[str, Any],
-) -> Optional[PatternSignal]:
-    """
-    Compute gap features, confirmation gate, exposure, and return
-    PatternSignal if all admission gates pass. All feature fields set here.
-    """
-    prev_close = float(inp.market_data["prev_close"])
-    open_price = float(inp.market_data["open_price"])
-    sigma_20d = float(inp.market_data["sigma_20d"])
+    reason: str,
+    *,
+    confirmation_gate: Optional[float] = None,
+    volume_weight: Optional[float] = None,
+    x_i1: Optional[float] = None,
+) -> None:
+    feat_dict["rejection_reason"] = reason
+    feat_dict["signal_generated"] = False
+    if confirmation_gate is not None:
+        feat_dict["confirmation_gate"] = confirmation_gate
+    if volume_weight is not None:
+        feat_dict["volume_weight"] = volume_weight
+    if x_i1 is not None:
+        feat_dict["X_I1"] = x_i1
 
-    # Gap computation
+
+def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> float:
+    prev_close = float(market_data["prev_close"])
+    open_price = float(market_data["open_price"])
+    sigma_20d = float(market_data["sigma_20d"])
+
     gap_pct = (open_price - prev_close) / prev_close
     gap_mag = compute_gap_magnitude(gap_pct, sigma_20d)
 
@@ -178,38 +188,28 @@ def _enrich_i1_signal(
     feat_dict["sigma_20d"] = sigma_20d
     feat_dict["gap_pct"] = round(gap_pct, 6)
     feat_dict["gap_magnitude"] = round(gap_mag, 6)
-    _copy_diagnostic_fields(feat_dict, inp.market_data)
+    _copy_diagnostic_fields(feat_dict, market_data)
+    return gap_mag
 
-    # Minimum gap gate
-    if gap_pct < MIN_GAP_PCT:
-        feat_dict["rejection_reason"] = "gap_below_minimum"
-        feat_dict["signal_generated"] = False
-        return None
 
-    pre_signal_rejection = _pre_signal_rejection_reason(feat_dict, inp.market_data)
-    if pre_signal_rejection is not None:
-        feat_dict["rejection_reason"] = pre_signal_rejection
-        feat_dict["signal_generated"] = False
-        feat_dict["confirmation_gate"] = 0.0
-        feat_dict["volume_weight"] = 0.0
-        feat_dict["X_I1"] = 0.0
-        return None
-
-    # Confirmation inputs
-    return_30min = inp.market_data.get("return_30min")
-    volume_30min = inp.market_data.get("volume_30min")
-    avg_volume_30min_20d = inp.market_data.get("avg_volume_30min_20d")
+def _copy_confirmation_inputs(
+    feat_dict: Dict[str, Any],
+    market_data: Dict[str, Any],
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[tuple[float, float, float, float]]:
+    return_30min = market_data.get("return_30min")
+    volume_30min = market_data.get("volume_30min")
+    avg_volume_30min_20d = market_data.get("avg_volume_30min_20d")
 
     if return_30min is None or volume_30min is None:
-        feat_dict["rejection_reason"] = "missing_confirmation_data"
-        feat_dict["signal_generated"] = False
+        _reject_signal(feat_dict, "missing_confirmation_data")
         warnings.append("missing return_30min or volume_30min for confirmation")
         return None
 
     return_30min = float(return_30min)
     volume_30min = float(volume_30min)
 
-    # Volume baseline
     baseline_volume_proxy = False
     if avg_volume_30min_20d is None or float(avg_volume_30min_20d) <= 0:
         avg_volume_30min_20d = volume_30min * 0.5  # conservative per DATA.md edge case
@@ -226,25 +226,38 @@ def _enrich_i1_signal(
     feat_dict["avg_volume_30min_20d"] = round(avg_volume_30min_20d, 2)
     feat_dict["volume_ratio_30min"] = round(volume_ratio, 6)
     feat_dict["baseline_volume_proxy"] = baseline_volume_proxy
+    return return_30min, volume_30min, avg_volume_30min_20d, volume_ratio
 
-    # Confirmation gate
+
+def _compute_i1_exposure(
+    feat_dict: Dict[str, Any],
+    gap_magnitude: float,
+    return_30min: float,
+    volume_30min: float,
+    avg_volume_30min_20d: float,
+    volume_ratio: float,
+) -> Optional[float]:
     conf_gate = compute_confirmation_gate(return_30min, volume_30min, avg_volume_30min_20d)
     feat_dict["confirmation_gate"] = conf_gate
 
     if conf_gate == 0.0:
-        feat_dict["rejection_reason"] = "confirmation_failed"
-        feat_dict["signal_generated"] = False
+        _reject_signal(feat_dict, "confirmation_failed")
         return None
 
-    # Volume weight and exposure
     vol_weight = compute_volume_weight(volume_ratio)
-    x_i1 = gap_mag * conf_gate * vol_weight
+    x_i1 = gap_magnitude * conf_gate * vol_weight
 
     feat_dict["volume_weight"] = vol_weight
     feat_dict["X_I1"] = round(x_i1, 6)
     feat_dict["signal_generated"] = True
+    return x_i1
 
-    # Expected-return priors
+
+def _build_i1_signal(
+    feat_dict: Dict[str, Any],
+    x_i1: float,
+    quality_flags: Dict[str, Any],
+) -> PatternSignal:
     raw_expected_edge = round(x_i1 * LAMBDA_I1_3TD, 6)
     signal_strength = round(min(x_i1 / X_I1_STRENGTH_DIVISOR, 1.0), 6)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
@@ -256,6 +269,49 @@ def _enrich_i1_signal(
         signal_horizon=SIGNAL_HORIZON,
         data_confidence=_data_confidence(quality_flags),
     )
+
+
+# ---------------------------------------------------------------------------
+# Activation enrichment
+# ---------------------------------------------------------------------------
+
+def _enrich_i1_signal(
+    feat_dict: Dict[str, Any],
+    inp: PatternInput,
+    warnings: List[str],
+    quality_flags: Dict[str, Any],
+) -> Optional[PatternSignal]:
+    """
+    Compute gap features, confirmation gate, exposure, and return
+    PatternSignal if all admission gates pass. All feature fields set here.
+    """
+    gap_mag = _copy_gap_features(feat_dict, inp.market_data)
+
+    # Minimum gap gate
+    if feat_dict["gap_pct"] < MIN_GAP_PCT:
+        _reject_signal(feat_dict, "gap_below_minimum")
+        return None
+
+    pre_signal_rejection = _pre_signal_rejection_reason(feat_dict, inp.market_data)
+    if pre_signal_rejection is not None:
+        _reject_signal(
+            feat_dict,
+            pre_signal_rejection,
+            confirmation_gate=0.0,
+            volume_weight=0.0,
+            x_i1=0.0,
+        )
+        return None
+
+    confirmation_inputs = _copy_confirmation_inputs(feat_dict, inp.market_data, warnings, quality_flags)
+    if confirmation_inputs is None:
+        return None
+
+    x_i1 = _compute_i1_exposure(feat_dict, gap_mag, *confirmation_inputs)
+    if x_i1 is None:
+        return None
+
+    return _build_i1_signal(feat_dict, x_i1, quality_flags)
 
 
 def _compute_hashes(
