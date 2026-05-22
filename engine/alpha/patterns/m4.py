@@ -16,6 +16,8 @@ Expected-return bridge (SPEC.md / EXPOSURE.md):
   lambda_M4_monthly = 1.1% (J&T 6/6 conservative)
   lambda_M4_15td = lambda_monthly * 15/21 = ~0.786%
   raw_expected_edge = X_M4 * lambda_M4_15td
+  Fired signals persist lambda_M4_monthly and lambda_M4_15td so validation
+  can reconstruct the expected-edge assumption.
 
 Signal admission (EXPOSURE.md amended):
   1. P >= H52w (breakout event, including exact-high closes)
@@ -26,6 +28,10 @@ Signal admission (EXPOSURE.md amended):
 This detector supports both vault-defined lanes:
   - base_daily close-confirmed breakouts
   - fresh_breakout_activation watchlist / activation rows
+
+Route class:
+  - base_daily uses Class A
+  - fresh_breakout_activation uses Class C after activation
 """
 
 from __future__ import annotations
@@ -82,6 +88,7 @@ DIAGNOSTIC_SOURCE_KEYS = (
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
+FRESH_ACTIVATION_FIELDS = ("activation_id", "activation_timestamp", *FRESH_QUOTE_FIELDS)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +286,8 @@ def _enrich_base_daily_breakout(
     # Expected-return priors
     x_m4 = feat_dict["X_M4"]
     raw_expected_edge = round(x_m4 * LAMBDA_M4_15TD, 6)
+    feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
+    feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
     feat_dict["expected_return_priors"] = {
         "tier": tier,
         "gross_bps": round(raw_expected_edge * 10_000, 2),
@@ -359,7 +368,8 @@ def _compute_hashes(
         "signals": [
             {"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
              "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-             "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+             "signal_status": s.signal_status, "route_class": s.route_class,
+             "data_confidence": s.data_confidence}
             for s in signals
         ],
         "warnings": warnings, "quality_flags": quality_flags,
@@ -456,7 +466,7 @@ class M4Detector(BasePatternDetector):
     ) -> None:
         activation_state = inp.market_data.get("activation_state", ACTIVATION_STATE_WATCHLIST)
         feat_dict["activation_state"] = activation_state
-        copy_fields(feat_dict, inp.market_data, FRESH_QUOTE_FIELDS)
+        copy_fields(feat_dict, inp.market_data, FRESH_ACTIVATION_FIELDS)
 
         base_nearness = feat_dict["base_nearness"]
         if activation_state == ACTIVATION_STATE_WATCHLIST:
@@ -471,6 +481,7 @@ class M4Detector(BasePatternDetector):
                     raw_expected_edge=0.0,
                     signal_horizon=SIGNAL_HORIZON,
                     signal_status="watchlist",
+                    route_class=RouteClass.C,
                     data_confidence=_data_confidence(inp, quality_flags),
                 ))
             return
@@ -517,6 +528,8 @@ class M4Detector(BasePatternDetector):
 
         x_fresh = fresh["x_m4_fresh"]
         raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
+        feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
+        feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
         feat_dict["expected_return_priors"] = {
             "tier": "default", "entry_lane": ENTRY_LANE_FRESH,
             "gross_bps": round(raw_expected_edge * 10_000, 2),
@@ -526,5 +539,6 @@ class M4Detector(BasePatternDetector):
             raw_signal_strength=round(min(x_fresh / X_M4_CAP, 1.0), 6),
             raw_expected_edge=raw_expected_edge,
             signal_horizon=SIGNAL_HORIZON,
+            route_class=RouteClass.C,
             data_confidence=_data_confidence(inp, quality_flags),
         ))

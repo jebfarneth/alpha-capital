@@ -91,7 +91,7 @@ def persist_detection_result(
             signal_status=sig.signal_status,
             signal_horizon=sig.signal_horizon,
             thesis_category=detector.thesis_category,
-            route_class=detector.route_class,
+            route_class=sig.route_class or detector.route_class,
             fidelity_tier=result.features.fidelity_tier,
             data_confidence=sig.data_confidence,
             data_lineage_ids=data_lineage_ids,

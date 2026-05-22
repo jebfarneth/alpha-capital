@@ -12,6 +12,7 @@ Vault contract verification (amended):
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from alpha.data.contracts import stable_hash
@@ -67,6 +68,14 @@ def _m4_fresh_quote_fields():
         "candidate_eval_quote_timestamp": "2026-05-20T15:00:00Z",
         "quote_age_ms": 650,
         "quote_freshness_max_ms": 1000,
+    }
+
+
+def _m4_fresh_activation_fields():
+    return {
+        "activation_id": "m4-act-ACME-20260520-150000",
+        "activation_timestamp": "2026-05-20T15:00:00Z",
+        **_m4_fresh_quote_fields(),
     }
 
 
@@ -298,6 +307,8 @@ class TestM4Firing:
         result = det.detect(inp)
         priors = result.features.features["expected_return_priors"]
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
+        assert result.features.features["lambda_M4_monthly"] == LAMBDA_M4_MONTHLY
+        assert result.features.features["lambda_M4_15td"] == round(LAMBDA_M4_15TD, 8)
 
     def test_diagnostic_source_features_logged(self):
         det = M4Detector()
@@ -347,6 +358,7 @@ class TestM4FreshBreakout:
         assert result.has_signal
         sig = result.signals[0]
         assert sig.signal_status == "watchlist"
+        assert sig.route_class == RouteClass.C
         assert sig.raw_expected_edge == 0.0
         assert result.features.features["watchlist_passed"] is True
 
@@ -360,7 +372,7 @@ class TestM4FreshBreakout:
                 "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.005,
                 "operating_universe_inclusion": True,
-                **_m4_fresh_quote_fields(),
+                **_m4_fresh_activation_fields(),
             },
             lineage_hashes=["hash1"],
         )
@@ -368,10 +380,15 @@ class TestM4FreshBreakout:
         assert result.has_signal
         sig = result.signals[0]
         assert sig.signal_status == "active"
+        assert sig.route_class == RouteClass.C
         assert sig.raw_expected_edge > 0
         f = result.features.features
         assert f["activation_passed"] is True
+        assert f["activation_id"] == "m4-act-ACME-20260520-150000"
+        assert f["activation_timestamp"] == "2026-05-20T15:00:00Z"
         assert f["fresh_breakout_extension"] == 0.05
+        assert f["lambda_M4_monthly"] == LAMBDA_M4_MONTHLY
+        assert f["lambda_M4_15td"] == round(LAMBDA_M4_15TD, 8)
         assert f["expected_return_priors"]["entry_lane"] == "fresh_breakout_activation"
 
     def test_fresh_activation_spread_failure(self):
@@ -550,7 +567,8 @@ class TestM4Hashes:
             "features": result.features.features,
             "signals": [{"direction": s.direction, "raw_signal_strength": s.raw_signal_strength,
                          "raw_expected_edge": s.raw_expected_edge, "signal_horizon": s.signal_horizon,
-                         "signal_status": s.signal_status, "data_confidence": s.data_confidence}
+                         "signal_status": s.signal_status, "route_class": s.route_class,
+                         "data_confidence": s.data_confidence}
                         for s in result.signals],
             "warnings": result.warnings, "quality_flags": result.quality_flags,
         })
@@ -596,6 +614,39 @@ class TestM4EvidenceBridge:
         assert sig.thesis_category == "right_tail_convex"
         feat = db_session.get(FeatureSnapshot, persisted.feature_snapshot_id)
         assert feat.feature_manifest_version == "m4-v1"
+
+    def test_fresh_activation_persists_class_c_route_and_activation_identity(self, db_session):
+        run = _setup_run(db_session)
+        lineage = record_data_lineage(
+            db_session, provider="Alpaca", endpoint="/v2/stocks/bars/latest",
+            asof_timestamp=_ts(), raw_payload={"last_price": 10.5}, job_run_id=run.job_run_id,
+        )
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_activation_fields(),
+            },
+            lineage_hashes=[lineage.raw_payload_hash], job_run_id=run.job_run_id,
+        )
+        result = det.detect(inp)
+        persisted = persist_detection_result(
+            db_session, result, det,
+            job_run_id=run.job_run_id, data_lineage_ids=[lineage.data_lineage_id],
+        )
+        db_session.flush()
+
+        sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
+        assert sig.route_class == "C"
+        feat = db_session.get(FeatureSnapshot, persisted.feature_snapshot_id)
+        features = json.loads(feat.feature_json)
+        assert features["activation_id"] == "m4-act-ACME-20260520-150000"
+        assert features["activation_timestamp"] == "2026-05-20T15:00:00Z"
 
     def test_job_run_id_preserved(self, db_session):
         run, _, persisted = self._run_detection(db_session)

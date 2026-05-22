@@ -112,6 +112,7 @@ class PatternSignal:
     raw_expected_edge: float
     signal_horizon: Optional[str] = None
     signal_status: str = "active"
+    route_class: Optional[str] = None
     data_confidence: Optional[float] = None
 
 
