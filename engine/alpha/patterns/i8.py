@@ -13,9 +13,29 @@ Exposure formula (EXPOSURE.md):
   breakout_strength = clip((price - range_high) / (sigma_20d * range_high), 0, 4)
   Minimum breakout gate: breakout_strength >= 0.5
   Spread gate: spread_quality > 0 (spread <= 2.5x normal)
+  Compressed-range treatment: confirmed boost/neutral/penalized by volume+spread
+
+Expected-return bridge (SPEC.md / EXPOSURE.md):
+  lambda_I8_3td = shadow prior (25 bp default), replaced by validated lambda
+  raw_expected_edge = X_I8 * validated_or_shadow_lambda_I8_3td
+
+Signal admission:
+  1. Operating-universe membership (fail-closed)
+  2. Market data quality (market_data_status, halt_status, corporate_action_filter_passed required)
+  3. No halt during opening bar, sufficient bar data, not late evaluation
+  4. Fresh executable quote (shared quote_rejection)
+  5. breakout_price > opening_range_high (strict)
+  6. breakout_strength >= 0.5
+  7. spread_quality > 0
+  8. X_I8 > 0
 
 Signal fires intraday 10:00-10:30 ET after opening bar completes.
+Evaluation cutoff: late_evaluation from pipeline rejects as late_evaluation_stale.
 Routing: Class C (marketable limit, 120-second cancel).
+
+Evidence: each fired signal persists validated_or_shadow_lambda_I8_3td,
+lambda_I8_default_3td, and lambda_I8_source so shadow validation can
+distinguish the shadow prior from a validated override.
 """
 
 from __future__ import annotations
