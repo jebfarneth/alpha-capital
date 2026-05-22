@@ -76,6 +76,9 @@ def _m4_fresh_activation_fields():
         "activation_id": "m4-act-ACME-20260520-150000",
         "activation_timestamp": "2026-05-20T15:00:00Z",
         "signal_freshness_passed": True,
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         **_m4_fresh_quote_fields(),
     }
 
@@ -419,6 +422,75 @@ class TestM4FreshBreakout:
         assert f["rejection_reason"] == "spread_too_wide"
         assert f["signal_generated"] is False
 
+    def test_fresh_activation_missing_spread_is_unavailable_not_too_wide(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_activation_fields(),
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["spread_pct_vs_eval_quote"] is None
+        assert f["spread_discipline_passed"] is False
+        assert f["activation_failure_reason"] == "spread_unavailable"
+        assert f["rejection_reason"] == "spread_unavailable"
+        assert f["signal_generated"] is False
+
+    def test_fresh_activation_truthy_string_spread_flag_fails_closed(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "spread_discipline_passed": "true",
+                "operating_universe_inclusion": True,
+                **_m4_fresh_activation_fields(),
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["spread_discipline_passed"] is False
+        assert f["activation_failure_reason"] == "spread_too_wide"
+        assert f["rejection_reason"] == "spread_too_wide"
+        assert f["signal_generated"] is False
+
+    def test_fresh_activation_requires_live_market_data_quality_fields(self):
+        det = M4Detector()
+        fields = _m4_fresh_activation_fields()
+        fields.pop("market_data_status")
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **fields,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["activation_failure_reason"] == "missing_market_data_quality"
+        assert f["rejection_reason"] == "missing_market_data_quality"
+        assert f["signal_generated"] is False
+
     def test_fresh_activation_missing_freshness_fails_closed(self):
         det = M4Detector()
         fields = _m4_fresh_activation_fields()
@@ -593,6 +665,14 @@ class TestM4NoSignal:
         det = M4Detector()
         inp = PatternInput(ticker="ACME", asof_timestamp=_ts(),
                            market_data={"high_52w": 10.00}, lineage_hashes=["h"])
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.features is None
+
+    def test_non_finite_price_returns_no_features(self):
+        det = M4Detector()
+        inp = PatternInput(ticker="ACME", asof_timestamp=_ts(),
+                           market_data=_m4_base_data(price=float("nan")), lineage_hashes=["h"])
         result = det.detect(inp)
         assert not result.has_signal
         assert result.features is None

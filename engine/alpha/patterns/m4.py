@@ -340,7 +340,7 @@ def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat["volume_confirmation_passed"]:
         return "volume_confirmation_failed"
     if not feat["spread_discipline_passed"]:
-        return "spread_too_wide"
+        return "spread_unavailable" if feat.get("spread_pct_vs_eval_quote") is None else "spread_too_wide"
     if not feat["signal_freshness_passed"]:
         return "signal_expired"
     return "unknown"
@@ -450,7 +450,7 @@ class M4Detector(BasePatternDetector):
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
         price, high_52w = float(price), float(high_52w)
-        if high_52w <= 0 or price <= 0:
+        if not math.isfinite(price) or not math.isfinite(high_52w) or high_52w <= 0 or price <= 0:
             warnings.append(f"invalid price={price} or high_52w={high_52w}")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
@@ -530,6 +530,18 @@ class M4Detector(BasePatternDetector):
                 feat_dict["signal_generated"] = False
             return
 
+        activation_quality_rejection = market_data_quality_rejection(
+            feat_dict, inp.market_data, require_fields=True,
+        )
+        if activation_quality_rejection is not None:
+            quality_flags["market_data_quality_rejected"] = True
+            feat_dict["activation_passed"] = False
+            feat_dict["activation_failure_reason"] = activation_quality_rejection
+            feat_dict["rejection_reason"] = activation_quality_rejection
+            feat_dict["signal_generated"] = False
+            warnings.append(f"fresh activation failed: {activation_quality_rejection}")
+            return
+
         identity_passed = _fresh_activation_identity_passed(inp.market_data)
         quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
         feat_dict["activation_identity_passed"] = identity_passed
@@ -540,7 +552,7 @@ class M4Detector(BasePatternDetector):
         vol_conf = float(inp.market_data.get("intraday_volume_confirmation", 0.0))
         spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
         spread_passed = (
-            bool(inp.market_data.get("spread_discipline_passed"))
+            inp.market_data.get("spread_discipline_passed") is True
             if "spread_discipline_passed" in inp.market_data
             else spread_pct is not None and float(spread_pct) <= FRESH_SPREAD_CAP
         )
@@ -555,6 +567,7 @@ class M4Detector(BasePatternDetector):
         feat_dict["fresh_high_break_passed"] = last_price > feat_dict["H_52w"]
         feat_dict["range_confirmation_passed"] = range_conf >= 1.0
         feat_dict["volume_confirmation_passed"] = vol_conf >= 1.0
+        feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
         feat_dict["spread_discipline_passed"] = spread_passed
         feat_dict["signal_freshness_passed"] = freshness_passed
 
