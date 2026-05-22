@@ -8,6 +8,8 @@ dependencies = [
     "alembic>=1.13",
     "psycopg2-binary>=2.9",
     "requests>=2.31",
+    # macOS system Python 3.9 is linked against LibreSSL; urllib3 v2 warns on every test run.
+    "urllib3<2",
 ]
 
 [project.optional-dependencies]
