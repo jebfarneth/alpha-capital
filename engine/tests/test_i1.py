@@ -209,6 +209,7 @@ class TestI1Firing:
         assert result.signals[0].signal_horizon == "3d"
         assert result.features.features["confirmation_gate"] == 1.0
         assert result.features.features["signal_generated"] is True
+        assert result.features.features["x_i1"] == result.features.features["X_I1"]
 
     def test_edge_deterministic(self):
         det = I1Detector()
@@ -232,6 +233,10 @@ class TestI1Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_confirmed_gap_data(), lineage_hashes=["h"]))
         priors = result.features.features["expected_return_priors"]
         assert priors["gross_bps"] == round(result.signals[0].raw_expected_edge * 10_000, 2)
+        assert set(priors) == {"gross_bps"}
+        assert result.features.features["lambda_I1_monthly"] == LAMBDA_I1_MONTHLY
+        assert result.features.features["microcap_amplification"] == AMPLIFICATION
+        assert result.features.features["amplified_lambda_I1_3td"] == round(LAMBDA_I1_3TD, 8)
 
     def test_data_confidence_default(self):
         det = I1Detector()
@@ -253,6 +258,7 @@ class TestI1Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.features.features["X_I1"] == 8.0
+        assert result.features.features["x_i1"] == 8.0
 
 
 # -----------------------------------------------------------------------
@@ -268,6 +274,7 @@ class TestI1NoSignal:
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
         assert result.features.features["X_I1"] == 0.0
+        assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "confirmation_failed"
 
     def test_small_gap_no_signal(self):
@@ -277,6 +284,7 @@ class TestI1NoSignal:
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
         assert result.features.features["X_I1"] == 0.0
+        assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "gap_below_minimum"
 
     def test_missing_price_no_features(self):
@@ -294,6 +302,7 @@ class TestI1NoSignal:
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
         assert result.features.features["X_I1"] == 0.0
+        assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "not_operating_universe"
 
     def test_missing_confirmation_data(self):
@@ -311,6 +320,7 @@ class TestI1NoSignal:
         assert result.features.features["confirmation_gate"] == 0.0
         assert result.features.features["volume_weight"] == 0.0
         assert result.features.features["X_I1"] == 0.0
+        assert result.features.features["x_i1"] == 0.0
         assert result.features.features["rejection_reason"] == "missing_confirmation_data"
 
     def test_low_volume_fails_confirmation(self):
@@ -347,6 +357,52 @@ class TestI1NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "data_delay"
         assert result.features.features["confirmation_gate"] == 0.0
+
+    def test_1014_evaluation_allowed(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["evaluation_timestamp"] = "2026-05-15T14:14:00Z"  # 10:14 AM ET
+        data["candidate_eval_quote_timestamp"] = "2026-05-15T14:14:00Z"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert "rejection_reason" not in result.features.features
+
+    def test_1015_evaluation_boundary_allowed(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["evaluation_timestamp"] = "2026-05-15T14:15:00Z"  # 10:15 AM ET exactly
+        data["candidate_eval_quote_timestamp"] = "2026-05-15T14:15:00Z"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert "rejection_reason" not in result.features.features
+
+    def test_1016_evaluation_rejected_as_data_delay(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["evaluation_timestamp"] = "2026-05-15T14:16:00Z"  # 10:16 AM ET
+        data["candidate_eval_quote_timestamp"] = "2026-05-15T14:16:00Z"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "data_delay"
+        assert result.features.features["X_I1"] == 0.0
+        assert result.features.features["x_i1"] == 0.0
+
+    def test_invalid_evaluation_timestamp_rejected(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["evaluation_timestamp"] = "not-a-timestamp"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "insufficient_timestamp_data"
+
+    def test_data_cutoff_after_evaluation_rejected(self):
+        det = I1Detector()
+        data = _confirmed_gap_data()
+        data["evaluation_timestamp"] = "2026-05-15T14:01:00Z"
+        data["data_cutoff_timestamp"] = "2026-05-15T14:02:00Z"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "insufficient_timestamp_data"
 
     def test_halt_during_confirmation_rejected_pre_signal(self):
         det = I1Detector()

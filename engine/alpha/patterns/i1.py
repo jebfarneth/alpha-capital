@@ -32,7 +32,9 @@ Routing: Class C (marketable limit, 120-second cancel).
 
 from __future__ import annotations
 
+from datetime import datetime, time
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from alpha.data.contracts import stable_hash
 from alpha.patterns.contracts import (
@@ -71,6 +73,8 @@ GAP_MAGNITUDE_CAP = 5.0
 VOLUME_WEIGHT_CAP = 2.0
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 TIMESTAMP_FIELDS = ("evaluation_timestamp", "data_cutoff_timestamp")
+EASTERN_TZ = ZoneInfo("America/New_York")
+EVALUATION_CUTOFF_ET = time(10, 15, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +136,43 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], market_data: Dict[str, An
     feat_dict.setdefault("filing_veto_status", "clear")
 
 
+def _parse_market_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=EASTERN_TZ)
+    return parsed.astimezone(EASTERN_TZ)
+
+
+def _timestamp_rejection(market_data: Dict[str, Any]) -> Optional[str]:
+    if any(market_data.get(field) is None for field in TIMESTAMP_FIELDS):
+        return "insufficient_timestamp_data"
+
+    evaluation_ts = _parse_market_timestamp(market_data["evaluation_timestamp"])
+    data_cutoff_ts = _parse_market_timestamp(market_data["data_cutoff_timestamp"])
+    if evaluation_ts is None or data_cutoff_ts is None:
+        return "insufficient_timestamp_data"
+
+    if data_cutoff_ts > evaluation_ts:
+        return "insufficient_timestamp_data"
+
+    if evaluation_ts.time() > EVALUATION_CUTOFF_ET:
+        return "data_delay"
+
+    return None
+
+
 def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> Optional[str]:
     market_data_rejection = market_data_quality_rejection(
         feat_dict,
@@ -147,8 +188,9 @@ def _pre_signal_rejection_reason(feat_dict: Dict[str, Any], market_data: Dict[st
     if feat_dict.get("opening_auction_quality") != "normal":
         return "opening_auction_quality_failed"
 
-    if any(market_data.get(field) is None for field in TIMESTAMP_FIELDS):
-        return "insufficient_timestamp_data"
+    timestamp_rej = _timestamp_rejection(market_data)
+    if timestamp_rej is not None:
+        return timestamp_rej
 
     quote_rej = quote_rejection(market_data, quote_fields=QUOTE_FIELDS)
     if quote_rej is not None:
@@ -170,6 +212,7 @@ def _reject_signal(
     feat_dict["confirmation_gate"] = confirmation_gate
     feat_dict["volume_weight"] = volume_weight
     feat_dict["X_I1"] = x_i1
+    feat_dict["x_i1"] = x_i1
 
 
 def _copy_gap_features(feat_dict: Dict[str, Any], market_data: Dict[str, Any]) -> float:
@@ -246,6 +289,7 @@ def _compute_i1_exposure(
 
     feat_dict["volume_weight"] = vol_weight
     feat_dict["X_I1"] = round(x_i1, 6)
+    feat_dict["x_i1"] = round(x_i1, 6)
     feat_dict["signal_generated"] = True
     return x_i1
 
@@ -257,6 +301,9 @@ def _build_i1_signal(
 ) -> PatternSignal:
     raw_expected_edge = round(x_i1 * LAMBDA_I1_3TD, 6)
     signal_strength = round(min(x_i1 / X_I1_STRENGTH_DIVISOR, 1.0), 6)
+    feat_dict["lambda_I1_monthly"] = LAMBDA_I1_MONTHLY
+    feat_dict["microcap_amplification"] = AMPLIFICATION
+    feat_dict["amplified_lambda_I1_3td"] = round(LAMBDA_I1_3TD, 8)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
 
     return PatternSignal(
