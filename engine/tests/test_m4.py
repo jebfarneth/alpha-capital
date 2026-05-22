@@ -362,6 +362,7 @@ class TestM4FreshBreakout:
         assert sig.route_class == RouteClass.C
         assert sig.raw_expected_edge == 0.0
         assert result.features.features["watchlist_passed"] is True
+        assert result.features.features["signal_generated"] is True
 
     def test_fresh_activation_signal(self):
         det = M4Detector()
@@ -385,6 +386,7 @@ class TestM4FreshBreakout:
         assert sig.raw_expected_edge > 0
         f = result.features.features
         assert f["activation_passed"] is True
+        assert f["signal_generated"] is True
         assert f["activation_identity_passed"] is True
         assert f["activation_id"] == "m4-act-ACME-20260520-150000"
         assert f["activation_timestamp"] == "2026-05-20T15:00:00Z"
@@ -413,6 +415,8 @@ class TestM4FreshBreakout:
         f = result.features.features
         assert f["activation_passed"] is False
         assert f["activation_failure_reason"] == "spread_too_wide"
+        assert f["rejection_reason"] == "spread_too_wide"
+        assert f["signal_generated"] is False
 
     def test_fresh_activation_missing_freshness_fails_closed(self):
         det = M4Detector()
@@ -436,6 +440,8 @@ class TestM4FreshBreakout:
         assert f["activation_passed"] is False
         assert f["signal_freshness_passed"] is False
         assert f["activation_failure_reason"] == "signal_expired"
+        assert f["rejection_reason"] == "signal_expired"
+        assert f["signal_generated"] is False
 
     def test_fresh_activation_false_freshness_fails_closed(self):
         det = M4Detector()
@@ -458,6 +464,31 @@ class TestM4FreshBreakout:
         assert f["activation_passed"] is False
         assert f["signal_freshness_passed"] is False
         assert f["activation_failure_reason"] == "signal_expired"
+        assert f["rejection_reason"] == "signal_expired"
+        assert f["signal_generated"] is False
+
+    def test_fresh_activation_truthy_string_freshness_fails_closed(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_activation_fields(),
+                "signal_freshness_passed": "true",
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["signal_freshness_passed"] is False
+        assert f["activation_failure_reason"] == "signal_expired"
+        assert f["signal_generated"] is False
 
     def test_fresh_activation_missing_activation_identity_fails_closed(self):
         det = M4Detector()
@@ -481,6 +512,8 @@ class TestM4FreshBreakout:
         assert f["activation_passed"] is False
         assert f["activation_identity_passed"] is False
         assert f["activation_failure_reason"] == "activation_identity_missing"
+        assert f["rejection_reason"] == "activation_identity_missing"
+        assert f["signal_generated"] is False
 
     def test_fresh_activation_missing_activation_timestamp_fails_closed(self):
         det = M4Detector()
@@ -504,6 +537,8 @@ class TestM4FreshBreakout:
         assert f["activation_passed"] is False
         assert f["activation_identity_passed"] is False
         assert f["activation_failure_reason"] == "activation_identity_missing"
+        assert f["rejection_reason"] == "activation_identity_missing"
+        assert f["signal_generated"] is False
 
     def test_fresh_watchlist_respects_operating_universe_exclusion(self):
         det = M4Detector()
@@ -550,6 +585,8 @@ class TestM4NoSignal:
         assert not result.has_signal
         assert result.features is not None
         assert result.features.features["X_M4"] == 0.95
+        assert result.features.features["signal_generated"] is False
+        assert result.features.features["rejection_reason"] == "below_high"
 
     def test_missing_price(self):
         det = M4Detector()

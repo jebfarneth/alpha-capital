@@ -328,9 +328,9 @@ def compute_m4_fresh_features(
 
 
 def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
-    if not feat.get("activation_identity_passed", True):
+    if feat.get("activation_identity_passed") is not True:
         return "activation_identity_missing"
-    if not feat.get("quote_capture_passed", True):
+    if feat.get("quote_capture_passed") is not True:
         return "quote_unavailable"
     if not feat["fresh_high_break_passed"]:
         return "fresh_high_break_failed"
@@ -487,7 +487,11 @@ class M4Detector(BasePatternDetector):
             sig = _enrich_base_daily_breakout(
                 feat_dict, inp, inp.market_data.get("cohort_extensions"), warnings, quality_flags,
             )
+            feat_dict["signal_generated"] = True
             signals.append(sig)
+        else:
+            feat_dict["rejection_reason"] = "below_high"
+            feat_dict["signal_generated"] = False
 
         input_hash, output_hash = _compute_hashes(inp, asof, feat_dict, signals, warnings, quality_flags)
 
@@ -518,7 +522,11 @@ class M4Detector(BasePatternDetector):
             )
             feat_dict["watchlist_passed"] = watchlist_passed
             if watchlist_passed:
+                feat_dict["signal_generated"] = True
                 signals.append(_build_fresh_watchlist_signal(inp, base_nearness, quality_flags))
+            else:
+                feat_dict["rejection_reason"] = "watchlist_not_qualified"
+                feat_dict["signal_generated"] = False
             return
 
         identity_passed = _fresh_activation_identity_passed(inp.market_data)
@@ -561,8 +569,11 @@ class M4Detector(BasePatternDetector):
         feat_dict["activation_passed"] = activation_passed
         if not activation_passed:
             feat_dict["activation_failure_reason"] = _fresh_activation_failure_reason(feat_dict)
+            feat_dict["rejection_reason"] = feat_dict["activation_failure_reason"]
+            feat_dict["signal_generated"] = False
             warnings.append(f"fresh activation failed: {feat_dict['activation_failure_reason']}")
             return
 
         x_fresh = fresh["x_m4_fresh"]
+        feat_dict["signal_generated"] = True
         signals.append(_build_fresh_activation_signal(inp, feat_dict, x_fresh, quality_flags))
