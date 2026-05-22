@@ -75,6 +75,7 @@ def _m4_fresh_activation_fields():
     return {
         "activation_id": "m4-act-ACME-20260520-150000",
         "activation_timestamp": "2026-05-20T15:00:00Z",
+        "signal_freshness_passed": True,
         **_m4_fresh_quote_fields(),
     }
 
@@ -384,8 +385,10 @@ class TestM4FreshBreakout:
         assert sig.raw_expected_edge > 0
         f = result.features.features
         assert f["activation_passed"] is True
+        assert f["activation_identity_passed"] is True
         assert f["activation_id"] == "m4-act-ACME-20260520-150000"
         assert f["activation_timestamp"] == "2026-05-20T15:00:00Z"
+        assert f["signal_freshness_passed"] is True
         assert f["fresh_breakout_extension"] == 0.05
         assert f["lambda_M4_monthly"] == LAMBDA_M4_MONTHLY
         assert f["lambda_M4_15td"] == round(LAMBDA_M4_15TD, 8)
@@ -401,7 +404,7 @@ class TestM4FreshBreakout:
                 "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
                 "spread_pct_vs_eval_quote": 0.02,
                 "operating_universe_inclusion": True,
-                **_m4_fresh_quote_fields(),
+                **_m4_fresh_activation_fields(),
             },
             lineage_hashes=["hash1"],
         )
@@ -410,6 +413,97 @@ class TestM4FreshBreakout:
         f = result.features.features
         assert f["activation_passed"] is False
         assert f["activation_failure_reason"] == "spread_too_wide"
+
+    def test_fresh_activation_missing_freshness_fails_closed(self):
+        det = M4Detector()
+        fields = _m4_fresh_activation_fields()
+        fields.pop("signal_freshness_passed")
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **fields,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["signal_freshness_passed"] is False
+        assert f["activation_failure_reason"] == "signal_expired"
+
+    def test_fresh_activation_false_freshness_fails_closed(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **_m4_fresh_activation_fields(),
+                "signal_freshness_passed": False,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["signal_freshness_passed"] is False
+        assert f["activation_failure_reason"] == "signal_expired"
+
+    def test_fresh_activation_missing_activation_identity_fails_closed(self):
+        det = M4Detector()
+        fields = _m4_fresh_activation_fields()
+        fields.pop("activation_id")
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **fields,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["activation_identity_passed"] is False
+        assert f["activation_failure_reason"] == "activation_identity_missing"
+
+    def test_fresh_activation_missing_activation_timestamp_fails_closed(self):
+        det = M4Detector()
+        fields = _m4_fresh_activation_fields()
+        fields.pop("activation_timestamp")
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data={
+                "entry_lane": "fresh_breakout_activation", "activation_state": "activated",
+                "price": 9.90, "last_price": 10.50, "high_52w": 10.00,
+                "intraday_range_confirmation": 1.25, "intraday_volume_confirmation": 1.50,
+                "spread_pct_vs_eval_quote": 0.005,
+                "operating_universe_inclusion": True,
+                **fields,
+            },
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        f = result.features.features
+        assert f["activation_passed"] is False
+        assert f["activation_identity_passed"] is False
+        assert f["activation_failure_reason"] == "activation_identity_missing"
 
     def test_fresh_watchlist_respects_operating_universe_exclusion(self):
         det = M4Detector()

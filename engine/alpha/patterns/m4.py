@@ -78,6 +78,7 @@ ENTRY_LANE_FRESH = "fresh_breakout_activation"
 ACTIVATION_STATE_WATCHLIST = "watchlist"
 ACTIVATION_STATE_ACTIVATED = "activated"
 FRESH_SPREAD_CAP = 0.01
+FRESH_IDENTITY_FIELDS = ("activation_id", "activation_timestamp")
 DIAGNOSTIC_SOURCE_KEYS = (
     "D1_decile",
     "R_6_12m_skip",
@@ -327,6 +328,8 @@ def compute_m4_fresh_features(
 
 
 def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
+    if not feat.get("activation_identity_passed", True):
+        return "activation_identity_missing"
     if not feat.get("quote_capture_passed", True):
         return "quote_unavailable"
     if not feat["fresh_high_break_passed"]:
@@ -340,6 +343,46 @@ def _fresh_activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat["signal_freshness_passed"]:
         return "signal_expired"
     return "unknown"
+
+
+def _fresh_activation_identity_passed(market_data: Dict[str, Any]) -> bool:
+    """Executable fresh activations must be joinable to m4_intraday_activation."""
+    return all(bool(market_data.get(field)) for field in FRESH_IDENTITY_FIELDS)
+
+
+def _build_fresh_watchlist_signal(
+    inp: PatternInput, base_nearness: float, quality_flags: Dict[str, Any],
+) -> PatternSignal:
+    return PatternSignal(
+        direction=SignalDirection.LONG,
+        raw_signal_strength=round(base_nearness, 6),
+        raw_expected_edge=0.0,
+        signal_horizon=SIGNAL_HORIZON,
+        signal_status="watchlist",
+        route_class=RouteClass.C,
+        data_confidence=_data_confidence(inp, quality_flags),
+    )
+
+
+def _build_fresh_activation_signal(
+    inp: PatternInput, feat_dict: Dict[str, Any], x_fresh: float,
+    quality_flags: Dict[str, Any],
+) -> PatternSignal:
+    raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
+    feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
+    feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
+    feat_dict["expected_return_priors"] = {
+        "tier": "default", "entry_lane": ENTRY_LANE_FRESH,
+        "gross_bps": round(raw_expected_edge * 10_000, 2),
+    }
+    return PatternSignal(
+        direction=SignalDirection.LONG,
+        raw_signal_strength=round(min(x_fresh / X_M4_CAP, 1.0), 6),
+        raw_expected_edge=raw_expected_edge,
+        signal_horizon=SIGNAL_HORIZON,
+        route_class=RouteClass.C,
+        data_confidence=_data_confidence(inp, quality_flags),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -475,18 +518,12 @@ class M4Detector(BasePatternDetector):
             )
             feat_dict["watchlist_passed"] = watchlist_passed
             if watchlist_passed:
-                signals.append(PatternSignal(
-                    direction=SignalDirection.LONG,
-                    raw_signal_strength=round(base_nearness, 6),
-                    raw_expected_edge=0.0,
-                    signal_horizon=SIGNAL_HORIZON,
-                    signal_status="watchlist",
-                    route_class=RouteClass.C,
-                    data_confidence=_data_confidence(inp, quality_flags),
-                ))
+                signals.append(_build_fresh_watchlist_signal(inp, base_nearness, quality_flags))
             return
 
+        identity_passed = _fresh_activation_identity_passed(inp.market_data)
         quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
+        feat_dict["activation_identity_passed"] = identity_passed
         feat_dict["quote_capture_passed"] = quote_rej is None
 
         last_price = float(inp.market_data.get("last_price", inp.market_data.get("price", 0.0)))
@@ -498,7 +535,7 @@ class M4Detector(BasePatternDetector):
             if "spread_discipline_passed" in inp.market_data
             else spread_pct is not None and float(spread_pct) <= FRESH_SPREAD_CAP
         )
-        freshness_passed = bool(inp.market_data.get("signal_freshness_passed", True))
+        freshness_passed = inp.market_data.get("signal_freshness_passed") is True
 
         fresh = compute_m4_fresh_features(
             last_price=last_price, high_52w=feat_dict["H_52w"],
@@ -517,6 +554,7 @@ class M4Detector(BasePatternDetector):
             and fresh["fresh_breakout_extension"] > 0
             and feat_dict["range_confirmation_passed"]
             and feat_dict["volume_confirmation_passed"]
+            and identity_passed
             and feat_dict["quote_capture_passed"]
             and spread_passed and freshness_passed
         )
@@ -527,18 +565,4 @@ class M4Detector(BasePatternDetector):
             return
 
         x_fresh = fresh["x_m4_fresh"]
-        raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
-        feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
-        feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
-        feat_dict["expected_return_priors"] = {
-            "tier": "default", "entry_lane": ENTRY_LANE_FRESH,
-            "gross_bps": round(raw_expected_edge * 10_000, 2),
-        }
-        signals.append(PatternSignal(
-            direction=SignalDirection.LONG,
-            raw_signal_strength=round(min(x_fresh / X_M4_CAP, 1.0), 6),
-            raw_expected_edge=raw_expected_edge,
-            signal_horizon=SIGNAL_HORIZON,
-            route_class=RouteClass.C,
-            data_confidence=_data_confidence(inp, quality_flags),
-        ))
+        signals.append(_build_fresh_activation_signal(inp, feat_dict, x_fresh, quality_flags))
