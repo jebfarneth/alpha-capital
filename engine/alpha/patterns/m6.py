@@ -157,7 +157,7 @@ def compute_effective_volume_confirmation(
         confirmations.append(compute_volume_confirmation(volume_ratio))
     if latest_5m_ratio is not None:
         confirmations.append(compute_volume_confirmation(latest_5m_ratio))
-    return max(confirmations) if confirmations else 1.0
+    return max(confirmations) if confirmations else 0.0
 
 
 def _activation_failure_reason(feat: Dict[str, Any]) -> str:
@@ -480,6 +480,19 @@ def _enrich_m6_activation(
     feat_dict["P_activation"] = price
     copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
 
+    activation_quality_rejection = market_data_quality_rejection(
+        feat_dict, inp.market_data, require_fields=True,
+    )
+    if activation_quality_rejection is not None:
+        quality_flags["market_data_quality_rejected"] = True
+        feat_dict["activation_state"] = ACTIVATION_STATE_FAILED
+        feat_dict["activation_passed"] = False
+        feat_dict["activation_failure_reason"] = activation_quality_rejection
+        feat_dict["rejection_reason"] = activation_quality_rejection
+        feat_dict["signal_generated"] = False
+        warnings.append(f"M6 activation failed: {activation_quality_rejection}")
+        return None
+
     brk_ext = _set_breakout_features(feat_dict, price, compression_high, sigma_20d)
     exp_conf = _set_expansion_features(feat_dict, inp, quality_flags, warnings)
     vol_conf = _set_volume_features(feat_dict, inp, quality_flags, warnings)
@@ -543,6 +556,7 @@ def _compute_hashes(
     input_hash = stable_hash({
         "ticker": inp.ticker, "asof_timestamp": asof,
         "market_data": inp.market_data, "fundamental_data": inp.fundamental_data,
+        "event_data": inp.event_data,
         "lineage_hashes": inp.lineage_hashes, "universe_snapshot_id": inp.universe_snapshot_id,
     })
     output_hash = stable_hash({
@@ -591,8 +605,17 @@ class M6Detector(BasePatternDetector):
         compression_high = float(compression_high)
         sigma_20d = float(sigma_20d)
 
-        if compression_high <= 0 or sigma_20d <= 0:
-            warnings.append(f"invalid compression_high={compression_high} or sigma_20d={sigma_20d}")
+        if (
+            not math.isfinite(compression_ratio)
+            or not math.isfinite(compression_high)
+            or not math.isfinite(sigma_20d)
+            or compression_high <= 0
+            or sigma_20d <= 0
+        ):
+            warnings.append(
+                f"invalid compression_ratio={compression_ratio}, "
+                f"compression_high={compression_high}, or sigma_20d={sigma_20d}"
+            )
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
         depth = compute_compression_depth(compression_ratio)

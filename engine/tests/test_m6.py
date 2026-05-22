@@ -36,6 +36,7 @@ from alpha.patterns.m6 import (
     M6Detector,
     compute_breakout_extension,
     compute_compression_depth,
+    compute_effective_volume_confirmation,
     compute_expansion_confirmation,
     compute_volume_confirmation,
 )
@@ -61,6 +62,9 @@ def _activation_evidence_fields():
         "watchlist_valid_session": "2026-05-20",
         "activation_session": "2026-05-20",
         "signal_freshness_passed": True,
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
     }
 
 
@@ -122,6 +126,9 @@ def _no_breakout_market_data():
         "compression_high": 5.00,
         "sigma_20d": 0.030,
         "price": 4.90,
+        "market_data_status": "current",
+        "halt_status": "clear",
+        "corporate_action_filter_passed": True,
         "operating_universe_inclusion": True,
     }
 
@@ -215,6 +222,9 @@ class TestConfirmationTiers:
     def test_volume_weak(self):
         assert compute_volume_confirmation(0.8) == 0.5
 
+    def test_effective_volume_missing_sources_is_zero(self):
+        assert compute_effective_volume_confirmation(None, None) == 0.0
+
 
 # -----------------------------------------------------------------------
 # Standard activation
@@ -279,6 +289,21 @@ class TestM6StandardActivation:
         assert f["cumulative_volume_confirmation"] == 0.5
         assert f["latest_5m_volume_confirmation"] == 1.5
         assert f["intraday_volume_confirmation"] == 1.5
+
+    def test_missing_all_volume_sources_records_zero_confirmation(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["cumulative_volume"]
+        del data["expected_tod_volume"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        f = result.features.features
+        assert f["intraday_volume_ratio"] is None
+        assert f["cumulative_volume_confirmation"] is None
+        assert f["latest_5m_volume_confirmation"] is None
+        assert f["intraday_volume_confirmation"] == 0.0
+        assert f["volume_ignition_passed"] is False
+        assert f["activation_failure_reason"] == "volume_ignition_failed"
 
     def test_data_confidence_default(self):
         det = M6Detector()
@@ -538,6 +563,14 @@ class TestM6NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data={"price": 5.0}, lineage_hashes=["h"]))
         assert result.features is None
 
+    def test_non_finite_compression_returns_no_features(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        data["compression_ratio"] = float("nan")
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features is None
+
     def test_weak_volume(self):
         det = M6Detector()
         data = _firing_market_data()
@@ -622,6 +655,18 @@ class TestM6NoSignal:
         assert result.features.features["activation_identity_passed"] is False
         assert result.features.features["activation_failure_reason"] == "activation_identity_missing"
         assert result.features.features["rejection_reason"] == "activation_identity_missing"
+        assert result.features.features["signal_generated"] is False
+
+    def test_missing_live_market_data_quality_fields_fail_activation(self):
+        det = M6Detector()
+        data = _firing_market_data()
+        del data["market_data_status"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.quality_flags["market_data_quality_rejected"] is True
+        assert result.features.features["activation_passed"] is False
+        assert result.features.features["activation_failure_reason"] == "missing_market_data_quality"
+        assert result.features.features["rejection_reason"] == "missing_market_data_quality"
         assert result.features.features["signal_generated"] is False
 
     def test_blank_activation_identity_fails_closed(self):
@@ -721,6 +766,27 @@ class TestM6Hashes:
         r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d2, lineage_hashes=["h"]))
         assert r1.has_signal
         assert not r2.has_signal
+        assert r1.output_hashes != r2.output_hashes
+
+    def test_input_hash_changes_with_event_data(self):
+        det = M6Detector()
+        base = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_market_data(),
+            event_data={"filing_veto_status": "not_computed"},
+            lineage_hashes=["h"],
+        )
+        changed = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_firing_market_data(),
+            event_data={"filing_veto_status": "clear"},
+            lineage_hashes=["h"],
+        )
+        r1 = det.detect(base)
+        r2 = det.detect(changed)
+        assert r1.input_hashes != r2.input_hashes
         assert r1.output_hashes != r2.output_hashes
 
     def test_output_hash_matches(self):
