@@ -249,10 +249,10 @@ def _compute_i8_volume_quality(
     volume_30min = float(volume_30min)
     baseline_volume_proxy = False
     if avg_volume_30min_20d is None or float(avg_volume_30min_20d) <= 0:
-        avg_volume_30min_20d = volume_30min * 0.5
+        avg_volume_30min_20d = volume_30min
         baseline_volume_proxy = True
         quality_flags["baseline_volume_proxy"] = True
-        warnings.append("avg_volume_30min_20d unavailable — using conservative proxy")
+        warnings.append("avg_volume_30min_20d unavailable — using neutral volume proxy")
     else:
         avg_volume_30min_20d = float(avg_volume_30min_20d)
 
@@ -533,6 +533,7 @@ class I8Detector(BasePatternDetector):
             "signal_generated": False,
             "rejection_reason": "insufficient_bar_data",
         }
+        _copy_diagnostic_fields(feat_dict, inp.market_data)
         pit_passed = quality_flags.get("point_in_time_passed") is not False
         fidelity = classify_fidelity(
             has_primary_data=True, has_secondary_data=True,

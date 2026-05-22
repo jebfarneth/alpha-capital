@@ -488,6 +488,12 @@ class TestI8NoSignal:
         assert result.features.features["opening_range_high"] == 4.85
         assert result.features.features["opening_range_low"] == 4.85
         assert result.features.features["rejection_reason"] == "insufficient_bar_data"
+        assert result.features.features["candidate_eval_id"] == "I8-ACME-20260515-101800"
+        assert result.features.features["opening_bar_close_timestamp"] == "2026-05-15T14:00:00Z"
+        assert result.features.features["data_cutoff_timestamp"] == "2026-05-15T14:18:00Z"
+        assert result.features.features["market_data_status"] == "current"
+        assert result.features.features["halt_status"] == "clear"
+        assert result.features.features["corporate_action_filter_passed"] is True
 
     def test_late_evaluation_rejection_reads_market_data(self):
         data = _firing_data()
@@ -518,6 +524,9 @@ class TestI8Quality:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.features.features["baseline_volume_proxy"] is True
+        assert result.features.features["avg_volume_30min_20d"] == result.features.features["volume_30min"]
+        assert result.features.features["volume_ratio"] == 1.0
+        assert result.features.features["volume_quality"] == 1.0
         assert result.signals[0].data_confidence < 1.0
 
     def test_missing_spread_uses_conservative_proxy(self):
