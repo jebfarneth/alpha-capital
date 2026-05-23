@@ -789,13 +789,14 @@ class TestForwardReturnUnavailable:
     def test_malformed_price_shape_is_per_signal_retryable(self, db_session):
         """One malformed provider response does not roll back the whole batch."""
         good1 = self._make_signal(db_session, "GOOD1")
-        bad = self._make_signal(db_session, "BAD")
+        bad_tuple = self._make_signal(db_session, "BADTUPLE")
+        bad_list = self._make_signal(db_session, "BADLIST")
         good2 = self._make_signal(db_session, "GOOD2")
 
         def price_fn(ticker, ts, horizon):
-            if ticker == "BAD":
+            if ticker == "BADTUPLE":
                 return (5.0, 5.5, 6.0)
-            if ticker == "GOOD2":
+            if ticker == "BADLIST":
                 return [4.0, 4.4]
             return (5.0, 5.5)
 
@@ -804,13 +805,14 @@ class TestForwardReturnUnavailable:
 
         assert result.ok
         assert result.metrics["computed"] == 2
-        assert result.metrics["retryable_unavailable"] == 1
-        assert result.metrics["pricing_errors"] == 1
+        assert result.metrics["retryable_unavailable"] == 2
+        assert result.metrics["pricing_errors"] == 2
 
-        bad_sig = db_session.get(SignalRegistry, bad)
-        assert bad_sig.forward_return_status == "invalid_price_shape_retry"
-        assert bad_sig.outcome_unavailable_reason == "invalid_price_shape"
-        assert bad_sig.forward_return_attempts == 1
+        for sid in (bad_tuple, bad_list):
+            bad_sig = db_session.get(SignalRegistry, sid)
+            assert bad_sig.forward_return_status == "invalid_price_shape_retry"
+            assert bad_sig.outcome_unavailable_reason == "invalid_price_shape"
+            assert bad_sig.forward_return_attempts == 1
 
         for sid in (good1, good2):
             sig = db_session.get(SignalRegistry, sid)

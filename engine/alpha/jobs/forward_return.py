@@ -43,8 +43,8 @@ def _finite_price(value: object) -> Optional[float]:
 
 
 def _price_pair(value: object) -> Optional[Tuple[object, object]]:
-    """Accept provider prices only when shaped as entry/exit pair."""
-    if not isinstance(value, (tuple, list)) or len(value) != 2:
+    """Accept provider prices only when shaped as an entry/exit tuple."""
+    if not isinstance(value, tuple) or len(value) != 2:
         return None
     return value[0], value[1]
 
