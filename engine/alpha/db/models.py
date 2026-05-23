@@ -19,6 +19,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -223,6 +224,15 @@ class FeatureSnapshot(Base):
 # ---------------------------------------------------------------------------
 class SignalRegistry(Base):
     __tablename__ = "signal_registry"
+    __table_args__ = (
+        Index(
+            "ux_signal_registry_pattern_ticker_identity",
+            "pattern_id",
+            "ticker",
+            "signal_identity_hash",
+            unique=True,
+        ),
+    )
 
     signal_id = Column(String, primary_key=True, default=_uuid)
     job_run_id = Column(

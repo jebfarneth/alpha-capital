@@ -7,18 +7,19 @@ Covers all required acceptance tests from MeasurementSpine.md:
   3. Scheduler retry dedup by signal_identity_hash.
   4. Genuine new event creates a new signal.
   5. Forward-return job writes outcomes for all candidate dispositions.
-  6. Forward-return job records outcome_unavailable with reason.
+  6. Forward-return job records retryable/terminal unavailable reasons.
   7. Validation scaffold refuses full confidence on insufficient sample.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List
 
+import pytest
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpScreenerResult
@@ -29,8 +30,7 @@ from alpha.db.models import (
     UniverseSnapshot,
     ValidationRun,
 )
-from alpha.evidence.writer import record_feature_snapshot, record_signal
-from alpha.jobs.contracts import JobContext, JobResult
+from alpha.evidence.writer import record_candidate, record_feature_snapshot, record_signal
 from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
 from alpha.jobs.forward_return import ForwardReturnJob
 from alpha.jobs.runner import run_job
@@ -245,14 +245,8 @@ class TestUniverseSnapshotHashes:
         job2 = UniverseBuilderJob(session=s2, screener_response=resp2)
         r2 = run_job(s2, job2)
 
-        # Market cap change doesn't affect inclusion/exclusion decisions,
-        # but the _classify result captures (symbol, included, reason) tuples.
-        # Both ACME variants are included, so ticker_decisions differ only
-        # if market_cap change causes different inclusion. Since both are
-        # in range, the output hash for ticker_decisions is the same.
-        # The hash is based on (symbol, included, reason), not market_cap.
-        # This proves the hash captures membership DECISIONS, which is
-        # correct per vault — but we also verify via snapshot rows.
+        assert r1.output_hashes["universe_snapshots"] != r2.output_hashes["universe_snapshots"]
+
         snap_caps = {
             s.ticker: s.market_cap
             for s in s2.query(UniverseSnapshot).all()
@@ -399,6 +393,43 @@ class TestSignalDedup:
         sigs = db_session.query(SignalRegistry).all()
         assert len(sigs) == 1
 
+    def test_database_unique_index_blocks_duplicate_identity(self, db_session):
+        """DB constraint protects dedup if two writers race past the application check."""
+        feat = record_feature_snapshot(
+            db_session,
+            pattern_id="M4",
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            features={"score": 0.95},
+            data_lineage_ids=[],
+        )
+        record_signal(
+            db_session,
+            pattern_id="M4",
+            ticker="ACME",
+            direction="long",
+            signal_timestamp=_ts(),
+            raw_signal_strength=0.95,
+            raw_expected_edge=0.08,
+            feature_snapshot_id=feat.feature_snapshot_id,
+            signal_identity_hash="same-event",
+        )
+        db_session.flush()
+
+        with pytest.raises(IntegrityError):
+            record_signal(
+                db_session,
+                pattern_id="M4",
+                ticker="ACME",
+                direction="long",
+                signal_timestamp=_ts(),
+                raw_signal_strength=0.95,
+                raw_expected_edge=0.08,
+                feature_snapshot_id=feat.feature_snapshot_id,
+                signal_identity_hash="same-event",
+            )
+        db_session.rollback()
+
     def test_no_identity_detector_persists_every_run(self, db_session):
         """Detector without identity persists on every run (no dedup possible)."""
         detectors = [NoIdentityDetector()]
@@ -426,6 +457,32 @@ class TestSignalDedup:
 
         sigs = db_session.query(SignalRegistry).all()
         assert len(sigs) == 2  # no dedup
+
+    def test_detector_error_marks_run_failed(self, db_session):
+        """A detector exception should not look like a clean finished scan."""
+        class BrokenDetector(StableIdentityDetector):
+            pattern_id = "M4"
+
+            def detect(self, inp):
+                raise ValueError("boom")
+
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=_ts(),
+                market_data={"fixture_score": 0.95, "operating_universe_inclusion": True},
+            ),
+        ]
+
+        orch = DetectorOrchestrationJob(
+            session=db_session, detectors=[BrokenDetector()], inputs=inputs,
+        )
+        result = run_job(db_session, orch)
+
+        assert result.status == "failed"
+        assert not result.ok
+        assert result.metrics["detector_errors"] == 1
+        assert result.errors[0]["ticker"] == "ACME"
 
 
 # ===================================================================
@@ -499,7 +556,7 @@ class TestForwardReturnOutcomes:
         db_session.flush()
 
         signal_ids = []
-        for _ in statuses:
+        for status in statuses:
             sig = record_signal(
                 db_session,
                 pattern_id="M4",
@@ -510,6 +567,29 @@ class TestForwardReturnOutcomes:
                 raw_expected_edge=0.08,
                 feature_snapshot_id=feat.feature_snapshot_id,
                 signal_horizon="15d",
+            )
+            decision = "enter"
+            skip_reason = None
+            constraint_reason = None
+            if status == "skipped":
+                decision = "skip"
+                skip_reason = "koth_loser"
+            elif status == "vetoed":
+                decision = "vetoed_hazard"
+            elif status == "unfilled":
+                constraint_reason = {"fill_status": "unfilled"}
+
+            record_candidate(
+                db_session,
+                candidate_pool_id=f"pool-{status}",
+                ticker="ACME",
+                direction="long",
+                primary_pattern="M4",
+                combined_expected_edge=0.08,
+                trade_decision=decision,
+                input_signal_ids=[sig.signal_id],
+                skip_reason=skip_reason,
+                constraint_reason=constraint_reason,
             )
             signal_ids.append(sig.signal_id)
 
@@ -571,7 +651,7 @@ class TestForwardReturnUnavailable:
         return sig.signal_id
 
     def test_pricing_unavailable_writes_reason(self, db_session):
-        """Missing price data writes outcome_unavailable with reason."""
+        """Missing provider price data stays retryable with a reason."""
         sid = self._make_signal(db_session)
 
         def price_fn(ticker, ts, horizon):
@@ -580,11 +660,29 @@ class TestForwardReturnUnavailable:
         fwd_job = ForwardReturnJob(session=db_session, price_fn=price_fn)
         result = run_job(db_session, fwd_job)
 
-        assert result.metrics["unavailable"] == 1
+        assert result.metrics["retryable_unavailable"] == 1
         sig = db_session.get(SignalRegistry, sid)
-        assert sig.forward_return_status == "outcome_unavailable"
+        assert sig.forward_return_status == "pricing_unavailable_retry"
         assert sig.outcome_unavailable_reason == "pricing_unavailable"
         assert sig.forward_return is None
+
+    def test_retryable_pricing_unavailable_can_later_compute(self, db_session):
+        """Transient provider lag can be retried instead of becoming terminal."""
+        sid = self._make_signal(db_session)
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=lambda ticker, ts, horizon: None)
+        run_job(db_session, fwd_job)
+
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "pricing_unavailable_retry"
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=lambda ticker, ts, horizon: (5.0, 5.5))
+        result = run_job(db_session, fwd_job)
+
+        assert result.metrics["computed"] == 1
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "computed"
+        assert abs(sig.forward_return - 0.10) < 0.001
 
     def test_invalid_entry_price_writes_reason(self, db_session):
         """Zero or negative entry price writes outcome_unavailable."""
@@ -630,7 +728,7 @@ class TestForwardReturnUnavailable:
         acme = db_session.get(SignalRegistry, sid1)
         beta = db_session.get(SignalRegistry, sid2)
         assert acme.forward_return_status == "computed"
-        assert beta.forward_return_status == "outcome_unavailable"
+        assert beta.forward_return_status == "pricing_unavailable_retry"
         # Neither is NULL — no silent drops
         assert acme.forward_return_status is not None
         assert beta.forward_return_status is not None

@@ -80,6 +80,21 @@ def persist_detection_result(
     persisted.feature_snapshot_id = feat.feature_snapshot_id
 
     for sequence, sig in enumerate(result.signals, start=1):
+        if signal_identity_hash:
+            existing_signal_id = (
+                session.query(SignalRegistry.signal_id)
+                .filter(
+                    SignalRegistry.pattern_id == result.pattern_id,
+                    SignalRegistry.ticker == result.ticker,
+                    SignalRegistry.signal_identity_hash == signal_identity_hash,
+                    SignalRegistry.signal_status == sig.signal_status,
+                )
+                .scalar()
+            )
+            if existing_signal_id:
+                persisted.signal_ids.append(existing_signal_id)
+                continue
+
         sr = record_signal(
             session,
             pattern_id=result.pattern_id,

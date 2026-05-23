@@ -3,8 +3,9 @@ All-firings forward-return population job.
 
 Computes forward_return for every mature signal_registry row that can be
 priced. Includes selected, skipped, vetoed, cash-throttled, unfilled, and
-untraded candidates. Writes outcome_unavailable with reason instead of
-silently dropping missing-price rows.
+untraded candidates. Missing provider pricing stays retryable; terminal bad
+price states write outcome_unavailable with reason instead of silently
+dropping rows.
 
 Per MeasurementSpine.md section 3.
 """
@@ -53,6 +54,7 @@ class ForwardReturnJob(BaseJob):
             self._session.query(SignalRegistry)
             .filter(
                 (SignalRegistry.forward_return_status == "pending")
+                | (SignalRegistry.forward_return_status == "pricing_unavailable_retry")
                 | (SignalRegistry.forward_return_status.is_(None))
             )
             .all()
@@ -60,6 +62,7 @@ class ForwardReturnJob(BaseJob):
 
         computed = 0
         unavailable = 0
+        retryable_unavailable = 0
         immature = 0
 
         for sig in pending:
@@ -73,9 +76,9 @@ class ForwardReturnJob(BaseJob):
                 sig.ticker, sig.signal_timestamp, sig.signal_horizon
             )
             if prices is None:
-                sig.forward_return_status = "outcome_unavailable"
+                sig.forward_return_status = "pricing_unavailable_retry"
                 sig.outcome_unavailable_reason = "pricing_unavailable"
-                unavailable += 1
+                retryable_unavailable += 1
                 continue
 
             entry_price, exit_price = prices
@@ -105,6 +108,7 @@ class ForwardReturnJob(BaseJob):
                 "total_pending": len(pending),
                 "computed": computed,
                 "unavailable": unavailable,
+                "retryable_unavailable": retryable_unavailable,
                 "immature": immature,
             },
         )

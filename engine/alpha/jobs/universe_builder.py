@@ -89,7 +89,7 @@ class UniverseBuilderJob(BaseJob):
 
         included_count = 0
         excluded_count = 0
-        ticker_decisions = []
+        snapshot_content = []
 
         for stock in resp.data:
             included, reason = _classify(stock)
@@ -106,7 +106,17 @@ class UniverseBuilderJob(BaseJob):
                 exclusion_reason=reason,
                 source_lineage_hash=lineage.raw_payload_hash,
             )
-            ticker_decisions.append((stock.symbol, included, reason))
+            snapshot_content.append({
+                "symbol": stock.symbol,
+                "market_cap": stock.market_cap,
+                "price": stock.price,
+                "country": stock.country,
+                "exchange": stock.exchange,
+                "is_etf": stock.is_etf,
+                "is_actively_trading": stock.is_actively_trading,
+                "included": included,
+                "exclusion_reason": reason,
+            })
             if included:
                 included_count += 1
             else:
@@ -115,7 +125,7 @@ class UniverseBuilderJob(BaseJob):
         self._session.flush()
 
         output_hash = stable_hash({
-            "tickers": sorted(ticker_decisions),
+            "snapshots": sorted(snapshot_content, key=lambda row: row["symbol"]),
             "included": included_count,
             "excluded": excluded_count,
         })

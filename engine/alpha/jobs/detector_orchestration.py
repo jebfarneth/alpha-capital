@@ -95,7 +95,7 @@ class DetectorOrchestrationJob(BaseJob):
         self._session.flush()
 
         return JobResult(
-            status="finished",
+            status="failed" if errors else "finished",
             metrics={
                 "signals_persisted": signals_persisted,
                 "duplicates_suppressed": duplicates_suppressed,
