@@ -71,7 +71,6 @@ class DetectorOrchestrationJob(BaseJob):
                             SignalRegistry.pattern_id == result.pattern_id,
                             SignalRegistry.ticker == result.ticker,
                             SignalRegistry.signal_identity_hash == identity_hash,
-                            SignalRegistry.signal_status == "active",
                         )
                         .first()
                     )
@@ -95,7 +94,7 @@ class DetectorOrchestrationJob(BaseJob):
         self._session.flush()
 
         return JobResult(
-            status="failed" if errors else "finished",
+            status="finished_with_errors" if errors else "finished",
             metrics={
                 "signals_persisted": signals_persisted,
                 "duplicates_suppressed": duplicates_suppressed,

@@ -352,6 +352,33 @@ class TestDetectorOrchestration:
         assert feat.job_run_id is not None
         assert sig.job_run_id == feat.job_run_id
 
+    def test_no_signal_evaluation_metric_without_signal_rows(self, db_session):
+        """A no-signal detector result increments the metric and creates no signal."""
+        detectors = [StableIdentityDetector()]
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=_ts(),
+                market_data={
+                    "fixture_score": 0.50,
+                    "price": 5.0,
+                    "high_52w": 10.0,
+                    "high_52w_date": "2026-01-01",
+                    "operating_universe_inclusion": True,
+                },
+            ),
+        ]
+
+        orch = DetectorOrchestrationJob(
+            session=db_session, detectors=detectors, inputs=inputs,
+        )
+        result = run_job(db_session, orch)
+
+        assert result.ok
+        assert result.metrics["signals_persisted"] == 0
+        assert result.metrics["no_signal_evaluations"] == 1
+        assert db_session.query(SignalRegistry).count() == 0
+
 
 # ===================================================================
 # 3. Scheduler retry dedup — same identity does not create duplicate
@@ -479,7 +506,7 @@ class TestSignalDedup:
         )
         result = run_job(db_session, orch)
 
-        assert result.status == "failed"
+        assert result.status == "finished_with_errors"
         assert not result.ok
         assert result.metrics["detector_errors"] == 1
         assert result.errors[0]["ticker"] == "ACME"
@@ -685,7 +712,7 @@ class TestForwardReturnUnavailable:
         assert abs(sig.forward_return - 0.10) < 0.001
 
     def test_invalid_entry_price_writes_reason(self, db_session):
-        """Zero or negative entry price writes outcome_unavailable."""
+        """Zero or negative entry price stays retryable with a reason."""
         sid = self._make_signal(db_session)
 
         def price_fn(ticker, ts, horizon):
@@ -695,11 +722,11 @@ class TestForwardReturnUnavailable:
         result = run_job(db_session, fwd_job)
 
         sig = db_session.get(SignalRegistry, sid)
-        assert sig.forward_return_status == "outcome_unavailable"
+        assert sig.forward_return_status == "invalid_entry_price_retry"
         assert sig.outcome_unavailable_reason == "invalid_entry_price"
 
     def test_missing_exit_price_writes_reason(self, db_session):
-        """None exit price writes outcome_unavailable."""
+        """None exit price stays retryable with a reason."""
         sid = self._make_signal(db_session)
 
         def price_fn(ticker, ts, horizon):
@@ -709,8 +736,30 @@ class TestForwardReturnUnavailable:
         result = run_job(db_session, fwd_job)
 
         sig = db_session.get(SignalRegistry, sid)
-        assert sig.forward_return_status == "outcome_unavailable"
+        assert sig.forward_return_status == "missing_exit_price_retry"
         assert sig.outcome_unavailable_reason == "missing_exit_price"
+
+    def test_price_fn_exception_is_per_signal_retryable(self, db_session):
+        """A bad price lookup marks that signal retryable without killing the batch."""
+        sid1 = self._make_signal(db_session, "ACME")
+        sid2 = self._make_signal(db_session, "BETA")
+
+        def price_fn(ticker, ts, horizon):
+            if ticker == "ACME":
+                raise RuntimeError("provider exploded")
+            return (5.0, 5.5)
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=price_fn)
+        result = run_job(db_session, fwd_job)
+
+        assert result.status == "finished"
+        assert result.metrics["pricing_errors"] == 1
+        assert result.metrics["computed"] == 1
+        acme = db_session.get(SignalRegistry, sid1)
+        beta = db_session.get(SignalRegistry, sid2)
+        assert acme.forward_return_status == "pricing_unavailable_retry"
+        assert acme.outcome_unavailable_reason == "price_fn_error:RuntimeError"
+        assert beta.forward_return_status == "computed"
 
     def test_does_not_silently_drop_rows(self, db_session):
         """Every signal gets a status — none remain NULL after the job runs."""
@@ -752,7 +801,7 @@ class TestForwardReturnUnavailable:
         assert result.metrics["computed"] == 0
 
         sig = db_session.get(SignalRegistry, sid)
-        assert sig.forward_return_status is None  # still pending
+        assert sig.forward_return_status == "pending"
 
 
 # ===================================================================
@@ -801,6 +850,9 @@ class TestValidationScaffold:
         assert "M4" in pattern_results
         m4 = pattern_results["M4"]
         assert m4["confidence_tier"] == "insufficient_sample"
+        assert m4["sample_size"] == 10
+        assert m4["computed_sample_size"] == 10
+        assert m4["unavailable_sample_size"] == 0
         assert m4["validation_weight_multiplier"] == 0.50
         assert m4["confidence_tier"] != "validated"
 
@@ -820,7 +872,44 @@ class TestValidationScaffold:
 
         m4 = result.metrics["pattern_results"]["M4"]
         assert m4["confidence_tier"] == "monitoring"
+        assert m4["sample_size"] == 50
+        assert m4["computed_sample_size"] == 50
         assert m4["validation_weight_multiplier"] == 0.75
+
+    def test_unavailable_outcomes_count_in_denominator(self, db_session):
+        """Unavailable mature outcomes are counted in sample_size, not dropped."""
+        self._seed_signals(db_session, "M4", count=10, forward_return=0.05)
+        feat = record_feature_snapshot(
+            db_session,
+            pattern_id="M4",
+            ticker="BETA",
+            asof_timestamp=_ts(),
+            features={"score": 0.9},
+            data_lineage_ids=[],
+        )
+        for _ in range(5):
+            sig = record_signal(
+                db_session,
+                pattern_id="M4",
+                ticker="BETA",
+                direction="long",
+                signal_timestamp=_ts(),
+                raw_signal_strength=0.9,
+                raw_expected_edge=0.08,
+                feature_snapshot_id=feat.feature_snapshot_id,
+            )
+            sig.forward_return_status = "outcome_unavailable"
+            sig.outcome_unavailable_reason = "delisted_no_exit_price"
+        db_session.flush()
+
+        val_job = ValidationScaffoldJob(session=db_session, minimum_sample=30)
+        result = run_job(db_session, val_job)
+
+        m4 = result.metrics["pattern_results"]["M4"]
+        assert m4["sample_size"] == 15
+        assert m4["computed_sample_size"] == 10
+        assert m4["unavailable_sample_size"] == 5
+        assert m4["confidence_tier"] == "insufficient_sample"
 
     def test_positive_returns_small_sample_not_validated(self, db_session):
         """Extremely positive returns with 5 samples must NOT be validated."""
@@ -909,7 +998,7 @@ class TestSchemaAdditions:
 
         stored = db_session.get(SignalRegistry, sig.signal_id)
         assert stored.forward_return is None
-        assert stored.forward_return_status is None
+        assert stored.forward_return_status == "pending"
         assert stored.outcome_unavailable_reason is None
         assert stored.intended_entry_price is None
 

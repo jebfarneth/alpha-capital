@@ -286,6 +286,7 @@ def record_signal(
     signal_event_sequence: int | None = None,
     signal_identity_hash: str | None = None,
     intended_entry_price: float | None = None,
+    forward_return_status: str = "pending",
 ) -> SignalRegistry:
     sig = SignalRegistry(
         signal_id=_uid(),
@@ -308,6 +309,7 @@ def record_signal(
         data_lineage_ids=json.dumps(data_lineage_ids) if data_lineage_ids else None,
         signal_identity_hash=signal_identity_hash,
         intended_entry_price=intended_entry_price,
+        forward_return_status=forward_return_status,
     )
     session.add(sig)
     session.flush()

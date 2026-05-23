@@ -87,7 +87,6 @@ def persist_detection_result(
                     SignalRegistry.pattern_id == result.pattern_id,
                     SignalRegistry.ticker == result.ticker,
                     SignalRegistry.signal_identity_hash == signal_identity_hash,
-                    SignalRegistry.signal_status == sig.signal_status,
                 )
                 .scalar()
             )

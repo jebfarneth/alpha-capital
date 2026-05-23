@@ -19,6 +19,13 @@ from sqlalchemy.orm import Session
 from alpha.db.models import SignalRegistry
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 
+RETRYABLE_FORWARD_RETURN_STATUSES = (
+    "pending",
+    "pricing_unavailable_retry",
+    "invalid_entry_price_retry",
+    "missing_exit_price_retry",
+)
+
 
 class ForwardReturnJob(BaseJob):
     """Populate forward_return for mature signal firings."""
@@ -53,9 +60,8 @@ class ForwardReturnJob(BaseJob):
         pending = (
             self._session.query(SignalRegistry)
             .filter(
-                (SignalRegistry.forward_return_status == "pending")
-                | (SignalRegistry.forward_return_status == "pricing_unavailable_retry")
-                | (SignalRegistry.forward_return_status.is_(None))
+                SignalRegistry.forward_return_status.in_(RETRYABLE_FORWARD_RETURN_STATUSES)
+                | SignalRegistry.forward_return_status.is_(None)
             )
             .all()
         )
@@ -64,17 +70,33 @@ class ForwardReturnJob(BaseJob):
         unavailable = 0
         retryable_unavailable = 0
         immature = 0
+        pricing_errors = 0
 
         for sig in pending:
-            if self._maturity_fn and not self._maturity_fn(
-                sig.signal_timestamp, sig.signal_horizon
-            ):
-                immature += 1
+            try:
+                if self._maturity_fn and not self._maturity_fn(
+                    sig.signal_timestamp, sig.signal_horizon
+                ):
+                    immature += 1
+                    continue
+            except Exception as exc:
+                sig.forward_return_status = "pricing_unavailable_retry"
+                sig.outcome_unavailable_reason = f"maturity_fn_error:{type(exc).__name__}"
+                retryable_unavailable += 1
+                pricing_errors += 1
                 continue
 
-            prices = self._price_fn(
-                sig.ticker, sig.signal_timestamp, sig.signal_horizon
-            )
+            try:
+                prices = self._price_fn(
+                    sig.ticker, sig.signal_timestamp, sig.signal_horizon
+                )
+            except Exception as exc:
+                sig.forward_return_status = "pricing_unavailable_retry"
+                sig.outcome_unavailable_reason = f"price_fn_error:{type(exc).__name__}"
+                retryable_unavailable += 1
+                pricing_errors += 1
+                continue
+
             if prices is None:
                 sig.forward_return_status = "pricing_unavailable_retry"
                 sig.outcome_unavailable_reason = "pricing_unavailable"
@@ -84,20 +106,21 @@ class ForwardReturnJob(BaseJob):
             entry_price, exit_price = prices
 
             if entry_price is None or entry_price <= 0:
-                sig.forward_return_status = "outcome_unavailable"
+                sig.forward_return_status = "invalid_entry_price_retry"
                 sig.outcome_unavailable_reason = "invalid_entry_price"
-                unavailable += 1
+                retryable_unavailable += 1
                 continue
 
             if exit_price is None:
-                sig.forward_return_status = "outcome_unavailable"
+                sig.forward_return_status = "missing_exit_price_retry"
                 sig.outcome_unavailable_reason = "missing_exit_price"
-                unavailable += 1
+                retryable_unavailable += 1
                 continue
 
             sig.intended_entry_price = entry_price
             sig.forward_return = (exit_price - entry_price) / entry_price
             sig.forward_return_status = "computed"
+            sig.outcome_unavailable_reason = None
             computed += 1
 
         self._session.flush()
@@ -110,5 +133,6 @@ class ForwardReturnJob(BaseJob):
                 "unavailable": unavailable,
                 "retryable_unavailable": retryable_unavailable,
                 "immature": immature,
+                "pricing_errors": pricing_errors,
             },
         )
