@@ -67,30 +67,130 @@ MAX_DAYS_SINCE_LAST_FILING = 20  # filing must be within 20 calendar days
 CLUSTER_WINDOW_DAYS = 30  # trailing 30 calendar days for cluster detection
 DECAY_TAU = 10.0  # exp(-days / 10) filing-detection decay
 LIVE_SOURCE_AUTHORITIES = {"sec_edgar", "fmp_backfill"}
+MISSING_TRADE_INTENSITY_DEFAULT = 0.75
+OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT = 0.75
+SHADOW_DECAY_TAUS = (5.0, 10.0, 15.0)
+ROLE_SHADOW_PRIOR_WEIGHTS = {
+    "unknown": 1.0,
+    "ten_percent_holder": 1.0,
+    "director": 1.0,
+    "other_officer": 1.10,
+    "c_suite": 1.20,
+}
+ROLE_SHADOW_SENIORITY = {
+    "unknown": 0,
+    "ten_percent_holder": 1,
+    "director": 2,
+    "other_officer": 3,
+    "c_suite": 4,
+}
 
 
 # ---------------------------------------------------------------------------
 # Pure computation helpers
 # ---------------------------------------------------------------------------
 
-def _has_accession_proof(value: Any) -> bool:
+def _accession_list(value: Any) -> List[str]:
     if isinstance(value, str):
-        normalized = value.strip().lower()
-        return bool(normalized) and normalized not in {"n/a", "na", "none", "null", "pending"}
+        normalized = value.strip()
+        if normalized and normalized.lower() not in {"n/a", "na", "none", "null", "pending"}:
+            return [normalized]
+        return []
     if isinstance(value, (list, tuple, set)):
-        return any(_has_accession_proof(item) for item in value)
+        accessions: List[str] = []
+        for item in value:
+            accessions.extend(_accession_list(item))
+        return accessions
+    return []
+
+
+def _has_accession_proof(value: Any) -> bool:
+    return bool(_accession_list(value))
+
+
+def _flag_is_true(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 1
     return False
+
+
+def _flatten_role_terms(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        terms: List[str] = []
+        for item in value.values():
+            terms.extend(_flatten_role_terms(item))
+        return terms
+    if isinstance(value, (list, tuple, set)):
+        terms = []
+        for item in value:
+            terms.extend(_flatten_role_terms(item))
+        return terms
+    return []
+
+
+def _classify_role_term(term: str) -> str:
+    normalized = term.lower().replace("-", " ")
+    if "chief executive" in normalized or "chief financial" in normalized or "ceo" in normalized or "cfo" in normalized:
+        return "c_suite"
+    if any(token in normalized for token in (
+        "chief", "officer", "president", "vice president", "vp", "coo", "cto",
+        "treasurer", "secretary",
+    )):
+        return "other_officer"
+    if "director" in normalized:
+        return "director"
+    if any(token in normalized for token in ("10%", "ten percent", "beneficial owner", "owner")):
+        return "ten_percent_holder"
+    return "unknown"
+
+
+def _role_shadow_metadata(insider_roles: Any) -> Dict[str, Any]:
+    tiers = [_classify_role_term(term) for term in _flatten_role_terms(insider_roles)]
+    tier = max(tiers or ["unknown"], key=lambda item: ROLE_SHADOW_SENIORITY[item])
+    return {
+        "insider_role_tier": tier,
+        "insider_role_weight_shadow": ROLE_SHADOW_PRIOR_WEIGHTS[tier],
+        "insider_role_resolution": "max_seniority",
+    }
+
+
+def _filing_age_bucket(days_since: Optional[int]) -> str:
+    if days_since is None:
+        return "missing"
+    if days_since < 0:
+        return "invalid"
+    if days_since <= 2:
+        return "0_2d"
+    if days_since <= 5:
+        return "3_5d"
+    if days_since <= 10:
+        return "6_10d"
+    if days_since <= 20:
+        return "11_20d"
+    return "gt_20d"
 
 
 def compute_x_m2(
     days_since_last_filing: int,
     n_distinct_opp_buyers: int,
     mean_trade_intensity_weight: float,
+    decay_tau: float = DECAY_TAU,
 ) -> float:
     """Per EXPOSURE.md: capped at 3.0."""
-    if days_since_last_filing < 0 or n_distinct_opp_buyers < 1 or mean_trade_intensity_weight <= 0:
+    if (
+        days_since_last_filing < 0
+        or n_distinct_opp_buyers < 1
+        or mean_trade_intensity_weight <= 0
+        or decay_tau <= 0
+    ):
         return 0.0
-    decay = math.exp(-days_since_last_filing / DECAY_TAU)
+    decay = math.exp(-days_since_last_filing / decay_tau)
     cluster_size = math.log(1 + n_distinct_opp_buyers) / math.log(3)
     raw = decay * cluster_size * mean_trade_intensity_weight
     return min(raw, X_M2_CAP)
@@ -129,6 +229,7 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any])
             "insider_roles", "filing_lag_days", "sec_vs_fmp_latency",
             "source_authority", "sec_accession_numbers", "sec_fmp_mismatch",
             "cluster_window_days", "identity_resolution_method", "identity_resolution_confidence",
+            "m2_cluster_id", "m2_cluster_signature_hash",
             "exchange", "sector_stress_indicator", "hamilton_regime_prob",
             "last_opp_buy_transaction_date", "last_opp_buy_filing_detected_at", "max_filing_lag_days",
             "cluster_notional_usd", "routine_trades_30d", "unclassifiable_buyers_30d",
@@ -185,12 +286,25 @@ def _enrich_m2_signal(
     n_unclassifiable_only = integral_int(md.get("n_unclassifiable_only_buyers_30d"))
     routine_trades = integral_int(md.get("routine_trades_30d"))
     unclassifiable_buyers = integral_int(md.get("unclassifiable_buyers_30d"))
+    role_meta = _role_shadow_metadata(md.get("insider_roles"))
     cluster_window_days = integral_int(md.get("cluster_window_days"))
     source_authority = md.get("source_authority")
     sec_accession_numbers = md.get("sec_accession_numbers")
     sec_fmp_mismatch = md.get("sec_fmp_mismatch")
+    accession_proof = _accession_list(sec_accession_numbers)
+    m2_cluster_id = md.get("m2_cluster_id")
+    m2_cluster_signature_hash = md.get("m2_cluster_signature_hash")
+    if m2_cluster_signature_hash is None and accession_proof:
+        m2_cluster_signature_hash = stable_hash({
+            "ticker": inp.ticker,
+            "source_authority": source_authority,
+            "sec_accession_numbers": sorted(set(accession_proof)),
+            "cluster_window_days": cluster_window_days,
+        })
+    if m2_cluster_id is None:
+        m2_cluster_id = m2_cluster_signature_hash
     m1_combined_signal_window = md.get("m1_combined_signal_window")
-    if m1_combined_signal_window is None and md.get("m1_also_firing") is True:
+    if m1_combined_signal_window is None and _flag_is_true(md.get("m1_also_firing")):
         m1_combined_signal_window = True
     opportunistic_sell_cluster = md.get("opportunistic_sell_cluster_30d")
     if opportunistic_sell_cluster is None:
@@ -202,12 +316,18 @@ def _enrich_m2_signal(
     feat_dict["cluster_window_days"] = cluster_window_days
     feat_dict["source_authority"] = source_authority
     feat_dict["sec_accession_numbers"] = sec_accession_numbers
+    feat_dict["m2_cluster_id"] = m2_cluster_id
+    feat_dict["m2_cluster_signature_hash"] = m2_cluster_signature_hash
     feat_dict["sec_fmp_mismatch"] = sec_fmp_mismatch
     feat_dict["mean_trade_size_weight"] = round(mean_trade_size_weight, 6) if mean_trade_size_weight is not None else None
     feat_dict["mean_locality_weight"] = round(mean_locality_weight, 6) if mean_locality_weight is not None else None
     feat_dict["mean_trade_intensity_weight"] = round(mean_intensity, 6) if mean_intensity is not None else None
     feat_dict["n_routine_only_buyers_30d"] = n_routine_only
     feat_dict["n_unclassifiable_only_buyers_30d"] = n_unclassifiable_only
+    feat_dict.update(role_meta)
+    feat_dict["decay_tau_used"] = DECAY_TAU
+    feat_dict["decay_shape_family"] = "exponential"
+    feat_dict["filing_age_bucket"] = _filing_age_bucket(days_since)
     feat_dict["routine_trades_30d"] = routine_trades if routine_trades is not None else n_routine_only
     feat_dict["unclassifiable_buyers_30d"] = (
         unclassifiable_buyers if unclassifiable_buyers is not None else n_unclassifiable_only
@@ -248,17 +368,19 @@ def _enrich_m2_signal(
     if mean_intensity is None or mean_intensity <= 0:
         if mean_intensity is not None and mean_intensity <= 0:
             quality_flags["invalid_trade_intensity"] = True
-        mean_intensity = 1.0
+        mean_intensity = MISSING_TRADE_INTENSITY_DEFAULT
         quality_flags["missing_trade_intensity"] = True
-        warnings.append("trade intensity unavailable or invalid — defaulting to 1.0")
-        feat_dict["mean_trade_intensity_weight"] = 1.0
+        warnings.append(
+            f"trade intensity unavailable or invalid — defaulting to {MISSING_TRADE_INTENSITY_DEFAULT}"
+        )
+        feat_dict["mean_trade_intensity_weight"] = MISSING_TRADE_INTENSITY_DEFAULT
 
     # Gate: minimum 2 classified opportunistic buyers
     if n_opp_buyers < MIN_OPP_BUYERS:
         if (n_routine_only or 0) > 0 or (n_unclassifiable_only or 0) > 0:
-            _reject_signal(feat_dict, "insufficient_opportunistic_buyers")
+            _reject_signal(feat_dict, "diluted_by_routine_or_unclassifiable")
         else:
-            _reject_signal(feat_dict, "insufficient_opportunistic_buyers")
+            _reject_signal(feat_dict, "no_opportunistic_cluster_present")
         return None
 
     # Gate: filing freshness (production clock is filing_detected_at, NOT transaction_date)
@@ -278,7 +400,24 @@ def _enrich_m2_signal(
     feat_dict["days_since_last_opp_buy_transaction"] = txn_days
 
     # Compute exposure
+    sell_cluster_haircut = (
+        OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT if _flag_is_true(opportunistic_sell_cluster) else 1.0
+    )
+    for tau in SHADOW_DECAY_TAUS:
+        tau_label = str(int(tau))
+        feat_dict[f"decay_multiplier_tau_{tau_label}"] = round(math.exp(-days_since / tau), 6)
+        feat_dict[f"x_m2_shadow_tau_{tau_label}"] = round(
+            compute_x_m2(days_since, n_opp_buyers, mean_intensity, decay_tau=tau) * sell_cluster_haircut,
+            6,
+        )
+
     x_m2 = compute_x_m2(days_since, n_opp_buyers, mean_intensity)
+    feat_dict["pre_sell_cluster_exposure_x_m2"] = round(x_m2, 6)
+    if sell_cluster_haircut != 1.0:
+        quality_flags["opportunistic_sell_cluster_present"] = True
+        warnings.append("opportunistic sell cluster present — applying M2 edge haircut")
+        feat_dict["opportunistic_sell_cluster_haircut"] = sell_cluster_haircut
+        x_m2 *= sell_cluster_haircut
     feat_dict["exposure_x_m2"] = round(x_m2, 6)
 
     if x_m2 <= 0:

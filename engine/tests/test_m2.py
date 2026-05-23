@@ -32,10 +32,13 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.evidence_bridge import persist_detection_result
 from alpha.patterns.m2 import (
+    DECAY_TAU,
     LAMBDA_M2_20TD,
     LAMBDA_M2_MONTHLY,
     MAX_DAYS_SINCE_LAST_FILING,
+    MISSING_TRADE_INTENSITY_DEFAULT,
     MIN_OPP_BUYERS,
+    OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT,
     X_M2_CAP,
     M2Detector,
     compute_x_m2,
@@ -98,8 +101,11 @@ class TestM2Metadata:
 
     def test_vault_constants(self):
         assert LAMBDA_M2_MONTHLY == 0.0082
+        assert DECAY_TAU == 10.0
         assert MIN_OPP_BUYERS == 2
         assert MAX_DAYS_SINCE_LAST_FILING == 20
+        assert MISSING_TRADE_INTENSITY_DEFAULT == 0.75
+        assert OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT == 0.75
         assert X_M2_CAP == 3.0
         assert abs(LAMBDA_M2_20TD - 0.0082 * 20 / 21) < 1e-10
 
@@ -230,7 +236,7 @@ class TestM2Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         assert result.signals[0].data_confidence == 1.0
 
-    def test_missing_intensity_defaults_neutral(self):
+    def test_missing_intensity_defaults_conservative(self):
         det = M2Detector()
         data = _firing_data()
         del data["mean_trade_size_weight"]
@@ -238,7 +244,7 @@ class TestM2Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.quality_flags["missing_trade_intensity"] is True
-        assert result.features.features["mean_trade_intensity_weight"] == 1.0
+        assert result.features.features["mean_trade_intensity_weight"] == MISSING_TRADE_INTENSITY_DEFAULT
         assert result.signals[0].data_confidence < 1.0
 
     def test_vault_size_and_locality_weights_drive_intensity(self):
@@ -270,6 +276,77 @@ class TestM2Firing:
         assert result.has_signal
         assert result.features.features["mean_trade_intensity_weight"] == 1.4
 
+    def test_role_shadow_metadata_uses_max_seniority_without_changing_edge(self):
+        det = M2Detector()
+        base = _firing_data()
+        with_roles = _firing_data()
+        with_roles["insider_roles"] = ["Director", "Chief Executive Officer", "10% Owner"]
+        r_base = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=base, lineage_hashes=["h"]))
+        r_roles = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=with_roles, lineage_hashes=["h"]))
+        f = r_roles.features.features
+        assert r_roles.has_signal
+        assert f["insider_role_tier"] == "c_suite"
+        assert f["insider_role_weight_shadow"] == 1.2
+        assert f["insider_role_resolution"] == "max_seniority"
+        assert r_roles.signals[0].raw_expected_edge == r_base.signals[0].raw_expected_edge
+
+    def test_role_shadow_metadata_handles_dict_values_only(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["insider_roles"] = {"owner1": ["Director"], "owner2": ["VP Finance"]}
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["insider_role_tier"] == "other_officer"
+
+    def test_decay_shape_shadow_fields_do_not_change_production_edge(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["days_since_last_opp_buy_filing_detected"] = 5
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["decay_tau_used"] == DECAY_TAU
+        assert f["decay_shape_family"] == "exponential"
+        assert f["filing_age_bucket"] == "3_5d"
+        assert f["x_m2_shadow_tau_5"] < f["x_m2_shadow_tau_10"] < f["x_m2_shadow_tau_15"]
+        assert f["x_m2_shadow_tau_10"] == f["exposure_x_m2"]
+
+    def test_cluster_signature_hash_is_stable_across_accession_order(self):
+        det = M2Detector()
+        d1 = _firing_data()
+        d2 = _firing_data()
+        d2["sec_accession_numbers"] = list(reversed(d1["sec_accession_numbers"]))
+        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d1, lineage_hashes=["h"]))
+        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d2, lineage_hashes=["h"]))
+        assert r1.has_signal
+        assert r2.has_signal
+        assert r1.features.features["m2_cluster_signature_hash"] == r2.features.features["m2_cluster_signature_hash"]
+        assert r1.features.features["m2_cluster_id"] == r1.features.features["m2_cluster_signature_hash"]
+
+    def test_provided_cluster_id_is_preserved_for_dedup(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["m2_cluster_id"] = "issuer-0001-window-2026-05-20"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["m2_cluster_id"] == "issuer-0001-window-2026-05-20"
+        assert result.features.features["m2_cluster_signature_hash"]
+
+    def test_opportunistic_sell_cluster_haircuts_exposure_not_signal(self):
+        det = M2Detector()
+        clean = _firing_data()
+        conflicted = _firing_data()
+        conflicted["opportunistic_sell_cluster_30d"] = True
+        r_clean = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=clean, lineage_hashes=["h"]))
+        r_conflicted = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=conflicted, lineage_hashes=["h"]))
+        assert r_clean.has_signal
+        assert r_conflicted.has_signal
+        pre = r_conflicted.features.features["pre_sell_cluster_exposure_x_m2"]
+        assert r_conflicted.features.features["opportunistic_sell_cluster_haircut"] == OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT
+        assert r_conflicted.features.features["exposure_x_m2"] == round(pre * OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT, 6)
+        assert r_conflicted.signals[0].raw_expected_edge < r_clean.signals[0].raw_expected_edge
+        assert r_conflicted.quality_flags["opportunistic_sell_cluster_present"] is True
+
 
 # -----------------------------------------------------------------------
 # No-signal / rejection cases
@@ -282,15 +359,16 @@ class TestM2NoSignal:
         data["n_distinct_opp_buyers_30d"] = 1
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
-        assert result.features.features["rejection_reason"] == "insufficient_opportunistic_buyers"
+        assert result.features.features["rejection_reason"] == "diluted_by_routine_or_unclassifiable"
 
     def test_0_buyers_rejected(self):
         det = M2Detector()
         data = _firing_data()
         data["n_distinct_opp_buyers_30d"] = 0
+        data["n_unclassifiable_only_buyers_30d"] = 0
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
-        assert result.features.features["rejection_reason"] == "insufficient_opportunistic_buyers"
+        assert result.features.features["rejection_reason"] == "no_opportunistic_cluster_present"
 
     def test_stale_filing_rejected(self):
         det = M2Detector()
@@ -316,7 +394,7 @@ class TestM2NoSignal:
         data["n_routine_only_buyers_30d"] = 3
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
-        assert result.features.features["rejection_reason"] == "insufficient_opportunistic_buyers"
+        assert result.features.features["rejection_reason"] == "diluted_by_routine_or_unclassifiable"
 
     def test_unclassifiable_only_cluster_rejected(self):
         det = M2Detector()
@@ -363,7 +441,7 @@ class TestM2NoSignal:
         data["mean_trade_size_weight"] = "N/A"
         data["mean_locality_weight"] = "N/A"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
-        assert result.has_signal  # defaults to 1.0
+        assert result.has_signal  # defaults to conservative shadow-safe intensity
 
     def test_invalid_cluster_window_rejected(self):
         det = M2Detector()
