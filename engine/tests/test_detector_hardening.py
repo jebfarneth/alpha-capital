@@ -20,6 +20,7 @@ from alpha.patterns.m1 import (
     M1Detector,
     compute_remaining_decay_integrated_avg,
 )
+from alpha.patterns.m3 import LAMBDA_M3_15TD, M3Detector
 from alpha.patterns.m4 import LAMBDA_M4_15TD, M4Detector
 from alpha.patterns.m5 import LAMBDA_M5_7TD, M5Detector
 from alpha.patterns.m6 import LAMBDA_M6_12TD, M6Detector
@@ -112,6 +113,13 @@ class TestStringCrashProtection:
     def test_i1_survives_string_prev_close(self):
         det = I1Detector()
         data = {"prev_close": "N/A", "open_price": 4.22, "sigma_20d": 0.025}
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features is None
+
+    def test_m3_survives_string_sector_return(self):
+        det = M3Detector()
+        data = {"sector": "Energy", "sector_return_6mo": "N/A", "sector_rank_normalized": 0.95, "operating_universe_inclusion": True}
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features is None
@@ -211,6 +219,10 @@ class TestHelperStringCrashProtection:
 # -----------------------------------------------------------------------
 
 class TestConstructorValidation:
+    def test_m3_rejects_nan_lambda(self):
+        with pytest.raises(ValueError, match="lambda_m3_15td"):
+            M3Detector(lambda_m3_15td=float("nan"))
+
     def test_m4_rejects_nan_lambda(self):
         with pytest.raises(ValueError, match="lambda_m4_15td"):
             M4Detector(lambda_m4_15td=float("nan"))

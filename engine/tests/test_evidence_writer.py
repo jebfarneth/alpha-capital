@@ -184,7 +184,14 @@ class TestCandidatePersistence:
             trade_decision="enter",
             input_signal_ids=[sig.signal_id],
             active_patterns=["M4"],
+            effective_hard_stop_pct=0.06,
+            base_risk_budget_pct=0.01,
+            risk_budget_pct=0.0049,
+            risk_multiplier_product=0.49,
+            risk_sized_cap=0.0817,
+            unstopped_heat_pct=None,
             expected_round_trip_cost=0.012,
+            cost_to_edge_ratio=0.20,
             missed_fill_adjustment=0.003,
             optimizer_input_expected_edge=0.045,
             validation_weight_multiplier=1.0,
@@ -208,6 +215,13 @@ class TestCandidatePersistence:
         assert stored.skip_reason is None
         assert stored.optimizer_input_expected_edge == 0.045
         assert stored.validation_weight_multiplier == 1.0
+        assert stored.effective_hard_stop_pct == 0.06
+        assert stored.base_risk_budget_pct == 0.01
+        assert stored.risk_budget_pct == 0.0049
+        assert stored.risk_multiplier_product == 0.49
+        assert stored.risk_sized_cap == 0.0817
+        assert stored.unstopped_heat_pct is None
+        assert stored.cost_to_edge_ratio == 0.20
         assert stored.max_position_pct == 0.40
         assert stored.catalyst_cluster == "earnings_momentum"
 
@@ -557,7 +571,33 @@ class TestSchemaCompleteness:
         engine = create_engine(f"sqlite:///{db_path}")
         try:
             tables = set(inspect(engine).get_table_names())
+            columns = {
+                table: {col["name"] for col in inspect(engine).get_columns(table)}
+                for table in ("trade_candidates", "shadow_positions", "real_positions")
+            }
         finally:
             engine.dispose()
 
         assert set(Base.metadata.tables.keys()) <= tables
+        assert {
+            "effective_hard_stop_pct",
+            "base_risk_budget_pct",
+            "risk_budget_pct",
+            "risk_multiplier_product",
+            "risk_sized_cap",
+            "unstopped_heat_pct",
+            "cost_to_edge_ratio",
+        } <= columns["trade_candidates"]
+        assert {
+            "forward_return",
+            "fill_status",
+            "intended_entry_price",
+            "realized_entry_price",
+            "execution_capture_gap",
+        } <= columns["shadow_positions"]
+        assert {
+            "fill_status",
+            "intended_entry_price",
+            "realized_entry_price",
+            "execution_capture_gap",
+        } <= columns["real_positions"]
