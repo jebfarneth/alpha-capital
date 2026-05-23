@@ -58,6 +58,7 @@ from alpha.patterns.guards import (
     copy_fields,
     classify_fidelity,
     compute_data_confidence,
+    finite_float,
     market_data_quality_rejection,
     operating_universe_rejection,
     quote_rejection,
@@ -87,6 +88,10 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "hamilton_regime_prob",
     "hazard_score_at_signal",
     "filing_veto_status",
+    "m3_also_firing",
+    "m5_also_firing",
+    "m6_also_firing",
+    "overlapping_pattern_ids",
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
@@ -125,9 +130,10 @@ def build_m4_source_features(
     """Build the full source_features dict: exposure + diagnostics + enrichment."""
     features = compute_m4_features(price, high_52w)
     market_cap = inp.fundamental_data.get("market_cap")
-    if market_cap is not None:
-        features["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
-        features["sub_universe"] = "A" if float(market_cap) < 80_000_000 else "B"
+    market_cap_f = finite_float(market_cap) if market_cap is not None else None
+    if market_cap_f is not None:
+        features["market_cap_mm"] = round(market_cap_f / 1e6, 1)
+        features["sub_universe"] = "A" if market_cap_f < 80_000_000 else "B"
     for key in ("sector", "industry"):
         if key in inp.fundamental_data:
             features[key] = inp.fundamental_data[key]
@@ -194,8 +200,8 @@ def compute_cohort_metadata(
 
 def _cohort_extension_value(item: Any) -> float:
     if isinstance(item, dict):
-        return float(item.get("breakout_extension", item.get("extension", 0.0)))
-    return float(item)
+        return finite_float(item.get("breakout_extension", item.get("extension", 0.0))) or 0.0
+    return finite_float(item) or 0.0
 
 
 def _cohort_records(cohort_extensions: List[Any]) -> List[Dict[str, Any]]:
@@ -205,12 +211,12 @@ def _cohort_records(cohort_extensions: List[Any]) -> List[Dict[str, Any]]:
             records.append({
                 "ticker": str(item.get("ticker", "")),
                 "extension": _cohort_extension_value(item),
-                "median_dollar_volume_20d": float(item.get("median_dollar_volume_20d", 0.0)),
+                "median_dollar_volume_20d": finite_float(item.get("median_dollar_volume_20d", 0.0)) or 0.0,
                 "signal_timestamp": str(item.get("signal_timestamp", "")),
             })
         else:
             records.append({
-                "ticker": "", "extension": float(item),
+                "ticker": "", "extension": finite_float(item) or 0.0,
                 "median_dollar_volume_20d": 0.0, "signal_timestamp": "",
             })
     return records
@@ -261,6 +267,7 @@ def _enrich_base_daily_breakout(
     cohort_extensions: List[Any] | None,
     warnings: List[str],
     quality_flags: Dict[str, Any],
+    lambda_15td: float = LAMBDA_M4_15TD,
 ) -> PatternSignal:
     """
     Enrich feat_dict with cohort metadata, tier, and priors for a base_daily
@@ -286,9 +293,14 @@ def _enrich_base_daily_breakout(
 
     # Expected-return priors
     x_m4 = feat_dict["X_M4"]
-    raw_expected_edge = round(x_m4 * LAMBDA_M4_15TD, 6)
+    raw_expected_edge = round(x_m4 * lambda_15td, 6)
     feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
-    feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
+    feat_dict["validated_or_shadow_lambda_M4_15td"] = lambda_15td
+    feat_dict["lambda_M4_15td"] = round(lambda_15td, 8)
+    feat_dict["lambda_M4_default_15td"] = round(LAMBDA_M4_15TD, 8)
+    feat_dict["lambda_M4_source"] = (
+        "shadow_prior" if lambda_15td == LAMBDA_M4_15TD else "validated_or_injected"
+    )
     feat_dict["expected_return_priors"] = {
         "tier": tier,
         "gross_bps": round(raw_expected_edge * 10_000, 2),
@@ -368,10 +380,16 @@ def _build_fresh_watchlist_signal(
 def _build_fresh_activation_signal(
     inp: PatternInput, feat_dict: Dict[str, Any], x_fresh: float,
     quality_flags: Dict[str, Any],
+    lambda_15td: float = LAMBDA_M4_15TD,
 ) -> PatternSignal:
-    raw_expected_edge = round(x_fresh * LAMBDA_M4_15TD, 6)
+    raw_expected_edge = round(x_fresh * lambda_15td, 6)
     feat_dict["lambda_M4_monthly"] = LAMBDA_M4_MONTHLY
-    feat_dict["lambda_M4_15td"] = round(LAMBDA_M4_15TD, 8)
+    feat_dict["validated_or_shadow_lambda_M4_15td"] = lambda_15td
+    feat_dict["lambda_M4_15td"] = round(lambda_15td, 8)
+    feat_dict["lambda_M4_default_15td"] = round(LAMBDA_M4_15TD, 8)
+    feat_dict["lambda_M4_source"] = (
+        "shadow_prior" if lambda_15td == LAMBDA_M4_15TD else "validated_or_injected"
+    )
     feat_dict["expected_return_priors"] = {
         "tier": "default", "entry_lane": ENTRY_LANE_FRESH,
         "gross_bps": round(raw_expected_edge * 10_000, 2),
@@ -433,6 +451,12 @@ class M4Detector(BasePatternDetector):
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.A
 
+    def __init__(self, lambda_m4_15td: float = LAMBDA_M4_15TD):
+        parsed = finite_float(lambda_m4_15td)
+        if parsed is None or parsed <= 0:
+            raise ValueError("lambda_m4_15td must be finite and positive")
+        self._lambda_m4_15td = parsed
+
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
@@ -449,11 +473,13 @@ class M4Detector(BasePatternDetector):
             warnings.append("missing required price or high_52w")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        price, high_52w = float(price), float(high_52w)
-        if not math.isfinite(price) or not math.isfinite(high_52w) or high_52w <= 0 or price <= 0:
-            warnings.append(f"invalid price={price} or high_52w={high_52w}")
+        price_f = finite_float(price)
+        high_52w_f = finite_float(high_52w)
+        if price_f is None or high_52w_f is None or high_52w_f <= 0 or price_f <= 0:
+            warnings.append(f"invalid price or high_52w")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
+        price, high_52w = price_f, high_52w_f
         feat_dict = build_m4_source_features(inp, price=price, high_52w=high_52w, entry_lane=entry_lane)
 
         pit_passed = quality_flags.get("point_in_time_passed") is not False
@@ -487,6 +513,7 @@ class M4Detector(BasePatternDetector):
         elif breakout:
             sig = _enrich_base_daily_breakout(
                 feat_dict, inp, inp.market_data.get("cohort_extensions"), warnings, quality_flags,
+                lambda_15td=self._lambda_m4_15td,
             )
             feat_dict["signal_generated"] = True
             signals.append(sig)
@@ -547,27 +574,39 @@ class M4Detector(BasePatternDetector):
         feat_dict["activation_identity_passed"] = identity_passed
         feat_dict["quote_capture_passed"] = quote_rej is None
 
-        last_price = float(inp.market_data.get("last_price", inp.market_data.get("price", 0.0)))
-        range_conf = float(inp.market_data.get("intraday_range_confirmation", 0.0))
-        vol_conf = float(inp.market_data.get("intraday_volume_confirmation", 0.0))
+        last_price = finite_float(inp.market_data.get("last_price", inp.market_data.get("price")))
+        range_conf = finite_float(inp.market_data.get("intraday_range_confirmation", 0.0))
+        vol_conf = finite_float(inp.market_data.get("intraday_volume_confirmation", 0.0))
+        if last_price is None:
+            quality_flags["invalid_fresh_last_price"] = True
+            warnings.append("invalid last_price for M4 fresh activation")
+        if range_conf is None:
+            quality_flags["invalid_range_confirmation"] = True
+            warnings.append("invalid intraday_range_confirmation for M4 fresh activation")
+            range_conf = 0.0
+        if vol_conf is None:
+            quality_flags["invalid_volume_confirmation"] = True
+            warnings.append("invalid intraday_volume_confirmation for M4 fresh activation")
+            vol_conf = 0.0
         spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
+        spread_pct_float = finite_float(spread_pct) if spread_pct is not None else None
         spread_passed = (
             inp.market_data.get("spread_discipline_passed") is True
             if "spread_discipline_passed" in inp.market_data
-            else spread_pct is not None and float(spread_pct) <= FRESH_SPREAD_CAP
+            else spread_pct_float is not None and spread_pct_float <= FRESH_SPREAD_CAP
         )
         freshness_passed = inp.market_data.get("signal_freshness_passed") is True
 
         fresh = compute_m4_fresh_features(
-            last_price=last_price, high_52w=feat_dict["H_52w"],
+            last_price=last_price or 0.0, high_52w=feat_dict["H_52w"],
             intraday_range_confirmation=range_conf, intraday_volume_confirmation=vol_conf,
         )
         feat_dict.update(fresh)
         feat_dict["last_price"] = last_price
-        feat_dict["fresh_high_break_passed"] = last_price > feat_dict["H_52w"]
+        feat_dict["fresh_high_break_passed"] = last_price is not None and last_price > feat_dict["H_52w"]
         feat_dict["range_confirmation_passed"] = range_conf >= 1.0
         feat_dict["volume_confirmation_passed"] = vol_conf >= 1.0
-        feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
+        feat_dict["spread_pct_vs_eval_quote"] = spread_pct_float
         feat_dict["spread_discipline_passed"] = spread_passed
         feat_dict["signal_freshness_passed"] = freshness_passed
 
@@ -590,4 +629,4 @@ class M4Detector(BasePatternDetector):
 
         x_fresh = fresh["x_m4_fresh"]
         feat_dict["signal_generated"] = True
-        signals.append(_build_fresh_activation_signal(inp, feat_dict, x_fresh, quality_flags))
+        signals.append(_build_fresh_activation_signal(inp, feat_dict, x_fresh, quality_flags, lambda_15td=self._lambda_m4_15td))

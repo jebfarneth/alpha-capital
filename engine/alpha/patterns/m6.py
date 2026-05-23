@@ -58,6 +58,7 @@ from alpha.patterns.guards import (
     copy_fields,
     classify_fidelity,
     compute_data_confidence as compute_quality_confidence,
+    finite_float,
     market_data_quality_rejection,
     operating_universe_rejection,
     quote_rejection,
@@ -142,11 +143,16 @@ def compute_expansion_ratio(
     return math.log(session_high / session_low) / math.sqrt(gk_avg_5d)
 
 
-def compute_m6_data_confidence(gk_warning: bool, quality_flags: Dict[str, Any]) -> float:
+def compute_m6_data_confidence(
+    gk_warning: bool,
+    quality_flags: Dict[str, Any],
+    *,
+    field_confidence_sources: Optional[tuple] = None,
+) -> float:
     flags = dict(quality_flags)
     if gk_warning:
         flags["gk_low_transaction_warning"] = True
-    return compute_quality_confidence(flags)
+    return compute_quality_confidence(flags, field_confidence_sources=field_confidence_sources)
 
 
 def compute_effective_volume_confirmation(
@@ -228,9 +234,16 @@ def _set_expansion_features(
     exp_ratio = None
     exp_conf = 1.0
     if session_high is not None and session_low is not None and gk_avg_5d is not None:
-        exp_ratio = compute_expansion_ratio(float(session_high), float(session_low), float(gk_avg_5d))
+        session_high_f = finite_float(session_high)
+        session_low_f = finite_float(session_low)
+        gk_avg_5d_f = finite_float(gk_avg_5d)
+        if session_high_f is not None and session_low_f is not None and gk_avg_5d_f is not None:
+            exp_ratio = compute_expansion_ratio(session_high_f, session_low_f, gk_avg_5d_f)
         if exp_ratio is not None:
             exp_conf = compute_expansion_confirmation(exp_ratio)
+        else:
+            quality_flags["missing_expansion_data"] = True
+            warnings.append("invalid session_high/session_low/gk_avg_5d for expansion confirmation")
     else:
         quality_flags["missing_expansion_data"] = True
         warnings.append("missing session_high/session_low/gk_avg_5d for expansion confirmation")
@@ -254,15 +267,18 @@ def _set_volume_features(
     cumulative_vol_conf = None
     vol_ratio = None
     if cumulative_volume is not None and expected_tod_volume is not None:
-        cv, ev = float(cumulative_volume), float(expected_tod_volume)
-        if ev > 0:
+        cv, ev = finite_float(cumulative_volume), finite_float(expected_tod_volume)
+        if cv is not None and ev is not None and ev > 0:
             vol_ratio = cv / ev
             cumulative_vol_conf = compute_volume_confirmation(vol_ratio)
+        else:
+            quality_flags["missing_volume_data"] = True
+            warnings.append("invalid cumulative_volume/expected_tod_volume for volume confirmation")
     else:
         quality_flags["missing_volume_data"] = True
         warnings.append("missing cumulative_volume/expected_tod_volume for volume confirmation")
 
-    latest_5m_ratio = float(latest_5m_volume_ratio) if latest_5m_volume_ratio is not None else None
+    latest_5m_ratio = finite_float(latest_5m_volume_ratio) if latest_5m_volume_ratio is not None else None
     latest_5m_vol_conf = compute_volume_confirmation(latest_5m_ratio) if latest_5m_ratio is not None else None
     vol_conf = compute_effective_volume_confirmation(vol_ratio, latest_5m_ratio)
     feat_dict["intraday_volume_ratio"] = round(vol_ratio, 6) if vol_ratio is not None else None
@@ -283,10 +299,11 @@ def _set_execution_gate_features(
     identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
+    spread_pct_float = finite_float(spread_pct) if spread_pct is not None else None
     spread_passed = (
         inp.market_data.get("spread_discipline_passed") is True
         if "spread_discipline_passed" in inp.market_data
-        else spread_pct is not None and float(spread_pct) <= SPREAD_CAP
+        else spread_pct_float is not None and spread_pct_float <= SPREAD_CAP
     )
     (
         source_freshness_passed,
@@ -297,7 +314,7 @@ def _set_execution_gate_features(
 
     feat_dict["activation_identity_passed"] = identity_passed
     feat_dict["quote_capture_passed"] = quote_rej is None
-    feat_dict["spread_pct_vs_eval_quote"] = float(spread_pct) if spread_pct is not None else None
+    feat_dict["spread_pct_vs_eval_quote"] = spread_pct_float
     feat_dict["spread_discipline_passed"] = spread_passed
     feat_dict["signal_freshness_source_passed"] = source_freshness_passed
     feat_dict["watchlist_identity_passed"] = watchlist_identity_passed
@@ -320,9 +337,14 @@ def _set_early_gap_features(
     minutes_since_open = inp.market_data.get("minutes_since_open")
     gk_avg_5d = inp.market_data.get("gk_avg_5d")
 
-    early_session_flag = minutes_since_open is not None and float(minutes_since_open) <= EARLY_GAP_WINDOW_MINUTES
-    gap_breakout_flag = open_price is not None and float(open_price) > compression_high
-    gap_brk_ext = compute_breakout_extension(float(open_price), compression_high, sigma_20d) if open_price is not None else 0.0
+    open_price_f = finite_float(open_price) if open_price is not None else None
+    prior_close_f = finite_float(prior_close) if prior_close is not None else None
+    minutes_since_open_f = finite_float(minutes_since_open) if minutes_since_open is not None else None
+    gk_avg_5d_f = finite_float(gk_avg_5d) if gk_avg_5d is not None else None
+
+    early_session_flag = minutes_since_open_f is not None and minutes_since_open_f <= EARLY_GAP_WINDOW_MINUTES
+    gap_breakout_flag = open_price_f is not None and open_price_f > compression_high
+    gap_brk_ext = compute_breakout_extension(open_price_f, compression_high, sigma_20d) if open_price_f is not None else 0.0
 
     gap_exp_proxy = None
     gap_exp_proxy_available = False
@@ -332,7 +354,7 @@ def _set_early_gap_features(
             gap_exp_proxy_reason = "missing_prior_close"
             quality_flags["missing_prior_close"] = True
             warnings.append("missing prior_close for gap expansion proxy; falling back conservatively")
-        elif float(prior_close) <= 0:
+        elif prior_close_f is None or prior_close_f <= 0:
             gap_exp_proxy_reason = "invalid_prior_close"
             quality_flags["invalid_prior_close"] = True
             warnings.append("invalid prior_close for gap expansion proxy; falling back conservatively")
@@ -340,18 +362,18 @@ def _set_early_gap_features(
             gap_exp_proxy_reason = "missing_gk_avg_5d"
             quality_flags["missing_gk_avg_5d_for_gap_proxy"] = True
             warnings.append("missing gk_avg_5d for gap expansion proxy; falling back conservatively")
-        elif float(gk_avg_5d) <= 0:
+        elif gk_avg_5d_f is None or gk_avg_5d_f <= 0:
             gap_exp_proxy_reason = "invalid_gk_avg_5d"
             quality_flags["invalid_gk_avg_5d_for_gap_proxy"] = True
             warnings.append("invalid gk_avg_5d for gap expansion proxy; falling back conservatively")
-        elif float(open_price) <= float(prior_close):
+        elif open_price_f <= prior_close_f:
             gap_exp_proxy_reason = "non_positive_open_gap"
         else:
-            gap_exp_proxy = math.log(float(open_price) / float(prior_close)) / math.sqrt(float(gk_avg_5d))
+            gap_exp_proxy = math.log(open_price_f / prior_close_f) / math.sqrt(gk_avg_5d_f)
             gap_exp_proxy_available = True
             gap_exp_proxy_reason = "valid"
 
-    feat_dict["prior_close"] = float(prior_close) if prior_close is not None else None
+    feat_dict["prior_close"] = prior_close_f
     feat_dict["gap_expansion_proxy"] = round(gap_exp_proxy, 6) if gap_exp_proxy is not None else None
     feat_dict["gap_expansion_proxy_available"] = gap_exp_proxy_available
     feat_dict["gap_expansion_proxy_reason"] = gap_exp_proxy_reason
@@ -440,15 +462,23 @@ def _build_activation_signal(
     x_m6_activation: float,
     gk_warning: bool,
     quality_flags: Dict[str, Any],
+    lambda_12td: float = LAMBDA_M6_12TD,
+    field_confidence_sources: Optional[tuple] = None,
 ) -> PatternSignal:
-    raw_expected_edge = round(x_m6_activation * LAMBDA_M6_12TD, 6)
+    raw_expected_edge = round(x_m6_activation * lambda_12td, 6)
     signal_strength = round(min(x_m6_activation / X_M6_CAP, 1.0), 6)
 
     feat_dict["activation_state"] = ACTIVATION_STATE_ACTIVATED
     feat_dict["signal_generated"] = True
     feat_dict["lambda_M6_monthly"] = LAMBDA_M6_MONTHLY
     feat_dict["microcap_amplification"] = AMPLIFICATION
-    feat_dict["amplified_lambda_M6_12td"] = round(LAMBDA_M6_12TD, 8)
+    feat_dict["validated_or_shadow_lambda_M6_12td"] = lambda_12td
+    feat_dict["lambda_M6_12td"] = round(lambda_12td, 8)
+    feat_dict["lambda_M6_default_12td"] = round(LAMBDA_M6_12TD, 8)
+    feat_dict["lambda_M6_source"] = (
+        "shadow_prior" if lambda_12td == LAMBDA_M6_12TD else "validated_or_injected"
+    )
+    feat_dict["amplified_lambda_M6_12td"] = round(lambda_12td, 8)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
 
     return PatternSignal(
@@ -457,7 +487,7 @@ def _build_activation_signal(
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
         route_class=RouteClass.C,
-        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
+        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags, field_confidence_sources=field_confidence_sources),
     )
 
 
@@ -470,13 +500,24 @@ def _enrich_m6_activation(
     gk_warning: bool,
     warnings: List[str],
     quality_flags: Dict[str, Any],
+    lambda_12td: float = LAMBDA_M6_12TD,
+    field_confidence_sources: Optional[tuple] = None,
 ) -> Optional[PatternSignal]:
     """
     Compute all activation features and gates for a compressed breakout.
     Returns a PatternSignal if activation passes, else None.
     All activation fields are set on feat_dict here.
     """
-    price = float(inp.market_data["price"])
+    price = finite_float(inp.market_data.get("price"))
+    if price is None or price <= 0:
+        feat_dict["activation_state"] = ACTIVATION_STATE_FAILED
+        feat_dict["activation_passed"] = False
+        feat_dict["activation_failure_reason"] = "breakout_ignition_failed"
+        feat_dict["rejection_reason"] = "breakout_ignition_failed"
+        feat_dict["signal_generated"] = False
+        quality_flags["invalid_activation_price"] = True
+        warnings.append("invalid price for M6 activation")
+        return None
     feat_dict["P_activation"] = price
     copy_fields(feat_dict, inp.market_data, ACTIVATION_DIAGNOSTIC_FIELDS)
 
@@ -528,11 +569,16 @@ def _enrich_m6_activation(
         _set_activation_rejection(feat_dict, brk_ext)
         return None
 
-    return _build_activation_signal(feat_dict, x_m6_activation, gk_warning, quality_flags)
+    return _build_activation_signal(
+        feat_dict, x_m6_activation, gk_warning, quality_flags,
+        lambda_12td=lambda_12td,
+        field_confidence_sources=field_confidence_sources,
+    )
 
 
 def _build_watchlist_signal(
     feat_dict: Dict[str, Any], depth: float, gk_warning: bool, quality_flags: Dict[str, Any],
+    field_confidence_sources: Optional[tuple] = None,
 ) -> PatternSignal:
     """Build a watchlist signal for a compressed setup without activation data."""
     feat_dict["activation_state"] = ACTIVATION_STATE_WATCHLIST
@@ -545,7 +591,7 @@ def _build_watchlist_signal(
         signal_horizon=SIGNAL_HORIZON,
         signal_status="watchlist",
         route_class=RouteClass.C,
-        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags),
+        data_confidence=compute_m6_data_confidence(gk_warning, quality_flags, field_confidence_sources=field_confidence_sources),
     )
 
 
@@ -585,6 +631,12 @@ class M6Detector(BasePatternDetector):
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.C
 
+    def __init__(self, lambda_m6_12td: float = LAMBDA_M6_12TD):
+        parsed = finite_float(lambda_m6_12td)
+        if parsed is None or parsed <= 0:
+            raise ValueError("lambda_m6_12td must be finite and positive")
+        self._lambda_m6_12td = parsed
+
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
@@ -601,22 +653,23 @@ class M6Detector(BasePatternDetector):
             warnings.append("missing required compression features")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        compression_ratio = float(compression_ratio)
-        compression_high = float(compression_high)
-        sigma_20d = float(sigma_20d)
+        compression_ratio_f = finite_float(compression_ratio)
+        compression_high_f = finite_float(compression_high)
+        sigma_20d_f = finite_float(sigma_20d)
 
         if (
-            not math.isfinite(compression_ratio)
-            or not math.isfinite(compression_high)
-            or not math.isfinite(sigma_20d)
-            or compression_high <= 0
-            or sigma_20d <= 0
+            compression_ratio_f is None
+            or compression_high_f is None
+            or sigma_20d_f is None
+            or compression_high_f <= 0
+            or sigma_20d_f <= 0
         ):
-            warnings.append(
-                f"invalid compression_ratio={compression_ratio}, "
-                f"compression_high={compression_high}, or sigma_20d={sigma_20d}"
-            )
+            warnings.append("invalid compression features")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
+
+        compression_ratio = compression_ratio_f
+        compression_high = compression_high_f
+        sigma_20d = sigma_20d_f
 
         depth = compute_compression_depth(compression_ratio)
         gk_vol_5d = inp.market_data.get("gk_vol_5d")
@@ -625,23 +678,25 @@ class M6Detector(BasePatternDetector):
         feat_dict: Dict[str, Any] = {
             "compression_ratio": round(compression_ratio, 6),
             "compression_depth": round(depth, 6),
-            "gk_vol_5d": float(gk_vol_5d) if gk_vol_5d is not None else None,
-            "gk_vol_60d": float(gk_vol_60d) if gk_vol_60d is not None else None,
+            "gk_vol_5d": finite_float(gk_vol_5d) if gk_vol_5d is not None else None,
+            "gk_vol_60d": finite_float(gk_vol_60d) if gk_vol_60d is not None else None,
             "compression_high": compression_high,
             "sigma_20d": sigma_20d,
             "X_M6_setup": round(depth, 6),
         }
         for source in (inp.market_data, inp.fundamental_data, inp.event_data):
-            if "filing_veto_status" in source:
-                feat_dict["filing_veto_status"] = source["filing_veto_status"]
+            for _k in ("filing_veto_status", "m4_also_firing", "m5_also_firing", "overlapping_pattern_ids"):
+                if _k in source:
+                    feat_dict[_k] = source[_k]
         feat_dict.setdefault("filing_veto_status", "not_computed")
 
         gk_warning = inp.market_data.get("gk_low_transaction_warning", False)
         feat_dict["gk_low_transaction_warning"] = gk_warning
 
         market_cap = inp.fundamental_data.get("market_cap")
-        if market_cap is not None:
-            feat_dict["market_cap_mm"] = round(float(market_cap) / 1e6, 1)
+        market_cap_f = finite_float(market_cap) if market_cap is not None else None
+        if market_cap_f is not None:
+            feat_dict["market_cap_mm"] = round(market_cap_f / 1e6, 1)
         if "sector" in inp.fundamental_data:
             feat_dict["sector"] = inp.fundamental_data["sector"]
 
@@ -652,7 +707,8 @@ class M6Detector(BasePatternDetector):
         if pre_signal_rejection is not None:
             quality_flags["market_data_quality_rejected"] = True
 
-        has_ohlcv = gk_vol_60d is not None and float(gk_vol_60d) > 0
+        gk_vol_60d_f = finite_float(gk_vol_60d) if gk_vol_60d is not None else None
+        has_ohlcv = gk_vol_60d_f is not None and gk_vol_60d_f > 0
         pit_passed = quality_flags.get("point_in_time_passed") is not False
         fidelity = classify_fidelity(
             has_primary_data=has_ohlcv, has_secondary_data=not gk_warning,
@@ -678,11 +734,16 @@ class M6Detector(BasePatternDetector):
             sig = _enrich_m6_activation(
                 feat_dict, inp, depth, compression_high, sigma_20d,
                 gk_warning, warnings, quality_flags,
+                lambda_12td=self._lambda_m6_12td,
+                field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
             )
             if sig is not None:
                 signals.append(sig)
         elif compressed:
-            signals.append(_build_watchlist_signal(feat_dict, depth, gk_warning, quality_flags))
+            signals.append(_build_watchlist_signal(
+                feat_dict, depth, gk_warning, quality_flags,
+                field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
+            ))
         else:
             feat_dict["activation_state"] = ACTIVATION_STATE_NOT_COMPRESSED
             feat_dict["rejection_reason"] = "not_compressed"

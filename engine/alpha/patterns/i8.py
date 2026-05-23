@@ -60,6 +60,7 @@ from alpha.patterns.guards import (
     DATA_QUALITY_FIELDS,
     classify_fidelity,
     compute_data_confidence,
+    finite_float,
     market_data_quality_rejection,
     operating_universe_rejection,
     quote_rejection,
@@ -159,8 +160,11 @@ def compute_spread_quality(spread_at_eval_bps: float, normal_spread_20d_bps: flo
     return 0.0  # hard gate: do not signal
 
 
-def _data_confidence(quality_flags: Dict[str, Any]) -> float:
-    return compute_data_confidence(quality_flags)
+def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
+    return compute_data_confidence(
+        quality_flags,
+        field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
+    )
 
 
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
@@ -219,9 +223,11 @@ def _copy_opening_range_features(
     inp: PatternInput,
 ) -> tuple[float, float, float]:
     md = inp.market_data
-    opening_range_high = float(md["opening_range_high"])
-    opening_range_low = float(md["opening_range_low"])
-    sigma_20d = float(md["sigma_20d"])
+    opening_range_high = finite_float(md["opening_range_high"])
+    opening_range_low = finite_float(md["opening_range_low"])
+    sigma_20d = finite_float(md["sigma_20d"])
+    if opening_range_high is None or opening_range_low is None or sigma_20d is None:
+        raise ValueError("opening range features require finite high, low, and sigma_20d")
     opening_range_size = opening_range_high - opening_range_low
 
     feat_dict["opening_range_high"] = opening_range_high
@@ -243,11 +249,11 @@ def _compute_i8_breakout_quality(
         _reject_signal(feat_dict, "no_upside_breakout")
         return None
 
-    breakout_price = float(breakout_price)
-    feat_dict["breakout_price"] = breakout_price
-    if not math.isfinite(breakout_price):
+    breakout_price = finite_float(breakout_price)
+    if breakout_price is None:
         _reject_signal(feat_dict, "no_upside_breakout")
         return None
+    feat_dict["breakout_price"] = breakout_price
 
     breakout_strength = compute_breakout_strength(breakout_price, opening_range_high, sigma_20d)
     feat_dict["breakout_strength"] = round(breakout_strength, 6)
@@ -271,22 +277,24 @@ def _compute_i8_volume_quality(
 ) -> Optional[float]:
     volume_30min = md.get("volume_30min")
     avg_volume_30min_20d = md.get("avg_volume_30min_20d")
-    if volume_30min is None or float(volume_30min) <= 0:
-        feat_dict["volume_30min"] = float(volume_30min) if volume_30min is not None else None
+    volume_30min_f = finite_float(volume_30min) if volume_30min is not None else None
+    if volume_30min_f is None or volume_30min_f <= 0:
+        feat_dict["volume_30min"] = volume_30min_f
         feat_dict["volume_ratio"] = 0.0
         feat_dict["volume_quality"] = 0.0
         _reject_signal(feat_dict, "volume_below_minimum")
         return None
 
-    volume_30min = float(volume_30min)
+    volume_30min = volume_30min_f
     baseline_volume_proxy = False
-    if avg_volume_30min_20d is None or float(avg_volume_30min_20d) <= 0:
+    avg_volume_30min_20d_f = finite_float(avg_volume_30min_20d) if avg_volume_30min_20d is not None else None
+    if avg_volume_30min_20d_f is None or avg_volume_30min_20d_f <= 0:
         avg_volume_30min_20d = volume_30min
         baseline_volume_proxy = True
         quality_flags["baseline_volume_proxy"] = True
         warnings.append("avg_volume_30min_20d unavailable — using neutral volume proxy")
     else:
-        avg_volume_30min_20d = float(avg_volume_30min_20d)
+        avg_volume_30min_20d = avg_volume_30min_20d_f
 
     volume_ratio = volume_30min / avg_volume_30min_20d if avg_volume_30min_20d > 0 else 0.0
     volume_quality = compute_volume_quality(volume_ratio)
@@ -306,14 +314,15 @@ def _compute_i8_range_ratio(
     quality_flags: Dict[str, Any],
 ) -> float:
     avg_range_30min_20d = md.get("avg_range_30min_20d")
-    if avg_range_30min_20d is None or float(avg_range_30min_20d) <= 0:
+    avg_range_30min_20d_f = finite_float(avg_range_30min_20d) if avg_range_30min_20d is not None else None
+    if avg_range_30min_20d_f is None or avg_range_30min_20d_f <= 0:
         range_ratio = 1.0
         quality_flags["baseline_range_proxy"] = True
         warnings.append("avg_range_30min_20d unavailable — assuming normal range")
     else:
-        range_ratio = opening_range_size / float(avg_range_30min_20d)
+        range_ratio = opening_range_size / avg_range_30min_20d_f
 
-    feat_dict["avg_range_30min_20d"] = float(avg_range_30min_20d) if avg_range_30min_20d is not None else None
+    feat_dict["avg_range_30min_20d"] = avg_range_30min_20d_f
     feat_dict["range_ratio"] = round(range_ratio, 6)
     feat_dict["base_range_quality"] = compute_range_quality(range_ratio)
     return range_ratio
@@ -327,21 +336,23 @@ def _compute_i8_spread_quality(
 ) -> float:
     spread_at_eval = md.get("spread_at_eval_bps")
     normal_spread = md.get("normal_spread_20d_bps")
-    if spread_at_eval is None:
+    spread_at_eval_f = finite_float(spread_at_eval) if spread_at_eval is not None else None
+    normal_spread_f = finite_float(normal_spread) if normal_spread is not None else None
+    if spread_at_eval_f is None:
         spread_quality = 0.75
         quality_flags["baseline_spread_proxy"] = True
         warnings.append("spread_at_eval_bps unavailable — using conservative wide-spread proxy")
     else:
-        if normal_spread is None or float(normal_spread) <= 0:
+        if normal_spread_f is None or normal_spread_f <= 0:
             quality_flags["baseline_spread_proxy"] = True
             warnings.append("normal_spread_20d_bps unavailable — using conservative wide-spread proxy")
         spread_quality = compute_spread_quality(
-            float(spread_at_eval),
-            float(normal_spread) if normal_spread is not None else 0.0,
+            spread_at_eval_f,
+            normal_spread_f if normal_spread_f is not None else 0.0,
         )
 
-    feat_dict["spread_at_eval_bps"] = float(spread_at_eval) if spread_at_eval is not None else None
-    feat_dict["normal_spread_20d_bps"] = float(normal_spread) if normal_spread is not None else None
+    feat_dict["spread_at_eval_bps"] = spread_at_eval_f
+    feat_dict["normal_spread_20d_bps"] = normal_spread_f
     feat_dict["spread_quality"] = spread_quality
     return spread_quality
 
@@ -370,6 +381,7 @@ def _build_i8_signal(
     x_i8: float,
     lambda_i8_3td: float,
     quality_flags: Dict[str, Any],
+    inp: Optional[PatternInput] = None,
 ) -> PatternSignal:
     raw_expected_edge = round(x_i8 * lambda_i8_3td, 6)
     signal_strength = round(min(x_i8 / X_I8_STRENGTH_DIVISOR, 1.0), 6)
@@ -389,7 +401,7 @@ def _build_i8_signal(
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
         route_class=RouteClass.C,
-        data_confidence=_data_confidence(quality_flags),
+        data_confidence=_data_confidence(inp, quality_flags) if inp is not None else compute_data_confidence(quality_flags),
     )
 
 
@@ -435,7 +447,7 @@ def _enrich_i8_signal(
     feat_dict["x_i8"] = round(x_i8, 6)
     feat_dict["signal_generated"] = True
 
-    return _build_i8_signal(feat_dict, x_i8, lambda_i8_3td, quality_flags)
+    return _build_i8_signal(feat_dict, x_i8, lambda_i8_3td, quality_flags, inp=inp)
 
 
 def _compute_hashes(
@@ -475,7 +487,10 @@ class I8Detector(BasePatternDetector):
     route_class = RouteClass.C
 
     def __init__(self, lambda_i8_3td: float = LAMBDA_I8_3TD_DEFAULT):
-        self._lambda_i8_3td = lambda_i8_3td
+        parsed = finite_float(lambda_i8_3td)
+        if parsed is None or parsed <= 0:
+            raise ValueError("lambda_i8_3td must be finite and positive")
+        self._lambda_i8_3td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
@@ -494,14 +509,14 @@ class I8Detector(BasePatternDetector):
             warnings.append("missing required fields (opening_range_high, opening_range_low, or sigma_20d)")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        opening_range_high_f = float(opening_range_high)
-        opening_range_low_f = float(opening_range_low)
-        sigma_20d_f = float(sigma_20d)
+        opening_range_high_f = finite_float(opening_range_high)
+        opening_range_low_f = finite_float(opening_range_low)
+        sigma_20d_f = finite_float(sigma_20d)
 
         if (
-            not math.isfinite(opening_range_high_f)
-            or not math.isfinite(opening_range_low_f)
-            or not math.isfinite(sigma_20d_f)
+            opening_range_high_f is None
+            or opening_range_low_f is None
+            or sigma_20d_f is None
             or opening_range_high_f <= 0
             or opening_range_low_f <= 0
             or sigma_20d_f <= 0

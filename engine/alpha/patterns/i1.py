@@ -61,6 +61,7 @@ from alpha.patterns.guards import (
     DEFAULT_QUOTE_FIELDS,
     classify_fidelity,
     compute_data_confidence,
+    finite_float,
     market_data_quality_rejection,
     operating_universe_rejection,
     quote_rejection,
@@ -124,8 +125,11 @@ def compute_volume_weight(volume_ratio_30min: float) -> float:
     return 0.0  # should not reach here if confirmation gate passed
 
 
-def _data_confidence(quality_flags: Dict[str, Any]) -> float:
-    return compute_data_confidence(quality_flags)
+def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
+    return compute_data_confidence(
+        quality_flags,
+        field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
+    )
 
 
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
@@ -227,9 +231,11 @@ def _reject_signal(
 
 def _copy_gap_features(feat_dict: Dict[str, Any], inp: PatternInput) -> tuple[float, float]:
     market_data = inp.market_data
-    prev_close = float(market_data["prev_close"])
-    open_price = float(market_data["open_price"])
-    sigma_20d = float(market_data["sigma_20d"])
+    prev_close = finite_float(market_data["prev_close"])
+    open_price = finite_float(market_data["open_price"])
+    sigma_20d = finite_float(market_data["sigma_20d"])
+    if prev_close is None or open_price is None or sigma_20d is None:
+        raise ValueError("gap features require finite prev_close, open_price, and sigma_20d")
 
     gap_pct = (open_price - prev_close) / prev_close
     gap_mag = compute_gap_magnitude(gap_pct, sigma_20d)
@@ -258,17 +264,25 @@ def _copy_confirmation_inputs(
         warnings.append("missing return_30min or volume_30min for confirmation")
         return None
 
-    return_30min = float(return_30min)
-    volume_30min = float(volume_30min)
+    return_30min_f = finite_float(return_30min)
+    volume_30min_f = finite_float(volume_30min)
+    if return_30min_f is None or volume_30min_f is None:
+        _reject_signal(feat_dict, "missing_confirmation_data")
+        warnings.append("invalid return_30min or volume_30min for confirmation")
+        quality_flags["missing_confirmation_data"] = True
+        return None
+    return_30min = return_30min_f
+    volume_30min = volume_30min_f
 
     baseline_volume_proxy = False
-    if avg_volume_30min_20d is None or float(avg_volume_30min_20d) <= 0:
+    avg_volume_30min_20d_f = finite_float(avg_volume_30min_20d) if avg_volume_30min_20d is not None else None
+    if avg_volume_30min_20d_f is None or avg_volume_30min_20d_f <= 0:
         avg_volume_30min_20d = volume_30min * 0.5  # conservative per DATA.md edge case
         baseline_volume_proxy = True
         quality_flags["baseline_volume_proxy"] = True
         warnings.append("avg_volume_30min_20d unavailable — using conservative proxy")
     else:
-        avg_volume_30min_20d = float(avg_volume_30min_20d)
+        avg_volume_30min_20d = avg_volume_30min_20d_f
 
     volume_ratio = volume_30min / avg_volume_30min_20d if avg_volume_30min_20d > 0 else 0.0
 
@@ -308,12 +322,20 @@ def _build_i1_signal(
     feat_dict: Dict[str, Any],
     x_i1: float,
     quality_flags: Dict[str, Any],
+    inp: Optional[PatternInput] = None,
+    lambda_3td: float = LAMBDA_I1_3TD,
 ) -> PatternSignal:
-    raw_expected_edge = round(x_i1 * LAMBDA_I1_3TD, 6)
+    raw_expected_edge = round(x_i1 * lambda_3td, 6)
     signal_strength = round(min(x_i1 / X_I1_STRENGTH_DIVISOR, 1.0), 6)
     feat_dict["lambda_I1_monthly"] = LAMBDA_I1_MONTHLY
     feat_dict["microcap_amplification"] = AMPLIFICATION
-    feat_dict["amplified_lambda_I1_3td"] = round(LAMBDA_I1_3TD, 8)
+    feat_dict["validated_or_shadow_lambda_I1_3td"] = lambda_3td
+    feat_dict["lambda_I1_3td"] = round(lambda_3td, 8)
+    feat_dict["lambda_I1_default_3td"] = round(LAMBDA_I1_3TD, 8)
+    feat_dict["lambda_I1_source"] = (
+        "shadow_prior" if lambda_3td == LAMBDA_I1_3TD else "validated_or_injected"
+    )
+    feat_dict["amplified_lambda_I1_3td"] = round(lambda_3td, 8)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
 
     return PatternSignal(
@@ -322,7 +344,7 @@ def _build_i1_signal(
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
         route_class=RouteClass.C,
-        data_confidence=_data_confidence(quality_flags),
+        data_confidence=_data_confidence(inp, quality_flags) if inp is not None else compute_data_confidence(quality_flags),
     )
 
 
@@ -335,6 +357,7 @@ def _enrich_i1_signal(
     inp: PatternInput,
     warnings: List[str],
     quality_flags: Dict[str, Any],
+    lambda_3td: float = LAMBDA_I1_3TD,
 ) -> Optional[PatternSignal]:
     """
     Compute gap features, confirmation gate, exposure, and return
@@ -366,7 +389,7 @@ def _enrich_i1_signal(
     if x_i1 is None:
         return None
 
-    return _build_i1_signal(feat_dict, x_i1, quality_flags)
+    return _build_i1_signal(feat_dict, x_i1, quality_flags, inp=inp, lambda_3td=lambda_3td)
 
 
 def _compute_hashes(
@@ -405,6 +428,12 @@ class I1Detector(BasePatternDetector):
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.C
 
+    def __init__(self, lambda_i1_3td: float = LAMBDA_I1_3TD):
+        parsed = finite_float(lambda_i1_3td)
+        if parsed is None or parsed <= 0:
+            raise ValueError("lambda_i1_3td must be finite and positive")
+        self._lambda_i1_3td = parsed
+
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
@@ -422,14 +451,14 @@ class I1Detector(BasePatternDetector):
             warnings.append("missing required fields (prev_close, open_price, or sigma_20d)")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        prev_close_f = float(prev_close)
-        open_price_f = float(open_price)
-        sigma_20d_f = float(sigma_20d)
+        prev_close_f = finite_float(prev_close)
+        open_price_f = finite_float(open_price)
+        sigma_20d_f = finite_float(sigma_20d)
 
         if (
-            not math.isfinite(prev_close_f)
-            or not math.isfinite(open_price_f)
-            or not math.isfinite(sigma_20d_f)
+            prev_close_f is None
+            or open_price_f is None
+            or sigma_20d_f is None
             or prev_close_f <= 0
             or open_price_f <= 0
             or sigma_20d_f <= 0
@@ -457,7 +486,7 @@ class I1Detector(BasePatternDetector):
             _copy_gap_features(feat_dict, inp)
             _reject_signal(feat_dict, universe_rejection)
         else:
-            sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags)
+            sig = _enrich_i1_signal(feat_dict, inp, warnings, quality_flags, lambda_3td=self._lambda_i1_3td)
             if sig is not None:
                 signals.append(sig)
 

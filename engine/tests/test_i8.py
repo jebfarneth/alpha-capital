@@ -372,7 +372,7 @@ class TestI8NoSignal:
         data["breakout_price"] = float("nan")
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
-        assert result.features.features["breakout_price"] != result.features.features["breakout_price"]
+        assert "breakout_price" not in result.features.features
         assert result.features.features["rejection_reason"] == "no_upside_breakout"
         assert result.features.features["x_i8"] == 0.0
 

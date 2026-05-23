@@ -10,6 +10,7 @@ the caller cannot proceed without it.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -226,6 +227,27 @@ def compute_data_confidence(
         field_confidence = source.get("field_confidence")
         if isinstance(field_confidence, dict):
             for value in field_confidence.values():
-                confidence *= float(value)
+                parsed = finite_float(value)
+                if parsed is not None:
+                    confidence *= min(max(parsed, 0.0), 1.0)
 
     return round(confidence, 4)
+
+
+def finite_float(value: Any) -> Optional[float]:
+    """Parse *value* to float, returning None for non-finite or unparseable inputs."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def integral_int(value: Any) -> Optional[int]:
+    """Parse *value* to int, returning None for non-integral, non-finite, or unparseable inputs."""
+    parsed = finite_float(value)
+    if parsed is None or not parsed.is_integer():
+        return None
+    return int(parsed)

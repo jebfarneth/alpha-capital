@@ -72,6 +72,7 @@ from alpha.patterns.guards import (
     copy_fields,
     classify_fidelity,
     compute_data_confidence,
+    finite_float,
     market_data_quality_rejection,
     operating_universe_rejection,
     quote_rejection,
@@ -220,8 +221,11 @@ def compute_spread_quality(spread_pct: Optional[float], pre_spread_x: float) -> 
     return 0.0
 
 
-def _data_confidence(quality_flags: Dict[str, Any]) -> float:
-    return compute_data_confidence(quality_flags)
+def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
+    return compute_data_confidence(
+        quality_flags,
+        field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -275,21 +279,22 @@ def _set_reclaim_features(
     feat_dict: Dict[str, Any], inp: PatternInput,
     support_level: Optional[float], sigma_20d: float,
 ) -> tuple[float, float]:
-    last_price = float(inp.market_data["price"])
+    last_price = finite_float(inp.market_data.get("price"))
     intraday_vwap_raw = inp.market_data.get("intraday_vwap")
-    intraday_vwap = float(intraday_vwap_raw) if intraday_vwap_raw is not None else None
+    intraday_vwap = finite_float(intraday_vwap_raw) if intraday_vwap_raw is not None else None
     open_price_raw = inp.market_data.get("open_price")
-    open_price = float(open_price_raw) if open_price_raw is not None else None
+    open_price = finite_float(open_price_raw) if open_price_raw is not None else None
     reversal_anchor_raw = inp.market_data.get("reversal_anchor_price")
     if support_level is not None:
         anchor_price = support_level
     elif reversal_anchor_raw is not None:
-        anchor_price = float(reversal_anchor_raw)
+        anchor_price = finite_float(reversal_anchor_raw)
     else:
         anchor_price = None
     support_anchor_available = anchor_price is not None and anchor_price > 0
+    price_available = last_price is not None and last_price > 0
 
-    if support_anchor_available:
+    if support_anchor_available and price_available:
         reclaim_ext = compute_support_reclaim_extension(last_price, anchor_price, sigma_20d)
         reclaim_strength = compute_support_reclaim_strength(reclaim_ext, last_price, anchor_price, intraday_vwap)
         stabilization = compute_stabilization_confirmation(last_price, open_price, intraday_vwap, anchor_price)
@@ -321,8 +326,8 @@ def _set_volume_features(
     vol_ratio = None
     vol_conf = 0.0
     if cumulative_volume is not None and expected_volume is not None:
-        cv, ev = float(cumulative_volume), float(expected_volume)
-        if ev > 0:
+        cv, ev = finite_float(cumulative_volume), finite_float(expected_volume)
+        if cv is not None and ev is not None and ev > 0:
             vol_ratio = cv / ev
             vol_conf = compute_volume_confirmation(vol_ratio)
         else:
@@ -332,8 +337,8 @@ def _set_volume_features(
         quality_flags["missing_volume_data"] = True
         warnings.append("missing cumulative_session_volume/expected_same_clock_volume_20d")
 
-    feat_dict["cumulative_session_volume"] = float(cumulative_volume) if cumulative_volume is not None else None
-    feat_dict["expected_same_clock_volume_20d"] = float(expected_volume) if expected_volume is not None else None
+    feat_dict["cumulative_session_volume"] = finite_float(cumulative_volume) if cumulative_volume is not None else None
+    feat_dict["expected_same_clock_volume_20d"] = finite_float(expected_volume) if expected_volume is not None else None
     feat_dict["intraday_volume_ratio"] = round(vol_ratio, 6) if vol_ratio is not None else None
     feat_dict["intraday_volume_confirmation"] = vol_conf
     feat_dict["volume_confirmation_passed"] = vol_conf >= 1.0
@@ -349,7 +354,7 @@ def _set_execution_gate_features(
     identity_passed = _activation_identity_passed(inp.market_data)
     quote_rej = quote_rejection(inp.market_data, quote_fields=QUOTE_FIELDS)
     spread_pct = inp.market_data.get("spread_pct_vs_eval_quote")
-    spread_pct_float = float(spread_pct) if spread_pct is not None else None
+    spread_pct_float = finite_float(spread_pct) if spread_pct is not None else None
     spread_quality = compute_spread_quality(spread_pct_float, pre_spread_x)
     if "spread_discipline_passed" in inp.market_data and inp.market_data.get("spread_discipline_passed") is not True:
         spread_quality = 0.0
@@ -390,6 +395,7 @@ def _enrich_m5_activation(
     sigma_20d: float,
     warnings: List[str],
     quality_flags: Dict[str, Any],
+    lambda_7td: float = LAMBDA_M5_7TD,
 ) -> Optional[PatternSignal]:
     """Compute all activation features. Returns PatternSignal if passes."""
     reclaim_strength, stabilization = _set_reclaim_features(
@@ -440,14 +446,20 @@ def _enrich_m5_activation(
         feat_dict["signal_generated"] = False
         return None
 
-    raw_expected_edge = round(x_m5_activation * LAMBDA_M5_7TD, 6)
+    raw_expected_edge = round(x_m5_activation * lambda_7td, 6)
     signal_strength = round(min(x_m5_activation / X_M5_CAP, 1.0), 6)
 
     feat_dict["activation_state"] = ACTIVATION_STATE_ACTIVATED
     feat_dict["signal_generated"] = True
     feat_dict["lambda_M5_weekly"] = LAMBDA_M5_WEEKLY
     feat_dict["microcap_amplification"] = AMPLIFICATION
-    feat_dict["amplified_lambda_M5_7td"] = round(LAMBDA_M5_7TD, 8)
+    feat_dict["validated_or_shadow_lambda_M5_7td"] = lambda_7td
+    feat_dict["lambda_M5_7td"] = round(lambda_7td, 8)
+    feat_dict["lambda_M5_default_7td"] = round(LAMBDA_M5_7TD, 8)
+    feat_dict["lambda_M5_source"] = (
+        "shadow_prior" if lambda_7td == LAMBDA_M5_7TD else "validated_or_injected"
+    )
+    feat_dict["amplified_lambda_M5_7td"] = round(lambda_7td, 8)
     feat_dict["expected_return_priors"] = {"gross_bps": round(raw_expected_edge * 10_000, 2)}
 
     return PatternSignal(
@@ -456,12 +468,13 @@ def _enrich_m5_activation(
         raw_expected_edge=raw_expected_edge,
         signal_horizon=SIGNAL_HORIZON,
         route_class=RouteClass.B,
-        data_confidence=_data_confidence(quality_flags),
+        data_confidence=_data_confidence(inp, quality_flags),
     )
 
 
 def _build_watchlist_signal(
     feat_dict: Dict[str, Any], x_m5_setup: float, quality_flags: Dict[str, Any],
+    inp: Optional[PatternInput] = None,
 ) -> PatternSignal:
     feat_dict["activation_state"] = ACTIVATION_STATE_WATCHLIST
     feat_dict["signal_generated"] = True
@@ -473,7 +486,7 @@ def _build_watchlist_signal(
         signal_horizon=SIGNAL_HORIZON,
         signal_status="watchlist",
         route_class=RouteClass.B,
-        data_confidence=_data_confidence(quality_flags),
+        data_confidence=_data_confidence(inp, quality_flags) if inp is not None else compute_data_confidence(quality_flags),
     )
 
 
@@ -517,6 +530,12 @@ class M5Detector(BasePatternDetector):
     thesis_category = ThesisCategory.MEAN_REVERSION
     route_class = RouteClass.B
 
+    def __init__(self, lambda_m5_7td: float = LAMBDA_M5_7TD):
+        parsed = finite_float(lambda_m5_7td)
+        if parsed is None or parsed <= 0:
+            raise ValueError("lambda_m5_7td must be finite and positive")
+        self._lambda_m5_7td = parsed
+
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
@@ -534,14 +553,16 @@ class M5Detector(BasePatternDetector):
             warnings.append("missing required fields (return_5d or sigma_20d)")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
 
-        return_5d = float(return_5d)
-        sigma_20d = float(sigma_20d)
-        if not math.isfinite(return_5d) or not math.isfinite(sigma_20d) or sigma_20d <= 0:
-            warnings.append(f"invalid return_5d={return_5d} or sigma_20d={sigma_20d}")
+        return_5d_f = finite_float(return_5d)
+        sigma_20d_f = finite_float(sigma_20d)
+        if return_5d_f is None or sigma_20d_f is None or sigma_20d_f <= 0:
+            warnings.append("invalid return_5d or sigma_20d")
             return self._no_features_result(inp.ticker, asof, warnings, quality_flags)
+        return_5d = return_5d_f
+        sigma_20d = sigma_20d_f
 
-        support_level = float(support_level_raw) if support_level_raw is not None else None
-        low_5d = float(low_5d_raw) if low_5d_raw is not None else None
+        support_level = finite_float(support_level_raw)
+        low_5d = finite_float(low_5d_raw)
 
         decline_mag = compute_decline_magnitude(return_5d, sigma_20d)
         support_break_weight = compute_support_break_attempt_weight(low_5d, support_level)
@@ -570,7 +591,9 @@ class M5Detector(BasePatternDetector):
         # Copy diagnostic fields from caller
         for source in (inp.market_data, inp.fundamental_data, inp.event_data):
             for key in ("hazard_score_at_signal", "filing_veto_status", "sector",
-                        "dollar_volume_ratio", "recent_halt"):
+                        "dollar_volume_ratio", "recent_halt",
+                        "m1_also_firing", "m4_also_firing", "m6_also_firing",
+                        "overlapping_pattern_ids"):
                 val = source.get(key)
                 if val is not None:
                     feat_dict[key] = val
@@ -625,11 +648,12 @@ class M5Detector(BasePatternDetector):
                 sig = _enrich_m5_activation(
                     feat_dict, inp, decline_mag, support_level, sigma_20d,
                     warnings, quality_flags,
+                    lambda_7td=self._lambda_m5_7td,
                 )
                 if sig is not None:
                     signals.append(sig)
         else:
-            signals.append(_build_watchlist_signal(feat_dict, x_m5_setup, quality_flags))
+            signals.append(_build_watchlist_signal(feat_dict, x_m5_setup, quality_flags, inp=inp))
 
         features = PatternFeatures(
             features=feat_dict, feature_manifest_version="m5-v1",
