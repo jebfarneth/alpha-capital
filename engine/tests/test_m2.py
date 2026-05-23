@@ -104,7 +104,7 @@ class TestM2Metadata:
         assert DECAY_TAU == 10.0
         assert MIN_OPP_BUYERS == 2
         assert MAX_DAYS_SINCE_LAST_FILING == 20
-        assert MISSING_TRADE_INTENSITY_DEFAULT == 0.75
+        assert MISSING_TRADE_INTENSITY_DEFAULT == 1.0
         assert OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT == 0.75
         assert X_M2_CAP == 3.0
         assert abs(LAMBDA_M2_20TD - 0.0082 * 20 / 21) < 1e-10
@@ -236,7 +236,7 @@ class TestM2Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         assert result.signals[0].data_confidence == 1.0
 
-    def test_missing_intensity_defaults_conservative(self):
+    def test_missing_intensity_defaults_neutral_with_confidence_flag(self):
         det = M2Detector()
         data = _firing_data()
         del data["mean_trade_size_weight"]
@@ -286,6 +286,10 @@ class TestM2Firing:
         f = r_roles.features.features
         assert r_roles.has_signal
         assert f["insider_role_tier"] == "c_suite"
+        assert f["insider_role_scope"] == "all_reported_insiders"
+        assert f["insider_role_tier_counts"]["c_suite"] == 1
+        assert f["insider_role_tier_counts"]["director"] == 1
+        assert f["insider_role_tier_counts"]["ten_percent_holder"] == 1
         assert f["insider_role_weight_shadow"] == 1.2
         assert f["insider_role_resolution"] == "max_seniority"
         assert r_roles.signals[0].raw_expected_edge == r_base.signals[0].raw_expected_edge
@@ -297,6 +301,20 @@ class TestM2Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.has_signal
         assert result.features.features["insider_role_tier"] == "other_officer"
+
+    def test_role_shadow_metadata_prefers_opportunistic_scoped_roles(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["insider_roles"] = ["Chief Executive Officer"]
+        data["opportunistic_insider_roles"] = ["Director", "VP Finance"]
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["insider_role_scope"] == "opportunistic_buyers"
+        assert f["insider_role_tier"] == "other_officer"
+        assert f["insider_role_tier_counts"]["c_suite"] == 0
+        assert f["insider_role_tier_counts"]["director"] == 1
+        assert f["insider_role_tier_counts"]["other_officer"] == 1
 
     def test_decay_shape_shadow_fields_do_not_change_production_edge(self):
         det = M2Detector()
@@ -323,6 +341,18 @@ class TestM2Firing:
         assert r1.features.features["m2_cluster_signature_hash"] == r2.features.features["m2_cluster_signature_hash"]
         assert r1.features.features["m2_cluster_id"] == r1.features.features["m2_cluster_signature_hash"]
 
+    def test_cluster_signature_hash_is_source_and_window_independent(self):
+        det = M2Detector()
+        d1 = _firing_data()
+        d2 = _firing_data()
+        d2["source_authority"] = "fmp_backfill"
+        d2["cluster_window_days"] = None
+        r1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d1, lineage_hashes=["h"]))
+        r2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=d2, lineage_hashes=["h"]))
+        assert r1.has_signal
+        assert r2.has_signal
+        assert r1.features.features["m2_cluster_signature_hash"] == r2.features.features["m2_cluster_signature_hash"]
+
     def test_provided_cluster_id_is_preserved_for_dedup(self):
         det = M2Detector()
         data = _firing_data()
@@ -346,6 +376,16 @@ class TestM2Firing:
         assert r_conflicted.features.features["exposure_x_m2"] == round(pre * OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT, 6)
         assert r_conflicted.signals[0].raw_expected_edge < r_clean.signals[0].raw_expected_edge
         assert r_conflicted.quality_flags["opportunistic_sell_cluster_present"] is True
+
+    def test_opportunistic_sell_cluster_count_haircuts_exposure(self):
+        det = M2Detector()
+        conflicted = _firing_data()
+        conflicted["opportunistic_sell_cluster_30d"] = 2
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=conflicted, lineage_hashes=["h"]))
+        pre = result.features.features["pre_sell_cluster_exposure_x_m2"]
+        assert result.has_signal
+        assert result.features.features["opportunistic_sell_cluster_haircut"] == OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT
+        assert result.features.features["exposure_x_m2"] == round(pre * OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT, 6)
 
 
 # -----------------------------------------------------------------------
@@ -441,7 +481,7 @@ class TestM2NoSignal:
         data["mean_trade_size_weight"] = "N/A"
         data["mean_locality_weight"] = "N/A"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
-        assert result.has_signal  # defaults to conservative shadow-safe intensity
+        assert result.has_signal  # defaults to neutral intensity and flags data confidence
 
     def test_invalid_cluster_window_rejected(self):
         det = M2Detector()

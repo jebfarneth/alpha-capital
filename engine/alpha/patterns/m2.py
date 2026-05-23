@@ -67,7 +67,7 @@ MAX_DAYS_SINCE_LAST_FILING = 20  # filing must be within 20 calendar days
 CLUSTER_WINDOW_DAYS = 30  # trailing 30 calendar days for cluster detection
 DECAY_TAU = 10.0  # exp(-days / 10) filing-detection decay
 LIVE_SOURCE_AUTHORITIES = {"sec_edgar", "fmp_backfill"}
-MISSING_TRADE_INTENSITY_DEFAULT = 0.75
+MISSING_TRADE_INTENSITY_DEFAULT = 1.0
 OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT = 0.75
 SHADOW_DECAY_TAUS = (5.0, 10.0, 15.0)
 ROLE_SHADOW_PRIOR_WEIGHTS = {
@@ -118,6 +118,13 @@ def _flag_is_true(value: Any) -> bool:
     return False
 
 
+def _flag_or_positive_count(value: Any) -> bool:
+    if _flag_is_true(value):
+        return True
+    count = finite_float(value)
+    return count is not None and count > 0
+
+
 def _flatten_role_terms(value: Any) -> List[str]:
     if isinstance(value, str):
         return [value]
@@ -136,11 +143,17 @@ def _flatten_role_terms(value: Any) -> List[str]:
 
 def _classify_role_term(term: str) -> str:
     normalized = term.lower().replace("-", " ")
-    if "chief executive" in normalized or "chief financial" in normalized or "ceo" in normalized or "cfo" in normalized:
+    tokens = set(normalized.replace(",", " ").replace("/", " ").split())
+    if (
+        any(phrase in normalized for phrase in (
+            "chief executive", "chief financial", "chief operating", "chief technology",
+        ))
+        or bool(tokens & {"ceo", "cfo", "coo", "cto"})
+        or ("president" in tokens and "vice" not in tokens)
+    ):
         return "c_suite"
     if any(token in normalized for token in (
-        "chief", "officer", "president", "vice president", "vp", "coo", "cto",
-        "treasurer", "secretary",
+        "chief", "officer", "vice president", "vp", "treasurer", "secretary",
     )):
         return "other_officer"
     if "director" in normalized:
@@ -150,13 +163,16 @@ def _classify_role_term(term: str) -> str:
     return "unknown"
 
 
-def _role_shadow_metadata(insider_roles: Any) -> Dict[str, Any]:
+def _role_shadow_metadata(insider_roles: Any, *, scoped_to_opportunistic_buyers: bool) -> Dict[str, Any]:
     tiers = [_classify_role_term(term) for term in _flatten_role_terms(insider_roles)]
+    tier_counts = {tier_name: tiers.count(tier_name) for tier_name in ROLE_SHADOW_SENIORITY}
     tier = max(tiers or ["unknown"], key=lambda item: ROLE_SHADOW_SENIORITY[item])
     return {
         "insider_role_tier": tier,
+        "insider_role_tier_counts": tier_counts,
         "insider_role_weight_shadow": ROLE_SHADOW_PRIOR_WEIGHTS[tier],
         "insider_role_resolution": "max_seniority",
+        "insider_role_scope": "opportunistic_buyers" if scoped_to_opportunistic_buyers else "all_reported_insiders",
     }
 
 
@@ -226,7 +242,9 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any])
             "d1_decile", "sigma_epsilon_decile", "illiq_decile",
             "cen_hq_county", "cen_sci_score",
             "sector", "industry",
-            "insider_roles", "filing_lag_days", "sec_vs_fmp_latency",
+            "insider_roles", "opportunistic_insider_roles", "opportunistic_buy_insider_roles",
+            "opportunistic_buyer_roles", "insider_roles_opportunistic",
+            "filing_lag_days", "sec_vs_fmp_latency",
             "source_authority", "sec_accession_numbers", "sec_fmp_mismatch",
             "cluster_window_days", "identity_resolution_method", "identity_resolution_confidence",
             "m2_cluster_id", "m2_cluster_signature_hash",
@@ -286,7 +304,17 @@ def _enrich_m2_signal(
     n_unclassifiable_only = integral_int(md.get("n_unclassifiable_only_buyers_30d"))
     routine_trades = integral_int(md.get("routine_trades_30d"))
     unclassifiable_buyers = integral_int(md.get("unclassifiable_buyers_30d"))
-    role_meta = _role_shadow_metadata(md.get("insider_roles"))
+    role_source = md.get("opportunistic_insider_roles")
+    if role_source is None:
+        role_source = md.get("opportunistic_buy_insider_roles")
+    if role_source is None:
+        role_source = md.get("opportunistic_buyer_roles")
+    if role_source is None:
+        role_source = md.get("insider_roles_opportunistic")
+    scoped_role_source = role_source is not None
+    if role_source is None:
+        role_source = md.get("insider_roles")
+    role_meta = _role_shadow_metadata(role_source, scoped_to_opportunistic_buyers=scoped_role_source)
     cluster_window_days = integral_int(md.get("cluster_window_days"))
     source_authority = md.get("source_authority")
     sec_accession_numbers = md.get("sec_accession_numbers")
@@ -297,9 +325,7 @@ def _enrich_m2_signal(
     if m2_cluster_signature_hash is None and accession_proof:
         m2_cluster_signature_hash = stable_hash({
             "ticker": inp.ticker,
-            "source_authority": source_authority,
             "sec_accession_numbers": sorted(set(accession_proof)),
-            "cluster_window_days": cluster_window_days,
         })
     if m2_cluster_id is None:
         m2_cluster_id = m2_cluster_signature_hash
@@ -401,7 +427,7 @@ def _enrich_m2_signal(
 
     # Compute exposure
     sell_cluster_haircut = (
-        OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT if _flag_is_true(opportunistic_sell_cluster) else 1.0
+        OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT if _flag_or_positive_count(opportunistic_sell_cluster) else 1.0
     )
     for tau in SHADOW_DECAY_TAUS:
         tau_label = str(int(tau))
