@@ -96,18 +96,34 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
 # Diagnostic field helpers
 # ---------------------------------------------------------------------------
 
-def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
-    for source in sources:
+def _copy_diagnostic_fields(
+    feat_dict: Dict[str, Any],
+    market_data: Dict[str, Any],
+    fundamental_data: Optional[Dict[str, Any]] = None,
+    event_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    market_only_keys = (
+        "sector", "industry", "sector_taxonomy_source",
+        "sector_return_6mo", "sector_return_6mo_ew",
+        "sector_return_point_in_time_passed", "sector_return_formation_cohort_passed",
+        "sector_history_coverage_years",
+        "return_1mo", "return_3mo",
+        "sector_rank", "n_sectors_in_universe", "sector_rank_normalized",
+        "market_data_status", "halt_status", "corporate_action_filter_passed",
+    )
+    for key in market_only_keys:
+        val = market_data.get(key)
+        if val is not None:
+            if key == "sector" and isinstance(val, str):
+                val = val.strip()
+                if not val:
+                    continue
+            feat_dict.setdefault(key, val)
+
+    for source in (market_data, fundamental_data or {}, event_data or {}):
         for key in (
-            "sector", "industry", "sector_taxonomy_source",
-            "sector_return_6mo", "sector_return_6mo_ew",
-            "sector_return_point_in_time_passed", "sector_return_formation_cohort_passed",
-            "sector_history_coverage_years",
-            "return_1mo", "return_3mo",
-            "sector_rank", "n_sectors_in_universe", "sector_rank_normalized",
             "hazard_score_at_signal", "filing_veto_status",
             "liquidity_score",
-            "market_data_status", "halt_status", "corporate_action_filter_passed",
             "market_cap_usd", "market_cap_mm", "sub_universe",
             "adv_20d_dollars", "adv_60d_dollars", "effective_spread_20d_pct", "price_at_signal",
             "d1_decile", "sigma_epsilon_decile", "illiq_decile",
@@ -118,10 +134,6 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any])
         ):
             val = source.get(key)
             if val is not None:
-                if key == "sector" and isinstance(val, str):
-                    val = val.strip()
-                    if not val:
-                        continue
                 feat_dict[key] = val
     feat_dict.setdefault("filing_veto_status", "not_computed")
     feat_dict.setdefault("sector_taxonomy_source", "FMP")
@@ -329,8 +341,13 @@ class M3Detector(BasePatternDetector):
         if universe_rejection is not None:
             _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
             _reject_signal(feat_dict, universe_rejection)
-        elif md.get("sector_return_point_in_time_passed") is not True:
+        elif (
+            md.get("sector_return_point_in_time_passed") is not True
+            or md.get("sector_return_formation_cohort_passed") is False
+        ):
             quality_flags["point_in_time_passed"] = False
+            if md.get("sector_return_formation_cohort_passed") is False:
+                quality_flags["formation_cohort_passed"] = False
             warnings.append("M3 sector return missing point-in-time formation-cohort proof")
             _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
             _reject_signal(feat_dict, "sector_return_not_point_in_time")

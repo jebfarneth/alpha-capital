@@ -361,6 +361,17 @@ class TestM3NoSignal:
         assert result.features.features["rejection_reason"] == "sector_return_not_point_in_time"
         assert result.quality_flags["point_in_time_passed"] is False
 
+    def test_false_formation_cohort_proof_rejected(self):
+        det = M3Detector()
+        data = _firing_data()
+        data["sector_return_point_in_time_passed"] = True
+        data["sector_return_formation_cohort_passed"] = False
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "sector_return_not_point_in_time"
+        assert result.quality_flags["point_in_time_passed"] is False
+        assert result.quality_flags["formation_cohort_passed"] is False
+
     def test_string_sector_return_no_crash(self):
         det = M3Detector()
         data = _firing_data()
@@ -501,6 +512,33 @@ class TestM3Quality:
         assert f["sub_universe"] == "B"
         assert f["filing_veto_status"] == "clear"
         assert f["overlapping_pattern_ids"] == ["M4"]
+
+    def test_load_bearing_sector_fields_are_market_data_authoritative(self):
+        det = M3Detector()
+        result = det.detect(PatternInput(
+            ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(),
+            fundamental_data={
+                "sector": "Utilities",
+                "sector_return_6mo": -0.50,
+                "sector_rank_normalized": 0.05,
+                "sector_return_point_in_time_passed": False,
+            },
+            event_data={
+                "sector": "Real Estate",
+                "sector_rank": 1,
+                "n_sectors_in_universe": 11,
+                "sector_return_formation_cohort_passed": False,
+            },
+            lineage_hashes=["h"],
+        ))
+        assert result.has_signal
+        f = result.features.features
+        assert f["sector"] == "Energy"
+        assert f["sector_return_6mo"] == 0.221
+        assert f["sector_rank_normalized"] == 0.955
+        assert f["sector_rank"] == 11
+        assert f["sector_return_point_in_time_passed"] is True
+        assert f["sector_return_formation_cohort_passed"] is True
 
     def test_overlap_diagnostics(self):
         det = M3Detector()
