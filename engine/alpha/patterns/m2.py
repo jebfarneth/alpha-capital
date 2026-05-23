@@ -67,7 +67,7 @@ MAX_DAYS_SINCE_LAST_FILING = 20  # filing must be within 20 calendar days
 CLUSTER_WINDOW_DAYS = 30  # trailing 30 calendar days for cluster detection
 DECAY_TAU = 10.0  # exp(-days / 10) filing-detection decay
 LIVE_SOURCE_AUTHORITIES = {"sec_edgar", "fmp_backfill"}
-MISSING_TRADE_INTENSITY_DEFAULT = 1.0
+MISSING_TRADE_INTENSITY_DEFAULT = 0.75
 OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT = 0.75
 SHADOW_DECAY_TAUS = (5.0, 10.0, 15.0)
 ROLE_SHADOW_PRIOR_WEIGHTS = {
@@ -217,8 +217,6 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
         quality_flags,
         field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
         extra_multipliers={
-            "missing_trade_intensity": 0.90,
-            "invalid_trade_intensity": 0.90,
             "fmp_backfill_authority": 0.90,
             "sec_fmp_mismatch": 0.95,
             "missing_cluster_window_proof": 0.95,

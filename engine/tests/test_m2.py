@@ -104,7 +104,7 @@ class TestM2Metadata:
         assert DECAY_TAU == 10.0
         assert MIN_OPP_BUYERS == 2
         assert MAX_DAYS_SINCE_LAST_FILING == 20
-        assert MISSING_TRADE_INTENSITY_DEFAULT == 1.0
+        assert MISSING_TRADE_INTENSITY_DEFAULT == 0.75
         assert OPPORTUNISTIC_SELL_CLUSTER_HAIRCUT == 0.75
         assert X_M2_CAP == 3.0
         assert abs(LAMBDA_M2_20TD - 0.0082 * 20 / 21) < 1e-10
@@ -236,7 +236,7 @@ class TestM2Firing:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(), lineage_hashes=["h"]))
         assert result.signals[0].data_confidence == 1.0
 
-    def test_missing_intensity_defaults_neutral_with_confidence_flag(self):
+    def test_missing_intensity_defaults_conservative_without_confidence_haircut(self):
         det = M2Detector()
         data = _firing_data()
         del data["mean_trade_size_weight"]
@@ -245,7 +245,7 @@ class TestM2Firing:
         assert result.has_signal
         assert result.quality_flags["missing_trade_intensity"] is True
         assert result.features.features["mean_trade_intensity_weight"] == MISSING_TRADE_INTENSITY_DEFAULT
-        assert result.signals[0].data_confidence < 1.0
+        assert result.signals[0].data_confidence == 1.0
 
     def test_vault_size_and_locality_weights_drive_intensity(self):
         det = M2Detector()
@@ -481,7 +481,7 @@ class TestM2NoSignal:
         data["mean_trade_size_weight"] = "N/A"
         data["mean_locality_weight"] = "N/A"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
-        assert result.has_signal  # defaults to neutral intensity and flags data confidence
+        assert result.has_signal  # defaults to conservative intensity and flags evidence
 
     def test_invalid_cluster_window_rejected(self):
         det = M2Detector()
