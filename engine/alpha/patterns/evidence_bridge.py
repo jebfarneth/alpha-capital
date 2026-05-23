@@ -60,6 +60,8 @@ def persist_detection_result(
     if result.features is None:
         return persisted
 
+    signal_identity_hash = result.features.features.get("signal_identity_hash") if result.features else None
+
     feat = record_feature_snapshot(
         session,
         pattern_id=result.pattern_id,
@@ -97,6 +99,7 @@ def persist_detection_result(
             data_lineage_ids=data_lineage_ids,
             universe_snapshot_id=universe_snapshot_id,
             signal_event_sequence=sequence,
+            signal_identity_hash=signal_identity_hash,
         )
         persisted.signal_ids.append(sr.signal_id)
 

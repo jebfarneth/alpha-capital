@@ -284,6 +284,8 @@ def record_signal(
     data_lineage_ids: list[str] | None = None,
     universe_snapshot_id: str | None = None,
     signal_event_sequence: int | None = None,
+    signal_identity_hash: str | None = None,
+    intended_entry_price: float | None = None,
 ) -> SignalRegistry:
     sig = SignalRegistry(
         signal_id=_uid(),
@@ -304,6 +306,8 @@ def record_signal(
         universe_snapshot_id=universe_snapshot_id,
         signal_event_sequence=signal_event_sequence,
         data_lineage_ids=json.dumps(data_lineage_ids) if data_lineage_ids else None,
+        signal_identity_hash=signal_identity_hash,
+        intended_entry_price=intended_entry_price,
     )
     session.add(sig)
     session.flush()

@@ -96,6 +96,7 @@ class UniverseBuilderJob(BaseJob):
             record_universe_snapshot(
                 self._session,
                 job_run_id=ctx.job_run_id,
+                scan_id=ctx.job_run_id,
                 ticker=stock.symbol,
                 asof_timestamp=resp.lineage.asof_timestamp,
                 source_provider=resp.lineage.provider,

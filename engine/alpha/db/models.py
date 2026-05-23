@@ -250,6 +250,11 @@ class SignalRegistry(Base):
         String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
     )
     data_lineage_ids = Column(Text, nullable=True)  # JSON array
+    signal_identity_hash = Column(String, nullable=True)
+    forward_return = Column(Float, nullable=True)
+    forward_return_status = Column(String, nullable=True)
+    outcome_unavailable_reason = Column(String, nullable=True)
+    intended_entry_price = Column(Float, nullable=True)
 
     feature_snapshot = relationship("FeatureSnapshot", back_populates="signals")
 
