@@ -55,6 +55,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (SPEC.md / EXPOSURE.md)
@@ -343,13 +344,14 @@ def _enrich_m2_signal(
     feat_dict["m2_cluster_id"] = m2_cluster_id
     feat_dict["m2_cluster_signature_hash"] = m2_cluster_signature_hash
     if m2_cluster_signature_hash is not None:
-        feat_dict["signal_identity_hash"] = m2_cluster_signature_hash
-        feat_dict["signal_identity_components"] = {
-            "pattern_id": PatternId.M2,
-            "ticker": inp.ticker,
-            "sec_accession_numbers": sorted(set(accession_proof)),
-        }
-        feat_dict["signal_identity_source"] = "sec_accession_cluster"
+        set_signal_identity(
+            feat_dict,
+            pattern_id=PatternId.M2,
+            ticker=inp.ticker,
+            components={"sec_accession_numbers": sorted(set(accession_proof))},
+            source="sec_accession_cluster",
+            identity_hash=m2_cluster_signature_hash,
+        )
     feat_dict["sec_fmp_mismatch"] = sec_fmp_mismatch
     feat_dict["mean_trade_size_weight"] = round(mean_trade_size_weight, 6) if mean_trade_size_weight is not None else None
     feat_dict["mean_locality_weight"] = round(mean_locality_weight, 6) if mean_locality_weight is not None else None

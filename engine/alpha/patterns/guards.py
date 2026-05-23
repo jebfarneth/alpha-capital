@@ -150,6 +150,7 @@ def set_signal_identity(
     ticker: str,
     components: Dict[str, Any],
     source: str,
+    identity_hash: Optional[str] = None,
 ) -> Optional[str]:
     """
     Persist a stable event/setup identity for downstream dedup.
@@ -175,7 +176,7 @@ def set_signal_identity(
         "ticker": ticker,
         **clean_components,
     }
-    identity_hash = stable_hash(identity_components)
+    identity_hash = identity_hash or stable_hash(identity_components)
     feat_dict["signal_identity_hash"] = identity_hash
     feat_dict["signal_identity_components"] = identity_components
     feat_dict["signal_identity_source"] = source
