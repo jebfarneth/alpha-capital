@@ -12,6 +12,7 @@ Per MeasurementSpine.md section 3.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -22,10 +23,30 @@ from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 RETRYABLE_FORWARD_RETURN_STATUSES = (
     "pending",
     "pricing_unavailable_retry",
+    "invalid_price_shape_retry",
     "invalid_entry_price_retry",
+    "invalid_exit_price_retry",
     "missing_exit_price_retry",
 )
 MAX_FORWARD_RETURN_ATTEMPTS = 3
+
+
+def _finite_price(value: object) -> Optional[float]:
+    """Coerce provider prices and reject NaN/Inf before arithmetic."""
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price):
+        return None
+    return price
+
+
+def _price_pair(value: object) -> Optional[Tuple[object, object]]:
+    """Accept provider prices only when shaped as entry/exit pair."""
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None
+    return value[0], value[1]
 
 
 class ForwardReturnJob(BaseJob):
@@ -44,7 +65,7 @@ class ForwardReturnJob(BaseJob):
         maturity_fn: Optional[
             Callable[[object, Optional[str]], bool]
         ] = None,
-        max_retry_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
+        max_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
     ):
         """
         Args:
@@ -53,14 +74,19 @@ class ForwardReturnJob(BaseJob):
                       (entry_price, exit_price) or None if pricing unavailable.
             maturity_fn: (signal_timestamp, signal_horizon) -> bool.
                          If None, all pending signals are considered mature.
-            max_retry_attempts: terminalize unavailable outcomes at this attempt.
+            max_attempts: terminalize unavailable outcomes at this total attempt count.
         """
-        if max_retry_attempts < 1:
-            raise ValueError("max_retry_attempts must be >= 1")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
         self._session = session
         self._price_fn = price_fn
         self._maturity_fn = maturity_fn
-        self._max_retry_attempts = max_retry_attempts
+        self._max_attempts = max_attempts
+
+    def _begin_attempt(self, sig: SignalRegistry) -> int:
+        attempts = (sig.forward_return_attempts or 0) + 1
+        sig.forward_return_attempts = attempts
+        return attempts
 
     def _mark_unavailable(
         self,
@@ -70,10 +96,8 @@ class ForwardReturnJob(BaseJob):
         reason: str,
     ) -> bool:
         """Return True if retryable, False if terminal outcome_unavailable."""
-        attempts = (sig.forward_return_attempts or 0) + 1
-        sig.forward_return_attempts = attempts
         sig.outcome_unavailable_reason = reason
-        if attempts >= self._max_retry_attempts:
+        if (sig.forward_return_attempts or 0) >= self._max_attempts:
             sig.forward_return_status = "outcome_unavailable"
             return False
         sig.forward_return_status = retry_status
@@ -103,6 +127,7 @@ class ForwardReturnJob(BaseJob):
                     immature += 1
                     continue
             except Exception as exc:
+                self._begin_attempt(sig)
                 retryable = self._mark_unavailable(
                     sig,
                     retry_status="pricing_unavailable_retry",
@@ -112,6 +137,8 @@ class ForwardReturnJob(BaseJob):
                 unavailable += int(not retryable)
                 pricing_errors += 1
                 continue
+
+            self._begin_attempt(sig)
 
             try:
                 prices = self._price_fn(
@@ -138,7 +165,21 @@ class ForwardReturnJob(BaseJob):
                 unavailable += int(not retryable)
                 continue
 
-            entry_price, exit_price = prices
+            price_pair = _price_pair(prices)
+            if price_pair is None:
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="invalid_price_shape_retry",
+                    reason="invalid_price_shape",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
+                pricing_errors += 1
+                continue
+
+            raw_entry_price, raw_exit_price = price_pair
+            entry_price = _finite_price(raw_entry_price)
+            exit_price = _finite_price(raw_exit_price)
 
             if entry_price is None or entry_price <= 0:
                 retryable = self._mark_unavailable(
@@ -150,11 +191,21 @@ class ForwardReturnJob(BaseJob):
                 unavailable += int(not retryable)
                 continue
 
-            if exit_price is None:
+            if raw_exit_price is None:
                 retryable = self._mark_unavailable(
                     sig,
                     retry_status="missing_exit_price_retry",
                     reason="missing_exit_price",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
+                continue
+
+            if exit_price is None or exit_price < 0:
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="invalid_exit_price_retry",
+                    reason="invalid_exit_price",
                 )
                 retryable_unavailable += int(retryable)
                 unavailable += int(not retryable)

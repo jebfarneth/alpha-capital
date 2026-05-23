@@ -22,7 +22,9 @@ OBSERVED_OUTCOME_STATUSES = (
     "computed",
     "outcome_unavailable",
     "pricing_unavailable_retry",
+    "invalid_price_shape_retry",
     "invalid_entry_price_retry",
+    "invalid_exit_price_retry",
     "missing_exit_price_retry",
 )
 

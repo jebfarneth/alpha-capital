@@ -702,7 +702,7 @@ class TestForwardReturnUnavailable:
         fwd_job = ForwardReturnJob(
             session=db_session,
             price_fn=lambda ticker, ts, horizon: None,
-            max_retry_attempts=2,
+            max_attempts=2,
         )
         first = run_job(db_session, fwd_job)
         assert first.metrics["retryable_unavailable"] == 1
@@ -738,7 +738,16 @@ class TestForwardReturnUnavailable:
         sig = db_session.get(SignalRegistry, sid)
         assert sig.forward_return_status == "computed"
         assert abs(sig.forward_return - 0.10) < 0.001
-        assert sig.forward_return_attempts == 1
+        assert sig.forward_return_attempts == 2
+
+    def test_constructor_rejects_non_positive_max_attempts(self, db_session):
+        """The attempt cap must leave at least one mature outcome attempt."""
+        with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+            ForwardReturnJob(
+                session=db_session,
+                price_fn=lambda ticker, ts, horizon: (5.0, 5.5),
+                max_attempts=0,
+            )
 
     def test_invalid_entry_price_writes_reason(self, db_session):
         """Zero or negative entry price stays retryable with a reason."""
@@ -754,6 +763,59 @@ class TestForwardReturnUnavailable:
         assert sig.forward_return_status == "invalid_entry_price_retry"
         assert sig.forward_return_attempts == 1
         assert sig.outcome_unavailable_reason == "invalid_entry_price"
+        assert sig.forward_return is None
+
+    def test_nan_and_inf_entry_prices_are_invalid(self, db_session):
+        """NaN/Inf entry prices never produce computed forward returns."""
+        sid1 = self._make_signal(db_session, "NAN")
+        sid2 = self._make_signal(db_session, "INF")
+
+        def price_fn(ticker, ts, horizon):
+            if ticker == "NAN":
+                return (float("nan"), 5.0)
+            return (float("inf"), 5.0)
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=price_fn)
+        result = run_job(db_session, fwd_job)
+
+        assert result.metrics["computed"] == 0
+        assert result.metrics["retryable_unavailable"] == 2
+        for sid in (sid1, sid2):
+            sig = db_session.get(SignalRegistry, sid)
+            assert sig.forward_return_status == "invalid_entry_price_retry"
+            assert sig.outcome_unavailable_reason == "invalid_entry_price"
+            assert sig.forward_return is None
+
+    def test_malformed_price_shape_is_per_signal_retryable(self, db_session):
+        """One malformed provider response does not roll back the whole batch."""
+        good1 = self._make_signal(db_session, "GOOD1")
+        bad = self._make_signal(db_session, "BAD")
+        good2 = self._make_signal(db_session, "GOOD2")
+
+        def price_fn(ticker, ts, horizon):
+            if ticker == "BAD":
+                return (5.0, 5.5, 6.0)
+            if ticker == "GOOD2":
+                return [4.0, 4.4]
+            return (5.0, 5.5)
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=price_fn)
+        result = run_job(db_session, fwd_job)
+
+        assert result.ok
+        assert result.metrics["computed"] == 2
+        assert result.metrics["retryable_unavailable"] == 1
+        assert result.metrics["pricing_errors"] == 1
+
+        bad_sig = db_session.get(SignalRegistry, bad)
+        assert bad_sig.forward_return_status == "invalid_price_shape_retry"
+        assert bad_sig.outcome_unavailable_reason == "invalid_price_shape"
+        assert bad_sig.forward_return_attempts == 1
+
+        for sid in (good1, good2):
+            sig = db_session.get(SignalRegistry, sid)
+            assert sig.forward_return_status == "computed"
+            assert sig.forward_return_attempts == 1
 
     def test_missing_exit_price_writes_reason(self, db_session):
         """None exit price stays retryable with a reason."""
@@ -769,6 +831,66 @@ class TestForwardReturnUnavailable:
         assert sig.forward_return_status == "missing_exit_price_retry"
         assert sig.forward_return_attempts == 1
         assert sig.outcome_unavailable_reason == "missing_exit_price"
+
+    def test_invalid_exit_price_writes_reason(self, db_session):
+        """NaN/Inf/negative exit prices stay retryable instead of computing impossible returns."""
+        sid1 = self._make_signal(db_session, "NAN")
+        sid2 = self._make_signal(db_session, "INF")
+        sid3 = self._make_signal(db_session, "NEG")
+
+        def price_fn(ticker, ts, horizon):
+            if ticker == "NAN":
+                return (5.0, float("nan"))
+            if ticker == "INF":
+                return (5.0, float("inf"))
+            return (5.0, -1.0)
+
+        fwd_job = ForwardReturnJob(session=db_session, price_fn=price_fn)
+        result = run_job(db_session, fwd_job)
+
+        assert result.metrics["computed"] == 0
+        assert result.metrics["retryable_unavailable"] == 3
+        for sid in (sid1, sid2, sid3):
+            sig = db_session.get(SignalRegistry, sid)
+            assert sig.forward_return_status == "invalid_exit_price_retry"
+            assert sig.outcome_unavailable_reason == "invalid_exit_price"
+            assert sig.forward_return is None
+
+    def test_zero_exit_price_computes_minus_one_hundred_percent(self, db_session):
+        """A zero exit is a valid long-equity terminal mark; negative exits are not."""
+        sid = self._make_signal(db_session)
+
+        fwd_job = ForwardReturnJob(
+            session=db_session,
+            price_fn=lambda ticker, ts, horizon: (5.0, 0.0),
+        )
+        result = run_job(db_session, fwd_job)
+
+        assert result.metrics["computed"] == 1
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "computed"
+        assert sig.forward_return == -1.0
+
+    def test_invalid_exit_price_eventually_terminalizes(self, db_session):
+        """Invalid exit-price retries use the same terminal outcome path."""
+        sid = self._make_signal(db_session)
+
+        fwd_job = ForwardReturnJob(
+            session=db_session,
+            price_fn=lambda ticker, ts, horizon: (5.0, -1.0),
+            max_attempts=2,
+        )
+        first = run_job(db_session, fwd_job)
+        assert first.metrics["retryable_unavailable"] == 1
+
+        second = run_job(db_session, fwd_job)
+        assert second.metrics["retryable_unavailable"] == 0
+        assert second.metrics["unavailable"] == 1
+
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "outcome_unavailable"
+        assert sig.outcome_unavailable_reason == "invalid_exit_price"
+        assert sig.forward_return_attempts == 2
 
     def test_price_fn_exception_is_per_signal_retryable(self, db_session):
         """A bad price lookup marks that signal retryable without killing the batch."""
