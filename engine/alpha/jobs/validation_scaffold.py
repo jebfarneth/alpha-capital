@@ -56,7 +56,7 @@ class ValidationScaffoldJob(BaseJob):
                 func.sum(
                     case((SignalRegistry.forward_return_status != "computed", 1), else_=0)
                 ).label("unavailable_sample_size"),
-                func.avg(SignalRegistry.forward_return).label("mean_return"),
+                func.avg(SignalRegistry.forward_return).label("mean_forward_return_computed"),
             )
             .filter(SignalRegistry.forward_return_status.in_(OBSERVED_OUTCOME_STATUSES))
             .group_by(SignalRegistry.pattern_id)
@@ -64,7 +64,7 @@ class ValidationScaffoldJob(BaseJob):
         )
 
         results = {}
-        for pattern_id, total_firings, computed_sample_size, unavailable_sample_size, mean_return in pattern_stats:
+        for pattern_id, total_firings, computed_sample_size, unavailable_sample_size, mean_forward_return_computed in pattern_stats:
             computed_count = int(computed_sample_size or 0)
             unavailable_count = int(unavailable_sample_size or 0)
             total_count = int(total_firings or 0)
@@ -78,7 +78,11 @@ class ValidationScaffoldJob(BaseJob):
                 "sample_size": total_count,
                 "computed_sample_size": computed_count,
                 "unavailable_sample_size": unavailable_count,
-                "mean_forward_return": float(mean_return) if mean_return is not None else None,
+                "mean_forward_return_computed": (
+                    float(mean_forward_return_computed)
+                    if mean_forward_return_computed is not None
+                    else None
+                ),
                 "confidence_tier": tier,
                 "validation_weight_multiplier": CONFIDENCE_TIERS[tier],
             }
@@ -90,7 +94,11 @@ class ValidationScaffoldJob(BaseJob):
                 pattern_id=pattern_id,
                 sample_size=total_count,
                 metrics={
-                    "mean_forward_return": float(mean_return) if mean_return is not None else None,
+                    "mean_forward_return_computed": (
+                        float(mean_forward_return_computed)
+                        if mean_forward_return_computed is not None
+                        else None
+                    ),
                     "sample_size": total_count,
                     "computed_sample_size": computed_count,
                     "unavailable_sample_size": unavailable_count,

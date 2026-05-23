@@ -485,8 +485,8 @@ class TestSignalDedup:
         sigs = db_session.query(SignalRegistry).all()
         assert len(sigs) == 2  # no dedup
 
-    def test_detector_error_marks_run_failed(self, db_session):
-        """A detector exception should not look like a clean finished scan."""
+    def test_detector_error_marks_run_finished_with_error_metrics(self, db_session):
+        """A detector exception is a partial scan, not an atomic run failure."""
         class BrokenDetector(StableIdentityDetector):
             pattern_id = "M4"
 
@@ -506,9 +506,10 @@ class TestSignalDedup:
         )
         result = run_job(db_session, orch)
 
-        assert result.status == "finished_with_errors"
-        assert not result.ok
+        assert result.status == "finished"
+        assert result.ok
         assert result.metrics["detector_errors"] == 1
+        assert result.metrics["finished_with_errors"] is True
         assert result.errors[0]["ticker"] == "ACME"
 
 
@@ -648,7 +649,7 @@ class TestForwardReturnOutcomes:
 
 
 # ===================================================================
-# 6. Forward-return records outcome_unavailable with reason
+# 6. Forward-return records retryable and terminal unavailable reasons
 # ===================================================================
 
 
@@ -690,8 +691,35 @@ class TestForwardReturnUnavailable:
         assert result.metrics["retryable_unavailable"] == 1
         sig = db_session.get(SignalRegistry, sid)
         assert sig.forward_return_status == "pricing_unavailable_retry"
+        assert sig.forward_return_attempts == 1
         assert sig.outcome_unavailable_reason == "pricing_unavailable"
         assert sig.forward_return is None
+
+    def test_retryable_pricing_eventually_terminalizes(self, db_session):
+        """Unpriceable signals stop retrying after the configured attempt cap."""
+        sid = self._make_signal(db_session)
+
+        fwd_job = ForwardReturnJob(
+            session=db_session,
+            price_fn=lambda ticker, ts, horizon: None,
+            max_retry_attempts=2,
+        )
+        first = run_job(db_session, fwd_job)
+        assert first.metrics["retryable_unavailable"] == 1
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "pricing_unavailable_retry"
+        assert sig.forward_return_attempts == 1
+
+        second = run_job(db_session, fwd_job)
+        assert second.metrics["retryable_unavailable"] == 0
+        assert second.metrics["unavailable"] == 1
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "outcome_unavailable"
+        assert sig.outcome_unavailable_reason == "pricing_unavailable"
+        assert sig.forward_return_attempts == 2
+
+        third = run_job(db_session, fwd_job)
+        assert third.metrics["total_pending"] == 0
 
     def test_retryable_pricing_unavailable_can_later_compute(self, db_session):
         """Transient provider lag can be retried instead of becoming terminal."""
@@ -710,6 +738,7 @@ class TestForwardReturnUnavailable:
         sig = db_session.get(SignalRegistry, sid)
         assert sig.forward_return_status == "computed"
         assert abs(sig.forward_return - 0.10) < 0.001
+        assert sig.forward_return_attempts == 1
 
     def test_invalid_entry_price_writes_reason(self, db_session):
         """Zero or negative entry price stays retryable with a reason."""
@@ -723,6 +752,7 @@ class TestForwardReturnUnavailable:
 
         sig = db_session.get(SignalRegistry, sid)
         assert sig.forward_return_status == "invalid_entry_price_retry"
+        assert sig.forward_return_attempts == 1
         assert sig.outcome_unavailable_reason == "invalid_entry_price"
 
     def test_missing_exit_price_writes_reason(self, db_session):
@@ -737,6 +767,7 @@ class TestForwardReturnUnavailable:
 
         sig = db_session.get(SignalRegistry, sid)
         assert sig.forward_return_status == "missing_exit_price_retry"
+        assert sig.forward_return_attempts == 1
         assert sig.outcome_unavailable_reason == "missing_exit_price"
 
     def test_price_fn_exception_is_per_signal_retryable(self, db_session):
@@ -758,8 +789,31 @@ class TestForwardReturnUnavailable:
         acme = db_session.get(SignalRegistry, sid1)
         beta = db_session.get(SignalRegistry, sid2)
         assert acme.forward_return_status == "pricing_unavailable_retry"
+        assert acme.forward_return_attempts == 1
         assert acme.outcome_unavailable_reason == "price_fn_error:RuntimeError"
         assert beta.forward_return_status == "computed"
+
+    def test_maturity_fn_exception_is_per_signal_retryable(self, db_session):
+        """A maturity policy error marks the signal retryable without killing the job."""
+        sid = self._make_signal(db_session)
+
+        def maturity_fn(ts, horizon):
+            raise RuntimeError("bad maturity policy")
+
+        fwd_job = ForwardReturnJob(
+            session=db_session,
+            price_fn=lambda ticker, ts, horizon: (5.0, 5.5),
+            maturity_fn=maturity_fn,
+        )
+        result = run_job(db_session, fwd_job)
+
+        assert result.status == "finished"
+        assert result.metrics["pricing_errors"] == 1
+        assert result.metrics["retryable_unavailable"] == 1
+        sig = db_session.get(SignalRegistry, sid)
+        assert sig.forward_return_status == "pricing_unavailable_retry"
+        assert sig.forward_return_attempts == 1
+        assert sig.outcome_unavailable_reason == "maturity_fn_error:RuntimeError"
 
     def test_does_not_silently_drop_rows(self, db_session):
         """Every signal gets a status — none remain NULL after the job runs."""
@@ -920,7 +974,7 @@ class TestValidationScaffold:
 
         i1 = result.metrics["pattern_results"]["I1"]
         assert i1["confidence_tier"] == "insufficient_sample"
-        assert i1["mean_forward_return"] > 0.40
+        assert i1["mean_forward_return_computed"] > 0.40
         # Despite great returns, sample is too small
         assert i1["confidence_tier"] != "validated"
 
@@ -974,7 +1028,7 @@ class TestSchemaAdditions:
         assert stored.signal_identity_hash == "test-hash-123"
 
     def test_forward_return_columns_nullable(self, db_session):
-        """forward_return fields default to None."""
+        """forward_return value fields default empty and status defaults pending."""
         feat = record_feature_snapshot(
             db_session,
             pattern_id="M4",
@@ -999,6 +1053,7 @@ class TestSchemaAdditions:
         stored = db_session.get(SignalRegistry, sig.signal_id)
         assert stored.forward_return is None
         assert stored.forward_return_status == "pending"
+        assert stored.forward_return_attempts == 0
         assert stored.outcome_unavailable_reason is None
         assert stored.intended_entry_price is None
 
@@ -1034,3 +1089,30 @@ class TestEvidenceBridgeIdentity:
         sig = db_session.get(SignalRegistry, persisted.signal_ids[0])
         assert sig.signal_identity_hash is not None
         assert sig.signal_identity_hash == result.features.features["signal_identity_hash"]
+
+    def test_duplicate_identity_reuses_existing_feature_snapshot(self, db_session):
+        """Bridge dedup must not create orphan feature snapshots on duplicate signals."""
+        from alpha.patterns.evidence_bridge import persist_detection_result
+
+        detector = StableIdentityDetector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={
+                "fixture_score": 0.95,
+                "price": 5.0,
+                "high_52w": 10.0,
+                "high_52w_date": "2026-01-01",
+                "operating_universe_inclusion": True,
+            },
+        )
+        result = detector.detect(inp)
+
+        p1 = persist_detection_result(db_session, result, detector)
+        p2 = persist_detection_result(db_session, result, detector)
+        db_session.flush()
+
+        assert p1.signal_ids == p2.signal_ids
+        assert p1.feature_snapshot_id == p2.feature_snapshot_id
+        assert db_session.query(FeatureSnapshot).count() == 1
+        assert db_session.query(SignalRegistry).count() == 1

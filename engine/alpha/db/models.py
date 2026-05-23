@@ -263,6 +263,7 @@ class SignalRegistry(Base):
     signal_identity_hash = Column(String, nullable=True)
     forward_return = Column(Float, nullable=True)
     forward_return_status = Column(String, nullable=True)
+    forward_return_attempts = Column(Integer, nullable=False, default=0)
     outcome_unavailable_reason = Column(String, nullable=True)
     intended_entry_price = Column(Float, nullable=True)
 

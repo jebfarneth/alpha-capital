@@ -30,7 +30,7 @@ class JobContext:
 class JobResult:
     """Outcome returned by every job."""
 
-    status: str  # finished, finished_with_errors, failed
+    status: str  # finished, failed
     metrics: Dict[str, Any] = field(default_factory=dict)
     input_hashes: Dict[str, str] = field(default_factory=dict)
     output_hashes: Dict[str, str] = field(default_factory=dict)

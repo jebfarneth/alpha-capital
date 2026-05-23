@@ -25,6 +25,7 @@ RETRYABLE_FORWARD_RETURN_STATUSES = (
     "invalid_entry_price_retry",
     "missing_exit_price_retry",
 )
+MAX_FORWARD_RETURN_ATTEMPTS = 3
 
 
 class ForwardReturnJob(BaseJob):
@@ -43,6 +44,7 @@ class ForwardReturnJob(BaseJob):
         maturity_fn: Optional[
             Callable[[object, Optional[str]], bool]
         ] = None,
+        max_retry_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
     ):
         """
         Args:
@@ -51,10 +53,31 @@ class ForwardReturnJob(BaseJob):
                       (entry_price, exit_price) or None if pricing unavailable.
             maturity_fn: (signal_timestamp, signal_horizon) -> bool.
                          If None, all pending signals are considered mature.
+            max_retry_attempts: terminalize unavailable outcomes at this attempt.
         """
+        if max_retry_attempts < 1:
+            raise ValueError("max_retry_attempts must be >= 1")
         self._session = session
         self._price_fn = price_fn
         self._maturity_fn = maturity_fn
+        self._max_retry_attempts = max_retry_attempts
+
+    def _mark_unavailable(
+        self,
+        sig: SignalRegistry,
+        *,
+        retry_status: str,
+        reason: str,
+    ) -> bool:
+        """Return True if retryable, False if terminal outcome_unavailable."""
+        attempts = (sig.forward_return_attempts or 0) + 1
+        sig.forward_return_attempts = attempts
+        sig.outcome_unavailable_reason = reason
+        if attempts >= self._max_retry_attempts:
+            sig.forward_return_status = "outcome_unavailable"
+            return False
+        sig.forward_return_status = retry_status
+        return True
 
     def run(self, ctx: JobContext) -> JobResult:
         pending = (
@@ -80,9 +103,13 @@ class ForwardReturnJob(BaseJob):
                     immature += 1
                     continue
             except Exception as exc:
-                sig.forward_return_status = "pricing_unavailable_retry"
-                sig.outcome_unavailable_reason = f"maturity_fn_error:{type(exc).__name__}"
-                retryable_unavailable += 1
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="pricing_unavailable_retry",
+                    reason=f"maturity_fn_error:{type(exc).__name__}",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
                 pricing_errors += 1
                 continue
 
@@ -91,30 +118,46 @@ class ForwardReturnJob(BaseJob):
                     sig.ticker, sig.signal_timestamp, sig.signal_horizon
                 )
             except Exception as exc:
-                sig.forward_return_status = "pricing_unavailable_retry"
-                sig.outcome_unavailable_reason = f"price_fn_error:{type(exc).__name__}"
-                retryable_unavailable += 1
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="pricing_unavailable_retry",
+                    reason=f"price_fn_error:{type(exc).__name__}",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
                 pricing_errors += 1
                 continue
 
             if prices is None:
-                sig.forward_return_status = "pricing_unavailable_retry"
-                sig.outcome_unavailable_reason = "pricing_unavailable"
-                retryable_unavailable += 1
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="pricing_unavailable_retry",
+                    reason="pricing_unavailable",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
                 continue
 
             entry_price, exit_price = prices
 
             if entry_price is None or entry_price <= 0:
-                sig.forward_return_status = "invalid_entry_price_retry"
-                sig.outcome_unavailable_reason = "invalid_entry_price"
-                retryable_unavailable += 1
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="invalid_entry_price_retry",
+                    reason="invalid_entry_price",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
                 continue
 
             if exit_price is None:
-                sig.forward_return_status = "missing_exit_price_retry"
-                sig.outcome_unavailable_reason = "missing_exit_price"
-                retryable_unavailable += 1
+                retryable = self._mark_unavailable(
+                    sig,
+                    retry_status="missing_exit_price_retry",
+                    reason="missing_exit_price",
+                )
+                retryable_unavailable += int(retryable)
+                unavailable += int(not retryable)
                 continue
 
             sig.intended_entry_price = entry_price

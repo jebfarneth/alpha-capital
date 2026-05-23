@@ -61,6 +61,20 @@ def persist_detection_result(
         return persisted
 
     signal_identity_hash = result.features.features.get("signal_identity_hash") if result.features else None
+    if signal_identity_hash and result.signals:
+        existing_signal = (
+            session.query(SignalRegistry)
+            .filter(
+                SignalRegistry.pattern_id == result.pattern_id,
+                SignalRegistry.ticker == result.ticker,
+                SignalRegistry.signal_identity_hash == signal_identity_hash,
+            )
+            .first()
+        )
+        if existing_signal:
+            persisted.feature_snapshot_id = existing_signal.feature_snapshot_id
+            persisted.signal_ids.append(existing_signal.signal_id)
+            return persisted
 
     feat = record_feature_snapshot(
         session,
@@ -80,20 +94,6 @@ def persist_detection_result(
     persisted.feature_snapshot_id = feat.feature_snapshot_id
 
     for sequence, sig in enumerate(result.signals, start=1):
-        if signal_identity_hash:
-            existing_signal_id = (
-                session.query(SignalRegistry.signal_id)
-                .filter(
-                    SignalRegistry.pattern_id == result.pattern_id,
-                    SignalRegistry.ticker == result.ticker,
-                    SignalRegistry.signal_identity_hash == signal_identity_hash,
-                )
-                .scalar()
-            )
-            if existing_signal_id:
-                persisted.signal_ids.append(existing_signal_id)
-                continue
-
         sr = record_signal(
             session,
             pattern_id=result.pattern_id,

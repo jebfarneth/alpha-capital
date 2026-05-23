@@ -94,13 +94,14 @@ class DetectorOrchestrationJob(BaseJob):
         self._session.flush()
 
         return JobResult(
-            status="finished_with_errors" if errors else "finished",
+            status="finished",
             metrics={
                 "signals_persisted": signals_persisted,
                 "duplicates_suppressed": duplicates_suppressed,
                 "no_signal_evaluations": no_signal_count,
                 "identity_missing": identity_missing_count,
                 "detector_errors": len(errors),
+                "finished_with_errors": bool(errors),
             },
             errors=errors,
         )
