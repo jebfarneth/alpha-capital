@@ -25,6 +25,7 @@ from alpha.patterns.m3 import LAMBDA_M3_15TD, M3Detector
 from alpha.patterns.m4 import LAMBDA_M4_15TD, M4Detector
 from alpha.patterns.m5 import LAMBDA_M5_7TD, M5Detector
 from alpha.patterns.m6 import LAMBDA_M6_12TD, M6Detector
+from alpha.patterns.m7 import LAMBDA_M7_10TD, M7Detector
 from alpha.patterns.i1 import LAMBDA_I1_3TD, I1Detector
 from alpha.patterns.i8 import LAMBDA_I8_3TD_DEFAULT, I8Detector
 
@@ -121,6 +122,15 @@ class TestStringCrashProtection:
     def test_m2_survives_string_buyers(self):
         det = M2Detector()
         data = {"n_distinct_opp_buyers_30d": "N/A", "days_since_last_opp_buy_filing_detected": 2, "operating_universe_inclusion": True}
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features is None
+
+    def test_m7_survives_string_rank(self):
+        det = M7Detector()
+        from tests.test_m7 import _firing_data as _m7_data
+        data = _m7_data()
+        data["predicted_return_rank_pct"] = "N/A"
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert not result.has_signal
         assert result.features is None
@@ -230,6 +240,10 @@ class TestConstructorValidation:
     def test_m2_rejects_nan_lambda(self):
         with pytest.raises(ValueError, match="lambda_m2_20td"):
             M2Detector(lambda_m2_20td=float("nan"))
+
+    def test_m7_rejects_nan_lambda(self):
+        with pytest.raises(ValueError, match="lambda_m7_10td"):
+            M7Detector(lambda_m7_10td=float("nan"))
 
     def test_m3_rejects_nan_lambda(self):
         with pytest.raises(ValueError, match="lambda_m3_15td"):
