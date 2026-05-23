@@ -32,7 +32,6 @@ Routing: Class A (midpoint limit, day-valid).
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional
 
 from alpha.data.contracts import stable_hash
@@ -80,6 +79,7 @@ LINEAGE_FIELDS = (
     "feature_snapshot_id", "feature_manifest_version",
     "model_artifact_hash", "data_cutoff_timestamp",
 )
+LINEAGE_ID_FIELDS = tuple(field for field in LINEAGE_FIELDS if field != "data_cutoff_timestamp")
 
 LOAD_BEARING_FIELDS = (
     "predicted_return_rank_pct", "predicted_return", "decay_haircut",
@@ -125,18 +125,23 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
 # Diagnostic field helpers
 # ---------------------------------------------------------------------------
 
-def _clean_required_value(value: Any) -> Optional[Any]:
+def _clean_required_value(value: Any, *, allow_datetime: bool = False) -> Optional[Any]:
     if value is None:
+        return None
+    if isinstance(value, bool):
         return None
     if isinstance(value, str):
         value = value.strip()
         if value.lower() in PLACEHOLDER_VALUES:
             return None
         return value
-    text = str(value).strip()
-    if text.lower() in PLACEHOLDER_VALUES:
-        return None
-    return value
+    if allow_datetime and hasattr(value, "isoformat"):
+        return value
+    return None
+
+
+def _clean_lineage_field(field: str, value: Any) -> Optional[Any]:
+    return _clean_required_value(value, allow_datetime=field == "data_cutoff_timestamp")
 
 
 def _copy_diagnostic_fields(
@@ -199,7 +204,7 @@ def _enrich_m7_signal(
         return None
 
     # Model lineage
-    lineage_values = {field: _clean_required_value(md.get(field)) for field in LINEAGE_FIELDS}
+    lineage_values = {field: _clean_lineage_field(field, md.get(field)) for field in LINEAGE_FIELDS}
     missing_lineage = [field for field, value in lineage_values.items() if value is None]
     if missing_lineage:
         quality_flags["missing_model_lineage"] = True
@@ -410,7 +415,7 @@ class M7Detector(BasePatternDetector):
 
         # Required: prediction rank and lineage must be present
         rank_raw = md.get("predicted_return_rank_pct")
-        has_lineage = all(_clean_required_value(md.get(f)) is not None for f in LINEAGE_FIELDS)
+        has_lineage = all(_clean_lineage_field(field, md.get(field)) is not None for field in LINEAGE_FIELDS)
 
         if rank_raw is None or not has_lineage:
             warnings.append("missing required M7 prediction/lineage fields")

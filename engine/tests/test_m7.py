@@ -290,6 +290,22 @@ class TestM7NoSignal:
         result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
         assert result.features is None
 
+    @pytest.mark.parametrize("bad_value", [False, True, 123, 4.5, {"id": "model"}, ["model"]])
+    def test_non_string_lineage_ids_rejected(self, bad_value):
+        det = M7Detector()
+        data = _firing_data()
+        data["model_version"] = bad_value
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.features is None
+
+    def test_datetime_data_cutoff_lineage_is_accepted(self):
+        det = M7Detector()
+        data = _firing_data()
+        data["data_cutoff_timestamp"] = datetime(2026, 5, 20, 20, 0, 0, tzinfo=timezone.utc)
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["data_cutoff_timestamp"] == data["data_cutoff_timestamp"]
+
     def test_run_not_completed_rejected(self):
         det = M7Detector()
         data = _firing_data()
