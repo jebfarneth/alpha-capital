@@ -250,6 +250,16 @@ class TestM2Firing:
         assert result.has_signal
         assert result.features.features["mean_trade_intensity_weight"] == round(1.18 * 1.08, 6)
 
+    def test_size_and_locality_override_legacy_intensity(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["mean_trade_size_weight"] = 1.18
+        data["mean_locality_weight"] = 1.08
+        data["mean_trade_intensity_weight"] = 0.5
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["mean_trade_intensity_weight"] == round(1.18 * 1.08, 6)
+
     def test_legacy_mean_intensity_fallback(self):
         det = M2Detector()
         data = _firing_data()
@@ -389,6 +399,21 @@ class TestM2NoSignal:
         assert not result.has_signal
         assert result.features.features["rejection_reason"] == "missing_sec_accession"
 
+    def test_malformed_truthy_accession_rejected(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["sec_accession_numbers"] = {"bad": "shape"}
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert not result.has_signal
+        assert result.features.features["rejection_reason"] == "missing_sec_accession"
+
+    def test_single_accession_string_accepted(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["sec_accession_numbers"] = "0001234567-26-000001"
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+
     def test_fmp_backfill_requires_accession_and_haircuts_confidence(self):
         det = M2Detector()
         data = _firing_data()
@@ -480,15 +505,45 @@ class TestM2Quality:
         det = M2Detector()
         result = det.detect(PatternInput(
             ticker="ACME", asof_timestamp=_ts(), market_data=_firing_data(),
-            fundamental_data={"market_cap_usd": 75_000_000, "sub_universe": "A"},
-            event_data={"filing_veto_status": "clear", "m1_also_firing": True, "overlapping_pattern_ids": ["M1"]},
+            fundamental_data={"market_cap_usd": 75_000_000, "sub_universe": "A", "next_earnings_days": 42},
+            event_data={
+                "filing_veto_status": "clear",
+                "m1_also_firing": True,
+                "m1_combined_signal_window": True,
+                "opportunistic_sell_cluster_30d": False,
+                "overlapping_pattern_ids": ["M1"],
+            },
             lineage_hashes=["h"],
         ))
         f = result.features.features
         assert f["market_cap_usd"] == 75_000_000
         assert f["filing_veto_status"] == "clear"
         assert f["m1_also_firing"] is True
+        assert f["m1_combined_signal_window"] is True
+        assert f["opportunistic_sell_cluster_30d"] is False
+        assert f["next_earnings_days"] == 42
         assert f["overlapping_pattern_ids"] == ["M1"]
+
+    def test_m1_also_firing_populates_combined_window_alias(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["m1_also_firing"] = True
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        assert result.has_signal
+        assert result.features.features["m1_combined_signal_window"] is True
+
+    def test_vault_diagnostic_aliases_persist(self):
+        det = M2Detector()
+        data = _firing_data()
+        data["routine_trades_30d"] = 2
+        data["unclassifiable_buyers_30d"] = 3
+        data["opp_sell_cluster_present"] = True
+        result = det.detect(PatternInput(ticker="ACME", asof_timestamp=_ts(), market_data=data, lineage_hashes=["h"]))
+        f = result.features.features
+        assert result.has_signal
+        assert f["routine_trades_30d"] == 2
+        assert f["unclassifiable_buyers_30d"] == 3
+        assert f["opportunistic_sell_cluster_30d"] is True
 
     def test_filing_veto_defaults_not_computed(self):
         det = M2Detector()

@@ -73,6 +73,15 @@ LIVE_SOURCE_AUTHORITIES = {"sec_edgar", "fmp_backfill"}
 # Pure computation helpers
 # ---------------------------------------------------------------------------
 
+def _has_accession_proof(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return bool(normalized) and normalized not in {"n/a", "na", "none", "null", "pending"}
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_accession_proof(item) for item in value)
+    return False
+
+
 def compute_x_m2(
     days_since_last_filing: int,
     n_distinct_opp_buyers: int,
@@ -121,9 +130,12 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any])
             "source_authority", "sec_accession_numbers", "sec_fmp_mismatch",
             "cluster_window_days", "identity_resolution_method", "identity_resolution_confidence",
             "exchange", "sector_stress_indicator", "hamilton_regime_prob",
-            "opp_sell_cluster_present", "unclassifiable_cluster_intensity",
-            "m1_also_firing", "m4_also_firing", "overlapping_pattern_ids",
-            "next_earnings_trading_days",
+            "last_opp_buy_transaction_date", "last_opp_buy_filing_detected_at", "max_filing_lag_days",
+            "cluster_notional_usd", "routine_trades_30d", "unclassifiable_buyers_30d",
+            "opportunistic_sell_cluster_30d", "opp_sell_cluster_present",
+            "unclassifiable_cluster_intensity",
+            "m1_combined_signal_window", "m1_also_firing", "m4_also_firing", "overlapping_pattern_ids",
+            "next_earnings_days", "next_earnings_trading_days",
         ):
             val = source.get(key)
             if val is not None:
@@ -164,15 +176,25 @@ def _enrich_m2_signal(
     days_since = integral_int(md.get("days_since_last_opp_buy_filing_detected"))
     mean_trade_size_weight = finite_float(md.get("mean_trade_size_weight"))
     mean_locality_weight = finite_float(md.get("mean_locality_weight"))
-    mean_intensity = finite_float(md.get("mean_trade_intensity_weight"))
-    if mean_intensity is None and mean_trade_size_weight is not None and mean_locality_weight is not None:
+    legacy_mean_intensity = finite_float(md.get("mean_trade_intensity_weight"))
+    if mean_trade_size_weight is not None and mean_locality_weight is not None:
         mean_intensity = mean_trade_size_weight * mean_locality_weight
+    else:
+        mean_intensity = legacy_mean_intensity
     n_routine_only = integral_int(md.get("n_routine_only_buyers_30d"))
     n_unclassifiable_only = integral_int(md.get("n_unclassifiable_only_buyers_30d"))
+    routine_trades = integral_int(md.get("routine_trades_30d"))
+    unclassifiable_buyers = integral_int(md.get("unclassifiable_buyers_30d"))
     cluster_window_days = integral_int(md.get("cluster_window_days"))
     source_authority = md.get("source_authority")
     sec_accession_numbers = md.get("sec_accession_numbers")
     sec_fmp_mismatch = md.get("sec_fmp_mismatch")
+    m1_combined_signal_window = md.get("m1_combined_signal_window")
+    if m1_combined_signal_window is None and md.get("m1_also_firing") is True:
+        m1_combined_signal_window = True
+    opportunistic_sell_cluster = md.get("opportunistic_sell_cluster_30d")
+    if opportunistic_sell_cluster is None:
+        opportunistic_sell_cluster = md.get("opp_sell_cluster_present")
 
     # Persist raw cluster evidence
     feat_dict["n_distinct_opp_buyers_30d"] = n_opp_buyers
@@ -186,6 +208,15 @@ def _enrich_m2_signal(
     feat_dict["mean_trade_intensity_weight"] = round(mean_intensity, 6) if mean_intensity is not None else None
     feat_dict["n_routine_only_buyers_30d"] = n_routine_only
     feat_dict["n_unclassifiable_only_buyers_30d"] = n_unclassifiable_only
+    feat_dict["routine_trades_30d"] = routine_trades if routine_trades is not None else n_routine_only
+    feat_dict["unclassifiable_buyers_30d"] = (
+        unclassifiable_buyers if unclassifiable_buyers is not None else n_unclassifiable_only
+    )
+    if opportunistic_sell_cluster is not None:
+        feat_dict["opportunistic_sell_cluster_30d"] = opportunistic_sell_cluster
+        feat_dict["opp_sell_cluster_present"] = opportunistic_sell_cluster
+    if m1_combined_signal_window is not None:
+        feat_dict["m1_combined_signal_window"] = m1_combined_signal_window
 
     # Validate cluster fields
     if n_opp_buyers is None or days_since is None:
@@ -203,12 +234,12 @@ def _enrich_m2_signal(
     if source_authority not in LIVE_SOURCE_AUTHORITIES:
         _reject_signal(feat_dict, "invalid_source_authority")
         return None
-    if source_authority == "sec_edgar" and not sec_accession_numbers:
+    if source_authority == "sec_edgar" and not _has_accession_proof(sec_accession_numbers):
         _reject_signal(feat_dict, "missing_sec_accession")
         return None
     if source_authority == "fmp_backfill":
         quality_flags["fmp_backfill_authority"] = True
-        if not sec_accession_numbers:
+        if not _has_accession_proof(sec_accession_numbers):
             _reject_signal(feat_dict, "missing_sec_accession")
             return None
     if sec_fmp_mismatch is True:
