@@ -65,6 +65,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
@@ -92,6 +93,7 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "m5_also_firing",
     "m6_also_firing",
     "overlapping_pattern_ids",
+    "high_52w_date",
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
@@ -143,6 +145,16 @@ def build_m4_source_features(
                 features[key] = source[key]
     features.setdefault("filing_veto_status", "not_computed")
     features["entry_lane"] = entry_lane
+    set_signal_identity(
+        features,
+        pattern_id=PatternId.M4,
+        ticker=inp.ticker,
+        components={
+            "high_52w": round(high_52w, 6),
+            "high_52w_date": inp.market_data.get("high_52w_date"),
+        },
+        source="52w_high_setup",
+    )
     n_sessions = inp.market_data.get("n_sessions_in_window")
     features["short_history_flag"] = n_sessions is not None and int(n_sessions) < 252
     return features

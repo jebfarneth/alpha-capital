@@ -65,6 +65,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
@@ -184,6 +185,26 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat.get("range_expansion_passed", False):
         return "range_expansion_failed"
     return "unknown"
+
+
+def _set_m6_signal_identity(feat_dict: Dict[str, Any], inp: PatternInput) -> None:
+    setup_id = inp.market_data.get("m6_setup_id") or inp.market_data.get("watchlist_signal_id")
+    if setup_id is not None:
+        components = {"m6_setup_id": setup_id}
+        source = "upstream_m6_setup_id"
+    else:
+        components = {
+            "compression_high": feat_dict.get("compression_high"),
+            "compression_ratio": feat_dict.get("compression_ratio"),
+        }
+        source = "compression_setup_content"
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.M6,
+        ticker=inp.ticker,
+        components=components,
+        source=source,
+    )
 
 
 def _activation_identity_passed(market_data: Dict[str, Any]) -> bool:
@@ -684,6 +705,7 @@ class M6Detector(BasePatternDetector):
             "sigma_20d": sigma_20d,
             "X_M6_setup": round(depth, 6),
         }
+        _set_m6_signal_identity(feat_dict, inp)
         for source in (inp.market_data, inp.fundamental_data, inp.event_data):
             for _k in ("filing_veto_status", "m4_also_firing", "m5_also_firing", "overlapping_pattern_ids"):
                 if _k in source:

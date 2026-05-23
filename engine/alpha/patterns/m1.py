@@ -59,6 +59,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (SPEC.md / EXPOSURE.md)
@@ -157,7 +158,9 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
     for source in sources:
         for key in (
-            "announcement_date", "announcement_time_utc", "next_earnings_date_estimate",
+            "earnings_event_id", "earnings_calendar_event_id", "m1_event_id",
+            "announcement_date", "announcement_time_utc", "fiscal_period_end",
+            "fiscal_year", "fiscal_quarter", "next_earnings_date_estimate",
             "next_earnings_trading_days_from_signal", "foster_history_quarters_used",
             "split_adjustment_continuity_check", "pre_announcement_car",
             "hazard_score_at_signal", "filing_veto_status",
@@ -170,6 +173,31 @@ def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any])
             if val is not None:
                 feat_dict[key] = val
     feat_dict.setdefault("filing_veto_status", "not_computed")
+
+
+def _set_m1_signal_identity(feat_dict: Dict[str, Any], inp: PatternInput) -> None:
+    event_id = (
+        feat_dict.get("earnings_event_id")
+        or feat_dict.get("earnings_calendar_event_id")
+        or feat_dict.get("m1_event_id")
+    )
+    if event_id is not None:
+        components = {"earnings_event_id": event_id}
+    else:
+        components = {
+            "announcement_date": feat_dict.get("announcement_date"),
+            "announcement_time_utc": feat_dict.get("announcement_time_utc"),
+            "fiscal_period_end": feat_dict.get("fiscal_period_end"),
+            "fiscal_year": feat_dict.get("fiscal_year"),
+            "fiscal_quarter": feat_dict.get("fiscal_quarter"),
+        }
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.M1,
+        ticker=inp.ticker,
+        components=components,
+        source="earnings_event_content",
+    )
 
 
 def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
@@ -302,12 +330,14 @@ def _enrich_m1_signal(
         feat_dict["sue_foster"] = round(sue_foster, 6)
         feat_dict["delta_t_trading_days"] = None
         _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
+        _set_m1_signal_identity(feat_dict, inp)
         _reject_signal(feat_dict, "invalid_delta_t")
         return None
 
     feat_dict["sue_foster"] = round(sue_foster, 6)
     feat_dict["delta_t_trading_days"] = delta_t
     _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
+    _set_m1_signal_identity(feat_dict, inp)
 
     # Market data quality (EOD M-track; not require_fields)
     pre_signal_rejection = market_data_quality_rejection(feat_dict, md)

@@ -54,6 +54,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (SPEC.md / EXPOSURE.md)
@@ -130,6 +131,8 @@ def _copy_diagnostic_fields(
             "cen_hq_county", "cen_sci_score",
             "sector_positive_earnings_surprises", "sector_upward_analyst_revisions",
             "sector_positive_material_news", "sector_total_confirmation_count",
+            "sector_rank_snapshot_id", "sector_return_snapshot_id",
+            "sector_return_formation_id", "sector_rank_formation_id",
             "m4_also_firing", "m6_also_firing", "overlapping_pattern_ids",
         ):
             val = source.get(key)
@@ -137,6 +140,24 @@ def _copy_diagnostic_fields(
                 feat_dict[key] = val
     feat_dict.setdefault("filing_veto_status", "not_computed")
     feat_dict.setdefault("sector_taxonomy_source", "FMP")
+
+
+def _set_m3_signal_identity(feat_dict: Dict[str, Any], inp: PatternInput) -> None:
+    snapshot_id = (
+        feat_dict.get("sector_rank_snapshot_id")
+        or feat_dict.get("sector_return_snapshot_id")
+        or feat_dict.get("sector_return_formation_id")
+        or feat_dict.get("sector_rank_formation_id")
+    )
+    if snapshot_id is None:
+        return
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.M3,
+        ticker=inp.ticker,
+        components={"sector_rank_snapshot_id": snapshot_id},
+        source="upstream_sector_rank_snapshot",
+    )
 
 
 def _reject_signal(feat_dict: Dict[str, Any], reason: str) -> None:
@@ -159,6 +180,7 @@ def _enrich_m3_signal(
     md = inp.market_data
 
     _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
+    _set_m3_signal_identity(feat_dict, inp)
 
     # Market data quality (EOD M-track; not require_fields)
     pre_signal_rejection = market_data_quality_rejection(feat_dict, md)

@@ -14,6 +14,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from alpha.data.contracts import stable_hash
 from alpha.patterns.contracts import FidelityTier
 
 
@@ -140,6 +141,45 @@ def copy_fields(feat_dict: Dict[str, Any], market_data: Dict[str, Any], fields: 
         val = market_data.get(key)
         if val is not None:
             feat_dict[key] = val
+
+
+def set_signal_identity(
+    feat_dict: Dict[str, Any],
+    *,
+    pattern_id: str,
+    ticker: str,
+    components: Dict[str, Any],
+    source: str,
+) -> Optional[str]:
+    """
+    Persist a stable event/setup identity for downstream dedup.
+
+    Components must describe the underlying event/setup, not the scan or
+    evaluation timestamp. Empty components are ignored; if nothing remains,
+    no identity is emitted.
+    """
+    clean_components: Dict[str, Any] = {}
+    for key, value in components.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        clean_components[key] = value
+    if not clean_components:
+        return None
+
+    identity_components = {
+        "pattern_id": pattern_id,
+        "ticker": ticker,
+        **clean_components,
+    }
+    identity_hash = stable_hash(identity_components)
+    feat_dict["signal_identity_hash"] = identity_hash
+    feat_dict["signal_identity_components"] = identity_components
+    feat_dict["signal_identity_source"] = source
+    return identity_hash
 
 
 def market_data_quality_rejection(

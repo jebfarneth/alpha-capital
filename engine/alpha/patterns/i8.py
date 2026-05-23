@@ -67,6 +67,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
@@ -167,6 +168,15 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
     )
 
 
+def _date_prefix(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    text = str(value).strip()
+    return text[:10] if len(text) >= 10 else None
+
+
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
     for source in sources:
         for key in (
@@ -235,6 +245,24 @@ def _copy_opening_range_features(
     feat_dict["opening_range_size"] = round(opening_range_size, 6)
     feat_dict["sigma_20d"] = sigma_20d
     _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
+    session_date = (
+        md.get("opening_range_session_date")
+        or md.get("trading_session")
+        or _date_prefix(md.get("opening_bar_close_timestamp"))
+        or _date_prefix(md.get("data_cutoff_timestamp"))
+        or _date_prefix(md.get("breakout_eval_timestamp"))
+    )
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.I8,
+        ticker=inp.ticker,
+        components={
+            "session_date": session_date,
+            "opening_range_high": opening_range_high,
+            "opening_range_low": opening_range_low,
+        },
+        source="opening_range_session_event",
+    )
     return opening_range_high, sigma_20d, opening_range_size
 
 

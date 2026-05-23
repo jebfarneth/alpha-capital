@@ -68,6 +68,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
@@ -130,6 +131,15 @@ def _data_confidence(inp: PatternInput, quality_flags: Dict[str, Any]) -> float:
         quality_flags,
         field_confidence_sources=(inp.market_data, inp.fundamental_data, inp.event_data),
     )
+
+
+def _date_prefix(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    text = str(value).strip()
+    return text[:10] if len(text) >= 10 else None
 
 
 def _copy_diagnostic_fields(feat_dict: Dict[str, Any], *sources: Dict[str, Any]) -> None:
@@ -246,6 +256,23 @@ def _copy_gap_features(feat_dict: Dict[str, Any], inp: PatternInput) -> tuple[fl
     feat_dict["gap_pct"] = round(gap_pct, 6)
     feat_dict["gap_magnitude"] = round(gap_mag, 6)
     _copy_diagnostic_fields(feat_dict, inp.market_data, inp.fundamental_data, inp.event_data)
+    session_date = (
+        market_data.get("gap_session_date")
+        or market_data.get("trading_session")
+        or _date_prefix(market_data.get("evaluation_timestamp"))
+        or _date_prefix(market_data.get("data_cutoff_timestamp"))
+    )
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.I1,
+        ticker=inp.ticker,
+        components={
+            "session_date": session_date,
+            "prev_close": prev_close,
+            "open_price": open_price,
+        },
+        source="gap_session_event",
+    )
     return gap_pct, gap_mag
 
 

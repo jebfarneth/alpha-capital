@@ -79,6 +79,7 @@ from alpha.patterns.guards import (
     reject_future_timestamp,
     require_asof_timestamp,
     require_lineage_hash,
+    set_signal_identity,
 )
 
 # Vault constants (EXPOSURE.md / SPEC.md)
@@ -273,6 +274,27 @@ def _activation_failure_reason(feat: Dict[str, Any]) -> str:
     if not feat.get("signal_freshness_passed", False):
         return "signal_expired"
     return "unknown"
+
+
+def _set_m5_signal_identity(feat_dict: Dict[str, Any], inp: PatternInput) -> None:
+    setup_id = inp.market_data.get("m5_setup_id") or inp.market_data.get("watchlist_signal_id")
+    if setup_id is not None:
+        components = {"m5_setup_id": setup_id}
+        source = "upstream_m5_setup_id"
+    else:
+        components = {
+            "setup_path": feat_dict.get("setup_path"),
+            "support_level": feat_dict.get("support_level"),
+            "low_5d": feat_dict.get("low_5d"),
+        }
+        source = "failed_breakdown_setup_content"
+    set_signal_identity(
+        feat_dict,
+        pattern_id=PatternId.M5,
+        ticker=inp.ticker,
+        components=components,
+        source=source,
+    )
 
 
 def _set_reclaim_features(
@@ -588,6 +610,7 @@ class M5Detector(BasePatternDetector):
             "support_break_attempt_weight": support_break_weight,
             "x_m5_setup": round(x_m5_setup, 6),
         }
+        _set_m5_signal_identity(feat_dict, inp)
         # Copy diagnostic fields from caller
         for source in (inp.market_data, inp.fundamental_data, inp.event_data):
             for key in ("hazard_score_at_signal", "filing_veto_status", "sector",
