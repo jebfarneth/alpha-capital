@@ -1031,7 +1031,7 @@ class TestValidationScaffold:
         assert m4["sample_size"] == 10
         assert m4["computed_sample_size"] == 10
         assert m4["unavailable_sample_size"] == 0
-        assert m4["validation_weight_multiplier"] == 0.50
+        assert m4["validation_weight_multiplier"] is None
         assert m4["confidence_tier"] != "validated"
 
         # Validation run persisted
@@ -1039,7 +1039,7 @@ class TestValidationScaffold:
             ValidationRun.pattern_id == "M4"
         ).one()
         assert vr.confidence_tier == "insufficient_sample"
-        assert vr.validation_weight_multiplier == 0.50
+        assert vr.validation_weight_multiplier is None
 
     def test_sufficient_sample_gets_monitoring(self, db_session):
         """Sufficient sample size gets monitoring tier (full validation math deferred)."""
@@ -1052,7 +1052,7 @@ class TestValidationScaffold:
         assert m4["confidence_tier"] == "monitoring"
         assert m4["sample_size"] == 50
         assert m4["computed_sample_size"] == 50
-        assert m4["validation_weight_multiplier"] == 0.75
+        assert m4["validation_weight_multiplier"] is None
 
     def test_unavailable_outcomes_count_in_denominator(self, db_session):
         """Unavailable mature outcomes are counted in sample_size, not dropped."""

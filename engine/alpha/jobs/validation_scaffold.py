@@ -4,6 +4,8 @@ Validation scaffold job.
 Minimal validation-job scaffolding proving that validation consumes
 all-firings forward_return, not filled-only returns. Full FM/NW/DSR/PBO
 math is deferred; this scaffold enforces sample-sufficiency guards.
+It intentionally does not emit a validation weight multiplier because
+sample sufficiency alone is not edge validation.
 
 Per MeasurementSpine.md section 4.
 """
@@ -28,13 +30,7 @@ OBSERVED_OUTCOME_STATUSES = (
     "missing_exit_price_retry",
 )
 
-CONFIDENCE_TIERS = {
-    "insufficient_sample": 0.50,
-    "monitoring": 0.75,
-    "reduced_confidence": 0.75,
-    "validated": 1.0,
-    "fail_confidence": 0.50,
-}
+SCAFFOLD_VALIDATION_WEIGHT_MULTIPLIER = None
 
 
 class ValidationScaffoldJob(BaseJob):
@@ -86,7 +82,7 @@ class ValidationScaffoldJob(BaseJob):
                     else None
                 ),
                 "confidence_tier": tier,
-                "validation_weight_multiplier": CONFIDENCE_TIERS[tier],
+                "validation_weight_multiplier": SCAFFOLD_VALIDATION_WEIGHT_MULTIPLIER,
             }
 
             record_validation_run(
@@ -106,7 +102,7 @@ class ValidationScaffoldJob(BaseJob):
                     "unavailable_sample_size": unavailable_count,
                 },
                 confidence_tier=tier,
-                validation_weight_multiplier=CONFIDENCE_TIERS[tier],
+                validation_weight_multiplier=SCAFFOLD_VALIDATION_WEIGHT_MULTIPLIER,
             )
 
         self._session.flush()
