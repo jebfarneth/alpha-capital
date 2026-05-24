@@ -15,23 +15,28 @@ Per Data-Sourcing-Audit.md Universe Filter section and
 MeasurementSpine.md section 1.
 
 Accepts screener results via injection (not live FMP).
-Records universe_snapshots and data_lineage via the evidence writer.
+Records universe_snapshots, universe_scans, and canonical_universe_scans.
 Preserves excluded symbols with operating_universe_inclusion=False.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import uuid
 from collections import Counter
 from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from alpha.data.contracts import AdapterResponse, stable_hash
 from alpha.data.fmp import FmpScreenerResult
+from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage, record_universe_snapshot
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 
@@ -129,6 +134,114 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def _derive_trading_date(params: Dict[str, Any], asof: datetime) -> str:
+    """Extract trading_date from job params or derive from asof timestamp."""
+    raw = params.get("trading_date")
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    if isinstance(raw, date):
+        return raw.isoformat()
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if cleaned:
+            return date.fromisoformat(cleaned).isoformat()
+    return asof.date().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+def get_canonical_universe_scan(
+    session: Session, trading_date: str,
+) -> Optional[UniverseScan]:
+    """Return the canonical universe scan for a trading date, or None."""
+    canonical = (
+        session.query(CanonicalUniverseScan)
+        .filter(CanonicalUniverseScan.trading_date == trading_date)
+        .first()
+    )
+    if canonical is None:
+        return None
+    return session.get(UniverseScan, canonical.scan_id)
+
+
+def get_canonical_universe_members(
+    session: Session,
+    trading_date: str,
+    *,
+    included_only: bool = True,
+) -> List[UniverseSnapshot]:
+    """Return universe snapshot rows from the canonical scan for a trading date."""
+    canonical = (
+        session.query(CanonicalUniverseScan)
+        .filter(CanonicalUniverseScan.trading_date == trading_date)
+        .first()
+    )
+    if canonical is None:
+        return []
+    query = (
+        session.query(UniverseSnapshot)
+        .filter(UniverseSnapshot.scan_id == canonical.scan_id)
+    )
+    if included_only:
+        query = query.filter(
+            UniverseSnapshot.operating_universe_inclusion.is_(True)
+        )
+    return query.order_by(UniverseSnapshot.ticker).all()
+
+
+def _upsert_canonical_universe_scan(
+    session: Session,
+    *,
+    trading_date: str,
+    scan_id: str,
+    job_run_id: str,
+) -> None:
+    """Select scan_id as the canonical scan for trading_date."""
+    existing = (
+        session.query(CanonicalUniverseScan)
+        .filter(CanonicalUniverseScan.trading_date == trading_date)
+        .first()
+    )
+    if existing:
+        existing.scan_id = scan_id
+        existing.selected_job_run_id = job_run_id
+        existing.selected_at = datetime.now(timezone.utc)
+        existing.selection_reason = "latest_successful_scan"
+        session.flush()
+        return
+
+    try:
+        with session.begin_nested():
+            session.add(CanonicalUniverseScan(
+                trading_date=trading_date,
+                scan_id=scan_id,
+                selected_job_run_id=job_run_id,
+                selection_reason="first_successful_scan",
+            ))
+            session.flush()
+        return
+    except IntegrityError:
+        # Another runner inserted the date between our read and insert.
+        pass
+
+    existing = (
+        session.query(CanonicalUniverseScan)
+        .filter(CanonicalUniverseScan.trading_date == trading_date)
+        .one()
+    )
+    existing.scan_id = scan_id
+    existing.selected_job_run_id = job_run_id
+    existing.selected_at = datetime.now(timezone.utc)
+    existing.selection_reason = "latest_successful_scan"
+    session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Job
+# ---------------------------------------------------------------------------
+
 class UniverseBuilderJob(BaseJob):
     """Builds operating universe from injected screener data."""
 
@@ -152,6 +265,7 @@ class UniverseBuilderJob(BaseJob):
 
     def run(self, ctx: JobContext) -> JobResult:
         resp = self._screener_response
+        trading_date = _derive_trading_date(ctx.params, resp.lineage.asof_timestamp)
 
         lineage = record_data_lineage(
             self._session,
@@ -167,6 +281,26 @@ class UniverseBuilderJob(BaseJob):
         )
 
         if not resp.ok or resp.data is None:
+            scan_id = str(uuid.uuid4())
+            self._session.add(UniverseScan(
+                scan_id=scan_id,
+                trading_date=trading_date,
+                job_run_id=ctx.job_run_id,
+                asof_timestamp=resp.lineage.asof_timestamp,
+                provider=resp.lineage.provider,
+                raw_count=0,
+                included_count=0,
+                excluded_count=0,
+                source_lineage_hash=lineage.raw_payload_hash,
+                run_status="failed",
+                metric_json=json.dumps({
+                    "raw_count": 0,
+                    "included": 0,
+                    "excluded": 0,
+                    "failure_stage": "screener_fetch",
+                }),
+            ))
+            self._session.flush()
             return JobResult(
                 status="failed",
                 input_hashes={"screener": resp.lineage.raw_payload_hash},
@@ -176,21 +310,45 @@ class UniverseBuilderJob(BaseJob):
                 }],
             )
 
+        scan_id = str(uuid.uuid4())
+
+        # Create scan row before snapshots so FK is satisfied
+        scan = UniverseScan(
+            scan_id=scan_id,
+            trading_date=trading_date,
+            job_run_id=ctx.job_run_id,
+            asof_timestamp=resp.lineage.asof_timestamp,
+            provider=resp.lineage.provider,
+            raw_count=0,
+            included_count=0,
+            excluded_count=0,
+            source_lineage_hash=lineage.raw_payload_hash,
+            run_status="building",
+        )
+        self._session.add(scan)
+        self._session.flush()
+
         included_count = 0
         excluded_count = 0
+        duplicate_symbol_count = 0
         exclusion_counts: Counter = Counter()
         snapshot_content: list = []
+        seen_symbols: set[str] = set()
 
         for stock in resp.data:
             included, reason = _classify(stock)
             symbol = _clean_symbol(stock.symbol)
+            if symbol in seen_symbols:
+                duplicate_symbol_count += 1
+                continue
+            seen_symbols.add(symbol)
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
             exchange = _clean_symbol(stock.exchange)
             record_universe_snapshot(
                 self._session,
                 job_run_id=ctx.job_run_id,
-                scan_id=ctx.job_run_id,
+                scan_id=scan_id,
                 ticker=symbol,
                 asof_timestamp=resp.lineage.asof_timestamp,
                 source_provider=resp.lineage.provider,
@@ -229,6 +387,8 @@ class UniverseBuilderJob(BaseJob):
 
         metrics: Dict = {
             "raw_count": len(resp.data),
+            "deduped_count": len(seen_symbols),
+            "duplicate_symbol_count": duplicate_symbol_count,
             "included": included_count,
             "excluded": excluded_count,
             "exclusion_counts": dict(exclusion_counts),
@@ -247,6 +407,23 @@ class UniverseBuilderJob(BaseJob):
                 for d in self._slice_diagnostics
             )
             metrics["slice_diagnostics"] = self._slice_diagnostics
+
+        # Finalize universe_scans row
+        scan.raw_count = len(resp.data)
+        scan.included_count = included_count
+        scan.excluded_count = excluded_count
+        scan.output_hash = output_hash
+        scan.run_status = "finished"
+        scan.metric_json = json.dumps(metrics, default=str)
+        self._session.flush()
+
+        # Update canonical pointer — successful builds only
+        _upsert_canonical_universe_scan(
+            self._session,
+            trading_date=trading_date,
+            scan_id=scan_id,
+            job_run_id=ctx.job_run_id,
+        )
 
         return JobResult(
             status="finished",

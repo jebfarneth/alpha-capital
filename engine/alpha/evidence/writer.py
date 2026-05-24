@@ -81,7 +81,7 @@ def start_run(
         run_status="running",
         started_at=_now(),
         app_commit_sha=app_commit_sha,
-        params_json=json.dumps(params) if params else None,
+        params_json=json.dumps(params, default=str) if params else None,
     )
     session.add(run)
     session.flush()

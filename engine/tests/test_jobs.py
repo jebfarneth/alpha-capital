@@ -13,7 +13,7 @@ Job orchestration tests.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import List
 from unittest.mock import MagicMock
@@ -28,7 +28,14 @@ from alpha.data.contracts import (
 )
 from alpha.data.fmp import FmpAdapter, FmpScreenerResult
 from alpha.data.universe import SliceDiagnostic, SlicedUniverseFetcher
-from alpha.db.models import DataLineage, EvidenceJob, EvidenceJobRun, UniverseSnapshot
+from alpha.db.models import (
+    CanonicalUniverseScan,
+    DataLineage,
+    EvidenceJob,
+    EvidenceJobRun,
+    UniverseScan,
+    UniverseSnapshot,
+)
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
 from alpha.jobs.universe_builder import (
@@ -39,6 +46,8 @@ from alpha.jobs.universe_builder import (
     UniverseBuilderJob,
     _classify,
     _is_non_common_symbol,
+    get_canonical_universe_members,
+    get_canonical_universe_scan,
 )
 
 
@@ -360,6 +369,12 @@ class TestUniverseBuilder:
 
         runs = db_session.query(EvidenceJobRun).all()
         assert runs[0].run_status == "failed"
+        scan = db_session.query(UniverseScan).one()
+        assert scan.run_status == "failed"
+        assert scan.raw_count == 0
+        assert scan.included_count == 0
+        assert scan.excluded_count == 0
+        assert db_session.query(CanonicalUniverseScan).count() == 0
 
     def test_market_cap_fields_captured(self, db_session):
         resp = _mock_screener_response()
@@ -395,6 +410,25 @@ class TestUniverseBuilder:
         assert snap.operating_universe_inclusion is True
         assert snap.ticker == "ACME"
         assert snap.primary_exchange == "NASDAQ"
+
+    def test_duplicate_normalized_symbols_are_deduped(self, db_session):
+        resp = AdapterResponse(
+            data=[
+                _stock(symbol="ACME", market_cap=75_000_000, price=5.0),
+                _stock(symbol=" acme ", market_cap=80_000_000, price=6.0),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job)
+
+        assert result.ok
+        assert result.metrics["raw_count"] == 2
+        assert result.metrics["deduped_count"] == 1
+        assert result.metrics["duplicate_symbol_count"] == 1
+        snaps = db_session.query(UniverseSnapshot).all()
+        assert len(snaps) == 1
+        assert snaps[0].ticker == "ACME"
 
     def test_slice_diagnostics_in_metrics(self, db_session):
         resp = _mock_screener_response()
@@ -1011,3 +1045,232 @@ class TestSlicedUniverseFetcher:
             is_etf=None,
             limit=1000,
         )
+
+
+# -----------------------------------------------------------------------
+# Test canonical universe scan selection
+# -----------------------------------------------------------------------
+
+class TestCanonicalUniverseScan:
+    def _run_builder(self, db_session, trading_date="2026-05-20"):
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        return run_job(db_session, job, params={"trading_date": trading_date})
+
+    def test_first_successful_run_becomes_canonical(self, db_session):
+        result = self._run_builder(db_session)
+
+        assert result.ok
+        scan = get_canonical_universe_scan(db_session, "2026-05-20")
+        assert scan is not None
+        assert scan.trading_date == "2026-05-20"
+        assert scan.run_status == "finished"
+        assert scan.included_count == 2
+
+        canonical = db_session.query(CanonicalUniverseScan).filter(
+            CanonicalUniverseScan.trading_date == "2026-05-20"
+        ).one()
+        assert canonical.selection_reason == "first_successful_scan"
+
+    def test_second_successful_run_replaces_canonical(self, db_session):
+        r1 = self._run_builder(db_session)
+        scan1 = get_canonical_universe_scan(db_session, "2026-05-20")
+        scan1_id = scan1.scan_id
+
+        r2 = self._run_builder(db_session)
+        scan2 = get_canonical_universe_scan(db_session, "2026-05-20")
+
+        assert scan2.scan_id != scan1_id
+        assert scan2.run_status == "finished"
+
+        canonical = db_session.query(CanonicalUniverseScan).filter(
+            CanonicalUniverseScan.trading_date == "2026-05-20"
+        ).one()
+        assert canonical.scan_id == scan2.scan_id
+        assert canonical.selection_reason == "latest_successful_scan"
+
+        # Both scans are immutable records
+        all_scans = db_session.query(UniverseScan).filter(
+            UniverseScan.trading_date == "2026-05-20"
+        ).all()
+        assert len(all_scans) == 2
+
+    def test_failed_run_does_not_replace_canonical(self, db_session):
+        r1 = self._run_builder(db_session)
+        scan1 = get_canonical_universe_scan(db_session, "2026-05-20")
+        scan1_id = scan1.scan_id
+
+        # Failed run
+        error_resp = AdapterResponse(
+            data=None,
+            lineage=_mock_lineage(),
+            error=ProviderError(
+                provider="FMP", endpoint="/stable/company-screener",
+                status_code=500, error_type="http",
+                message="Internal Server Error", retryable=True,
+            ),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=error_resp)
+        r2 = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert not r2.ok
+
+        # Canonical pointer unchanged
+        scan_after = get_canonical_universe_scan(db_session, "2026-05-20")
+        assert scan_after.scan_id == scan1_id
+        scans = db_session.query(UniverseScan).filter(
+            UniverseScan.trading_date == "2026-05-20"
+        ).all()
+        assert len(scans) == 2
+        assert {scan.run_status for scan in scans} == {"finished", "failed"}
+
+    def test_failed_first_run_records_scan_without_canonical(self, db_session):
+        error_resp = AdapterResponse(
+            data=None,
+            lineage=_mock_lineage(),
+            error=ProviderError(
+                provider="FMP", endpoint="/stable/company-screener",
+                status_code=500, error_type="http",
+                message="Internal Server Error", retryable=True,
+            ),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=error_resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert not result.ok
+        scan = db_session.query(UniverseScan).one()
+        assert scan.trading_date == "2026-05-20"
+        assert scan.run_status == "failed"
+        assert get_canonical_universe_scan(db_session, "2026-05-20") is None
+
+    def test_canonical_members_returns_only_canonical_scan(self, db_session):
+        self._run_builder(db_session)
+        self._run_builder(db_session)
+
+        members = get_canonical_universe_members(db_session, "2026-05-20")
+        assert len(members) == 2
+        tickers = {m.ticker for m in members}
+        assert tickers == {"INCL1", "INCL2"}
+
+        scan = get_canonical_universe_scan(db_session, "2026-05-20")
+        assert all(m.scan_id == scan.scan_id for m in members)
+
+    def test_canonical_members_included_only(self, db_session):
+        self._run_builder(db_session)
+
+        included = get_canonical_universe_members(db_session, "2026-05-20", included_only=True)
+        all_members = get_canonical_universe_members(db_session, "2026-05-20", included_only=False)
+
+        assert len(included) == 2
+        assert len(all_members) == 7
+
+    def test_canonical_members_ordered_by_ticker(self, db_session):
+        resp = AdapterResponse(
+            data=[
+                _stock("ZZZZ", market_cap=75_000_000, price=5.0),
+                _stock("AAAA", market_cap=80_000_000, price=6.0),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        members = get_canonical_universe_members(db_session, "2026-05-20")
+        assert [m.ticker for m in members] == ["AAAA", "ZZZZ"]
+
+    def test_canonical_query_nonexistent_date_returns_empty(self, db_session):
+        assert get_canonical_universe_scan(db_session, "2099-01-01") is None
+        assert get_canonical_universe_members(db_session, "2099-01-01") == []
+
+    def test_different_trading_dates_independent(self, db_session):
+        self._run_builder(db_session, "2026-05-20")
+        self._run_builder(db_session, "2026-05-21")
+
+        scan_20 = get_canonical_universe_scan(db_session, "2026-05-20")
+        scan_21 = get_canonical_universe_scan(db_session, "2026-05-21")
+        assert scan_20.scan_id != scan_21.scan_id
+
+    def test_universe_scans_row_created(self, db_session):
+        self._run_builder(db_session)
+
+        scans = db_session.query(UniverseScan).all()
+        assert len(scans) == 1
+        assert scans[0].trading_date == "2026-05-20"
+        assert scans[0].raw_count == 7
+        assert scans[0].included_count == 2
+        assert scans[0].excluded_count == 5
+        assert scans[0].run_status == "finished"
+        assert scans[0].output_hash is not None
+
+    def test_scan_id_links_snapshots(self, db_session):
+        self._run_builder(db_session)
+
+        scan = db_session.query(UniverseScan).one()
+        snaps = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.scan_id == scan.scan_id
+        ).all()
+        assert len(snaps) == 7
+
+    def test_duplicate_ticker_in_same_scan_blocked(self, db_session):
+        """DB unique constraint blocks same ticker twice in one scan."""
+        from sqlalchemy.exc import IntegrityError
+        from alpha.evidence.writer import record_universe_snapshot
+
+        scan = UniverseScan(
+            scan_id="test-scan",
+            trading_date="2026-05-20",
+            asof_timestamp=_ts(),
+            raw_count=0,
+            included_count=0,
+            excluded_count=0,
+            run_status="finished",
+        )
+        db_session.add(scan)
+        db_session.flush()
+
+        record_universe_snapshot(
+            db_session, ticker="ACME", asof_timestamp=_ts(),
+            operating_universe_inclusion=True, scan_id="test-scan",
+        )
+        db_session.flush()
+
+        with pytest.raises(IntegrityError):
+            record_universe_snapshot(
+                db_session, ticker="ACME", asof_timestamp=_ts(),
+                operating_universe_inclusion=True, scan_id="test-scan",
+            )
+            db_session.flush()
+
+    def test_trading_date_derived_from_asof_when_not_provided(self, db_session):
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        run_job(db_session, job)
+
+        scan = db_session.query(UniverseScan).one()
+        assert scan.trading_date == "2026-05-20"
+
+    @pytest.mark.parametrize(
+        "trading_date_param",
+        [
+            date(2026, 5, 20),
+            datetime(2026, 5, 20, 14, 30, 0, tzinfo=timezone.utc),
+            " 2026-05-20 ",
+        ],
+    )
+    def test_trading_date_param_normalized(self, db_session, trading_date_param):
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        run_job(db_session, job, params={"trading_date": trading_date_param})
+
+        scan = db_session.query(UniverseScan).one()
+        assert scan.trading_date == "2026-05-20"
+        assert get_canonical_universe_scan(db_session, "2026-05-20") is not None
+
+    def test_invalid_trading_date_param_fails(self, db_session):
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "bad-date"})
+
+        assert not result.ok
+        assert db_session.query(UniverseScan).count() == 0
+        assert db_session.query(CanonicalUniverseScan).count() == 0

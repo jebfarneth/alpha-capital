@@ -128,10 +128,70 @@ class EvidenceSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# universe_scans
+# ---------------------------------------------------------------------------
+class UniverseScan(Base):
+    __tablename__ = "universe_scans"
+    __table_args__ = (
+        Index("ix_universe_scans_trading_date", "trading_date"),
+        Index("ix_universe_scans_job_run_id", "job_run_id"),
+    )
+
+    scan_id = Column(String, primary_key=True, default=_uuid)
+    trading_date = Column(String, nullable=False)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    asof_timestamp = Column(DateTime(timezone=True), nullable=False)
+    provider = Column(String, nullable=True)
+    raw_count = Column(Integer, nullable=False, default=0)
+    included_count = Column(Integer, nullable=False, default=0)
+    excluded_count = Column(Integer, nullable=False, default=0)
+    source_lineage_hash = Column(String, nullable=True)
+    output_hash = Column(String, nullable=True)
+    run_status = Column(String, nullable=False, default="finished")
+    metric_json = Column(Text, nullable=True)
+
+    snapshots = relationship("UniverseSnapshot", back_populates="scan")
+
+
+# ---------------------------------------------------------------------------
+# canonical_universe_scans
+# ---------------------------------------------------------------------------
+class CanonicalUniverseScan(Base):
+    __tablename__ = "canonical_universe_scans"
+
+    trading_date = Column(String, primary_key=True)
+    scan_id = Column(
+        String, ForeignKey("universe_scans.scan_id"), nullable=False
+    )
+    selected_job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    selected_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    selection_reason = Column(String, nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # universe_snapshots
 # ---------------------------------------------------------------------------
 class UniverseSnapshot(Base):
     __tablename__ = "universe_snapshots"
+    __table_args__ = (
+        Index(
+            "ux_universe_snapshots_scan_ticker",
+            "scan_id", "ticker",
+            unique=True,
+        ),
+        Index(
+            "ix_universe_snapshots_scan_inclusion",
+            "scan_id", "operating_universe_inclusion",
+        ),
+        Index(
+            "ix_universe_snapshots_ticker_asof",
+            "ticker", "asof_timestamp",
+        ),
+    )
 
     universe_snapshot_id = Column(String, primary_key=True, default=_uuid)
     evidence_snapshot_id = Column(
@@ -140,7 +200,9 @@ class UniverseSnapshot(Base):
     job_run_id = Column(
         String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
     )
-    scan_id = Column(String, nullable=True)
+    scan_id = Column(
+        String, ForeignKey("universe_scans.scan_id"), nullable=True
+    )
     ticker = Column(String, nullable=False)
     asof_timestamp = Column(DateTime(timezone=True), nullable=False)
     source_provider = Column(String, nullable=True)
@@ -161,6 +223,8 @@ class UniverseSnapshot(Base):
     dataset_version = Column(String, nullable=True)
     schema_hash = Column(String, nullable=True)
     source_lineage_hash = Column(String, nullable=True)
+
+    scan = relationship("UniverseScan", back_populates="snapshots")
 
 
 # ---------------------------------------------------------------------------
