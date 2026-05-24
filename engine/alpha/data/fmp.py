@@ -38,6 +38,12 @@ def _bool_or_raw(value: Any) -> Any:
             return False
         if value == 1:
             return True
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"true", "1", "yes", "y"}:
+            return True
+        if cleaned in {"false", "0", "no", "n"}:
+            return False
     return value
 
 

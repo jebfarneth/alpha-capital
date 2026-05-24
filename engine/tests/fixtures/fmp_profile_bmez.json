@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "BMEZ",
+    "companyName": "BlackRock Health Sciences Trust II",
+    "marketCap": 172800000,
+    "sector": "Financial Services",
+    "industry": "Asset Management",
+    "exchange": "New York Stock Exchange",
+    "exchangeShortName": "NYSE",
+    "country": "US",
+    "isEtf": false,
+    "isFund": true,
+    "isAdr": false,
+    "isActivelyTrading": true
+  }
+]

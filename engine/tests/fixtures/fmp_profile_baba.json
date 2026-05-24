@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "BABA",
+    "companyName": "Alibaba Group Holding Limited",
+    "marketCap": 203000000000,
+    "sector": "Consumer Cyclical",
+    "industry": "Specialty Retail",
+    "exchange": "New York Stock Exchange",
+    "exchangeShortName": "NYSE",
+    "country": "CN",
+    "isEtf": false,
+    "isFund": false,
+    "isAdr": true,
+    "isActivelyTrading": true
+  }
+]

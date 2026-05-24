@@ -514,6 +514,12 @@ class TestEnrichmentJob:
             "is_etf": False,
             "raw": {"isFund": False},
         })
+        assert prof.classification_output_hash == stable_hash({
+            "classifier_version": CLASSIFIER_VERSION,
+            "security_type": COMMON_STOCK,
+            "classification_reason": "profile_fields_present",
+            "refresh_status": REFRESH_STATUS_ENRICHED,
+        })
 
     def test_multiple_symbols(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -539,6 +545,45 @@ class TestEnrichmentJob:
         counts = result.metrics["security_type_counts"]
         assert counts[COMMON_STOCK] == 1
         assert counts[ETF] == 1
+
+    def test_derived_symbols_include_suffix_excluded_candidates(self, db_session):
+        db_session.add_all([
+            UniverseSnapshot(
+                ticker="INCL",
+                asof_timestamp=_ts(),
+                operating_universe_inclusion=True,
+                exclusion_reason=None,
+            ),
+            UniverseSnapshot(
+                ticker="ABCDX",
+                asof_timestamp=_ts(),
+                operating_universe_inclusion=False,
+                exclusion_reason="non_common_symbol_suffix",
+            ),
+            UniverseSnapshot(
+                ticker="PENY",
+                asof_timestamp=_ts(),
+                operating_universe_inclusion=False,
+                exclusion_reason="price_below_3",
+            ),
+        ])
+        db_session.flush()
+
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_company_profile.return_value = _mock_no_data_response()
+
+        job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=adapter,
+            retry_backoff_seconds=0,
+        )
+        result = run_job(db_session, job)
+
+        called_symbols = {
+            call.args[0] for call in adapter.get_company_profile.call_args_list
+        }
+        assert result.ok
+        assert called_symbols == {"INCL", "ABCDX"}
 
     def test_security_type_counts_in_metrics(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -748,6 +793,31 @@ class TestBuilderCacheIntegration:
         assert snap.operating_universe_inclusion is False
         assert snap.exclusion_reason == "security_profile_stale"
         assert result.metrics["security_profile_stale_count"] == 1
+
+    def test_stale_non_common_profile_does_not_override_suffix_reason(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="ABCDX", security_type=MUTUAL_FUND,
+            last_refreshed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("ABCDX")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(
+            session=db_session,
+            screener_response=resp,
+            profile_cache_max_age_days=7,
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "ABCDX"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "non_common_symbol_suffix"
+        assert snap.security_type == MUTUAL_FUND
+        assert result.metrics["security_profile_stale_count"] == 1
+        assert "mutual_fund" not in result.metrics["security_type_exclusion_counts"]
 
     def test_common_stock_cache_rescues_suffix_fallback(self, db_session):
         db_session.add(SecurityProfile(

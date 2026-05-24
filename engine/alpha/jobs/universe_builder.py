@@ -496,6 +496,7 @@ class UniverseBuilderJob(BaseJob):
                 cache_hit_count += 1
                 security_type = cached_profile.security_type
                 refresh_status = cached_profile.refresh_status
+                profile_usable = False
                 stale = _security_profile_stale(
                     cached_profile,
                     resp.lineage.asof_timestamp,
@@ -516,6 +517,7 @@ class UniverseBuilderJob(BaseJob):
                         included = False
                         reason = f"security_profile_unresolved:{refresh_status or 'unknown'}"
                 else:
+                    profile_usable = True
                     if profile_required:
                         security_profile_enriched_count += 1
                     if (
@@ -526,7 +528,7 @@ class UniverseBuilderJob(BaseJob):
                         included = True
                         reason = None
                         security_type_suffix_rescue_count += 1
-                if security_type in NON_COMMON_TYPES and (
+                if profile_usable and security_type in NON_COMMON_TYPES and (
                     included or reason == "non_common_symbol_suffix"
                 ):
                     included = False

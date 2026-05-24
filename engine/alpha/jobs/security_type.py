@@ -17,6 +17,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import stable_hash
@@ -361,6 +362,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 "classifier_version": CLASSIFIER_VERSION,
                 "security_type": security_type,
                 "classification_reason": reason,
+                "refresh_status": REFRESH_STATUS_ENRICHED,
             })
 
             self._upsert_profile(
@@ -412,7 +414,10 @@ class SecurityTypeEnrichmentJob(BaseJob):
         from alpha.db.models import UniverseSnapshot
         rows = (
             self._session.query(UniverseSnapshot.ticker)
-            .filter(UniverseSnapshot.operating_universe_inclusion.is_(True))
+            .filter(or_(
+                UniverseSnapshot.operating_universe_inclusion.is_(True),
+                UniverseSnapshot.exclusion_reason == "non_common_symbol_suffix",
+            ))
             .distinct()
             .all()
         )

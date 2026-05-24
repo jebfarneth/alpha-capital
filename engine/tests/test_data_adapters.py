@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.polygon import PolygonAdapter
+from alpha.jobs.security_type import ADR, MUTUAL_FUND, classify_security_type
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,11 @@ def _alpaca_config():
 
 def _polygon_config():
     return PolygonConfig(api_key="test-polygon-key")
+
+
+def _fixture_json(name: str):
+    path = Path(__file__).parent / "fixtures" / name
+    return json.loads(path.read_text())
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +284,27 @@ class TestFmpAdapter:
         assert resp.data[0].is_etf is False
         assert resp.data[0].is_actively_trading is True
 
+    def test_get_stock_screener_normalizes_string_booleans(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "ACME",
+                "companyName": "Acme Corp",
+                "marketCap": 75000000,
+                "price": 5.25,
+                "isEtf": "false",
+                "isActivelyTrading": "true",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_stock_screener()
+
+        assert resp.ok
+        assert resp.data[0].is_etf is False
+        assert resp.data[0].is_actively_trading is True
+
     def test_get_company_profile_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -304,6 +332,38 @@ class TestFmpAdapter:
         assert resp.data.is_actively_trading is True
         assert resp.data.raw["exchange"] == "NASDAQ"
         assert resp.lineage.endpoint == "/stable/profile"
+
+    def test_recorded_fmp_profile_fixture_classifies_fund_from_adapter_raw(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_bmez.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("BMEZ")
+
+        assert resp.ok
+        assert resp.data.exchange == "NYSE"
+        assert resp.data.raw["isFund"] is True
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == MUTUAL_FUND
+        assert reason == "raw_flag:isFund"
+
+    def test_recorded_fmp_profile_fixture_classifies_adr_from_adapter_raw(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_baba.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("BABA")
+
+        assert resp.ok
+        assert resp.data.exchange == "NYSE"
+        assert resp.data.raw["isAdr"] is True
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == ADR
+        assert reason == "raw_flag:isAdr"
 
     def test_get_company_profile_empty_result_is_no_data_error(self):
         session = MagicMock(spec=requests.Session)
