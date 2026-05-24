@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "AAPL",
+    "companyName": "Apple Inc.",
+    "marketCap": 2960000000000,
+    "sector": "Technology",
+    "industry": "Consumer Electronics",
+    "exchange": "NASDAQ",
+    "exchangeFullName": "NASDAQ Global Select",
+    "country": "US",
+    "isEtf": false,
+    "isFund": false,
+    "isAdr": false,
+    "isActivelyTrading": true
+  }
+]

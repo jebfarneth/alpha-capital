@@ -37,6 +37,7 @@ from alpha.jobs.security_type import (
     COMMON_STOCK,
     ETF,
     MUTUAL_FUND,
+    BUSINESS_DEVELOPMENT_COMPANY,
     NON_COMMON_TYPES,
     PREFERRED,
     RIGHT,
@@ -216,6 +217,51 @@ class TestClassifier:
         )
         assert st == COMMON_STOCK
 
+    def test_bdc_from_business_development_name(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Example Business Development Company",
+                sector="Financial Services",
+                industry="Asset Management",
+            )
+        )
+        assert st == BUSINESS_DEVELOPMENT_COMPANY
+        assert reason == "name_contains:BUSINESS_DEVELOPMENT_COMPANY"
+
+    def test_bdc_from_capital_corporation_financial_profile(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Ares Capital Corporation",
+                sector="Financial Services",
+                industry="Asset Management",
+            )
+        )
+        assert st == BUSINESS_DEVELOPMENT_COMPANY
+        assert reason == "name_industry:CAPITAL_CORPORATION_BDC"
+
+    def test_bdc_from_raw_description(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Hercules Capital, Inc.",
+                sector="Financial Services",
+                industry="Asset Management",
+            ),
+            raw_json={"description": "Hercules Capital, Inc. is a business development company."},
+        )
+        assert st == BUSINESS_DEVELOPMENT_COMPANY
+        assert reason == "raw_description:BUSINESS_DEVELOPMENT_COMPANY"
+
+    def test_capital_corporation_outside_financial_profile_not_bdc(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Acme Capital Corporation",
+                sector="Technology",
+                industry="Software",
+            )
+        )
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
     def test_raw_provider_is_fund_flag_wins(self):
         st, reason = classify_security_type(
             _profile(company_name="Opaque Profile Inc"),
@@ -250,6 +296,7 @@ class TestClassifier:
         assert UNIT in NON_COMMON_TYPES
         assert RIGHT in NON_COMMON_TYPES
         assert SPAC_OR_BLANK_CHECK in NON_COMMON_TYPES
+        assert BUSINESS_DEVELOPMENT_COMPANY in NON_COMMON_TYPES
         assert COMMON_STOCK not in NON_COMMON_TYPES
         assert UNKNOWN not in NON_COMMON_TYPES
 
@@ -838,6 +885,25 @@ class TestBuilderCacheIntegration:
         assert snap.security_type == COMMON_STOCK
         assert result.metrics["security_type_suffix_rescue_count"] == 1
         assert result.metrics["security_profile_coverage_ratio"] == 1.0
+
+    def test_common_stock_cache_does_not_rescue_warrant_suffix(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="ASTSW", security_type=COMMON_STOCK,
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("ASTSW")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "ASTSW"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "non_common_symbol_suffix"
+        assert snap.security_type == COMMON_STOCK
+        assert result.metrics["security_type_suffix_rescue_count"] == 0
 
     def test_non_common_cache_overrides_suffix_reason(self, db_session):
         db_session.add(SecurityProfile(

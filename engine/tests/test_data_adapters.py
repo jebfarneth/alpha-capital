@@ -25,7 +25,14 @@ from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.polygon import PolygonAdapter
-from alpha.jobs.security_type import ADR, MUTUAL_FUND, classify_security_type
+from alpha.jobs.security_type import (
+    ADR,
+    BUSINESS_DEVELOPMENT_COMPANY,
+    COMMON_STOCK,
+    ETF,
+    MUTUAL_FUND,
+    classify_security_type,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +371,52 @@ class TestFmpAdapter:
         security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
         assert security_type == ADR
         assert reason == "raw_flag:isAdr"
+
+    def test_recorded_fmp_profile_fixture_classifies_common_stock(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_aapl.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("AAPL")
+
+        assert resp.ok
+        assert resp.data.raw["isFund"] is False
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
+    def test_recorded_fmp_profile_fixture_classifies_etf(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_spy.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("SPY")
+
+        assert resp.ok
+        assert resp.data.raw["isEtf"] is True
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == ETF
+        assert reason == "is_etf=True"
+
+    def test_recorded_fmp_profile_fixture_classifies_bdc(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_arcc.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("ARCC")
+
+        assert resp.ok
+        assert resp.data.raw["isFund"] is False
+        assert "business development company" in resp.data.raw["description"].lower()
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == BUSINESS_DEVELOPMENT_COMPANY
+        assert reason == "raw_description:BUSINESS_DEVELOPMENT_COMPANY"
 
     def test_get_company_profile_empty_result_is_no_data_error(self):
         session = MagicMock(spec=requests.Session)

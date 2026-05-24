@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "SPY",
+    "companyName": "State Street SPDR S&P 500 ETF Trust",
+    "marketCap": 655000000000,
+    "sector": "Financial Services",
+    "industry": "Asset Management",
+    "exchange": "AMEX",
+    "exchangeFullName": "NYSE Arca",
+    "country": "US",
+    "isEtf": true,
+    "isFund": false,
+    "isAdr": false,
+    "isActivelyTrading": true
+  }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "symbol": "ARCC",
+    "companyName": "Ares Capital Corporation",
+    "marketCap": 14300000000,
+    "sector": "Financial Services",
+    "industry": "Asset Management",
+    "exchange": "NASDAQ",
+    "exchangeFullName": "NASDAQ Global Select",
+    "country": "US",
+    "isEtf": false,
+    "isFund": false,
+    "isAdr": false,
+    "isActivelyTrading": true,
+    "description": "Ares Capital Corporation is a business development company specializing in acquisition, recapitalization, mezzanine debt, restructurings, rescue financing, and leveraged buyout transactions of middle market companies."
+  }
+]

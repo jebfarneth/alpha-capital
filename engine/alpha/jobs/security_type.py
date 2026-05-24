@@ -40,9 +40,10 @@ WARRANT = "warrant"
 UNIT = "unit"
 RIGHT = "right"
 SPAC_OR_BLANK_CHECK = "spac_or_blank_check"
+BUSINESS_DEVELOPMENT_COMPANY = "business_development_company"
 UNKNOWN = "unknown"
 
-CLASSIFIER_VERSION = "security_type_v1"
+CLASSIFIER_VERSION = "security_type_v2"
 
 REFRESH_STATUS_ENRICHED = "enriched"
 REFRESH_STATUS_NO_DATA = "no_data"
@@ -59,6 +60,7 @@ NON_COMMON_TYPES = frozenset({
     UNIT,
     RIGHT,
     SPAC_OR_BLANK_CHECK,
+    BUSINESS_DEVELOPMENT_COMPANY,
 })
 
 
@@ -115,12 +117,17 @@ def _raw_type_text(raw_json: Dict[str, Any]) -> str:
     return _clean_text(" ".join(values))
 
 
+def _raw_description_text(raw_json: Dict[str, Any]) -> str:
+    return _clean_text(raw_json.get("description"))
+
+
 def _classification_input(profile: FmpCompanyProfile, raw_json: Dict[str, Any]) -> Dict[str, Any]:
     raw_keys = (
         "isFund", "is_fund",
         "isAdr", "isADR", "is_adr",
         "isEtf", "isETF", "is_etf",
         "type", "securityType", "security_type", "assetType", "asset_class",
+        "description",
     )
     return {
         "symbol": profile.symbol,
@@ -145,6 +152,7 @@ def classify_security_type(
     industry = _clean_text(profile.industry)
     sector = _clean_text(profile.sector)
     raw_type = _raw_type_text(raw_json)
+    raw_description = _raw_description_text(raw_json)
 
     if profile.is_etf is True or _raw_bool(raw_json, "isEtf", "isETF", "is_etf") is True:
         return ETF, "is_etf=True"
@@ -175,6 +183,8 @@ def classify_security_type(
             return UNIT, "raw_type:UNIT"
         if _has_phrase(raw_type, "RIGHT"):
             return RIGHT, "raw_type:RIGHT"
+        if _has_phrase(raw_type, "BUSINESS DEVELOPMENT COMPANY") or _has_phrase(raw_type, "BDC"):
+            return BUSINESS_DEVELOPMENT_COMPANY, "raw_type:BUSINESS_DEVELOPMENT_COMPANY"
 
     has_closed_indicator = (
         _has_phrase(name, "CLOSED")
@@ -241,6 +251,19 @@ def classify_security_type(
     kw = _has_any_phrase(name, spac_keywords)
     if kw:
         return SPAC_OR_BLANK_CHECK, f"name_contains:{kw}"
+
+    # BDC indicators. FMP does not mark BDCs like ARCC/MAIN with isFund=True.
+    if (
+        _has_phrase(raw_description, "BUSINESS DEVELOPMENT COMPANY")
+        or _has_phrase(raw_description, "BUSINESS DEVELOPMENT COMPANIES")
+    ):
+        return BUSINESS_DEVELOPMENT_COMPANY, "raw_description:BUSINESS_DEVELOPMENT_COMPANY"
+    if _has_phrase(name, "BUSINESS DEVELOPMENT COMPANY") or _has_phrase(name, "BDC"):
+        return BUSINESS_DEVELOPMENT_COMPANY, "name_contains:BUSINESS_DEVELOPMENT_COMPANY"
+    bdc_industries = {"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"}
+    if sector == "FINANCIAL SERVICES" and industry in bdc_industries:
+        if _has_phrase(name, "CAPITAL CORPORATION") or _has_phrase(name, "CAPITAL CORP"):
+            return BUSINESS_DEVELOPMENT_COMPANY, "name_industry:CAPITAL_CORPORATION_BDC"
 
     # ETF fallback from sector/industry
     if sector == "ETF" or industry == "EXCHANGE TRADED FUND":

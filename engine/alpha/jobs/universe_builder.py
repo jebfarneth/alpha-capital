@@ -96,6 +96,17 @@ def _is_non_common_symbol(symbol: object) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def _allows_security_type_suffix_rescue(symbol: object) -> bool:
+    """Only fund-proxy X suffixes can be rescued by a common-stock profile.
+
+    Warrant/unit-like suffixes often resolve to the parent company's profile
+    at FMP, so a common_stock profile is not strong enough evidence to rescue
+    W/U/WS/WT forms.
+    """
+    upper = _clean_symbol(symbol)
+    return len(upper) == 5 and upper.endswith("X")
+
+
 def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     """Return (included, exclusion_reason).
 
@@ -524,6 +535,7 @@ class UniverseBuilderJob(BaseJob):
                         security_type == COMMON_STOCK
                         and not included
                         and reason == "non_common_symbol_suffix"
+                        and _allows_security_type_suffix_rescue(symbol)
                     ):
                         included = True
                         reason = None
