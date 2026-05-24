@@ -237,18 +237,20 @@ class FmpAdapter:
         self,
         market_cap_min: int = 30_000_000,
         market_cap_max: int = 200_000_000,
-        country: str = "US",
-        is_etf: bool = False,
+        country: Optional[str] = "US",
+        is_etf: Optional[bool] = False,
         limit: int = 5000,
     ) -> AdapterResponse[List[FmpScreenerResult]]:
         endpoint = "/stable/company-screener"
         params = {
             "marketCapMoreThan": market_cap_min,
             "marketCapLowerThan": market_cap_max,
-            "country": country,
-            "isEtf": str(is_etf).lower(),
             "limit": limit,
         }
+        if country is not None:
+            params["country"] = country
+        if is_etf is not None:
+            params["isEtf"] = str(is_etf).lower()
         resp = self._request(endpoint, params=params)
         if not resp.ok:
             return resp  # type: ignore[return-value]

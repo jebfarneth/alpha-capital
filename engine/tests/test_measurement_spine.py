@@ -67,8 +67,8 @@ def _lineage():
 
 def _screener_data() -> List[FmpScreenerResult]:
     return [
-        FmpScreenerResult(symbol="ACME", company_name="Acme Corp", market_cap=75_000_000, price=5.0, country="US", is_etf=False, is_actively_trading=True),
-        FmpScreenerResult(symbol="BETA", company_name="Beta Inc", market_cap=50_000_000, price=3.0, country="US", is_etf=False, is_actively_trading=True),
+        FmpScreenerResult(symbol="ACME", company_name="Acme Corp", market_cap=75_000_000, price=5.0, exchange="NASDAQ", country="US", is_etf=False, is_actively_trading=True),
+        FmpScreenerResult(symbol="BETA", company_name="Beta Inc", market_cap=50_000_000, price=3.0, exchange="NASDAQ", country="US", is_etf=False, is_actively_trading=True),
     ]
 
 
