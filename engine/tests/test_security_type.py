@@ -23,7 +23,7 @@ from alpha.data.contracts import (
     stable_hash,
 )
 from alpha.data.fmp import FmpAdapter, FmpCompanyProfile, FmpScreenerResult
-from alpha.db.models import Base, SecurityProfile, UniverseSnapshot
+from alpha.db.models import Base, SecurityProfile, UniverseScan, UniverseSnapshot
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import (
     ADR,
@@ -38,6 +38,11 @@ from alpha.jobs.security_type import (
     UNIT,
     UNKNOWN,
     WARRANT,
+    CLASSIFIER_VERSION,
+    REFRESH_STATUS_ENRICHED,
+    REFRESH_STATUS_FAILED,
+    REFRESH_STATUS_NO_DATA,
+    REFRESH_STATUS_RETRYABLE_ERROR,
     SecurityTypeEnrichmentJob,
     classify_security_type,
 )
@@ -270,6 +275,36 @@ def _mock_no_data_response():
     )
 
 
+def _mock_retryable_response():
+    return AdapterResponse(
+        data=None,
+        lineage=_lineage(),
+        error=ProviderError(
+            provider="FMP",
+            endpoint="/stable/profile",
+            status_code=429,
+            error_type="rate_limit",
+            message="Rate limited",
+            retryable=True,
+        ),
+    )
+
+
+def _mock_auth_error_response():
+    return AdapterResponse(
+        data=None,
+        lineage=_lineage(),
+        error=ProviderError(
+            provider="FMP",
+            endpoint="/stable/profile",
+            status_code=403,
+            error_type="auth",
+            message="Auth failed",
+            retryable=False,
+        ),
+    )
+
+
 class TestEnrichmentJob:
     def test_upserts_profile(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -289,13 +324,16 @@ class TestEnrichmentJob:
             SecurityProfile.symbol == "ACME"
         ).one()
         assert prof.security_type == COMMON_STOCK
-        assert prof.refresh_status == "enriched"
+        assert prof.refresh_status == REFRESH_STATUS_ENRICHED
         assert prof.source_provider == "FMP"
+        assert prof.classifier_version == CLASSIFIER_VERSION
+        assert prof.classification_input_hash
+        assert prof.classification_output_hash
 
     def test_updates_existing_profile(self, db_session):
         db_session.add(SecurityProfile(
             symbol="ACME", security_type=UNKNOWN,
-            last_refreshed_at=_ts(), refresh_status="no_data",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_NO_DATA,
         ))
         db_session.flush()
 
@@ -313,7 +351,7 @@ class TestEnrichmentJob:
             SecurityProfile.symbol == "ACME"
         ).one()
         assert prof.security_type == COMMON_STOCK
-        assert prof.refresh_status == "enriched"
+        assert prof.refresh_status == REFRESH_STATUS_ENRICHED
 
     def test_handles_no_data_without_failing(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -332,7 +370,9 @@ class TestEnrichmentJob:
             SecurityProfile.symbol == "GHOST"
         ).one()
         assert prof.security_type == UNKNOWN
-        assert prof.refresh_status == "no_data"
+        assert prof.refresh_status == REFRESH_STATUS_NO_DATA
+        assert prof.classifier_version == CLASSIFIER_VERSION
+        assert prof.classification_output_hash
 
     def test_handles_exception_without_failing(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -350,8 +390,89 @@ class TestEnrichmentJob:
             SecurityProfile.symbol == "CRASH"
         ).one()
         assert prof.security_type == UNKNOWN
-        assert prof.refresh_status == "failed"
+        assert prof.refresh_status == REFRESH_STATUS_FAILED
         assert prof.classification_reason == "profile_fetch_exception:RuntimeError"
+
+    def test_retryable_error_retries_then_records_retryable_status(self, db_session):
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_company_profile.side_effect = [
+            _mock_retryable_response(),
+            _mock_retryable_response(),
+        ]
+        sleeps = []
+
+        job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=adapter,
+            symbols=["SLOW"],
+            max_retries=1,
+            retry_backoff_seconds=0.25,
+            sleep_fn=sleeps.append,
+        )
+        result = run_job(db_session, job)
+
+        assert result.ok
+        assert adapter.get_company_profile.call_count == 2
+        assert sleeps == [0.25]
+        assert result.metrics["retryable_error_count"] == 1
+        assert result.metrics["no_data_count"] == 0
+        assert result.metrics["retry_attempt_count"] == 1
+
+        prof = db_session.query(SecurityProfile).filter(
+            SecurityProfile.symbol == "SLOW"
+        ).one()
+        assert prof.security_type == UNKNOWN
+        assert prof.refresh_status == REFRESH_STATUS_RETRYABLE_ERROR
+        assert prof.classification_reason == "profile_fetch_retryable:rate_limit"
+
+    def test_retryable_error_then_success_does_not_mark_no_data(self, db_session):
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_company_profile.side_effect = [
+            _mock_retryable_response(),
+            _mock_profile_response(_profile("SLOW")),
+        ]
+        sleeps = []
+
+        job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=adapter,
+            symbols=["SLOW"],
+            max_retries=1,
+            retry_backoff_seconds=0.25,
+            sleep_fn=sleeps.append,
+        )
+        result = run_job(db_session, job)
+
+        assert result.metrics["enriched_count"] == 1
+        assert result.metrics["retryable_error_count"] == 0
+        assert result.metrics["no_data_count"] == 0
+        assert result.metrics["retry_attempt_count"] == 1
+        assert sleeps == [0.25]
+
+        prof = db_session.query(SecurityProfile).filter(
+            SecurityProfile.symbol == "SLOW"
+        ).one()
+        assert prof.security_type == COMMON_STOCK
+        assert prof.refresh_status == REFRESH_STATUS_ENRICHED
+
+    def test_non_retryable_error_is_failed_not_no_data(self, db_session):
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_company_profile.return_value = _mock_auth_error_response()
+
+        job = SecurityTypeEnrichmentJob(
+            session=db_session, adapter=adapter, symbols=["AUTH"],
+        )
+        result = run_job(db_session, job)
+
+        assert result.metrics["failed_count"] == 1
+        assert result.metrics["no_data_count"] == 0
+        assert result.metrics["retryable_error_count"] == 0
+
+        prof = db_session.query(SecurityProfile).filter(
+            SecurityProfile.symbol == "AUTH"
+        ).one()
+        assert prof.refresh_status == REFRESH_STATUS_FAILED
+        assert prof.classification_reason == "profile_fetch_failed:auth"
 
     def test_raw_profile_payload_is_persisted(self, db_session):
         adapter = MagicMock(spec=FmpAdapter)
@@ -376,6 +497,16 @@ class TestEnrichmentJob:
             "symbol": "RAWP",
             "companyName": "Raw Payload Corp",
             "isFund": False,
+        })
+        assert prof.classification_input_hash == stable_hash({
+            "symbol": "RAWP",
+            "company_name": "Raw Payload Corp",
+            "sector": "Technology",
+            "industry": "Software",
+            "exchange": "NASDAQ",
+            "country": "US",
+            "is_etf": False,
+            "raw": {"isFund": False},
         })
 
     def test_multiple_symbols(self, db_session):
@@ -446,7 +577,9 @@ class TestBuilderCacheIntegration:
     def test_cache_hit_populates_security_type(self, db_session):
         db_session.add(SecurityProfile(
             symbol="ACME", security_type=COMMON_STOCK,
-            last_refreshed_at=_ts(), refresh_status="enriched",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
+            classification_output_hash="common-hash",
         ))
         db_session.flush()
 
@@ -461,11 +594,14 @@ class TestBuilderCacheIntegration:
         assert snap.security_type == COMMON_STOCK
         assert snap.operating_universe_inclusion is True
         assert result.metrics["security_profile_cache_hit_count"] == 1
+        assert result.input_hashes["security_profile_cache"]
+        scan = db_session.query(UniverseScan).one()
+        assert scan.security_profile_cache_hash == result.input_hashes["security_profile_cache"]
 
     def test_non_common_type_excludes_with_reason(self, db_session):
         db_session.add(SecurityProfile(
             symbol="BADF", security_type=MUTUAL_FUND,
-            last_refreshed_at=_ts(), refresh_status="enriched",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
         ))
         db_session.flush()
 
@@ -494,11 +630,12 @@ class TestBuilderCacheIntegration:
         assert snap.operating_universe_inclusion is True
         assert snap.security_type is None
         assert result.metrics["security_profile_cache_miss_count"] == 1
+        assert result.metrics["security_profile_cache_miss_included_count"] == 1
 
-    def test_unknown_type_does_not_exclude(self, db_session):
+    def test_unknown_type_excludes_clean_symbol(self, db_session):
         db_session.add(SecurityProfile(
             symbol="MYSTK", security_type=UNKNOWN,
-            last_refreshed_at=_ts(), refresh_status="no_data",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_NO_DATA,
         ))
         db_session.flush()
 
@@ -510,14 +647,57 @@ class TestBuilderCacheIntegration:
         snap = db_session.query(UniverseSnapshot).filter(
             UniverseSnapshot.ticker == "MYSTK"
         ).one()
-        assert snap.operating_universe_inclusion is True
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_profile_unresolved:no_data"
         assert snap.security_type == UNKNOWN
         assert result.metrics["security_type_unknown_count"] == 1
+        assert result.metrics["security_profile_unresolved_count"] == 1
+
+    def test_retryable_profile_status_excludes_clean_symbol(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="SLOW", security_type=UNKNOWN,
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_RETRYABLE_ERROR,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("SLOW")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "SLOW"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_profile_unresolved:retryable_error"
+        assert result.metrics["security_profile_unresolved_count"] == 1
+
+    def test_stale_profile_excludes_clean_symbol(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="OLD", security_type=COMMON_STOCK,
+            last_refreshed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("OLD")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(
+            session=db_session,
+            screener_response=resp,
+            profile_cache_max_age_days=7,
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "OLD"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_profile_stale"
+        assert result.metrics["security_profile_stale_count"] == 1
 
     def test_common_stock_cache_rescues_suffix_fallback(self, db_session):
         db_session.add(SecurityProfile(
             symbol="ABCDX", security_type=COMMON_STOCK,
-            last_refreshed_at=_ts(), refresh_status="enriched",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
         ))
         db_session.flush()
 
@@ -539,7 +719,7 @@ class TestBuilderCacheIntegration:
             sym = f"T{i:03d}"
             db_session.add(SecurityProfile(
                 symbol=sym, security_type=st,
-                last_refreshed_at=_ts(), refresh_status="enriched",
+                last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
             ))
         db_session.flush()
 
@@ -558,7 +738,7 @@ class TestBuilderCacheIntegration:
         """If hard filter already excludes, security_type doesn't override the reason."""
         db_session.add(SecurityProfile(
             symbol="PENY", security_type=COMMON_STOCK,
-            last_refreshed_at=_ts(), refresh_status="enriched",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
         ))
         db_session.flush()
 
@@ -587,8 +767,11 @@ class TestSecurityProfileSchema:
     def test_insert_and_query(self, db_session):
         db_session.add(SecurityProfile(
             symbol="TEST", security_type=COMMON_STOCK,
-            last_refreshed_at=_ts(), refresh_status="enriched",
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
             classification_reason="test",
+            classifier_version=CLASSIFIER_VERSION,
+            classification_input_hash="input",
+            classification_output_hash="output",
         ))
         db_session.flush()
 
@@ -597,3 +780,6 @@ class TestSecurityProfileSchema:
         ).one()
         assert row.security_type == COMMON_STOCK
         assert row.classification_reason == "test"
+        assert row.classifier_version == CLASSIFIER_VERSION
+        assert row.classification_input_hash == "input"
+        assert row.classification_output_hash == "output"

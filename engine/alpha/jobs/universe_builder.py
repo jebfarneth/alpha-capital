@@ -26,7 +26,7 @@ import math
 import uuid
 from collections import Counter
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,7 +39,12 @@ from alpha.data.fmp import FmpScreenerResult
 from alpha.db.models import CanonicalUniverseScan, SecurityProfile, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage, record_universe_snapshot
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
-from alpha.jobs.security_type import COMMON_STOCK, NON_COMMON_TYPES
+from alpha.jobs.security_type import (
+    COMMON_STOCK,
+    NON_COMMON_TYPES,
+    REFRESH_STATUS_ENRICHED,
+    UNKNOWN,
+)
 
 MCAP_MIN = 30_000_000
 MCAP_MAX = 200_000_000
@@ -154,6 +159,49 @@ def _datetime_order_key(value: datetime) -> datetime:
     if value.tzinfo is not None and value.utcoffset() is not None:
         return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value
+
+
+def _security_profile_stale(
+    profile: SecurityProfile,
+    asof: datetime,
+    max_age_days: Optional[int],
+) -> bool:
+    if max_age_days is None:
+        return False
+    if profile.last_refreshed_at is None:
+        return True
+    cutoff = _datetime_order_key(asof) - timedelta(days=max_age_days)
+    return _datetime_order_key(profile.last_refreshed_at) < cutoff
+
+
+def _security_profile_cache_hash(
+    profile_cache: Dict[str, SecurityProfile],
+    symbols: List[str],
+    *,
+    asof: datetime,
+    max_age_days: Optional[int],
+) -> str:
+    rows = []
+    for symbol in sorted(set(symbols)):
+        profile = profile_cache.get(symbol)
+        if profile is None:
+            rows.append({"symbol": symbol, "cache_status": "missing"})
+            continue
+        rows.append({
+            "symbol": symbol,
+            "cache_status": "hit",
+            "security_type": profile.security_type,
+            "refresh_status": profile.refresh_status,
+            "classifier_version": profile.classifier_version,
+            "classification_input_hash": profile.classification_input_hash,
+            "classification_output_hash": profile.classification_output_hash,
+            "last_refreshed_at": profile.last_refreshed_at,
+            "stale": _security_profile_stale(profile, asof, max_age_days),
+        })
+    return stable_hash({
+        "profile_cache_max_age_days": max_age_days,
+        "security_profiles": rows,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +366,13 @@ class UniverseBuilderJob(BaseJob):
         screener_response: AdapterResponse[List[FmpScreenerResult]],
         *,
         slice_diagnostics: Optional[List[Any]] = None,
+        profile_cache_max_age_days: Optional[int] = 7,
     ):
+        if profile_cache_max_age_days is not None and profile_cache_max_age_days < 0:
+            raise ValueError("profile_cache_max_age_days must be non-negative or None")
         self._session = session
         self._screener_response = screener_response
+        self._profile_cache_max_age_days = profile_cache_max_age_days
         self._slice_diagnostics = (
             [_slice_diagnostic_to_dict(d) for d in slice_diagnostics]
             if slice_diagnostics is not None
@@ -406,10 +458,19 @@ class UniverseBuilderJob(BaseJob):
 
         # Load security profile cache
         profile_cache = self._load_security_profile_cache()
+        security_profile_cache_hash = _security_profile_cache_hash(
+            profile_cache,
+            [symbol for _, _, _, symbol in deduped_rows],
+            asof=resp.lineage.asof_timestamp,
+            max_age_days=self._profile_cache_max_age_days,
+        )
         cache_hit_count = 0
         cache_miss_count = 0
+        cache_miss_included_count = 0
         security_type_exclusion_counts: Counter = Counter()
         security_type_unknown_count = 0
+        security_profile_unresolved_count = 0
+        security_profile_stale_count = 0
         security_type_suffix_rescue_count = 0
 
         for stock, included, reason, symbol in deduped_rows:
@@ -423,7 +484,25 @@ class UniverseBuilderJob(BaseJob):
             if cached_profile is not None:
                 cache_hit_count += 1
                 security_type = cached_profile.security_type
-                if (
+                refresh_status = cached_profile.refresh_status
+                stale = _security_profile_stale(
+                    cached_profile,
+                    resp.lineage.asof_timestamp,
+                    self._profile_cache_max_age_days,
+                )
+                if stale:
+                    security_profile_stale_count += 1
+                    if included:
+                        included = False
+                        reason = "security_profile_stale"
+                elif refresh_status != REFRESH_STATUS_ENRICHED or security_type == UNKNOWN:
+                    security_profile_unresolved_count += 1
+                    if security_type == UNKNOWN:
+                        security_type_unknown_count += 1
+                    if included:
+                        included = False
+                        reason = f"security_profile_unresolved:{refresh_status or 'unknown'}"
+                elif (
                     security_type == COMMON_STOCK
                     and not included
                     and reason == "non_common_symbol_suffix"
@@ -435,10 +514,10 @@ class UniverseBuilderJob(BaseJob):
                     included = False
                     reason = f"security_type:{security_type}"
                     security_type_exclusion_counts[security_type] += 1
-                if security_type == "unknown":
-                    security_type_unknown_count += 1
             else:
                 cache_miss_count += 1
+                if included:
+                    cache_miss_included_count += 1
 
             record_universe_snapshot(
                 self._session,
@@ -489,11 +568,16 @@ class UniverseBuilderJob(BaseJob):
             "included": included_count,
             "excluded": excluded_count,
             "exclusion_counts": dict(exclusion_counts),
+            "security_profile_cache_hash": security_profile_cache_hash,
             "security_profile_cache_hit_count": cache_hit_count,
             "security_profile_cache_miss_count": cache_miss_count,
+            "security_profile_cache_miss_included_count": cache_miss_included_count,
             "security_type_exclusion_counts": dict(security_type_exclusion_counts),
             "security_type_unknown_count": security_type_unknown_count,
+            "security_profile_unresolved_count": security_profile_unresolved_count,
+            "security_profile_stale_count": security_profile_stale_count,
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
+            "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }
         if self._slice_diagnostics is not None:
             metrics["slice_count"] = len(self._slice_diagnostics)
@@ -516,6 +600,7 @@ class UniverseBuilderJob(BaseJob):
         scan.duplicate_symbol_count = duplicate_symbol_count
         scan.included_count = included_count
         scan.excluded_count = excluded_count
+        scan.security_profile_cache_hash = security_profile_cache_hash
         scan.output_hash = output_hash
         scan.run_status = "finished"
         scan.metric_json = json.dumps(metrics, default=str)
@@ -532,7 +617,10 @@ class UniverseBuilderJob(BaseJob):
         return JobResult(
             status="finished",
             metrics=metrics,
-            input_hashes={"screener": resp.lineage.raw_payload_hash},
+            input_hashes={
+                "screener": resp.lineage.raw_payload_hash,
+                "security_profile_cache": security_profile_cache_hash,
+            },
             output_hashes={"universe_snapshots": output_hash},
         )
 

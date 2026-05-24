@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -39,6 +40,13 @@ UNIT = "unit"
 RIGHT = "right"
 SPAC_OR_BLANK_CHECK = "spac_or_blank_check"
 UNKNOWN = "unknown"
+
+CLASSIFIER_VERSION = "security_type_v1"
+
+REFRESH_STATUS_ENRICHED = "enriched"
+REFRESH_STATUS_NO_DATA = "no_data"
+REFRESH_STATUS_RETRYABLE_ERROR = "retryable_error"
+REFRESH_STATUS_FAILED = "failed"
 
 NON_COMMON_TYPES = frozenset({
     ETF,
@@ -104,6 +112,25 @@ def _raw_type_text(raw_json: Dict[str, Any]) -> str:
         if value:
             values.append(str(value))
     return _clean_text(" ".join(values))
+
+
+def _classification_input(profile: FmpCompanyProfile, raw_json: Dict[str, Any]) -> Dict[str, Any]:
+    raw_keys = (
+        "isFund", "is_fund",
+        "isAdr", "isADR", "is_adr",
+        "isEtf", "isETF", "is_etf",
+        "type", "securityType", "security_type", "assetType", "asset_class",
+    )
+    return {
+        "symbol": profile.symbol,
+        "company_name": profile.company_name,
+        "sector": profile.sector,
+        "industry": profile.industry,
+        "exchange": profile.exchange,
+        "country": profile.country,
+        "is_etf": profile.is_etf,
+        "raw": {key: raw_json.get(key) for key in raw_keys if key in raw_json},
+    }
 
 
 def classify_security_type(
@@ -240,10 +267,21 @@ class SecurityTypeEnrichmentJob(BaseJob):
         session: Session,
         adapter: FmpAdapter,
         symbols: Optional[List[str]] = None,
+        *,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 0.5,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ):
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be non-negative")
         self._session = session
         self._adapter = adapter
         self._symbols = symbols
+        self._max_retries = max_retries
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._sleep_fn = sleep_fn
 
     def run(self, ctx: JobContext) -> JobResult:
         symbols = self._symbols
@@ -252,28 +290,51 @@ class SecurityTypeEnrichmentJob(BaseJob):
 
         enriched_count = 0
         no_data_count = 0
+        retryable_error_count = 0
         failed_count = 0
+        retry_attempt_count = 0
         security_type_counts: Counter = Counter()
 
         for symbol in symbols:
             try:
-                resp = self._adapter.get_company_profile(symbol)
+                resp, attempts = self._get_company_profile_with_retry(symbol)
+                retry_attempt_count += max(0, attempts - 1)
             except Exception as exc:
                 failed_count += 1
                 self._mark_profile_failed(symbol, exc)
                 continue
 
             if not resp.ok or resp.data is None:
-                no_data_count += 1
+                error_type = resp.error.error_type if resp.error else "no_data"
+                if resp.error and resp.error.retryable:
+                    retryable_error_count += 1
+                    refresh_status = REFRESH_STATUS_RETRYABLE_ERROR
+                    reason = f"profile_fetch_retryable:{error_type}"
+                elif resp.error is None or error_type == "no_data":
+                    no_data_count += 1
+                    refresh_status = REFRESH_STATUS_NO_DATA
+                    reason = "no_profile_data"
+                else:
+                    failed_count += 1
+                    refresh_status = REFRESH_STATUS_FAILED
+                    reason = f"profile_fetch_failed:{error_type}"
                 self._upsert_profile(
                     symbol=symbol,
                     security_type=UNKNOWN,
-                    classification_reason="no_profile_data",
+                    classification_reason=reason,
                     source_lineage_hash=resp.lineage.raw_payload_hash,
                     profile_payload_hash="",
+                    classification_input_hash="",
+                    classification_output_hash=stable_hash({
+                        "classifier_version": CLASSIFIER_VERSION,
+                        "security_type": UNKNOWN,
+                        "classification_reason": reason,
+                        "refresh_status": refresh_status,
+                    }),
+                    classifier_version=CLASSIFIER_VERSION,
                     profile_asof_timestamp=resp.lineage.asof_timestamp,
                     raw_profile_json=None,
-                    refresh_status="no_data",
+                    refresh_status=refresh_status,
                 )
                 continue
 
@@ -294,6 +355,13 @@ class SecurityTypeEnrichmentJob(BaseJob):
             }
             profile_payload = raw_json or fallback_profile_payload
             profile_hash = stable_hash(profile_payload)
+            classification_input = _classification_input(profile, raw_json or {})
+            classification_input_hash = stable_hash(classification_input)
+            classification_output_hash = stable_hash({
+                "classifier_version": CLASSIFIER_VERSION,
+                "security_type": security_type,
+                "classification_reason": reason,
+            })
 
             self._upsert_profile(
                 symbol=symbol,
@@ -301,9 +369,12 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 classification_reason=reason,
                 source_lineage_hash=resp.lineage.raw_payload_hash,
                 profile_payload_hash=profile_hash,
+                classification_input_hash=classification_input_hash,
+                classification_output_hash=classification_output_hash,
+                classifier_version=CLASSIFIER_VERSION,
                 profile_asof_timestamp=resp.lineage.asof_timestamp,
                 raw_profile_json=json.dumps(profile_payload, sort_keys=True, default=str),
-                refresh_status="enriched",
+                refresh_status=REFRESH_STATUS_ENRICHED,
             )
             security_type_counts[security_type] += 1
             enriched_count += 1
@@ -316,10 +387,26 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 "total_symbols": len(symbols),
                 "enriched_count": enriched_count,
                 "no_data_count": no_data_count,
+                "retryable_error_count": retryable_error_count,
                 "failed_count": failed_count,
+                "retry_attempt_count": retry_attempt_count,
                 "security_type_counts": dict(security_type_counts),
+                "classifier_version": CLASSIFIER_VERSION,
             },
         )
+
+    def _get_company_profile_with_retry(self, symbol: str):
+        attempts = 0
+        while True:
+            attempts += 1
+            resp = self._adapter.get_company_profile(symbol)
+            if resp.ok or not (resp.error and resp.error.retryable):
+                return resp, attempts
+            if attempts > self._max_retries:
+                return resp, attempts
+            delay = self._retry_backoff_seconds * (2 ** (attempts - 1))
+            if delay > 0:
+                self._sleep_fn(delay)
 
     def _derive_symbols(self) -> List[str]:
         from alpha.db.models import UniverseSnapshot
@@ -342,11 +429,20 @@ class SecurityTypeEnrichmentJob(BaseJob):
         )
         now = datetime.now(timezone.utc)
         reason = f"profile_fetch_exception:{exc.__class__.__name__}"
+        output_hash = stable_hash({
+            "classifier_version": CLASSIFIER_VERSION,
+            "security_type": UNKNOWN,
+            "classification_reason": reason,
+            "refresh_status": REFRESH_STATUS_FAILED,
+        })
         if existing:
-            existing.refresh_status = "failed"
+            existing.security_type = UNKNOWN
+            existing.refresh_status = REFRESH_STATUS_FAILED
             existing.last_refreshed_at = now
-            if not existing.classification_reason:
-                existing.classification_reason = reason
+            existing.classification_reason = reason
+            existing.classification_input_hash = ""
+            existing.classification_output_hash = output_hash
+            existing.classifier_version = CLASSIFIER_VERSION
         else:
             self._session.add(SecurityProfile(
                 symbol=normalized,
@@ -354,9 +450,12 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 source_provider="FMP",
                 source_lineage_hash="",
                 profile_payload_hash="",
+                classification_input_hash="",
+                classification_output_hash=output_hash,
+                classifier_version=CLASSIFIER_VERSION,
                 profile_asof_timestamp=now,
                 last_refreshed_at=now,
-                refresh_status="failed",
+                refresh_status=REFRESH_STATUS_FAILED,
                 raw_profile_json=None,
                 classification_reason=reason,
             ))
@@ -370,6 +469,9 @@ class SecurityTypeEnrichmentJob(BaseJob):
         classification_reason: str,
         source_lineage_hash: str,
         profile_payload_hash: str,
+        classification_input_hash: str,
+        classification_output_hash: str,
+        classifier_version: str,
         profile_asof_timestamp: datetime,
         raw_profile_json: Optional[str],
         refresh_status: str,
@@ -386,6 +488,9 @@ class SecurityTypeEnrichmentJob(BaseJob):
             existing.classification_reason = classification_reason
             existing.source_lineage_hash = source_lineage_hash
             existing.profile_payload_hash = profile_payload_hash
+            existing.classification_input_hash = classification_input_hash
+            existing.classification_output_hash = classification_output_hash
+            existing.classifier_version = classifier_version
             existing.profile_asof_timestamp = profile_asof_timestamp
             existing.raw_profile_json = raw_profile_json
             existing.refresh_status = refresh_status
@@ -397,6 +502,9 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 source_provider="FMP",
                 source_lineage_hash=source_lineage_hash,
                 profile_payload_hash=profile_payload_hash,
+                classification_input_hash=classification_input_hash,
+                classification_output_hash=classification_output_hash,
+                classifier_version=classifier_version,
                 profile_asof_timestamp=profile_asof_timestamp,
                 last_refreshed_at=now,
                 refresh_status=refresh_status,
