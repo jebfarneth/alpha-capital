@@ -539,6 +539,7 @@ class TestValidationHashes:
 class TestSchemaCompleteness:
     def test_all_tables_created_by_metadata(self, db_session):
         expected = {
+            "security_profiles",
             "universe_scans",
             "canonical_universe_scans",
             "universe_snapshots",

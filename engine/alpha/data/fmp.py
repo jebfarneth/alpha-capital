@@ -82,6 +82,7 @@ class FmpCompanyProfile:
     is_etf: Optional[bool] = None
     is_actively_trading: Optional[bool] = None
     ipo_date: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -332,6 +333,7 @@ class FmpAdapter:
             is_etf=_bool_or_raw(r.get("isEtf")),
             is_actively_trading=_bool_or_raw(r.get("isActivelyTrading")),
             ipo_date=r.get("ipoDate"),
+            raw=dict(r),
         )
         return AdapterResponse(data=profile, lineage=resp.lineage)
 

@@ -128,6 +128,28 @@ class EvidenceSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# security_profiles
+# ---------------------------------------------------------------------------
+class SecurityProfile(Base):
+    __tablename__ = "security_profiles"
+    __table_args__ = (
+        Index("ix_security_profiles_security_type", "security_type"),
+        Index("ix_security_profiles_last_refreshed_at", "last_refreshed_at"),
+    )
+
+    symbol = Column(String, primary_key=True)
+    security_type = Column(String, nullable=False, default="unknown")
+    source_provider = Column(String, nullable=True)
+    source_lineage_hash = Column(String, nullable=True)
+    profile_payload_hash = Column(String, nullable=True)
+    profile_asof_timestamp = Column(DateTime(timezone=True), nullable=True)
+    last_refreshed_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    refresh_status = Column(String, nullable=True)
+    raw_profile_json = Column(Text, nullable=True)
+    classification_reason = Column(String, nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # universe_scans
 # ---------------------------------------------------------------------------
 class UniverseScan(Base):

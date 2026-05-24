@@ -36,9 +36,10 @@ from sqlalchemy.exc import IntegrityError
 
 from alpha.data.contracts import AdapterResponse, stable_hash
 from alpha.data.fmp import FmpScreenerResult
-from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapshot
+from alpha.db.models import CanonicalUniverseScan, SecurityProfile, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage, record_universe_snapshot
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.security_type import COMMON_STOCK, NON_COMMON_TYPES
 
 MCAP_MIN = 30_000_000
 MCAP_MAX = 200_000_000
@@ -403,10 +404,42 @@ class UniverseBuilderJob(BaseJob):
         snapshot_content: list = []
         deduped_rows, duplicate_symbol_count = _dedupe_screener_rows(resp.data)
 
+        # Load security profile cache
+        profile_cache = self._load_security_profile_cache()
+        cache_hit_count = 0
+        cache_miss_count = 0
+        security_type_exclusion_counts: Counter = Counter()
+        security_type_unknown_count = 0
+        security_type_suffix_rescue_count = 0
+
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
             exchange = _clean_symbol(stock.exchange)
+
+            # Security profile cache lookup
+            security_type = None
+            cached_profile = profile_cache.get(symbol)
+            if cached_profile is not None:
+                cache_hit_count += 1
+                security_type = cached_profile.security_type
+                if (
+                    security_type == COMMON_STOCK
+                    and not included
+                    and reason == "non_common_symbol_suffix"
+                ):
+                    included = True
+                    reason = None
+                    security_type_suffix_rescue_count += 1
+                if included and security_type in NON_COMMON_TYPES:
+                    included = False
+                    reason = f"security_type:{security_type}"
+                    security_type_exclusion_counts[security_type] += 1
+                if security_type == "unknown":
+                    security_type_unknown_count += 1
+            else:
+                cache_miss_count += 1
+
             record_universe_snapshot(
                 self._session,
                 job_run_id=ctx.job_run_id,
@@ -417,6 +450,7 @@ class UniverseBuilderJob(BaseJob):
                 market_cap=market_cap,
                 price=price,
                 primary_exchange=exchange or None,
+                security_type=security_type,
                 operating_universe_inclusion=included,
                 exclusion_reason=reason,
                 source_lineage_hash=lineage.raw_payload_hash,
@@ -427,6 +461,7 @@ class UniverseBuilderJob(BaseJob):
                 "price": price,
                 "country": stock.country,
                 "exchange": exchange,
+                "security_type": security_type,
                 "is_etf": stock.is_etf,
                 "is_actively_trading": stock.is_actively_trading,
                 "included": included,
@@ -454,6 +489,11 @@ class UniverseBuilderJob(BaseJob):
             "included": included_count,
             "excluded": excluded_count,
             "exclusion_counts": dict(exclusion_counts),
+            "security_profile_cache_hit_count": cache_hit_count,
+            "security_profile_cache_miss_count": cache_miss_count,
+            "security_type_exclusion_counts": dict(security_type_exclusion_counts),
+            "security_type_unknown_count": security_type_unknown_count,
+            "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
         }
         if self._slice_diagnostics is not None:
             metrics["slice_count"] = len(self._slice_diagnostics)
@@ -495,6 +535,11 @@ class UniverseBuilderJob(BaseJob):
             input_hashes={"screener": resp.lineage.raw_payload_hash},
             output_hashes={"universe_snapshots": output_hash},
         )
+
+    def _load_security_profile_cache(self) -> Dict[str, SecurityProfile]:
+        """Load all SecurityProfile rows into a dict keyed by normalized symbol."""
+        rows = self._session.query(SecurityProfile).all()
+        return {row.symbol: row for row in rows}
 
 
 def _slice_diagnostic_to_dict(diagnostic: Any) -> Dict:
