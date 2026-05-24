@@ -65,7 +65,7 @@ def _is_non_common_symbol(symbol: object) -> Tuple[bool, Optional[str]]:
     Excludes:
       - Symbols containing "." or "-" (non-common separators)
       - Five-or-more-character symbols ending in "WS" or "WT" (warrant forms)
-      - Five-character symbols ending in "W" or "U" (warrant/unit forms)
+      - Five-character symbols ending in "W", "U", or "X" (warrant/unit/fund forms)
 
     Does NOT exclude ordinary tickers ending in single letters W/U/R/P/X.
 
@@ -80,7 +80,7 @@ def _is_non_common_symbol(symbol: object) -> Tuple[bool, Optional[str]]:
         return True, "non_common_symbol_separator"
     if len(upper) >= 5 and (upper.endswith("WS") or upper.endswith("WT")):
         return True, "non_common_symbol_suffix"
-    if len(upper) == 5 and upper[-1] in ("W", "U"):
+    if len(upper) == 5 and upper[-1] in ("W", "U", "X"):
         return True, "non_common_symbol_suffix"
     return False, None
 
@@ -237,6 +237,14 @@ class UniverseBuilderJob(BaseJob):
             metrics["slice_count"] = len(self._slice_diagnostics)
             metrics["slice_limit_hits"] = sum(
                 1 for d in self._slice_diagnostics if d.get("hit_limit")
+            )
+            metrics["slice_subdivision_count"] = sum(
+                1 for d in self._slice_diagnostics
+                if d.get("hit_limit") and d.get("subdivided")
+            )
+            metrics["slice_limit_exhausted"] = any(
+                d.get("hit_limit") and not d.get("subdivided")
+                for d in self._slice_diagnostics
             )
             metrics["slice_diagnostics"] = self._slice_diagnostics
 

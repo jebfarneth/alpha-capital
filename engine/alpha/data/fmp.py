@@ -329,8 +329,8 @@ class FmpAdapter:
             industry=r.get("industry"),
             exchange=r.get("exchangeShortName"),
             country=r.get("country"),
-            is_etf=r.get("isEtf"),
-            is_actively_trading=r.get("isActivelyTrading"),
+            is_etf=_bool_or_raw(r.get("isEtf")),
+            is_actively_trading=_bool_or_raw(r.get("isActivelyTrading")),
             ipo_date=r.get("ipoDate"),
         )
         return AdapterResponse(data=profile, lineage=resp.lineage)

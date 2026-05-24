@@ -281,7 +281,15 @@ class TestFmpAdapter:
         session = MagicMock(spec=requests.Session)
         session.params = {}
         json_data = [
-            {"symbol": "ACME", "companyName": "Acme Corp", "mktCap": 75000000, "sector": "Technology", "industry": "Software"}
+            {
+                "symbol": "ACME",
+                "companyName": "Acme Corp",
+                "mktCap": 75000000,
+                "sector": "Technology",
+                "industry": "Software",
+                "isEtf": 0,
+                "isActivelyTrading": 1,
+            }
         ]
         session.get.return_value = _mock_response(200, json_data)
         adapter = self._adapter(session)
@@ -290,6 +298,8 @@ class TestFmpAdapter:
         assert resp.ok
         assert resp.data.symbol == "ACME"
         assert resp.data.market_cap == 75000000
+        assert resp.data.is_etf is False
+        assert resp.data.is_actively_trading is True
         assert resp.lineage.endpoint == "/stable/profile"
 
     def test_get_company_profile_empty_result_is_no_data_error(self):

@@ -405,8 +405,9 @@ class TestUniverseBuilder:
                 upper=50_000_000,
                 returned_count=100,
                 hit_limit=True,
-                query_lower=39_999_999,
-                query_upper=50_000_001,
+                query_lower=39_999_000,
+                query_upper=50_001_000,
+                subdivided=True,
             ),
         ]
         job = UniverseBuilderJob(
@@ -416,8 +417,10 @@ class TestUniverseBuilder:
 
         assert result.metrics["slice_count"] == 2
         assert result.metrics["slice_limit_hits"] == 1
+        assert result.metrics["slice_subdivision_count"] == 1
+        assert result.metrics["slice_limit_exhausted"] is False
         assert result.metrics["slice_diagnostics"][0] == diags[0]
-        assert result.metrics["slice_diagnostics"][1]["query_lower"] == 39_999_999
+        assert result.metrics["slice_diagnostics"][1]["query_lower"] == 39_999_000
 
 
 # -----------------------------------------------------------------------
@@ -632,9 +635,11 @@ class TestHardenedFilter:
     def test_four_letter_x_kept(self):
         assert _classify(_stock(symbol="ABCX"))[0]
 
-    def test_five_letter_x_not_auto_excluded(self):
-        """5-char X ending is NOT excluded unless profile confirms fund."""
-        assert _classify(_stock(symbol="ABCDX"))[0]
+    def test_five_letter_x_excluded_as_fund_proxy(self):
+        """Until profile type exists, 5-char X is the mutual-fund cleanup rule."""
+        included, reason = _classify(_stock(symbol="ABCDX"))
+        assert not included
+        assert reason == "non_common_symbol_suffix"
 
     def test_five_letter_r_kept(self):
         assert _classify(_stock(symbol="ABCDR"))[0]
@@ -736,10 +741,10 @@ class TestSlicedUniverseFetcher:
     def test_unions_and_dedups_symbols(self):
         """Same symbol in two slices appears once in results."""
         responses = {
-            (29_999_999, 40_000_001): _ok_response(
+            (29_999_000, 40_001_000): _ok_response(
                 [_stock("ACME", market_cap=35_000_000)], (30_000_000, 40_000_000),
             ),
-            (39_999_999, 50_000_001): _ok_response(
+            (39_999_000, 50_001_000): _ok_response(
                 [_stock("ACME", market_cap=35_000_000), _stock("BETA", market_cap=45_000_000)],
                 (40_000_000, 50_000_000),
             ),
@@ -758,7 +763,7 @@ class TestSlicedUniverseFetcher:
     def test_unions_and_dedups_normalized_symbols(self):
         """Provider symbol whitespace/case variants collapse to one raw row."""
         responses = {
-            (29_999_999, 40_000_001): _ok_response(
+            (29_999_000, 40_001_000): _ok_response(
                 [
                     _stock("ACME", market_cap=35_000_000),
                     _stock(" acme ", market_cap=35_100_000),
@@ -785,9 +790,9 @@ class TestSlicedUniverseFetcher:
         sub2 = [_stock(f"S{i}", market_cap=35_000_000 + i * 100) for i in range(3, limit)]
 
         responses = {
-            (29_999_999, 40_000_001): _ok_response(big_slice, (30_000_000, 40_000_000)),
-            (29_999_999, 35_000_001): _ok_response(sub1, (30_000_000, 35_000_000)),
-            (34_999_999, 40_000_001): _ok_response(sub2, (35_000_000, 40_000_000)),
+            (29_999_000, 40_001_000): _ok_response(big_slice, (30_000_000, 40_000_000)),
+            (29_999_000, 35_001_000): _ok_response(sub1, (30_000_000, 35_000_000)),
+            (34_999_000, 40_001_000): _ok_response(sub2, (35_000_000, 40_000_000)),
         }
         adapter = _make_mock_adapter(responses_by_range=responses)
         fetcher = SlicedUniverseFetcher(
@@ -800,6 +805,8 @@ class TestSlicedUniverseFetcher:
         assert result.unique_raw_count == limit
         assert result.total_raw_count == limit
         assert result.slice_limit_hits == 1
+        assert result.slice_subdivision_count == 1
+        assert result.slice_limit_exhausted is False
         assert any(d.hit_limit and d.subdivided for d in result.slice_diagnostics)
         assert any(d.lower == 30_000_000 and d.upper == 35_000_000 for d in result.slice_diagnostics)
 
@@ -822,6 +829,7 @@ class TestSlicedUniverseFetcher:
         assert not result.response.ok
         assert result.response.error.error_type == "slice_limit_exhausted"
         assert result.slice_limit_hits >= 1
+        assert result.slice_limit_exhausted is True
 
     def test_provider_error_propagates(self):
         """An FMP error on one slice fails the whole fetch."""
@@ -839,8 +847,8 @@ class TestSlicedUniverseFetcher:
             ),
         )
         responses = {
-            (29_999_999, 40_000_001): _ok_response([], (30_000_000, 40_000_000)),
-            (39_999_999, 50_000_001): error_resp,
+            (29_999_000, 40_001_000): _ok_response([], (30_000_000, 40_000_000)),
+            (39_999_000, 50_001_000): error_resp,
         }
         adapter = _make_mock_adapter(responses_by_range=responses)
         fetcher = SlicedUniverseFetcher(
@@ -873,15 +881,52 @@ class TestSlicedUniverseFetcher:
         )
         adapter = MagicMock(spec=FmpAdapter)
         adapter.get_stock_screener.side_effect = [error_resp, success_resp]
+        sleeps = []
         fetcher = SlicedUniverseFetcher(
             adapter, mcap_min=30_000_000, mcap_max=40_000_000,
             slice_width=10_000_000, max_slice_retries=1,
+            sleep_fn=sleeps.append,
         )
         result = fetcher.fetch()
 
         assert result.response.ok
         assert result.unique_raw_count == 1
         assert adapter.get_stock_screener.call_count == 2
+        assert sleeps == [1.0]
+
+    def test_retryable_slice_error_uses_exponential_backoff(self):
+        error_resp = AdapterResponse(
+            data=None,
+            lineage=LineageMeta(
+                provider="FMP", endpoint="/stable/company-screener",
+                request_timestamp=_ts(), asof_timestamp=_ts(),
+                raw_payload_hash="", source_authority="FMP_Ultimate",
+            ),
+            error=ProviderError(
+                provider="FMP", endpoint="/stable/company-screener",
+                status_code=429, error_type="rate_limit",
+                message="rate limited", retryable=True,
+            ),
+        )
+        success_resp = _ok_response(
+            [_stock("ACME", market_cap=35_000_000)],
+            (30_000_000, 40_000_000),
+        )
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_stock_screener.side_effect = [
+            error_resp, error_resp, success_resp,
+        ]
+        sleeps = []
+        fetcher = SlicedUniverseFetcher(
+            adapter, mcap_min=30_000_000, mcap_max=40_000_000,
+            slice_width=10_000_000, max_slice_retries=2,
+            retry_backoff_seconds=0.5, sleep_fn=sleeps.append,
+        )
+        result = fetcher.fetch()
+
+        assert result.response.ok
+        assert adapter.get_stock_screener.call_count == 3
+        assert sleeps == [0.5, 1.0]
 
     def test_non_retryable_slice_error_does_not_retry(self):
         error_resp = AdapterResponse(
@@ -914,6 +959,13 @@ class TestSlicedUniverseFetcher:
         with pytest.raises(ValueError):
             SlicedUniverseFetcher(adapter, max_slice_retries=-1)
 
+    def test_rejects_negative_retry_backoff_and_overlap(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError):
+            SlicedUniverseFetcher(adapter, retry_backoff_seconds=-0.1)
+        with pytest.raises(ValueError):
+            SlicedUniverseFetcher(adapter, boundary_overlap=-1)
+
     def test_empty_slices_produce_zero_results(self):
         """All-empty slices produce a valid empty result."""
         adapter = _make_mock_adapter()
@@ -928,7 +980,7 @@ class TestSlicedUniverseFetcher:
         """A single narrow range that fits under limit returns directly."""
         stocks = [_stock("ONLY", market_cap=35_000_000)]
         responses = {
-            (29_999_999, 40_000_001): _ok_response(stocks, (30_000_000, 40_000_000)),
+            (29_999_000, 40_001_000): _ok_response(stocks, (30_000_000, 40_000_000)),
         }
         adapter = _make_mock_adapter(responses_by_range=responses)
         fetcher = SlicedUniverseFetcher(
@@ -953,8 +1005,8 @@ class TestSlicedUniverseFetcher:
 
         assert result.response.ok
         adapter.get_stock_screener.assert_called_once_with(
-            market_cap_min=29_999_999,
-            market_cap_max=40_000_001,
+            market_cap_min=29_999_000,
+            market_cap_max=40_001_000,
             country=None,
             is_etf=None,
             limit=1000,

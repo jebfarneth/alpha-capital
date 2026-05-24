@@ -12,8 +12,9 @@ Per Data-Sourcing-Audit.md Universe Filter section.
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from alpha.data.contracts import (
     AdapterResponse,
@@ -29,6 +30,8 @@ MCAP_MAX = 200_000_000
 SLICE_WIDTH = 10_000_000
 MIN_SLICE_WIDTH = 1_000_000
 DEFAULT_SLICE_LIMIT = 1000
+DEFAULT_BOUNDARY_OVERLAP = 1_000
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 
 
 @dataclass
@@ -53,6 +56,8 @@ class SlicedUniverseResult:
     duplicate_count: int = 0
     slice_count: int = 0
     slice_limit_hits: int = 0
+    slice_subdivision_count: int = 0
+    slice_limit_exhausted: bool = False
 
 
 class SlicedUniverseFetcher:
@@ -68,6 +73,9 @@ class SlicedUniverseFetcher:
         min_slice_width: int = MIN_SLICE_WIDTH,
         limit_per_slice: int = DEFAULT_SLICE_LIMIT,
         max_slice_retries: int = 2,
+        retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        boundary_overlap: int = DEFAULT_BOUNDARY_OVERLAP,
     ):
         self._adapter = adapter
         self._mcap_min = mcap_min
@@ -77,7 +85,14 @@ class SlicedUniverseFetcher:
         self._limit = limit_per_slice
         if max_slice_retries < 0:
             raise ValueError("max_slice_retries must be non-negative")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be non-negative")
+        if boundary_overlap < 0:
+            raise ValueError("boundary_overlap must be non-negative")
         self._max_slice_retries = max_slice_retries
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._sleep = sleep_fn
+        self._boundary_overlap = boundary_overlap
 
     def fetch(self) -> SlicedUniverseResult:
         seen: Dict[str, FmpScreenerResult] = {}
@@ -125,6 +140,12 @@ class SlicedUniverseFetcher:
                 duplicate_count=total_raw - len(seen),
                 slice_count=len(diagnostics),
                 slice_limit_hits=sum(1 for d in diagnostics if d.hit_limit),
+                slice_subdivision_count=sum(
+                    1 for d in diagnostics if d.hit_limit and d.subdivided
+                ),
+                slice_limit_exhausted=(
+                    error.error_type == "slice_limit_exhausted"
+                ),
             )
 
         return SlicedUniverseResult(
@@ -135,6 +156,10 @@ class SlicedUniverseFetcher:
             duplicate_count=total_raw - len(seen),
             slice_count=len(diagnostics),
             slice_limit_hits=sum(1 for d in diagnostics if d.hit_limit),
+            slice_subdivision_count=sum(
+                1 for d in diagnostics if d.hit_limit and d.subdivided
+            ),
+            slice_limit_exhausted=False,
         )
 
     def _fetch_range(
@@ -149,8 +174,8 @@ class SlicedUniverseFetcher:
         cursor = lower
         while cursor < upper:
             slice_upper = min(cursor + width, upper)
-            query_lower = max(0, cursor - 1)
-            query_upper = slice_upper + 1
+            query_lower = max(0, cursor - self._boundary_overlap)
+            query_upper = slice_upper + self._boundary_overlap
             resp = self._fetch_slice(query_lower, query_upper)
             if not resp.ok:
                 return resp.error
@@ -224,6 +249,10 @@ class SlicedUniverseFetcher:
                 return resp
             if attempt == attempts - 1:
                 return resp
+            if self._retry_backoff_seconds:
+                self._sleep(
+                    self._retry_backoff_seconds * (2 ** attempt)
+                )
         return resp
 
 
