@@ -195,7 +195,6 @@ def _security_profile_cache_hash(
             "classifier_version": profile.classifier_version,
             "classification_input_hash": profile.classification_input_hash,
             "classification_output_hash": profile.classification_output_hash,
-            "last_refreshed_at": profile.last_refreshed_at,
             "stale": _security_profile_stale(profile, asof, max_age_days),
         })
     return stable_hash({
@@ -367,12 +366,18 @@ class UniverseBuilderJob(BaseJob):
         *,
         slice_diagnostics: Optional[List[Any]] = None,
         profile_cache_max_age_days: Optional[int] = 7,
+        require_security_profile_cache: bool = False,
+        min_security_profile_coverage: float = 0.95,
     ):
         if profile_cache_max_age_days is not None and profile_cache_max_age_days < 0:
             raise ValueError("profile_cache_max_age_days must be non-negative or None")
+        if not 0.0 <= min_security_profile_coverage <= 1.0:
+            raise ValueError("min_security_profile_coverage must be between 0 and 1")
         self._session = session
         self._screener_response = screener_response
         self._profile_cache_max_age_days = profile_cache_max_age_days
+        self._require_security_profile_cache = require_security_profile_cache
+        self._min_security_profile_coverage = min_security_profile_coverage
         self._slice_diagnostics = (
             [_slice_diagnostic_to_dict(d) for d in slice_diagnostics]
             if slice_diagnostics is not None
@@ -471,12 +476,18 @@ class UniverseBuilderJob(BaseJob):
         security_type_unknown_count = 0
         security_profile_unresolved_count = 0
         security_profile_stale_count = 0
+        security_profile_required_count = 0
+        security_profile_enriched_count = 0
+        security_profile_cache_miss_required_count = 0
         security_type_suffix_rescue_count = 0
 
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
             exchange = _clean_symbol(stock.exchange)
+            profile_required = included or reason == "non_common_symbol_suffix"
+            if profile_required:
+                security_profile_required_count += 1
 
             # Security profile cache lookup
             security_type = None
@@ -491,25 +502,30 @@ class UniverseBuilderJob(BaseJob):
                     self._profile_cache_max_age_days,
                 )
                 if stale:
-                    security_profile_stale_count += 1
+                    if profile_required:
+                        security_profile_stale_count += 1
                     if included:
                         included = False
                         reason = "security_profile_stale"
                 elif refresh_status != REFRESH_STATUS_ENRICHED or security_type == UNKNOWN:
-                    security_profile_unresolved_count += 1
+                    if profile_required:
+                        security_profile_unresolved_count += 1
                     if security_type == UNKNOWN:
                         security_type_unknown_count += 1
                     if included:
                         included = False
                         reason = f"security_profile_unresolved:{refresh_status or 'unknown'}"
-                elif (
-                    security_type == COMMON_STOCK
-                    and not included
-                    and reason == "non_common_symbol_suffix"
-                ):
-                    included = True
-                    reason = None
-                    security_type_suffix_rescue_count += 1
+                else:
+                    if profile_required:
+                        security_profile_enriched_count += 1
+                    if (
+                        security_type == COMMON_STOCK
+                        and not included
+                        and reason == "non_common_symbol_suffix"
+                    ):
+                        included = True
+                        reason = None
+                        security_type_suffix_rescue_count += 1
                 if security_type in NON_COMMON_TYPES and (
                     included or reason == "non_common_symbol_suffix"
                 ):
@@ -518,6 +534,8 @@ class UniverseBuilderJob(BaseJob):
                     security_type_exclusion_counts[security_type] += 1
             else:
                 cache_miss_count += 1
+                if profile_required:
+                    security_profile_cache_miss_required_count += 1
                 if included:
                     cache_miss_included_count += 1
 
@@ -562,6 +580,12 @@ class UniverseBuilderJob(BaseJob):
             "included": included_count,
             "excluded": excluded_count,
         })
+        if security_profile_required_count:
+            security_profile_coverage_ratio = (
+                security_profile_enriched_count / security_profile_required_count
+            )
+        else:
+            security_profile_coverage_ratio = 1.0
 
         metrics: Dict = {
             "raw_count": len(resp.data),
@@ -574,10 +598,16 @@ class UniverseBuilderJob(BaseJob):
             "security_profile_cache_hit_count": cache_hit_count,
             "security_profile_cache_miss_count": cache_miss_count,
             "security_profile_cache_miss_included_count": cache_miss_included_count,
+            "security_profile_cache_miss_required_count": security_profile_cache_miss_required_count,
             "security_type_exclusion_counts": dict(security_type_exclusion_counts),
             "security_type_unknown_count": security_type_unknown_count,
             "security_profile_unresolved_count": security_profile_unresolved_count,
             "security_profile_stale_count": security_profile_stale_count,
+            "security_profile_required_count": security_profile_required_count,
+            "security_profile_enriched_count": security_profile_enriched_count,
+            "security_profile_coverage_ratio": security_profile_coverage_ratio,
+            "require_security_profile_cache": self._require_security_profile_cache,
+            "min_security_profile_coverage": self._min_security_profile_coverage,
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
             "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }
@@ -607,6 +637,32 @@ class UniverseBuilderJob(BaseJob):
         scan.run_status = "finished"
         scan.metric_json = json.dumps(metrics, default=str)
         self._session.flush()
+
+        if (
+            self._require_security_profile_cache
+            and security_profile_coverage_ratio < self._min_security_profile_coverage
+        ):
+            metrics["failure_stage"] = "security_profile_coverage"
+            scan.run_status = "failed"
+            scan.metric_json = json.dumps(metrics, default=str)
+            self._session.flush()
+            return JobResult(
+                status="failed",
+                metrics=metrics,
+                input_hashes={
+                    "screener": resp.lineage.raw_payload_hash,
+                    "security_profile_cache": security_profile_cache_hash,
+                },
+                output_hashes={"universe_snapshots": output_hash},
+                errors=[{
+                    "stage": "security_profile_coverage",
+                    "message": (
+                        "security profile coverage "
+                        f"{security_profile_coverage_ratio:.4f} below required "
+                        f"{self._min_security_profile_coverage:.4f}"
+                    ),
+                }],
+            )
 
         # Update canonical pointer — successful builds only
         _upsert_canonical_universe_scan(

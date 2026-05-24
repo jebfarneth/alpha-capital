@@ -23,7 +23,13 @@ from alpha.data.contracts import (
     stable_hash,
 )
 from alpha.data.fmp import FmpAdapter, FmpCompanyProfile, FmpScreenerResult
-from alpha.db.models import Base, SecurityProfile, UniverseScan, UniverseSnapshot
+from alpha.db.models import (
+    Base,
+    CanonicalUniverseScan,
+    SecurityProfile,
+    UniverseScan,
+    UniverseSnapshot,
+)
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import (
     ADR,
@@ -46,7 +52,7 @@ from alpha.jobs.security_type import (
     SecurityTypeEnrichmentJob,
     classify_security_type,
 )
-from alpha.jobs.universe_builder import UniverseBuilderJob
+from alpha.jobs.universe_builder import UniverseBuilderJob, _security_profile_cache_hash
 
 
 def _ts():
@@ -594,6 +600,9 @@ class TestBuilderCacheIntegration:
         assert snap.security_type == COMMON_STOCK
         assert snap.operating_universe_inclusion is True
         assert result.metrics["security_profile_cache_hit_count"] == 1
+        assert result.metrics["security_profile_required_count"] == 1
+        assert result.metrics["security_profile_enriched_count"] == 1
+        assert result.metrics["security_profile_coverage_ratio"] == 1.0
         assert result.input_hashes["security_profile_cache"]
         scan = db_session.query(UniverseScan).one()
         assert scan.security_profile_cache_hash == result.input_hashes["security_profile_cache"]
@@ -631,6 +640,52 @@ class TestBuilderCacheIntegration:
         assert snap.security_type is None
         assert result.metrics["security_profile_cache_miss_count"] == 1
         assert result.metrics["security_profile_cache_miss_included_count"] == 1
+        assert result.metrics["security_profile_cache_miss_required_count"] == 1
+        assert result.metrics["security_profile_coverage_ratio"] == 0.0
+
+    def test_required_security_profile_coverage_blocks_canonical_on_miss(self, db_session):
+        resp = AdapterResponse(data=[_stock("NOCACHE")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(
+            session=db_session,
+            screener_response=resp,
+            require_security_profile_cache=True,
+            min_security_profile_coverage=1.0,
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert not result.ok
+        assert result.status == "failed"
+        assert result.metrics["failure_stage"] == "security_profile_coverage"
+        assert result.metrics["security_profile_required_count"] == 1
+        assert result.metrics["security_profile_enriched_count"] == 0
+        assert result.metrics["security_profile_coverage_ratio"] == 0.0
+        assert result.metrics["security_profile_cache_miss_required_count"] == 1
+
+        scan = db_session.query(UniverseScan).one()
+        assert scan.run_status == "failed"
+        assert db_session.query(CanonicalUniverseScan).count() == 0
+
+    def test_required_security_profile_coverage_allows_complete_cache(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="ACME", security_type=COMMON_STOCK,
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("ACME")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(
+            session=db_session,
+            screener_response=resp,
+            require_security_profile_cache=True,
+            min_security_profile_coverage=1.0,
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["security_profile_coverage_ratio"] == 1.0
+        scan = db_session.query(UniverseScan).one()
+        assert scan.run_status == "finished"
+        assert db_session.query(CanonicalUniverseScan).count() == 1
 
     def test_unknown_type_excludes_clean_symbol(self, db_session):
         db_session.add(SecurityProfile(
@@ -712,6 +767,7 @@ class TestBuilderCacheIntegration:
         assert snap.exclusion_reason is None
         assert snap.security_type == COMMON_STOCK
         assert result.metrics["security_type_suffix_rescue_count"] == 1
+        assert result.metrics["security_profile_coverage_ratio"] == 1.0
 
     def test_non_common_cache_overrides_suffix_reason(self, db_session):
         db_session.add(SecurityProfile(
@@ -801,3 +857,36 @@ class TestSecurityProfileSchema:
         assert row.classifier_version == CLASSIFIER_VERSION
         assert row.classification_input_hash == "input"
         assert row.classification_output_hash == "output"
+
+    def test_cache_hash_ignores_refresh_timestamp_inside_fresh_window(self):
+        profile_a = SecurityProfile(
+            symbol="ACME", security_type=COMMON_STOCK,
+            refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
+            classification_input_hash="input",
+            classification_output_hash="output",
+            last_refreshed_at=datetime(2026, 5, 19, tzinfo=timezone.utc),
+        )
+        profile_b = SecurityProfile(
+            symbol="ACME", security_type=COMMON_STOCK,
+            refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
+            classification_input_hash="input",
+            classification_output_hash="output",
+            last_refreshed_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
+        )
+
+        hash_a = _security_profile_cache_hash(
+            {"ACME": profile_a},
+            ["ACME"],
+            asof=_ts(),
+            max_age_days=7,
+        )
+        hash_b = _security_profile_cache_hash(
+            {"ACME": profile_b},
+            ["ACME"],
+            asof=_ts(),
+            max_age_days=7,
+        )
+
+        assert hash_a == hash_b
