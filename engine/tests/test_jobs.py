@@ -46,6 +46,7 @@ from alpha.jobs.universe_builder import (
     UniverseBuilderJob,
     _classify,
     _is_non_common_symbol,
+    _upsert_canonical_universe_scan,
     get_canonical_universe_members,
     get_canonical_universe_scan,
 )
@@ -372,6 +373,8 @@ class TestUniverseBuilder:
         scan = db_session.query(UniverseScan).one()
         assert scan.run_status == "failed"
         assert scan.raw_count == 0
+        assert scan.deduped_count == 0
+        assert scan.duplicate_symbol_count == 0
         assert scan.included_count == 0
         assert scan.excluded_count == 0
         assert db_session.query(CanonicalUniverseScan).count() == 0
@@ -429,6 +432,29 @@ class TestUniverseBuilder:
         snaps = db_session.query(UniverseSnapshot).all()
         assert len(snaps) == 1
         assert snaps[0].ticker == "ACME"
+        scan = db_session.query(UniverseScan).one()
+        assert scan.raw_count == 2
+        assert scan.deduped_count == 1
+        assert scan.duplicate_symbol_count == 1
+        assert scan.included_count + scan.excluded_count == scan.deduped_count
+
+    def test_duplicate_symbol_prefers_included_row(self, db_session):
+        resp = AdapterResponse(
+            data=[
+                _stock(symbol="ACME", exchange="OTC"),
+                _stock(symbol=" acme ", exchange="NASDAQ"),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job)
+
+        assert result.ok
+        snap = db_session.query(UniverseSnapshot).one()
+        assert snap.ticker == "ACME"
+        assert snap.operating_universe_inclusion is True
+        assert snap.primary_exchange == "NASDAQ"
+        assert result.metrics["duplicate_symbol_count"] == 1
 
     def test_slice_diagnostics_in_metrics(self, db_session):
         resp = _mock_screener_response()
@@ -1197,6 +1223,8 @@ class TestCanonicalUniverseScan:
         assert len(scans) == 1
         assert scans[0].trading_date == "2026-05-20"
         assert scans[0].raw_count == 7
+        assert scans[0].deduped_count == 7
+        assert scans[0].duplicate_symbol_count == 0
         assert scans[0].included_count == 2
         assert scans[0].excluded_count == 5
         assert scans[0].run_status == "finished"
@@ -1240,6 +1268,15 @@ class TestCanonicalUniverseScan:
                 operating_universe_inclusion=True, scan_id="test-scan",
             )
             db_session.flush()
+
+    def test_upsert_rejects_missing_scan_id(self, db_session):
+        with pytest.raises(ValueError, match="scan_id does not exist"):
+            _upsert_canonical_universe_scan(
+                db_session,
+                trading_date="2026-05-20",
+                scan_id="missing-scan",
+                job_run_id="job-1",
+            )
 
     def test_trading_date_derived_from_asof_when_not_provided(self, db_session):
         resp = _mock_screener_response()

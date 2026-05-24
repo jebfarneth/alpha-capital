@@ -145,6 +145,8 @@ class UniverseScan(Base):
     asof_timestamp = Column(DateTime(timezone=True), nullable=False)
     provider = Column(String, nullable=True)
     raw_count = Column(Integer, nullable=False, default=0)
+    deduped_count = Column(Integer, nullable=False, default=0)
+    duplicate_symbol_count = Column(Integer, nullable=False, default=0)
     included_count = Column(Integer, nullable=False, default=0)
     excluded_count = Column(Integer, nullable=False, default=0)
     source_lineage_hash = Column(String, nullable=True)

@@ -26,6 +26,8 @@ def upgrade() -> None:
         sa.Column("asof_timestamp", sa.DateTime(timezone=True), nullable=False),
         sa.Column("provider", sa.String(), nullable=True),
         sa.Column("raw_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("deduped_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("duplicate_symbol_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("included_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("excluded_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("source_lineage_hash", sa.String(), nullable=True),

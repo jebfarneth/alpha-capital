@@ -199,6 +199,9 @@ def _upsert_canonical_universe_scan(
     job_run_id: str,
 ) -> None:
     """Select scan_id as the canonical scan for trading_date."""
+    if session.get(UniverseScan, scan_id) is None:
+        raise ValueError(f"canonical universe scan_id does not exist: {scan_id}")
+
     existing = (
         session.query(CanonicalUniverseScan)
         .filter(CanonicalUniverseScan.trading_date == trading_date)
@@ -224,7 +227,10 @@ def _upsert_canonical_universe_scan(
         return
     except IntegrityError:
         # Another runner inserted the date between our read and insert.
-        pass
+        if session.get(UniverseScan, scan_id) is None:
+            raise ValueError(
+                f"canonical universe scan_id does not exist after insert race: {scan_id}"
+            )
 
     existing = (
         session.query(CanonicalUniverseScan)
@@ -236,6 +242,29 @@ def _upsert_canonical_universe_scan(
     existing.selected_at = datetime.now(timezone.utc)
     existing.selection_reason = "latest_successful_scan"
     session.flush()
+
+
+def _dedupe_screener_rows(
+    rows: List[FmpScreenerResult],
+) -> Tuple[List[Tuple[FmpScreenerResult, bool, Optional[str], str]], int]:
+    """Deduplicate rows by symbol, preferring rows that pass inclusion."""
+    selected: Dict[str, Tuple[FmpScreenerResult, bool, Optional[str], str]] = {}
+    duplicate_count = 0
+    for stock in rows:
+        included, reason = _classify(stock)
+        symbol = _clean_symbol(stock.symbol)
+        candidate = (stock, included, reason, symbol)
+        existing = selected.get(symbol)
+        if existing is None:
+            selected[symbol] = candidate
+            continue
+
+        duplicate_count += 1
+        _, existing_included, _, _ = existing
+        if included and not existing_included:
+            selected[symbol] = candidate
+
+    return list(selected.values()), duplicate_count
 
 
 # ---------------------------------------------------------------------------
@@ -289,12 +318,16 @@ class UniverseBuilderJob(BaseJob):
                 asof_timestamp=resp.lineage.asof_timestamp,
                 provider=resp.lineage.provider,
                 raw_count=0,
+                deduped_count=0,
+                duplicate_symbol_count=0,
                 included_count=0,
                 excluded_count=0,
                 source_lineage_hash=lineage.raw_payload_hash,
                 run_status="failed",
                 metric_json=json.dumps({
                     "raw_count": 0,
+                    "deduped_count": 0,
+                    "duplicate_symbol_count": 0,
                     "included": 0,
                     "excluded": 0,
                     "failure_stage": "screener_fetch",
@@ -320,6 +353,8 @@ class UniverseBuilderJob(BaseJob):
             asof_timestamp=resp.lineage.asof_timestamp,
             provider=resp.lineage.provider,
             raw_count=0,
+            deduped_count=0,
+            duplicate_symbol_count=0,
             included_count=0,
             excluded_count=0,
             source_lineage_hash=lineage.raw_payload_hash,
@@ -330,18 +365,11 @@ class UniverseBuilderJob(BaseJob):
 
         included_count = 0
         excluded_count = 0
-        duplicate_symbol_count = 0
         exclusion_counts: Counter = Counter()
         snapshot_content: list = []
-        seen_symbols: set[str] = set()
+        deduped_rows, duplicate_symbol_count = _dedupe_screener_rows(resp.data)
 
-        for stock in resp.data:
-            included, reason = _classify(stock)
-            symbol = _clean_symbol(stock.symbol)
-            if symbol in seen_symbols:
-                duplicate_symbol_count += 1
-                continue
-            seen_symbols.add(symbol)
+        for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
             exchange = _clean_symbol(stock.exchange)
@@ -387,7 +415,7 @@ class UniverseBuilderJob(BaseJob):
 
         metrics: Dict = {
             "raw_count": len(resp.data),
-            "deduped_count": len(seen_symbols),
+            "deduped_count": len(deduped_rows),
             "duplicate_symbol_count": duplicate_symbol_count,
             "included": included_count,
             "excluded": excluded_count,
@@ -410,6 +438,8 @@ class UniverseBuilderJob(BaseJob):
 
         # Finalize universe_scans row
         scan.raw_count = len(resp.data)
+        scan.deduped_count = len(deduped_rows)
+        scan.duplicate_symbol_count = duplicate_symbol_count
         scan.included_count = included_count
         scan.excluded_count = excluded_count
         scan.output_hash = output_hash
