@@ -116,8 +116,6 @@ def classify_security_type(
     name = _clean_text(profile.company_name)
     industry = _clean_text(profile.industry)
     sector = _clean_text(profile.sector)
-    country = _clean_text(profile.country)
-    exchange = _clean_text(profile.exchange)
     raw_type = _raw_type_text(raw_json)
 
     if profile.is_etf is True or _raw_bool(raw_json, "isEtf", "isETF", "is_etf") is True:
@@ -130,9 +128,14 @@ def classify_security_type(
     if raw_type:
         if _has_phrase(raw_type, "EXCHANGE TRADED FUND") or _has_phrase(raw_type, "ETF"):
             return ETF, "raw_type:ETF"
-        if _has_phrase(raw_type, "MUTUAL FUND"):
+        if _has_phrase(raw_type, "MUTUAL FUND") or _has_phrase(raw_type, "MUTUAL FUNDS"):
             return MUTUAL_FUND, "raw_type:MUTUAL_FUND"
-        if _has_phrase(raw_type, "CLOSED END FUND") or _has_phrase(raw_type, "CLOSED-END FUND"):
+        if (
+            _has_phrase(raw_type, "CLOSED END FUND")
+            or _has_phrase(raw_type, "CLOSED END FUNDS")
+            or _has_phrase(raw_type, "CLOSED-END FUND")
+            or _has_phrase(raw_type, "CLOSED-END FUNDS")
+        ):
             return CLOSED_END_FUND, "raw_type:CLOSED_END_FUND"
         if _has_phrase(raw_type, "ADR") or _has_phrase(raw_type, "AMERICAN DEPOSITARY"):
             return ADR, "raw_type:ADR"
@@ -158,7 +161,7 @@ def classify_security_type(
         if has_closed_indicator:
             return CLOSED_END_FUND, f"name_contains:{kw}+CLOSED"
         return MUTUAL_FUND, f"name_contains:{kw}"
-    if _has_phrase(name, "FUND"):
+    if _has_phrase(name, "FUND") or _has_phrase(name, "FUNDS"):
         if has_closed_indicator:
             return CLOSED_END_FUND, "name_contains:FUND+CLOSED"
         return MUTUAL_FUND, "name_contains:FUND"
@@ -168,11 +171,6 @@ def classify_security_type(
     kw = _has_any_phrase(name, cef_keywords)
     if kw:
         return CLOSED_END_FUND, f"name_contains:{kw}"
-
-    # Industry-level fund classification
-    if industry in ("ASSET MANAGEMENT", "SHELL COMPANIES"):
-        if _has_any_phrase(name, ("TRUST", "INCOME", "CAPITAL ALLOCATION")):
-            return CLOSED_END_FUND, f"industry:{industry}+trust_name"
 
     # ADR indicators
     if _has_phrase(name, "ADR") or _has_phrase(name, "AMERICAN DEPOSITARY"):
@@ -205,21 +203,20 @@ def classify_security_type(
         return RIGHT, "name_contains:RIGHT"
 
     # SPAC / blank-check indicators
-    spac_keywords = ("SPAC", "BLANK CHECK", "ACQUISITION CORP", "ACQUISITION CO")
+    spac_keywords = (
+        "SPAC",
+        "BLANK CHECK",
+        "ACQUISITION CORP",
+        "ACQUISITION CORPORATION",
+        "ACQUISITION CO",
+    )
     kw = _has_any_phrase(name, spac_keywords)
     if kw:
         return SPAC_OR_BLANK_CHECK, f"name_contains:{kw}"
-    if sector == "FINANCIAL SERVICES" and _has_phrase(name, "ACQUISITION"):
-        return SPAC_OR_BLANK_CHECK, "sector:financial+acquisition_name"
 
     # ETF fallback from sector/industry
     if sector == "ETF" or industry == "EXCHANGE TRADED FUND":
         return ETF, f"sector_or_industry:ETF"
-
-    # The operating universe is US common stock. A non-US issuer on a US
-    # exchange is non-common for this universe even when the name omits ADR.
-    if country and country != "US" and exchange in {"NASDAQ", "NYSE", "AMEX"}:
-        return ADR, f"profile_country:{country}"
 
     # Sufficient data for common_stock classification
     if profile.company_name and profile.exchange:

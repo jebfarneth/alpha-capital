@@ -287,6 +287,7 @@ class TestFmpAdapter:
                 "mktCap": 75000000,
                 "sector": "Technology",
                 "industry": "Software",
+                "exchange": "NASDAQ",
                 "isEtf": 0,
                 "isActivelyTrading": 1,
             }
@@ -298,8 +299,10 @@ class TestFmpAdapter:
         assert resp.ok
         assert resp.data.symbol == "ACME"
         assert resp.data.market_cap == 75000000
+        assert resp.data.exchange == "NASDAQ"
         assert resp.data.is_etf is False
         assert resp.data.is_actively_trading is True
+        assert resp.data.raw["exchange"] == "NASDAQ"
         assert resp.lineage.endpoint == "/stable/profile"
 
     def test_get_company_profile_empty_result_is_no_data_error(self):

@@ -328,7 +328,7 @@ class FmpAdapter:
             market_cap=r.get("marketCap") or r.get("mktCap"),
             sector=r.get("sector"),
             industry=r.get("industry"),
-            exchange=r.get("exchangeShortName"),
+            exchange=r.get("exchangeShortName") or r.get("exchange"),
             country=r.get("country"),
             is_etf=_bool_or_raw(r.get("isEtf")),
             is_actively_trading=_bool_or_raw(r.get("isActivelyTrading")),

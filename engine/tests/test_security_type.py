@@ -109,6 +109,10 @@ class TestClassifier:
         st, _ = classify_security_type(_profile(company_name="Vanguard Growth Fund"))
         assert st == MUTUAL_FUND
 
+    def test_mutual_funds_plural_from_name(self):
+        st, _ = classify_security_type(_profile(company_name="Gabelli Funds Inc"))
+        assert st == MUTUAL_FUND
+
     def test_closed_end_fund_from_name(self):
         st, _ = classify_security_type(_profile(company_name="Nuveen Closed-End Fund"))
         assert st == CLOSED_END_FUND
@@ -153,6 +157,13 @@ class TestClassifier:
         st, _ = classify_security_type(_profile(company_name="Thunder Acquisition Corp"))
         assert st == SPAC_OR_BLANK_CHECK
 
+    def test_spac_from_acquisition_corporation(self):
+        st, reason = classify_security_type(
+            _profile(company_name="Black Hawk Acquisition Corporation")
+        )
+        assert st == SPAC_OR_BLANK_CHECK
+        assert reason == "name_contains:ACQUISITION CORPORATION"
+
     def test_spac_from_blank_check(self):
         st, _ = classify_security_type(_profile(company_name="Blank Check Corp"))
         assert st == SPAC_OR_BLANK_CHECK
@@ -179,6 +190,21 @@ class TestClassifier:
         st, _ = classify_security_type(_profile(company_name="Acme Funding Corp"))
         assert st == COMMON_STOCK
 
+    def test_trust_asset_manager_not_auto_closed_end_fund(self):
+        st, _ = classify_security_type(
+            _profile(company_name="First Trust Inc", industry="Asset Management")
+        )
+        assert st == COMMON_STOCK
+
+    def test_financial_acquisition_business_not_auto_spac(self):
+        st, _ = classify_security_type(
+            _profile(
+                company_name="Talent Acquisition Solutions Inc",
+                sector="Financial Services",
+            )
+        )
+        assert st == COMMON_STOCK
+
     def test_raw_provider_is_fund_flag_wins(self):
         st, reason = classify_security_type(
             _profile(company_name="Opaque Profile Inc"),
@@ -195,12 +221,12 @@ class TestClassifier:
         assert st == ADR
         assert reason == "raw_flag:isAdr"
 
-    def test_non_us_issuer_on_us_exchange_is_not_common_stock(self):
+    def test_non_us_issuer_on_us_exchange_is_not_auto_adr(self):
         st, reason = classify_security_type(
             _profile(company_name="Banco Santander SA", country="ES", exchange="NYSE")
         )
-        assert st == ADR
-        assert reason == "profile_country:ES"
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
 
     def test_all_non_common_types_in_set(self):
         """Verify NON_COMMON_TYPES covers all non-common classifications."""
