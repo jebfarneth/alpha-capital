@@ -35,8 +35,8 @@ PROVIDER = "FMP"
 @dataclass
 class FmpQuote:
     symbol: str
-    price: float
-    volume: int
+    price: Optional[float]
+    volume: Optional[int]
     market_cap: Optional[float] = None
     name: Optional[str] = None
     exchange: Optional[str] = None
@@ -77,7 +77,7 @@ class FmpCompanyProfile:
 class FmpScreenerResult:
     symbol: str
     company_name: str
-    market_cap: float
+    market_cap: Optional[float]
     price: Optional[float] = None
     volume: Optional[int] = None
     sector: Optional[str] = None
@@ -231,6 +231,26 @@ class FmpAdapter:
 
         return AdapterResponse(data=data, lineage=lineage)
 
+    def _no_data_response(
+        self,
+        *,
+        endpoint: str,
+        lineage: LineageMeta,
+        message: str,
+    ) -> AdapterResponse[None]:
+        return AdapterResponse(
+            data=None,
+            lineage=lineage,
+            error=ProviderError(
+                provider=PROVIDER,
+                endpoint=endpoint,
+                status_code=200,
+                error_type="no_data",
+                message=message,
+                retryable=False,
+            ),
+        )
+
     # --- Universe / security profile ---
 
     def get_stock_screener(
@@ -255,11 +275,12 @@ class FmpAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
+        rows = resp.data or []
         results = [
             FmpScreenerResult(
                 symbol=r.get("symbol", ""),
                 company_name=r.get("companyName", ""),
-                market_cap=r.get("marketCap", 0),
+                market_cap=r.get("marketCap"),
                 price=r.get("price"),
                 volume=r.get("volume"),
                 sector=r.get("sector"),
@@ -269,7 +290,7 @@ class FmpAdapter:
                 is_etf=r.get("isEtf"),
                 is_actively_trading=r.get("isActivelyTrading"),
             )
-            for r in resp.data
+            for r in rows
         ]
         return AdapterResponse(data=results, lineage=resp.lineage)
 
@@ -283,7 +304,11 @@ class FmpAdapter:
 
         rows = resp.data
         if not rows:
-            return AdapterResponse(data=None, lineage=resp.lineage)
+            return self._no_data_response(
+                endpoint=endpoint,
+                lineage=resp.lineage,
+                message=f"No company profile found for {ticker}",
+            )
         r = rows[0]
         profile = FmpCompanyProfile(
             symbol=r.get("symbol", ticker),
@@ -309,12 +334,16 @@ class FmpAdapter:
 
         rows = resp.data
         if not rows:
-            return AdapterResponse(data=None, lineage=resp.lineage)
+            return self._no_data_response(
+                endpoint=endpoint,
+                lineage=resp.lineage,
+                message=f"No quote found for {ticker}",
+            )
         r = rows[0]
         quote = FmpQuote(
             symbol=r.get("symbol", ticker),
-            price=r.get("price", 0.0),
-            volume=r.get("volume", 0),
+            price=r.get("price"),
+            volume=r.get("volume"),
             market_cap=r.get("marketCap"),
             name=r.get("name"),
             exchange=r.get("exchange"),
@@ -343,7 +372,14 @@ class FmpAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        historical = resp.data.get("historical", []) if isinstance(resp.data, dict) else resp.data
+        if isinstance(resp.data, dict):
+            historical = resp.data.get("historical") or []
+        elif resp.data is None:
+            historical = []
+        elif isinstance(resp.data, list):
+            historical = resp.data
+        else:
+            historical = []
         bars = [
             FmpBar(
                 date=b.get("date", ""),

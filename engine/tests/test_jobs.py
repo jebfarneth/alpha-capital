@@ -805,6 +805,68 @@ class TestSlicedUniverseFetcher:
         assert not result.response.ok
         assert result.response.error.error_type == "http"
 
+    def test_retryable_slice_error_retries_and_recovers(self):
+        """A transient slice failure is retried before failing the whole snapshot."""
+        error_resp = AdapterResponse(
+            data=None,
+            lineage=LineageMeta(
+                provider="FMP", endpoint="/stable/company-screener",
+                request_timestamp=_ts(), asof_timestamp=_ts(),
+                raw_payload_hash="", source_authority="FMP_Ultimate",
+            ),
+            error=ProviderError(
+                provider="FMP", endpoint="/stable/company-screener",
+                status_code=429, error_type="rate_limit",
+                message="rate limited", retryable=True,
+            ),
+        )
+        success_resp = _ok_response(
+            [_stock("ACME", market_cap=35_000_000)],
+            (30_000_000, 40_000_000),
+        )
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_stock_screener.side_effect = [error_resp, success_resp]
+        fetcher = SlicedUniverseFetcher(
+            adapter, mcap_min=30_000_000, mcap_max=40_000_000,
+            slice_width=10_000_000, max_slice_retries=1,
+        )
+        result = fetcher.fetch()
+
+        assert result.response.ok
+        assert result.unique_raw_count == 1
+        assert adapter.get_stock_screener.call_count == 2
+
+    def test_non_retryable_slice_error_does_not_retry(self):
+        error_resp = AdapterResponse(
+            data=None,
+            lineage=LineageMeta(
+                provider="FMP", endpoint="/stable/company-screener",
+                request_timestamp=_ts(), asof_timestamp=_ts(),
+                raw_payload_hash="", source_authority="FMP_Ultimate",
+            ),
+            error=ProviderError(
+                provider="FMP", endpoint="/stable/company-screener",
+                status_code=403, error_type="auth",
+                message="auth failed", retryable=False,
+            ),
+        )
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_stock_screener.return_value = error_resp
+        fetcher = SlicedUniverseFetcher(
+            adapter, mcap_min=30_000_000, mcap_max=40_000_000,
+            slice_width=10_000_000, max_slice_retries=2,
+        )
+        result = fetcher.fetch()
+
+        assert not result.response.ok
+        assert result.response.error.error_type == "auth"
+        assert adapter.get_stock_screener.call_count == 1
+
+    def test_rejects_negative_max_slice_retries(self):
+        adapter = _make_mock_adapter()
+        with pytest.raises(ValueError):
+            SlicedUniverseFetcher(adapter, max_slice_retries=-1)
+
     def test_empty_slices_produce_zero_results(self):
         """All-empty slices produce a valid empty result."""
         adapter = _make_mock_adapter()

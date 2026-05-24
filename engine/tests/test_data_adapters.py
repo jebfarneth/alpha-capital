@@ -166,6 +166,31 @@ class TestFmpAdapter:
             timeout=30,
         )
 
+    def test_get_quote_empty_result_is_no_data_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, [])
+        adapter = self._adapter(session)
+        resp = adapter.get_quote("ZZZZ_NOT_A_TICKER")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "no_data"
+        assert resp.error.retryable is False
+
+    def test_get_quote_missing_price_stays_none(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, [{"symbol": "ACME", "volume": 100000}]
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_quote("ACME")
+
+        assert resp.ok
+        assert resp.data.price is None
+        assert resp.data.volume == 100000
+
     def test_get_historical_price_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -186,6 +211,21 @@ class TestFmpAdapter:
         assert resp.lineage.provider == "FMP"
         assert resp.lineage.endpoint == "/stable/historical-price-eod/full"
 
+    def test_get_historical_price_null_response_returns_empty_list(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        resp_mock = MagicMock(spec=requests.Response)
+        resp_mock.status_code = 200
+        resp_mock.headers = {}
+        resp_mock.text = "null"
+        resp_mock.json.return_value = None
+        session.get.return_value = resp_mock
+        adapter = self._adapter(session)
+        resp = adapter.get_historical_price("DELISTED")
+
+        assert resp.ok
+        assert resp.data == []
+
     def test_get_stock_screener_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -203,6 +243,19 @@ class TestFmpAdapter:
         assert resp.data[0].market_cap == 75000000
         assert resp.lineage.endpoint == "/stable/company-screener"
 
+    def test_get_stock_screener_missing_market_cap_stays_none(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {"symbol": "ACME", "companyName": "Acme Corp", "price": 5.25}
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_stock_screener()
+
+        assert resp.ok
+        assert resp.data[0].market_cap is None
+
     def test_get_company_profile_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -217,6 +270,17 @@ class TestFmpAdapter:
         assert resp.data.symbol == "ACME"
         assert resp.data.market_cap == 75000000
         assert resp.lineage.endpoint == "/stable/profile"
+
+    def test_get_company_profile_empty_result_is_no_data_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, [])
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("ZZZZ_NOT_A_TICKER")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "no_data"
 
     def test_get_sec_filings_ok(self):
         session = MagicMock(spec=requests.Session)

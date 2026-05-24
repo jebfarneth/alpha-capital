@@ -67,6 +67,7 @@ class SlicedUniverseFetcher:
         slice_width: int = SLICE_WIDTH,
         min_slice_width: int = MIN_SLICE_WIDTH,
         limit_per_slice: int = DEFAULT_SLICE_LIMIT,
+        max_slice_retries: int = 2,
     ):
         self._adapter = adapter
         self._mcap_min = mcap_min
@@ -74,6 +75,9 @@ class SlicedUniverseFetcher:
         self._slice_width = slice_width
         self._min_slice_width = min_slice_width
         self._limit = limit_per_slice
+        if max_slice_retries < 0:
+            raise ValueError("max_slice_retries must be non-negative")
+        self._max_slice_retries = max_slice_retries
 
     def fetch(self) -> SlicedUniverseResult:
         seen: Dict[str, FmpScreenerResult] = {}
@@ -147,13 +151,7 @@ class SlicedUniverseFetcher:
             slice_upper = min(cursor + width, upper)
             query_lower = max(0, cursor - 1)
             query_upper = slice_upper + 1
-            resp = self._adapter.get_stock_screener(
-                market_cap_min=query_lower,
-                market_cap_max=query_upper,
-                country=None,
-                is_etf=None,
-                limit=self._limit,
-            )
+            resp = self._fetch_slice(query_lower, query_upper)
             if not resp.ok:
                 return resp.error
 
@@ -207,6 +205,26 @@ class SlicedUniverseFetcher:
             cursor = slice_upper
 
         return None
+
+    def _fetch_slice(
+        self, query_lower: int, query_upper: int
+    ) -> AdapterResponse[List[FmpScreenerResult]]:
+        attempts = self._max_slice_retries + 1
+        for attempt in range(attempts):
+            resp = self._adapter.get_stock_screener(
+                market_cap_min=query_lower,
+                market_cap_max=query_upper,
+                country=None,
+                is_etf=None,
+                limit=self._limit,
+            )
+            if resp.ok:
+                return resp
+            if not resp.error or not resp.error.retryable:
+                return resp
+            if attempt == attempts - 1:
+                return resp
+        return resp
 
 
 def _normalize_symbol(symbol: object) -> str:
