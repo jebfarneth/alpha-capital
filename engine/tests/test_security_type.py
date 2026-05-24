@@ -713,6 +713,24 @@ class TestBuilderCacheIntegration:
         assert snap.security_type == COMMON_STOCK
         assert result.metrics["security_type_suffix_rescue_count"] == 1
 
+    def test_non_common_cache_overrides_suffix_reason(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="ABCDX", security_type=MUTUAL_FUND,
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("ABCDX")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "ABCDX"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_type:mutual_fund"
+        assert result.metrics["security_type_exclusion_counts"]["mutual_fund"] == 1
+
     def test_all_non_common_types_excluded(self, db_session):
         """Every canonical non-common type produces an exclusion."""
         for i, st in enumerate(sorted(NON_COMMON_TYPES)):

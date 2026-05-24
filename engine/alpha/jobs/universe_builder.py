@@ -510,7 +510,9 @@ class UniverseBuilderJob(BaseJob):
                     included = True
                     reason = None
                     security_type_suffix_rescue_count += 1
-                if included and security_type in NON_COMMON_TYPES:
+                if security_type in NON_COMMON_TYPES and (
+                    included or reason == "non_common_symbol_suffix"
+                ):
                     included = False
                     reason = f"security_type:{security_type}"
                     security_type_exclusion_counts[security_type] += 1
