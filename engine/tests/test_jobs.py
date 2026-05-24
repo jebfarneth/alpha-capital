@@ -39,7 +39,7 @@ from alpha.db.models import (
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
-from alpha.jobs.run_universe import _required_profile_symbols
+from alpha.jobs.run_universe import _parse_args, _required_profile_symbols
 from alpha.jobs.universe_builder import (
     ALLOWED_EXCHANGES,
     MCAP_MAX,
@@ -254,6 +254,8 @@ class TestUniverseBuilder:
         assert result.metrics["raw_count"] == 7
         assert result.metrics["included"] == 2
         assert result.metrics["excluded"] == 5
+        assert result.metrics["mcap_min"] == MCAP_MIN
+        assert result.metrics["mcap_max"] == MCAP_MAX
 
         snaps = db_session.query(UniverseSnapshot).all()
         assert len(snaps) == 7
@@ -604,7 +606,7 @@ class TestHardenedFilter:
     def test_mcap_below_excluded(self):
         included, reason = _classify(_stock(market_cap=29_000_000))
         assert not included
-        assert reason == "mcap_below_30000000"
+        assert reason == f"mcap_below_{MCAP_MIN}"
 
     def test_mcap_above_excluded(self):
         included, reason = _classify(_stock(market_cap=MCAP_MAX + 1))
@@ -783,6 +785,12 @@ class TestNonCommonSymbol:
 # -----------------------------------------------------------------------
 
 class TestRunUniverseEntrypointHelpers:
+    def test_live_cli_defaults_to_full_security_profile_coverage(self):
+        args = _parse_args(["--live"])
+
+        assert args.min_security_profile_coverage == 1.0
+        assert args.allow_incomplete_security_cache is False
+
     def test_required_profile_symbols_include_included_and_suffix_excluded(self):
         symbols = _required_profile_symbols([
             _stock("INCL", market_cap=75_000_000, price=5.0),

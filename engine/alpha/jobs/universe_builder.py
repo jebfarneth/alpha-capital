@@ -377,7 +377,7 @@ class UniverseBuilderJob(BaseJob):
         slice_diagnostics: Optional[List[Any]] = None,
         profile_cache_max_age_days: Optional[int] = 7,
         require_security_profile_cache: bool = False,
-        min_security_profile_coverage: float = 0.95,
+        min_security_profile_coverage: float = 1.0,
     ):
         if profile_cache_max_age_days is not None and profile_cache_max_age_days < 0:
             raise ValueError("profile_cache_max_age_days must be non-negative or None")
@@ -606,6 +606,8 @@ class UniverseBuilderJob(BaseJob):
             "duplicate_symbol_count": duplicate_symbol_count,
             "included": included_count,
             "excluded": excluded_count,
+            "mcap_min": MCAP_MIN,
+            "mcap_max": MCAP_MAX,
             "exclusion_counts": dict(exclusion_counts),
             "security_profile_cache_hash": security_profile_cache_hash,
             "security_profile_cache_hit_count": cache_hit_count,

@@ -227,7 +227,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--min-security-profile-coverage",
         type=float,
-        default=0.95,
+        default=1.0,
         help="Minimum required security-profile coverage for strict live builds.",
     )
     parser.add_argument(
