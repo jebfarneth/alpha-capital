@@ -19,6 +19,7 @@ from typing import List
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from alpha.data.contracts import (
     AdapterResponse,
@@ -45,6 +46,7 @@ from alpha.jobs.universe_builder import (
     PRICE_MIN,
     UniverseBuilderJob,
     _classify,
+    _dedupe_screener_rows,
     _is_non_common_symbol,
     _upsert_canonical_universe_scan,
     get_canonical_universe_members,
@@ -455,6 +457,18 @@ class TestUniverseBuilder:
         assert snap.operating_universe_inclusion is True
         assert snap.primary_exchange == "NASDAQ"
         assert result.metrics["duplicate_symbol_count"] == 1
+
+    def test_duplicate_symbol_tie_break_is_deterministic(self):
+        low_cap = _stock(symbol="ACME", market_cap=75_000_000, price=5.0)
+        high_cap = _stock(symbol=" acme ", market_cap=80_000_000, price=6.0)
+
+        rows1, dupes1 = _dedupe_screener_rows([low_cap, high_cap])
+        rows2, dupes2 = _dedupe_screener_rows([high_cap, low_cap])
+
+        assert dupes1 == 1
+        assert dupes2 == 1
+        assert rows1[0][0].market_cap == 80_000_000
+        assert rows2[0][0].market_cap == 80_000_000
 
     def test_slice_diagnostics_in_metrics(self, db_session):
         resp = _mock_screener_response()
@@ -1121,6 +1135,50 @@ class TestCanonicalUniverseScan:
         ).all()
         assert len(all_scans) == 2
 
+    def test_stale_successful_run_does_not_replace_canonical(self, db_session):
+        fresh_resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc),
+                asof_timestamp=datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc),
+                raw_payload_hash="fresh",
+                source_authority="mock",
+            ),
+        )
+        stale_resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=datetime(2026, 5, 20, 15, 0, tzinfo=timezone.utc),
+                asof_timestamp=datetime(2026, 5, 20, 15, 0, tzinfo=timezone.utc),
+                raw_payload_hash="stale",
+                source_authority="mock",
+            ),
+        )
+
+        run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=fresh_resp),
+            params={"trading_date": "2026-05-20"},
+        )
+        fresh_scan = get_canonical_universe_scan(db_session, "2026-05-20")
+
+        stale_result = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=stale_resp),
+            params={"trading_date": "2026-05-20"},
+        )
+        after_stale = get_canonical_universe_scan(db_session, "2026-05-20")
+
+        assert stale_result.ok
+        assert after_stale.scan_id == fresh_scan.scan_id
+        assert db_session.query(UniverseScan).filter(
+            UniverseScan.trading_date == "2026-05-20"
+        ).count() == 2
+
     def test_failed_run_does_not_replace_canonical(self, db_session):
         r1 = self._run_builder(db_session)
         scan1 = get_canonical_universe_scan(db_session, "2026-05-20")
@@ -1276,6 +1334,133 @@ class TestCanonicalUniverseScan:
                 trading_date="2026-05-20",
                 scan_id="missing-scan",
                 job_run_id="job-1",
+            )
+
+    def test_upsert_integrity_fallback_updates_visible_competing_pointer(self):
+        class FakeNested:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeQuery:
+            def __init__(self, session):
+                self.session = session
+
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                self.session.first_calls += 1
+                if self.session.first_calls == 1:
+                    return None
+                return self.session.existing_pointer
+
+        class FakeSession:
+            def __init__(self):
+                self.first_calls = 0
+                self.flush_calls = 0
+                self.candidate_scan = UniverseScan(
+                    scan_id="candidate",
+                    trading_date="2026-05-20",
+                    asof_timestamp=datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc),
+                    run_status="finished",
+                )
+                self.existing_scan = UniverseScan(
+                    scan_id="existing",
+                    trading_date="2026-05-20",
+                    asof_timestamp=datetime(2026, 5, 20, 15, 0, tzinfo=timezone.utc),
+                    run_status="finished",
+                )
+                self.existing_pointer = CanonicalUniverseScan(
+                    trading_date="2026-05-20",
+                    scan_id="existing",
+                    selected_job_run_id="old-job",
+                )
+
+            def get(self, model, key):
+                if model is UniverseScan:
+                    return {
+                        "candidate": self.candidate_scan,
+                        "existing": self.existing_scan,
+                    }.get(key)
+                return None
+
+            def query(self, _model):
+                return FakeQuery(self)
+
+            def begin_nested(self):
+                return FakeNested()
+
+            def add(self, _obj):
+                pass
+
+            def flush(self):
+                self.flush_calls += 1
+                if self.flush_calls == 1:
+                    raise IntegrityError("insert", {}, Exception("unique"))
+
+        session = FakeSession()
+
+        _upsert_canonical_universe_scan(
+            session,
+            trading_date="2026-05-20",
+            scan_id="candidate",
+            job_run_id="new-job",
+        )
+
+        assert session.existing_pointer.scan_id == "candidate"
+        assert session.existing_pointer.selected_job_run_id == "new-job"
+        assert session.existing_pointer.selection_reason == "latest_successful_scan"
+
+    def test_upsert_integrity_fallback_raises_when_pointer_not_visible(self):
+        class FakeNested:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.candidate_scan = UniverseScan(
+                    scan_id="candidate",
+                    trading_date="2026-05-20",
+                    asof_timestamp=datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc),
+                    run_status="finished",
+                )
+
+            def get(self, model, key):
+                if model is UniverseScan and key == "candidate":
+                    return self.candidate_scan
+                return None
+
+            def query(self, _model):
+                return FakeQuery()
+
+            def begin_nested(self):
+                return FakeNested()
+
+            def add(self, _obj):
+                pass
+
+            def flush(self):
+                raise IntegrityError("insert", {}, Exception("unique"))
+
+        with pytest.raises(RuntimeError, match="no competing pointer is visible"):
+            _upsert_canonical_universe_scan(
+                FakeSession(),
+                trading_date="2026-05-20",
+                scan_id="candidate",
+                job_run_id="new-job",
             )
 
     def test_trading_date_derived_from_asof_when_not_provided(self, db_session):

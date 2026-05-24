@@ -148,6 +148,13 @@ def _derive_trading_date(params: Dict[str, Any], asof: datetime) -> str:
     return asof.date().isoformat()
 
 
+def _datetime_order_key(value: datetime) -> datetime:
+    """Return a comparable timestamp key across SQLite aware/naive round trips."""
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -199,8 +206,24 @@ def _upsert_canonical_universe_scan(
     job_run_id: str,
 ) -> None:
     """Select scan_id as the canonical scan for trading_date."""
-    if session.get(UniverseScan, scan_id) is None:
+    candidate_scan = session.get(UniverseScan, scan_id)
+    if candidate_scan is None:
         raise ValueError(f"canonical universe scan_id does not exist: {scan_id}")
+
+    def _replace_if_current_or_newer(existing: CanonicalUniverseScan) -> None:
+        existing_scan = session.get(UniverseScan, existing.scan_id)
+        if (
+            existing_scan is not None
+            and _datetime_order_key(candidate_scan.asof_timestamp)
+            < _datetime_order_key(existing_scan.asof_timestamp)
+        ):
+            return
+
+        existing.scan_id = scan_id
+        existing.selected_job_run_id = job_run_id
+        existing.selected_at = datetime.now(timezone.utc)
+        existing.selection_reason = "latest_successful_scan"
+        session.flush()
 
     existing = (
         session.query(CanonicalUniverseScan)
@@ -208,11 +231,7 @@ def _upsert_canonical_universe_scan(
         .first()
     )
     if existing:
-        existing.scan_id = scan_id
-        existing.selected_job_run_id = job_run_id
-        existing.selected_at = datetime.now(timezone.utc)
-        existing.selection_reason = "latest_successful_scan"
-        session.flush()
+        _replace_if_current_or_newer(existing)
         return
 
     try:
@@ -235,13 +254,14 @@ def _upsert_canonical_universe_scan(
     existing = (
         session.query(CanonicalUniverseScan)
         .filter(CanonicalUniverseScan.trading_date == trading_date)
-        .one()
+        .first()
     )
-    existing.scan_id = scan_id
-    existing.selected_job_run_id = job_run_id
-    existing.selected_at = datetime.now(timezone.utc)
-    existing.selection_reason = "latest_successful_scan"
-    session.flush()
+    if existing is None:
+        raise RuntimeError(
+            "canonical universe scan insert raced but no competing pointer is visible; "
+            "retry the universe builder job"
+        )
+    _replace_if_current_or_newer(existing)
 
 
 def _dedupe_screener_rows(
@@ -249,6 +269,21 @@ def _dedupe_screener_rows(
 ) -> Tuple[List[Tuple[FmpScreenerResult, bool, Optional[str], str]], int]:
     """Deduplicate rows by symbol, preferring rows that pass inclusion."""
     selected: Dict[str, Tuple[FmpScreenerResult, bool, Optional[str], str]] = {}
+
+    def _rank(candidate: Tuple[FmpScreenerResult, bool, Optional[str], str]) -> Tuple:
+        stock, included, reason, symbol = candidate
+        market_cap = _finite_real(stock.market_cap)
+        price = _finite_real(stock.price)
+        return (
+            1 if included else 0,
+            market_cap if market_cap is not None else float("-inf"),
+            price if price is not None else float("-inf"),
+            _clean_symbol(stock.exchange),
+            _clean_symbol(stock.country),
+            _clean_symbol(reason),
+            symbol,
+        )
+
     duplicate_count = 0
     for stock in rows:
         included, reason = _classify(stock)
@@ -260,8 +295,7 @@ def _dedupe_screener_rows(
             continue
 
         duplicate_count += 1
-        _, existing_included, _, _ = existing
-        if included and not existing_included:
+        if _rank(candidate) > _rank(existing):
             selected[symbol] = candidate
 
     return list(selected.values()), duplicate_count
