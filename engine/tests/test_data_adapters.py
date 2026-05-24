@@ -256,6 +256,27 @@ class TestFmpAdapter:
         assert resp.ok
         assert resp.data[0].market_cap is None
 
+    def test_get_stock_screener_normalizes_integer_booleans(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "ACME",
+                "companyName": "Acme Corp",
+                "marketCap": 75000000,
+                "price": 5.25,
+                "isEtf": 0,
+                "isActivelyTrading": 1,
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_stock_screener()
+
+        assert resp.ok
+        assert resp.data[0].is_etf is False
+        assert resp.data[0].is_actively_trading is True
+
     def test_get_company_profile_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}

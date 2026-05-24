@@ -30,6 +30,17 @@ from alpha.data.contracts import (
 PROVIDER = "FMP"
 
 
+def _bool_or_raw(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    return value
+
+
 # --- Response types ---
 
 @dataclass
@@ -287,8 +298,8 @@ class FmpAdapter:
                 industry=r.get("industry"),
                 exchange=r.get("exchangeShortName"),
                 country=r.get("country"),
-                is_etf=r.get("isEtf"),
-                is_actively_trading=r.get("isActivelyTrading"),
+                is_etf=_bool_or_raw(r.get("isEtf")),
+                is_actively_trading=_bool_or_raw(r.get("isActivelyTrading")),
             )
             for r in rows
         ]

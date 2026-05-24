@@ -24,6 +24,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import asdict, is_dataclass
+from decimal import Decimal
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,9 +48,12 @@ def _clean_symbol(symbol: object) -> str:
 
 
 def _finite_real(value: object) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, bool):
         return None
-    number = float(value)
+    if isinstance(value, Real) or isinstance(value, Decimal):
+        number = float(value)
+    else:
+        return None
     if not math.isfinite(number):
         return None
     return number
@@ -60,7 +64,7 @@ def _is_non_common_symbol(symbol: object) -> Tuple[bool, Optional[str]]:
 
     Excludes:
       - Symbols containing "." or "-" (non-common separators)
-      - Symbols ending in "WS" or "WT" (warrant forms)
+      - Five-or-more-character symbols ending in "WS" or "WT" (warrant forms)
       - Five-character symbols ending in "W" or "U" (warrant/unit forms)
 
     Does NOT exclude ordinary tickers ending in single letters W/U/R/P/X.
@@ -74,7 +78,7 @@ def _is_non_common_symbol(symbol: object) -> Tuple[bool, Optional[str]]:
         return True, "non_common_symbol_separator"
     if "." in upper or "-" in upper:
         return True, "non_common_symbol_separator"
-    if upper.endswith("WS") or upper.endswith("WT"):
+    if len(upper) >= 5 and (upper.endswith("WS") or upper.endswith("WT")):
         return True, "non_common_symbol_suffix"
     if len(upper) == 5 and upper[-1] in ("W", "U"):
         return True, "non_common_symbol_suffix"
@@ -93,10 +97,16 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
         return False, "etf_status_missing_or_invalid"
     if stock.is_actively_trading is not True:
         return False, "not_actively_trading"
-    if stock.country != "US":
-        return False, f"country:{stock.country}"
-    if stock.exchange not in ALLOWED_EXCHANGES:
-        return False, f"exchange:{stock.exchange}"
+    country = _clean_symbol(stock.country)
+    if not country:
+        return False, "country_missing"
+    if country != "US":
+        return False, f"country:{country}"
+    exchange = _clean_symbol(stock.exchange)
+    if not exchange:
+        return False, "exchange_missing"
+    if exchange not in ALLOWED_EXCHANGES:
+        return False, f"exchange:{exchange}"
 
     market_cap = _finite_real(stock.market_cap)
     if market_cap is None:
@@ -176,6 +186,7 @@ class UniverseBuilderJob(BaseJob):
             symbol = _clean_symbol(stock.symbol)
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
+            exchange = _clean_symbol(stock.exchange)
             record_universe_snapshot(
                 self._session,
                 job_run_id=ctx.job_run_id,
@@ -185,7 +196,7 @@ class UniverseBuilderJob(BaseJob):
                 source_provider=resp.lineage.provider,
                 market_cap=market_cap,
                 price=price,
-                primary_exchange=stock.exchange,
+                primary_exchange=exchange or None,
                 operating_universe_inclusion=included,
                 exclusion_reason=reason,
                 source_lineage_hash=lineage.raw_payload_hash,
@@ -195,7 +206,7 @@ class UniverseBuilderJob(BaseJob):
                 "market_cap": market_cap,
                 "price": price,
                 "country": stock.country,
-                "exchange": stock.exchange,
+                "exchange": exchange,
                 "is_etf": stock.is_etf,
                 "is_actively_trading": stock.is_actively_trading,
                 "included": included,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List
 from unittest.mock import MagicMock
 
@@ -375,6 +376,26 @@ class TestUniverseBuilder:
         assert snap.source_provider == "FMP"
         assert snap.primary_exchange == "NASDAQ"
 
+    def test_symbol_and_exchange_normalized_in_snapshot(self, db_session):
+        resp = AdapterResponse(
+            data=[
+                _stock(
+                    symbol=" acme ",
+                    market_cap=75_000_000,
+                    price=5.0,
+                    exchange=" nasdaq ",
+                )
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        run_job(db_session, job)
+
+        snap = db_session.query(UniverseSnapshot).one()
+        assert snap.operating_universe_inclusion is True
+        assert snap.ticker == "ACME"
+        assert snap.primary_exchange == "NASDAQ"
+
     def test_slice_diagnostics_in_metrics(self, db_session):
         resp = _mock_screener_response()
         diags = [
@@ -461,7 +482,17 @@ class TestHardenedFilter:
     def test_none_exchange_excluded(self):
         included, reason = _classify(_stock(exchange=None))
         assert not included
-        assert reason == "exchange:None"
+        assert reason == "exchange_missing"
+
+    def test_exchange_normalized_before_classification(self):
+        assert _classify(_stock(exchange=" nasdaq "))[0]
+        assert _classify(_stock(exchange="nyse"))[0]
+        assert _classify(_stock(exchange=" AmEx "))[0]
+
+    def test_missing_country_reason_is_explicit(self):
+        included, reason = _classify(_stock(country=None))
+        assert not included
+        assert reason == "country_missing"
 
     def test_nasdaq_included(self):
         assert _classify(_stock(exchange="NASDAQ"))[0]
@@ -502,6 +533,11 @@ class TestHardenedFilter:
         assert not included
         assert reason == "mcap_missing_or_invalid"
 
+    def test_mcap_decimal_accepted(self):
+        included, reason = _classify(_stock(market_cap=Decimal("75000000")))
+        assert included is True
+        assert reason is None
+
     def test_price_below_3_excluded(self):
         included, reason = _classify(_stock(price=2.99))
         assert not included
@@ -525,6 +561,11 @@ class TestHardenedFilter:
         assert not included
         assert reason == "price_missing_or_invalid"
 
+    def test_price_decimal_accepted(self):
+        included, reason = _classify(_stock(price=Decimal("5.0")))
+        assert included is True
+        assert reason is None
+
     # --- Conservative symbol cleanup ---
 
     def test_dot_separator_excluded(self):
@@ -546,6 +587,12 @@ class TestHardenedFilter:
         included, reason = _classify(_stock(symbol="ABCWT"))
         assert not included
         assert reason == "non_common_symbol_suffix"
+
+    def test_four_char_ws_wt_tickers_kept(self):
+        """Avoid false positives like NEWS/NEWT; WS/WT suffix needs 5+ chars."""
+        assert _classify(_stock(symbol="NEWS"))[0]
+        assert _classify(_stock(symbol="NEWT"))[0]
+        assert _classify(_stock(symbol="LAWS"))[0]
 
     def test_five_char_w_excluded(self):
         included, reason = _classify(_stock(symbol="ABCDW"))
@@ -626,9 +673,9 @@ class TestNonCommonSymbol:
     def test_case_insensitive_ws(self):
         assert _is_non_common_symbol("abcws")[0]
 
-    def test_three_char_ws(self):
-        """Short symbol ending WS is still caught."""
-        assert _is_non_common_symbol("AWS")[0]
+    def test_three_char_ws_kept(self):
+        """Short common symbols ending WS are not warrant suffixes."""
+        assert _is_non_common_symbol("AWS") == (False, None)
 
 
 # -----------------------------------------------------------------------
