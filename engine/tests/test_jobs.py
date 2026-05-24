@@ -39,6 +39,7 @@ from alpha.db.models import (
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
+from alpha.jobs.run_universe import _required_profile_symbols
 from alpha.jobs.universe_builder import (
     ALLOWED_EXCHANGES,
     MCAP_MAX,
@@ -288,6 +289,26 @@ class TestUniverseBuilder:
         assert counts["etf"] == 1
         assert counts["not_actively_trading"] == 1
         assert "country:CA" in counts
+
+    def test_zero_included_scan_fails_without_canonical(self, db_session):
+        resp = AdapterResponse(
+            data=[
+                _stock("ETF1", market_cap=80_000_000, price=25.0, is_etf=True),
+                _stock("DEAD", market_cap=60_000_000, price=4.0, is_actively_trading=False),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert not result.ok
+        assert result.status == "failed"
+        assert result.metrics["included"] == 0
+        assert result.metrics["failure_stage"] == "empty_universe"
+
+        scan = db_session.query(UniverseScan).one()
+        assert scan.run_status == "failed"
+        assert db_session.query(CanonicalUniverseScan).count() == 0
 
     def test_snapshots_link_to_job_run(self, db_session):
         resp = _mock_screener_response()
@@ -586,9 +607,9 @@ class TestHardenedFilter:
         assert reason == "mcap_below_30000000"
 
     def test_mcap_above_excluded(self):
-        included, reason = _classify(_stock(market_cap=201_000_000))
+        included, reason = _classify(_stock(market_cap=MCAP_MAX + 1))
         assert not included
-        assert reason == "mcap_above_200000000"
+        assert reason == f"mcap_above_{MCAP_MAX}"
 
     def test_mcap_missing_excluded(self):
         included, reason = _classify(_stock(market_cap=None))
@@ -758,6 +779,22 @@ class TestNonCommonSymbol:
 
 
 # -----------------------------------------------------------------------
+# Test run_universe helpers
+# -----------------------------------------------------------------------
+
+class TestRunUniverseEntrypointHelpers:
+    def test_required_profile_symbols_include_included_and_suffix_excluded(self):
+        symbols = _required_profile_symbols([
+            _stock("INCL", market_cap=75_000_000, price=5.0),
+            _stock("ABCDX", market_cap=75_000_000, price=5.0),
+            _stock("ETF1", market_cap=75_000_000, price=25.0, is_etf=True),
+            _stock("PENY", market_cap=75_000_000, price=1.0),
+        ])
+
+        assert symbols == ["ABCDX", "INCL"]
+
+
+# -----------------------------------------------------------------------
 # Test sliced universe fetcher
 # -----------------------------------------------------------------------
 
@@ -803,14 +840,14 @@ def _ok_response(stocks, key=(0, 0)):
 
 class TestSlicedUniverseFetcher:
     def test_calls_once_per_slice(self):
-        """17 slices from 30M to 200M in 10M increments."""
+        """22 slices from 30M to 250M in 10M increments."""
         adapter = _make_mock_adapter()
         fetcher = SlicedUniverseFetcher(adapter)
         result = fetcher.fetch()
 
         assert result.response.ok
-        assert result.slice_count == 17
-        assert adapter.get_stock_screener.call_count == 17
+        assert result.slice_count == 22
+        assert adapter.get_stock_screener.call_count == 22
 
     def test_unions_and_dedups_symbols(self):
         """Same symbol in two slices appears once in results."""

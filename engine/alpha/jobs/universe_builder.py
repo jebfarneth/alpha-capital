@@ -2,7 +2,7 @@
 Universe builder job.
 
 Builds the operating universe from screener data, applying vault rules:
-  - Market cap $30M-$200M, finite
+  - Market cap in configured operating band, finite
   - Price >= $3.00, finite
   - US country only
   - NASDAQ / NYSE / AMEX exchanges only
@@ -36,6 +36,7 @@ from sqlalchemy.exc import IntegrityError
 
 from alpha.data.contracts import AdapterResponse, stable_hash
 from alpha.data.fmp import FmpScreenerResult
+from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 from alpha.db.models import CanonicalUniverseScan, SecurityProfile, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage, record_universe_snapshot
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
@@ -46,8 +47,6 @@ from alpha.jobs.security_type import (
     UNKNOWN,
 )
 
-MCAP_MIN = 30_000_000
-MCAP_MAX = 200_000_000
 PRICE_MIN = 3.0
 ALLOWED_EXCHANGES = frozenset({"NASDAQ", "NYSE", "AMEX"})
 
@@ -134,9 +133,9 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     if market_cap is None:
         return False, "mcap_missing_or_invalid"
     if market_cap < MCAP_MIN:
-        return False, "mcap_below_30000000"
+        return False, f"mcap_below_{MCAP_MIN}"
     if market_cap > MCAP_MAX:
-        return False, "mcap_above_200000000"
+        return False, f"mcap_above_{MCAP_MAX}"
 
     price = _finite_real(stock.price)
     if price is None:
@@ -675,6 +674,25 @@ class UniverseBuilderJob(BaseJob):
                         f"{security_profile_coverage_ratio:.4f} below required "
                         f"{self._min_security_profile_coverage:.4f}"
                     ),
+                }],
+            )
+
+        if included_count == 0:
+            metrics["failure_stage"] = "empty_universe"
+            scan.run_status = "failed"
+            scan.metric_json = json.dumps(metrics, default=str)
+            self._session.flush()
+            return JobResult(
+                status="failed",
+                metrics=metrics,
+                input_hashes={
+                    "screener": resp.lineage.raw_payload_hash,
+                    "security_profile_cache": security_profile_cache_hash,
+                },
+                output_hashes={"universe_snapshots": output_hash},
+                errors=[{
+                    "stage": "empty_universe",
+                    "message": "universe builder produced zero included symbols",
                 }],
             )
 

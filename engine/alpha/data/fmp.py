@@ -26,6 +26,7 @@ from alpha.data.contracts import (
     stable_hash,
     utcnow,
 )
+from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 
 PROVIDER = "FMP"
 
@@ -273,8 +274,8 @@ class FmpAdapter:
 
     def get_stock_screener(
         self,
-        market_cap_min: int = 30_000_000,
-        market_cap_max: int = 200_000_000,
+        market_cap_min: int = MCAP_MIN,
+        market_cap_max: int = MCAP_MAX,
         country: Optional[str] = "US",
         is_etf: Optional[bool] = False,
         limit: int = 5000,

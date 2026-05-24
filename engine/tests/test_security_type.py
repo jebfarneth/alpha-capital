@@ -706,7 +706,10 @@ class TestBuilderCacheIntegration:
         ))
         db_session.flush()
 
-        resp = AdapterResponse(data=[_stock("BADF")], lineage=_mock_lineage_screener())
+        resp = AdapterResponse(
+            data=[_stock("BADF"), _stock("GOOD")],
+            lineage=_mock_lineage_screener(),
+        )
         job = UniverseBuilderJob(session=db_session, screener_response=resp)
         result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
 
@@ -786,7 +789,10 @@ class TestBuilderCacheIntegration:
         ))
         db_session.flush()
 
-        resp = AdapterResponse(data=[_stock("MYSTK")], lineage=_mock_lineage_screener())
+        resp = AdapterResponse(
+            data=[_stock("MYSTK"), _stock("GOOD")],
+            lineage=_mock_lineage_screener(),
+        )
         job = UniverseBuilderJob(session=db_session, screener_response=resp)
         result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
 
@@ -934,12 +940,13 @@ class TestBuilderCacheIntegration:
         db_session.flush()
 
         stocks = [_stock(f"T{i:03d}") for i in range(len(NON_COMMON_TYPES))]
+        stocks.append(_stock("GOOD"))
         resp = AdapterResponse(data=stocks, lineage=_mock_lineage_screener())
         job = UniverseBuilderJob(session=db_session, screener_response=resp)
         result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
 
         assert result.ok
-        assert result.metrics["included"] == 0
+        assert result.metrics["included"] == 1
         assert result.metrics["excluded"] == len(NON_COMMON_TYPES)
         for st in NON_COMMON_TYPES:
             assert f"security_type:{st}" in result.metrics["exclusion_counts"]

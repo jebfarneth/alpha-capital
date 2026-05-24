@@ -1,7 +1,7 @@
 """
 Sliced FMP universe source.
 
-Pulls the $30M-$200M market-cap band in equal-width slices to avoid
+Pulls the configured operating market-cap band in equal-width slices to avoid
 provider limit truncation (FMP returns the largest names first when a
 single broad request hits the limit). Recursively subdivides any slice
 that returns exactly ``limit`` results until the slice width reaches
@@ -24,11 +24,8 @@ from alpha.data.contracts import (
     utcnow,
 )
 from alpha.data.fmp import FmpAdapter, FmpScreenerResult
+from alpha.data.universe_config import MCAP_MAX, MCAP_MIN, MIN_SLICE_WIDTH, SLICE_WIDTH
 
-MCAP_MIN = 30_000_000
-MCAP_MAX = 200_000_000
-SLICE_WIDTH = 10_000_000
-MIN_SLICE_WIDTH = 1_000_000
 DEFAULT_SLICE_LIMIT = 1000
 DEFAULT_BOUNDARY_OVERLAP = 1_000
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0

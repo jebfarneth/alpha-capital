@@ -1,0 +1,6 @@
+"""Shared operating-universe bounds."""
+
+MCAP_MIN = 30_000_000
+MCAP_MAX = 250_000_000
+SLICE_WIDTH = 10_000_000
+MIN_SLICE_WIDTH = 1_000_000

@@ -63,6 +63,8 @@ NON_COMMON_TYPES = frozenset({
     BUSINESS_DEVELOPMENT_COMPANY,
 })
 
+BDC_INDUSTRIES = frozenset({"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"})
+
 
 # ---------------------------------------------------------------------------
 # Classifier
@@ -260,8 +262,7 @@ def classify_security_type(
         return BUSINESS_DEVELOPMENT_COMPANY, "raw_description:BUSINESS_DEVELOPMENT_COMPANY"
     if _has_phrase(name, "BUSINESS DEVELOPMENT COMPANY") or _has_phrase(name, "BDC"):
         return BUSINESS_DEVELOPMENT_COMPANY, "name_contains:BUSINESS_DEVELOPMENT_COMPANY"
-    bdc_industries = {"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"}
-    if sector == "FINANCIAL SERVICES" and industry in bdc_industries:
+    if sector == "FINANCIAL SERVICES" and industry in BDC_INDUSTRIES:
         if _has_phrase(name, "CAPITAL CORPORATION") or _has_phrase(name, "CAPITAL CORP"):
             return BUSINESS_DEVELOPMENT_COMPANY, "name_industry:CAPITAL_CORPORATION_BDC"
 
