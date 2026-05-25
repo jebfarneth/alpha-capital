@@ -1188,6 +1188,14 @@ class TestSlicedUniverseFetcher:
         assert result.response.ok
         assert result.slice_count == 22
         assert adapter.get_stock_screener.call_count == 22
+        assert result.response.lineage.request_timestamp.tzinfo is not None
+        assert result.response.lineage.request_timestamp.utcoffset() == timezone.utc.utcoffset(
+            result.response.lineage.request_timestamp
+        )
+        assert result.response.lineage.asof_timestamp.tzinfo is not None
+        assert result.response.lineage.asof_timestamp.utcoffset() == timezone.utc.utcoffset(
+            result.response.lineage.asof_timestamp
+        )
         assert result.response.lineage.data_quality_flags["asof_source"] == (
             "request_timestamp_no_historical_screener_asof"
         )

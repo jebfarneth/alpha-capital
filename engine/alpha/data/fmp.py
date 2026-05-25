@@ -12,7 +12,7 @@ Does not write to DB. Returns AdapterResponse with LineageMeta.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -29,6 +29,15 @@ from alpha.data.contracts import (
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 
 PROVIDER = "FMP"
+
+
+def _aware_utc_or_none(value: Optional[datetime]) -> Optional[datetime]:
+    """Adapter boundary contract: caller-supplied asof values must be aware."""
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc)
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -134,7 +143,29 @@ class FmpAdapter:
     ) -> AdapterResponse[Any]:
         url = f"{self._config.base_url}{endpoint}"
         request_ts = utcnow()
-        asof_ts = asof or request_ts
+        if asof is None:
+            asof_ts = request_ts
+        else:
+            asof_ts = _aware_utc_or_none(asof)
+            if asof_ts is None:
+                return AdapterResponse(
+                    data=None,
+                    lineage=LineageMeta(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        request_timestamp=request_ts,
+                        asof_timestamp=request_ts,
+                        raw_payload_hash="",
+                    ),
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        status_code=None,
+                        error_type="validation",
+                        message="FMP adapter asof timestamp must be timezone-aware",
+                        retryable=False,
+                    ),
+                )
 
         try:
             resp = self._session.get(url, params=params or {}, timeout=30)

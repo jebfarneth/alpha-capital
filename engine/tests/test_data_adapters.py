@@ -16,6 +16,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -50,6 +51,11 @@ def _mock_response(status_code: int = 200, json_data=None, text: str = "", heade
         resp.text = text
         resp.json.side_effect = ValueError("No JSON")
     return resp
+
+
+def _assert_aware_utc(value: datetime) -> None:
+    assert value.tzinfo is not None
+    assert value.utcoffset() == timezone.utc.utcoffset(value)
 
 
 def _fmp_config():
@@ -174,6 +180,8 @@ class TestFmpAdapter:
         assert resp.lineage.endpoint == "/stable/quote"
         assert resp.lineage.raw_payload_hash != ""
         assert resp.lineage.source_authority == "FMP_Ultimate"
+        _assert_aware_utc(resp.lineage.request_timestamp)
+        _assert_aware_utc(resp.lineage.asof_timestamp)
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/quote",
             params={"symbol": "ACME"},
@@ -256,9 +264,44 @@ class TestFmpAdapter:
         assert resp.data[0].symbol == "ACME"
         assert resp.data[0].market_cap == 75000000
         assert resp.lineage.endpoint == "/stable/company-screener"
+        _assert_aware_utc(resp.lineage.request_timestamp)
+        _assert_aware_utc(resp.lineage.asof_timestamp)
         params = session.get.call_args.kwargs["params"]
         assert "country" not in params
         assert "isEtf" not in params
+
+    def test_request_converts_aware_asof_to_utc(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, [{"symbol": "ACME"}])
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stable/company-screener",
+            asof=datetime(2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        assert resp.ok
+        assert resp.lineage.asof_timestamp == datetime(
+            2026, 5, 20, 4, 0, tzinfo=timezone.utc
+        )
+        _assert_aware_utc(resp.lineage.request_timestamp)
+
+    def test_request_rejects_naive_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stable/company-screener",
+            asof=datetime(2026, 5, 20, 14, 30),
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "FMP adapter asof timestamp must be timezone-aware"
+        session.get.assert_not_called()
 
     def test_get_stock_screener_missing_market_cap_stays_none(self):
         session = MagicMock(spec=requests.Session)
