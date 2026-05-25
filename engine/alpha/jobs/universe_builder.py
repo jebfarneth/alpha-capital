@@ -50,6 +50,12 @@ from alpha.jobs.security_type import (
 PRICE_MIN = 3.0
 ALLOWED_EXCHANGES = frozenset({"NASDAQ", "NYSE", "AMEX"})
 COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX = "country_requires_security_profile"
+SHELL_COMPANY_CLASSIFICATION_REASON = "industry:SHELL_COMPANIES"
+SPAC_PATTERN_CLASSIFICATION_REASONS = frozenset({
+    SHELL_COMPANY_CLASSIFICATION_REASON,
+    "name_pattern:ACQUISITION_SEQUENCE",
+    "name_pattern:INVESTMENT_CORP_SEQUENCE",
+})
 
 
 def _country_requires_security_profile_reason(country: str) -> str:
@@ -69,6 +75,17 @@ def _requires_security_profile(included: bool, reason: Optional[str]) -> bool:
         or reason == "non_common_symbol_suffix"
         or _country_requires_security_profile(reason)
     )
+
+
+def _market_cap_bucket(market_cap: object) -> str:
+    cap = _finite_real(market_cap)
+    if cap is None:
+        return "unknown"
+    if cap < 100_000_000:
+        return "30m_100m"
+    if cap < 200_000_000:
+        return "100m_200m"
+    return "200m_250m"
 
 
 def _clean_symbol(symbol: object) -> str:
@@ -518,6 +535,10 @@ class UniverseBuilderJob(BaseJob):
         security_type_suffix_rescue_count = 0
         country_profile_rescue_count = 0
         included_country_counts: Counter[str] = Counter()
+        included_market_cap_bucket_counts: Counter[str] = Counter()
+        security_type_classification_reason_counts: Counter[str] = Counter()
+        shell_company_exclusion_symbols: list[str] = []
+        spac_pattern_exclusion_symbols: list[str] = []
 
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
@@ -581,6 +602,16 @@ class UniverseBuilderJob(BaseJob):
                     included = False
                     reason = f"security_type:{security_type}"
                     security_type_exclusion_counts[security_type] += 1
+                    classification_reason = (
+                        cached_profile.classification_reason or "missing"
+                    )
+                    security_type_classification_reason_counts[
+                        classification_reason
+                    ] += 1
+                    if classification_reason == SHELL_COMPANY_CLASSIFICATION_REASON:
+                        shell_company_exclusion_symbols.append(symbol)
+                    if classification_reason in SPAC_PATTERN_CLASSIFICATION_REASONS:
+                        spac_pattern_exclusion_symbols.append(symbol)
             else:
                 cache_miss_count += 1
                 if profile_required:
@@ -590,6 +621,7 @@ class UniverseBuilderJob(BaseJob):
 
             if included:
                 included_country_counts[_clean_symbol(stock.country) or "MISSING"] += 1
+                included_market_cap_bucket_counts[_market_cap_bucket(market_cap)] += 1
 
             record_universe_snapshot(
                 self._session,
@@ -654,6 +686,17 @@ class UniverseBuilderJob(BaseJob):
             "security_profile_cache_miss_included_count": cache_miss_included_count,
             "security_profile_cache_miss_required_count": security_profile_cache_miss_required_count,
             "security_type_exclusion_counts": dict(security_type_exclusion_counts),
+            "security_type_classification_reason_counts": dict(
+                security_type_classification_reason_counts
+            ),
+            "shell_company_exclusion_count": len(shell_company_exclusion_symbols),
+            "shell_company_exclusion_symbols_sample": sorted(
+                shell_company_exclusion_symbols
+            )[:25],
+            "spac_pattern_exclusion_count": len(spac_pattern_exclusion_symbols),
+            "spac_pattern_exclusion_symbols_sample": sorted(
+                spac_pattern_exclusion_symbols
+            )[:25],
             "security_type_unknown_count": security_type_unknown_count,
             "security_profile_unresolved_count": security_profile_unresolved_count,
             "security_profile_stale_count": security_profile_stale_count,
@@ -665,6 +708,7 @@ class UniverseBuilderJob(BaseJob):
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
             "country_profile_rescue_count": country_profile_rescue_count,
             "included_country_counts": dict(included_country_counts),
+            "included_market_cap_bucket_counts": dict(included_market_cap_bucket_counts),
             "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }
         if self._slice_diagnostics is not None:

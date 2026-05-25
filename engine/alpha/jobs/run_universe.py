@@ -195,6 +195,11 @@ def _run_live(args) -> int:
     print(f"Coverage:      {metrics.get('security_profile_coverage_ratio')}")
     print(f"Slices:        {sliced.slice_count}")
     print(f"Slice limits:  {sliced.slice_limit_hits}")
+    print(f"Country rescues: {metrics.get('country_profile_rescue_count', 0)}")
+    print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
+    print(f"Countries:     {metrics.get('included_country_counts', {})}")
+    print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
+    print(f"SPAC pattern review: {metrics.get('spac_pattern_exclusion_symbols_sample', [])}")
     print(f"Security type exclusions: {metrics.get('security_type_exclusion_counts', {})}")
 
     exclusion_counts = metrics.get("exclusion_counts", {})

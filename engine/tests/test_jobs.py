@@ -41,7 +41,12 @@ from alpha.db.models import (
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
 from alpha.jobs.run_universe import _parse_args, _required_profile_symbols
-from alpha.jobs.security_type import COMMON_STOCK, MUTUAL_FUND, REFRESH_STATUS_ENRICHED
+from alpha.jobs.security_type import (
+    COMMON_STOCK,
+    MUTUAL_FUND,
+    REFRESH_STATUS_ENRICHED,
+    SPAC_OR_BLANK_CHECK,
+)
 from alpha.jobs.universe_builder import (
     ALLOWED_EXCHANGES,
     COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX,
@@ -52,6 +57,7 @@ from alpha.jobs.universe_builder import (
     _classify,
     _dedupe_screener_rows,
     _is_non_common_symbol,
+    _market_cap_bucket,
     _requires_security_profile,
     _upsert_canonical_universe_scan,
     get_canonical_universe_members,
@@ -260,6 +266,10 @@ class TestUniverseBuilder:
         assert result.metrics["excluded"] == 5
         assert result.metrics["mcap_min"] == MCAP_MIN
         assert result.metrics["mcap_max"] == MCAP_MAX
+        assert result.metrics["included_market_cap_bucket_counts"] == {
+            "30m_100m": 1,
+            "100m_200m": 1,
+        }
 
         snaps = db_session.query(UniverseSnapshot).all()
         assert len(snaps) == 7
@@ -296,6 +306,12 @@ class TestUniverseBuilder:
         assert counts["not_actively_trading"] == 1
         assert counts[f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"] == 1
 
+    def test_market_cap_bucket_helper(self):
+        assert _market_cap_bucket(75_000_000) == "30m_100m"
+        assert _market_cap_bucket(150_000_000) == "100m_200m"
+        assert _market_cap_bucket(225_000_000) == "200m_250m"
+        assert _market_cap_bucket(None) == "unknown"
+
     def test_non_us_common_stock_profile_is_included(self, db_session):
         db_session.add(SecurityProfile(
             symbol="FRGN",
@@ -321,6 +337,7 @@ class TestUniverseBuilder:
         assert snap.security_type == COMMON_STOCK
         assert result.metrics["country_profile_rescue_count"] == 1
         assert result.metrics["included_country_counts"]["CA"] == 1
+        assert result.metrics["included_market_cap_bucket_counts"]["30m_100m"] == 1
 
     def test_non_us_non_common_profile_is_excluded_by_security_type(self, db_session):
         db_session.add(SecurityProfile(
@@ -347,6 +364,35 @@ class TestUniverseBuilder:
         ).one()
         assert snap.operating_universe_inclusion is False
         assert snap.exclusion_reason == "security_type:mutual_fund"
+
+    def test_shell_company_exclusion_operational_metrics(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="SHEL",
+            security_type=SPAC_OR_BLANK_CHECK,
+            classification_reason="industry:SHELL_COMPANIES",
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[_stock("SHEL"), _stock("GOOD")],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["shell_company_exclusion_count"] == 1
+        assert result.metrics["shell_company_exclusion_symbols_sample"] == ["SHEL"]
+        assert result.metrics["spac_pattern_exclusion_count"] == 1
+        assert result.metrics["spac_pattern_exclusion_symbols_sample"] == ["SHEL"]
+        assert (
+            result.metrics["security_type_classification_reason_counts"][
+                "industry:SHELL_COMPANIES"
+            ]
+            == 1
+        )
 
     def test_zero_included_scan_fails_without_canonical(self, db_session):
         resp = AdapterResponse(
