@@ -390,6 +390,22 @@ class TestFmpAdapter:
         assert security_type == COMMON_STOCK
         assert reason == "profile_fields_present"
 
+    def test_recorded_fmp_profile_fixture_keeps_cpbi_shell_label_common_stock(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200, _fixture_json("fmp_profile_cpbi.json")
+        )
+        adapter = self._adapter(session)
+        resp = adapter.get_company_profile("CPBI")
+
+        assert resp.ok
+        assert resp.data.raw["industry"] == "Shell Companies"
+        assert "banking products and services" in resp.data.raw["description"]
+        security_type, reason = classify_security_type(resp.data, raw_json=resp.data.raw)
+        assert security_type == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
     def test_recorded_fmp_profile_fixture_classifies_etf(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
