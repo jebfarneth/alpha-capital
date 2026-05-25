@@ -203,10 +203,13 @@ def _run_live(args) -> int:
     print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
     print(f"Countries:     {metrics.get('included_country_counts', {})}")
     print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
+    print(f"Included shell-label names: {metrics.get('included_shell_company_count', 0)}")
     shell_review = metrics.get("shell_company_exclusion_review_records", [])
     spac_review = metrics.get("spac_pattern_exclusion_review_records", [])
+    included_shell_review = metrics.get("included_shell_company_review_records", [])
     print(f"Shell review preview: {shell_review[:25]}")
     print(f"SPAC pattern review preview: {spac_review[:25]}")
+    print(f"Included shell-label review preview: {included_shell_review[:25]}")
     print(f"Security type exclusions: {metrics.get('security_type_exclusion_counts', {})}")
     print(
         "Security type reasons: "

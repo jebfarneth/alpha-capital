@@ -395,6 +395,7 @@ class TestUniverseBuilder:
 
         assert result.ok
         assert result.metrics["shell_company_exclusion_count"] == 1
+        assert result.metrics["included_shell_company_count"] == 0
         assert result.metrics["shell_company_exclusion_symbols_sample"] == ["SHEL"]
         assert result.metrics["shell_company_exclusion_review_sample"] == [{
             "symbol": "SHEL",
@@ -428,6 +429,89 @@ class TestUniverseBuilder:
             sum(result.metrics["security_type_classification_reason_counts"].values())
             == sum(result.metrics["security_type_exclusion_counts"].values())
         )
+
+    def test_included_shell_company_operational_metrics(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="CPBI",
+            security_type=COMMON_STOCK,
+            classification_reason="profile_fields_present",
+            raw_profile_json=json.dumps({
+                "companyName": "Central Plains Bancshares, Inc. Common Stock",
+                "industry": "Shell Companies",
+                "description": (
+                    "Central Plains Bancshares, Inc. focuses on providing "
+                    "various banking products and services."
+                ),
+            }),
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[
+                _stock(
+                    "CPBI",
+                    company_name="Central Plains Bancshares, Inc. Common Stock",
+                ),
+                _stock("GOOD"),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["included"] == 2
+        assert result.metrics["included_shell_company_count"] == 1
+        assert result.metrics["included_shell_company_symbols_sample"] == ["CPBI"]
+        expected_record = {
+            "symbol": "CPBI",
+            "company_name": "Central Plains Bancshares, Inc. Common Stock",
+            "classification_reason": "profile_fields_present",
+        }
+        assert result.metrics["included_shell_company_review_sample"] == [expected_record]
+        assert result.metrics["included_shell_company_review_records"] == [expected_record]
+        assert result.metrics["shell_company_exclusion_count"] == 0
+        assert result.metrics["spac_pattern_exclusion_count"] == 0
+
+    def test_included_shell_company_metric_covers_country_rescue(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="FRGN",
+            security_type=COMMON_STOCK,
+            classification_reason="profile_fields_present",
+            raw_profile_json=json.dumps({
+                "companyName": "Foreign Operating Co",
+                "industry": "Shell Companies",
+                "description": "Foreign Operating Co provides software services.",
+            }),
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[
+                _stock(
+                    "FRGN",
+                    company_name="Foreign Operating Co",
+                    country="CA",
+                ),
+                _stock("GOOD"),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["country_profile_rescue_count"] == 1
+        assert result.metrics["included_shell_company_count"] == 1
+        assert result.metrics["included_shell_company_review_records"] == [{
+            "symbol": "FRGN",
+            "company_name": "Foreign Operating Co",
+            "classification_reason": "profile_fields_present",
+        }]
 
     def test_spac_pattern_operational_metrics_cover_regex_reasons(self, db_session):
         db_session.add_all([

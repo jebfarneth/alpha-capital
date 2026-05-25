@@ -123,6 +123,27 @@ def _sorted_review_records(
     return sorted(records, key=lambda row: row["symbol"] or "")
 
 
+def _raw_profile_payload(cached_profile) -> Dict[str, Any]:
+    if not cached_profile.raw_profile_json:
+        return {}
+    try:
+        payload = json.loads(cached_profile.raw_profile_json)
+    except (TypeError, ValueError):
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _profile_industry_is_shell_company(
+    cached_profile,
+    stock: FmpScreenerResult,
+) -> bool:
+    raw_payload = _raw_profile_payload(cached_profile)
+    industry = raw_payload.get("industry") or stock.industry
+    return " ".join(str(industry or "").upper().split()) == "SHELL COMPANIES"
+
+
 def _clean_symbol(symbol: object) -> str:
     if symbol is None:
         return ""
@@ -574,6 +595,7 @@ class UniverseBuilderJob(BaseJob):
         security_type_classification_reason_counts: Counter[str] = Counter()
         shell_company_exclusion_records: List[Dict[str, Optional[str]]] = []
         spac_pattern_exclusion_records: List[Dict[str, Optional[str]]] = []
+        included_shell_company_records: List[Dict[str, Optional[str]]] = []
 
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
@@ -586,11 +608,11 @@ class UniverseBuilderJob(BaseJob):
             # Security profile cache lookup
             security_type = None
             cached_profile = profile_cache.get(symbol)
+            profile_usable = False
             if cached_profile is not None:
                 cache_hit_count += 1
                 security_type = cached_profile.security_type
                 refresh_status = cached_profile.refresh_status
-                profile_usable = False
                 stale = _security_profile_stale(
                     cached_profile,
                     resp.lineage.asof_timestamp,
@@ -660,6 +682,19 @@ class UniverseBuilderJob(BaseJob):
                     cache_miss_included_count += 1
 
             if included:
+                if (
+                    profile_usable
+                    and cached_profile is not None
+                    and security_type == COMMON_STOCK
+                    and _profile_industry_is_shell_company(cached_profile, stock)
+                ):
+                    included_shell_company_records.append(
+                        _security_type_review_record(
+                            stock,
+                            symbol,
+                            cached_profile.classification_reason or "missing",
+                        )
+                    )
                 included_country_counts[_clean_symbol(stock.country) or "MISSING"] += 1
                 included_market_cap_bucket_counts[_market_cap_bucket(market_cap)] += 1
 
@@ -731,6 +766,9 @@ class UniverseBuilderJob(BaseJob):
         spac_pattern_review_records = _sorted_review_records(
             spac_pattern_exclusion_records
         )
+        included_shell_company_review_records = _sorted_review_records(
+            included_shell_company_records
+        )
 
         metrics: Dict = {
             "raw_count": len(resp.data),
@@ -762,6 +800,14 @@ class UniverseBuilderJob(BaseJob):
             ],
             "spac_pattern_exclusion_review_records": spac_pattern_review_records,
             "spac_pattern_exclusion_review_sample": spac_pattern_review_records[:25],
+            "included_shell_company_count": len(included_shell_company_records),
+            "included_shell_company_symbols_sample": [
+                row["symbol"] for row in included_shell_company_review_records[:25]
+            ],
+            "included_shell_company_review_records": included_shell_company_review_records,
+            "included_shell_company_review_sample": (
+                included_shell_company_review_records[:25]
+            ),
             "security_type_unknown_count": security_type_unknown_count,
             "security_profile_unresolved_count": security_profile_unresolved_count,
             "security_profile_stale_count": security_profile_stale_count,
