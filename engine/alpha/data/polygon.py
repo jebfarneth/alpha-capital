@@ -23,6 +23,7 @@ from alpha.data.contracts import (
     LineageMeta,
     ProviderError,
     RateLimitInfo,
+    aware_utc_or_none,
     stable_hash,
     utcnow,
 )
@@ -85,7 +86,29 @@ class PolygonAdapter:
     ) -> AdapterResponse[Any]:
         url = f"{self._config.base_url}{endpoint}"
         request_ts = utcnow()
-        asof_ts = asof or request_ts
+        if asof is None:
+            asof_ts = request_ts
+        else:
+            asof_ts = aware_utc_or_none(asof)
+            if asof_ts is None:
+                return AdapterResponse(
+                    data=None,
+                    lineage=LineageMeta(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        request_timestamp=request_ts,
+                        asof_timestamp=request_ts,
+                        raw_payload_hash="",
+                    ),
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        status_code=None,
+                        error_type="validation",
+                        message="Polygon adapter asof timestamp must be timezone-aware datetime",
+                        retryable=False,
+                    ),
+                )
 
         try:
             resp = self._session.get(url, params=params or {}, timeout=30)

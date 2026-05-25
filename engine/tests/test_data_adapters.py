@@ -300,7 +300,23 @@ class TestFmpAdapter:
         assert not resp.ok
         assert resp.error.error_type == "validation"
         assert resp.error.retryable is False
-        assert resp.error.message == "FMP adapter asof timestamp must be timezone-aware"
+        assert resp.error.message == "FMP adapter asof timestamp must be timezone-aware datetime"
+        session.get.assert_not_called()
+
+    def test_request_rejects_malformed_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stable/company-screener",
+            asof="",  # type: ignore[arg-type]
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "FMP adapter asof timestamp must be timezone-aware datetime"
         session.get.assert_not_called()
 
     def test_get_stock_screener_missing_market_cap_stays_none(self):
@@ -720,6 +736,58 @@ class TestAlpacaAdapter:
         assert not resp.ok
         assert resp.error.error_type == "timeout"
 
+    def test_request_converts_aware_asof_to_utc(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.return_value = _mock_response(200, {"ok": True})
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "GET",
+            "/v2/account",
+            asof=datetime(2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        assert resp.ok
+        assert resp.lineage.asof_timestamp == datetime(
+            2026, 5, 20, 4, 0, tzinfo=timezone.utc
+        )
+        _assert_aware_utc(resp.lineage.request_timestamp)
+
+    def test_request_rejects_naive_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "GET",
+            "/v2/account",
+            asof=datetime(2026, 5, 20, 14, 30),
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Alpaca adapter asof timestamp must be timezone-aware datetime"
+        session.request.assert_not_called()
+
+    def test_request_rejects_malformed_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "GET",
+            "/v2/account",
+            asof="",  # type: ignore[arg-type]
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Alpaca adapter asof timestamp must be timezone-aware datetime"
+        session.request.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Polygon adapter
@@ -839,6 +907,55 @@ class TestPolygonAdapter:
         resp2 = adapter.get_short_interest("ACME")
         assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
 
+    def test_request_converts_aware_asof_to_utc(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": []})
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stocks/v1/short-interest",
+            asof=datetime(2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        assert resp.ok
+        assert resp.lineage.asof_timestamp == datetime(
+            2026, 5, 20, 4, 0, tzinfo=timezone.utc
+        )
+        _assert_aware_utc(resp.lineage.request_timestamp)
+
+    def test_request_rejects_naive_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stocks/v1/short-interest",
+            asof=datetime(2026, 5, 20, 14, 30),
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Polygon adapter asof timestamp must be timezone-aware datetime"
+        session.get.assert_not_called()
+
+    def test_request_rejects_malformed_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/stocks/v1/short-interest",
+            asof="",  # type: ignore[arg-type]
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Polygon adapter asof timestamp must be timezone-aware datetime"
+        session.get.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Cross-adapter: lineage metadata completeness
@@ -870,6 +987,8 @@ class TestLineageMetadata:
             assert resp.lineage.endpoint != ""
             assert resp.lineage.request_timestamp is not None
             assert resp.lineage.asof_timestamp is not None
+            _assert_aware_utc(resp.lineage.request_timestamp)
+            _assert_aware_utc(resp.lineage.asof_timestamp)
             assert resp.lineage.raw_payload_hash != ""
 
     def test_every_error_response_has_lineage(self):
@@ -892,4 +1011,6 @@ class TestLineageMetadata:
             assert not resp.ok
             assert resp.lineage.provider != ""
             assert resp.lineage.endpoint != ""
+            _assert_aware_utc(resp.lineage.request_timestamp)
+            _assert_aware_utc(resp.lineage.asof_timestamp)
             assert resp.error is not None

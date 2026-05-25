@@ -12,7 +12,7 @@ Does not write to DB. Returns AdapterResponse with LineageMeta.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -23,21 +23,13 @@ from alpha.data.contracts import (
     LineageMeta,
     ProviderError,
     RateLimitInfo,
+    aware_utc_or_none,
     stable_hash,
     utcnow,
 )
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 
 PROVIDER = "FMP"
-
-
-def _aware_utc_or_none(value: Optional[datetime]) -> Optional[datetime]:
-    """Adapter boundary contract: caller-supplied asof values must be aware."""
-    if value is None:
-        return None
-    if value.tzinfo is None or value.utcoffset() is None:
-        return None
-    return value.astimezone(timezone.utc)
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -146,7 +138,7 @@ class FmpAdapter:
         if asof is None:
             asof_ts = request_ts
         else:
-            asof_ts = _aware_utc_or_none(asof)
+            asof_ts = aware_utc_or_none(asof)
             if asof_ts is None:
                 return AdapterResponse(
                     data=None,
@@ -162,7 +154,7 @@ class FmpAdapter:
                         endpoint=endpoint,
                         status_code=None,
                         error_type="validation",
-                        message="FMP adapter asof timestamp must be timezone-aware",
+                        message="FMP adapter asof timestamp must be timezone-aware datetime",
                         retryable=False,
                     ),
                 )

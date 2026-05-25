@@ -29,6 +29,15 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def aware_utc_or_none(value: Any) -> Optional[datetime]:
+    """Normalize aware datetimes to UTC; reject naive or non-datetime inputs."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class LineageMeta:
     """Metadata produced by every adapter call, sufficient for record_data_lineage."""
