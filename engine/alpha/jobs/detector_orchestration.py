@@ -16,8 +16,9 @@ import inspect
 import pkgutil
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -37,6 +38,9 @@ from alpha.patterns.contracts import (
     PatternInput,
 )
 from alpha.patterns.evidence_bridge import persist_detection_result
+
+
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +159,16 @@ def check_lookahead_guard(
     if not inp.asof_timestamp:
         return False, "missing_asof_timestamp"
 
+    requested_trading_date = date.fromisoformat(trading_date)
+    input_market_date = _market_date(inp.asof_timestamp)
+    if input_market_date > requested_trading_date:
+        return (
+            False,
+            "asof_timestamp "
+            f"{inp.asof_timestamp.isoformat()} has market date "
+            f"{input_market_date.isoformat()} after trading_date {trading_date}",
+        )
+
     if max_asof_timestamp is not None:
         if _comparable_datetime(inp.asof_timestamp) > _comparable_datetime(
             max_asof_timestamp
@@ -185,6 +199,17 @@ def _comparable_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_aware_datetime(value: datetime) -> datetime:
+    """Normalize SQLite naive UTC round trips back to aware UTC datetimes."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _market_date(value: datetime) -> date:
+    return _utc_aware_datetime(value).astimezone(MARKET_TIMEZONE).date()
 
 
 def _result_guard_passed(result: PatternDetectionResult) -> Tuple[bool, Optional[str]]:
@@ -288,6 +313,10 @@ class DetectorOrchestrationJob(BaseJob):
         if error:
             return JobResult(
                 status="failed",
+                metrics={
+                    "trading_date": trading_date,
+                    "total_signals_persisted": 0,
+                },
                 errors=[{"stage": "canonical_universe", "message": error}],
             )
 
@@ -379,6 +408,18 @@ class DetectorOrchestrationJob(BaseJob):
         scan = self._session.get(UniverseScan, canonical.scan_id)
         if scan is None:
             return None, None, [], f"canonical scan_id {canonical.scan_id} not found"
+        scan_asof_timestamp = _utc_aware_datetime(scan.asof_timestamp)
+        requested_trading_date = date.fromisoformat(trading_date)
+        scan_market_date = _market_date(scan_asof_timestamp)
+        if scan_market_date != requested_trading_date:
+            return (
+                None,
+                None,
+                [],
+                "canonical scan asof market date "
+                f"{scan_market_date.isoformat()} does not match trading_date "
+                f"{trading_date}; refusing lookahead-contaminated universe scan",
+            )
 
         snapshots = (
             self._session.query(UniverseSnapshot)
@@ -388,7 +429,7 @@ class DetectorOrchestrationJob(BaseJob):
             )
             .all()
         )
-        return canonical.scan_id, scan.asof_timestamp, snapshots, None
+        return canonical.scan_id, scan_asof_timestamp, snapshots, None
 
     def _build_inputs_from_snapshots(
         self,
@@ -415,7 +456,7 @@ class DetectorOrchestrationJob(BaseJob):
             lineage_ids = lineage_by_hash.get(snap.source_lineage_hash or "", [])
             inp = PatternInput(
                 ticker=snap.ticker,
-                asof_timestamp=snap.asof_timestamp,
+                asof_timestamp=_utc_aware_datetime(snap.asof_timestamp),
                 market_data={
                     "price": snap.price,
                     "market_cap": snap.market_cap,

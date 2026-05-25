@@ -60,12 +60,19 @@ def reject_future_timestamp(
     Does NOT raise — the detector can still run but the output is flagged.
     """
     now = reference or datetime.now(timezone.utc)
-    if asof > now:
+    if _comparable_datetime(asof) > _comparable_datetime(now):
         warnings.append(f"asof_timestamp {asof.isoformat()} is in the future")
         quality_flags["future_timestamp"] = True
         quality_flags["point_in_time_passed"] = False
         return False
     return True
+
+
+def _comparable_datetime(value: datetime) -> datetime:
+    """Normalize aware/naive SQLite round trips before timestamp comparison."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def require_lineage_hash(

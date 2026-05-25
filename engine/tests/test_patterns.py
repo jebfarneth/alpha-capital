@@ -87,6 +87,17 @@ class TestGuards:
         assert result is True
         assert len(warnings) == 0
 
+    def test_reject_future_timestamp_handles_sqlite_naive_asof(self):
+        asof = datetime(2026, 5, 20, 14, 30, 0)
+        reference = datetime(2026, 5, 20, 14, 31, 0, tzinfo=timezone.utc)
+        warnings = []
+        flags = {}
+
+        result = reject_future_timestamp(asof, warnings, flags, reference=reference)
+
+        assert result is True
+        assert warnings == []
+
     def test_require_lineage_hash_warns_on_empty(self):
         warnings = []
         flags = {}

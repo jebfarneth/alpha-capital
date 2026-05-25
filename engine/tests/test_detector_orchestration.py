@@ -198,6 +198,17 @@ class CrashingDetector(BasePatternDetector):
         raise RuntimeError("detector crashed")
 
 
+class AssertingTimestampDetector(AlwaysFiresDetector):
+    """Detector that proves default DB-built inputs are UTC-aware."""
+
+    pattern_id = "TEST_AWARE_TS"
+
+    def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        assert inp.asof_timestamp.tzinfo is not None
+        assert inp.asof_timestamp.utcoffset() is not None
+        return super().detect(inp)
+
+
 class PartiallyCrashingDetector(AlwaysFiresDetector):
     """Detector that persists one ticker and crashes on another."""
 
@@ -250,6 +261,31 @@ class TestNoCanonicalScan:
         assert result.status == "failed"
         assert any("canonical" in e.get("message", "").lower() for e in result.errors)
         assert db_session.query(SignalRegistry).count() == 0
+
+    def test_lookahead_contaminated_canonical_scan_refused(self, db_session):
+        _setup_canonical_universe(db_session, trading_date="2026-05-24", tickers=["ACME"])
+        scan = db_session.get(UniverseScan, "test-scan")
+        scan.asof_timestamp = datetime(2026, 5, 25, 8, 3, tzinfo=timezone.utc)
+        db_session.flush()
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-24",
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-24"})
+
+        assert result.status == "failed"
+        assert result.metrics["total_signals_persisted"] == 0
+        assert db_session.query(SignalRegistry).count() == 0
+        assert result.errors == [{
+            "stage": "canonical_universe",
+            "message": (
+                "canonical scan asof market date 2026-05-25 does not match "
+                "trading_date 2026-05-24; refusing lookahead-contaminated "
+                "universe scan"
+            ),
+        }]
 
     def test_missing_trading_date_fails(self, db_session):
         job = DetectorOrchestrationJob(db_session, detectors=[AlwaysFiresDetector()])
@@ -398,6 +434,20 @@ class TestSignalIdentityHash:
 # -----------------------------------------------------------------------
 
 class TestIdempotency:
+    def test_default_db_inputs_normalize_sqlite_naive_datetimes(self, db_session):
+        _setup_canonical_universe(db_session)
+        db_session.expire_all()
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AssertingTimestampDetector()],
+            trading_date="2026-05-20",
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.status == "finished"
+        assert db_session.query(SignalRegistry).count() == 2
+
     def test_double_run_no_duplicates(self, db_session):
         _setup_canonical_universe(db_session)
 
@@ -559,6 +609,22 @@ class TestStrictRefusal:
         assert result.status == "partial_failed"
         assert diag["detector_status"] == "failed"
         assert diag["lookahead_failure_count"] == 1
+
+    def test_future_market_date_fails_even_with_later_scan_asof(self, db_session):
+        passed, reason = check_lookahead_guard(
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=datetime(2026, 5, 25, 4, 35, tzinfo=timezone.utc),
+                market_data={"price": 5.0},
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+            trading_date="2026-05-24",
+            max_asof_timestamp=datetime(2026, 5, 25, 8, 3, tzinfo=timezone.utc),
+        )
+
+        assert passed is False
+        assert "after trading_date 2026-05-24" in reason
 
     def test_detector_feature_guard_false_refuses_signal(self, db_session):
         _setup_canonical_universe(db_session)
