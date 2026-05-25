@@ -4,8 +4,8 @@ Universe builder job.
 Builds the operating universe from screener data, applying vault rules:
   - Market cap in configured operating band, finite
   - Price >= $3.00, finite
-  - US country only
-  - NASDAQ / NYSE / AMEX exchanges only
+  - US-listed on NASDAQ / NYSE / AMEX exchanges only
+  - Non-US domicile requires profile-confirmed common_stock classification
   - Actively trading
   - No ETFs
   - Conservative symbol cleanup (separators, warrant/unit suffixes)
@@ -49,6 +49,26 @@ from alpha.jobs.security_type import (
 
 PRICE_MIN = 3.0
 ALLOWED_EXCHANGES = frozenset({"NASDAQ", "NYSE", "AMEX"})
+COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX = "country_requires_security_profile"
+
+
+def _country_requires_security_profile_reason(country: str) -> str:
+    return f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:{country}"
+
+
+def _country_requires_security_profile(reason: Optional[str]) -> bool:
+    return bool(
+        reason
+        and reason.startswith(f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:")
+    )
+
+
+def _requires_security_profile(included: bool, reason: Optional[str]) -> bool:
+    return (
+        included
+        or reason == "non_common_symbol_suffix"
+        or _country_requires_security_profile(reason)
+    )
 
 
 def _clean_symbol(symbol: object) -> str:
@@ -121,8 +141,11 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     country = _clean_symbol(stock.country)
     if not country:
         return False, "country_missing"
-    if country != "US":
-        return False, f"country:{country}"
+    country_requires_profile = (
+        _country_requires_security_profile_reason(country)
+        if country != "US"
+        else None
+    )
     exchange = _clean_symbol(stock.exchange)
     if not exchange:
         return False, "exchange_missing"
@@ -146,6 +169,9 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     excluded, reason = _is_non_common_symbol(stock.symbol)
     if excluded:
         return False, reason
+
+    if country_requires_profile:
+        return False, country_requires_profile
 
     return True, None
 
@@ -490,12 +516,14 @@ class UniverseBuilderJob(BaseJob):
         security_profile_enriched_count = 0
         security_profile_cache_miss_required_count = 0
         security_type_suffix_rescue_count = 0
+        country_profile_rescue_count = 0
+        included_country_counts: Counter[str] = Counter()
 
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
             price = _finite_real(stock.price)
             exchange = _clean_symbol(stock.exchange)
-            profile_required = included or reason == "non_common_symbol_suffix"
+            profile_required = _requires_security_profile(included, reason)
             if profile_required:
                 security_profile_required_count += 1
 
@@ -515,7 +543,7 @@ class UniverseBuilderJob(BaseJob):
                 if stale:
                     if profile_required:
                         security_profile_stale_count += 1
-                    if included:
+                    if included or _country_requires_security_profile(reason):
                         included = False
                         reason = "security_profile_stale"
                 elif refresh_status != REFRESH_STATUS_ENRICHED or security_type == UNKNOWN:
@@ -523,7 +551,7 @@ class UniverseBuilderJob(BaseJob):
                         security_profile_unresolved_count += 1
                     if security_type == UNKNOWN:
                         security_type_unknown_count += 1
-                    if included:
+                    if included or _country_requires_security_profile(reason):
                         included = False
                         reason = f"security_profile_unresolved:{refresh_status or 'unknown'}"
                 else:
@@ -539,8 +567,16 @@ class UniverseBuilderJob(BaseJob):
                         included = True
                         reason = None
                         security_type_suffix_rescue_count += 1
+                    elif (
+                        security_type == COMMON_STOCK
+                        and not included
+                        and _country_requires_security_profile(reason)
+                    ):
+                        included = True
+                        reason = None
+                        country_profile_rescue_count += 1
                 if profile_usable and security_type in NON_COMMON_TYPES and (
-                    included or reason == "non_common_symbol_suffix"
+                    included or _requires_security_profile(False, reason)
                 ):
                     included = False
                     reason = f"security_type:{security_type}"
@@ -551,6 +587,9 @@ class UniverseBuilderJob(BaseJob):
                     security_profile_cache_miss_required_count += 1
                 if included:
                     cache_miss_included_count += 1
+
+            if included:
+                included_country_counts[_clean_symbol(stock.country) or "MISSING"] += 1
 
             record_universe_snapshot(
                 self._session,
@@ -624,6 +663,8 @@ class UniverseBuilderJob(BaseJob):
             "require_security_profile_cache": self._require_security_profile_cache,
             "min_security_profile_coverage": self._min_security_profile_coverage,
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
+            "country_profile_rescue_count": country_profile_rescue_count,
+            "included_country_counts": dict(included_country_counts),
             "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }
         if self._slice_diagnostics is not None:

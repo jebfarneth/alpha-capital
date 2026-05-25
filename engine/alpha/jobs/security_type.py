@@ -64,6 +64,13 @@ NON_COMMON_TYPES = frozenset({
 })
 
 BDC_INDUSTRIES = frozenset({"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"})
+SPAC_ACQUISITION_SEQUENCE_RE = re.compile(
+    r"\bACQUISITION\s+(?:(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\s+)?"
+    r"(?:CORP(?:ORATION)?|CO|LIMITED|LTD)\b"
+)
+SPAC_INVESTMENT_CORP_SEQUENCE_RE = re.compile(
+    r"\bINVESTMENT\s+CORP(?:ORATION)?\s+(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\b"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +260,12 @@ def classify_security_type(
     kw = _has_any_phrase(name, spac_keywords)
     if kw:
         return SPAC_OR_BLANK_CHECK, f"name_contains:{kw}"
+    if industry == "SHELL COMPANIES":
+        return SPAC_OR_BLANK_CHECK, "industry:SHELL_COMPANIES"
+    if SPAC_ACQUISITION_SEQUENCE_RE.search(name):
+        return SPAC_OR_BLANK_CHECK, "name_pattern:ACQUISITION_SEQUENCE"
+    if SPAC_INVESTMENT_CORP_SEQUENCE_RE.search(name):
+        return SPAC_OR_BLANK_CHECK, "name_pattern:INVESTMENT_CORP_SEQUENCE"
 
     # BDC indicators. FMP does not mark BDCs like ARCC/MAIN with isFund=True.
     if (

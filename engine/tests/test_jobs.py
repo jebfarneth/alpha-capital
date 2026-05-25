@@ -34,14 +34,17 @@ from alpha.db.models import (
     DataLineage,
     EvidenceJob,
     EvidenceJobRun,
+    SecurityProfile,
     UniverseScan,
     UniverseSnapshot,
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
 from alpha.jobs.run_universe import _parse_args, _required_profile_symbols
+from alpha.jobs.security_type import COMMON_STOCK, MUTUAL_FUND, REFRESH_STATUS_ENRICHED
 from alpha.jobs.universe_builder import (
     ALLOWED_EXCHANGES,
+    COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX,
     MCAP_MAX,
     MCAP_MIN,
     PRICE_MIN,
@@ -49,6 +52,7 @@ from alpha.jobs.universe_builder import (
     _classify,
     _dedupe_screener_rows,
     _is_non_common_symbol,
+    _requires_security_profile,
     _upsert_canonical_universe_scan,
     get_canonical_universe_members,
     get_canonical_universe_scan,
@@ -280,7 +284,7 @@ class TestUniverseBuilder:
         assert "mcap_below" in reasons["TINY"]
         assert "mcap_above" in reasons["HUGE"]
         assert reasons["DEAD"] == "not_actively_trading"
-        assert "country" in reasons["FRGN"]
+        assert reasons["FRGN"] == f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"
 
     def test_exclusion_counts_in_metrics(self, db_session):
         resp = _mock_screener_response()
@@ -290,7 +294,59 @@ class TestUniverseBuilder:
         counts = result.metrics["exclusion_counts"]
         assert counts["etf"] == 1
         assert counts["not_actively_trading"] == 1
-        assert "country:CA" in counts
+        assert counts[f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"] == 1
+
+    def test_non_us_common_stock_profile_is_included(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="FRGN",
+            security_type=COMMON_STOCK,
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[_stock("FRGN", market_cap=90_000_000, price=7.0, country="CA")],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "FRGN"
+        ).one()
+        assert snap.operating_universe_inclusion is True
+        assert snap.exclusion_reason is None
+        assert snap.security_type == COMMON_STOCK
+        assert result.metrics["country_profile_rescue_count"] == 1
+        assert result.metrics["included_country_counts"]["CA"] == 1
+
+    def test_non_us_non_common_profile_is_excluded_by_security_type(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="FRGN",
+            security_type=MUTUAL_FUND,
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[
+                _stock("FRGN", market_cap=90_000_000, price=7.0, country="CA"),
+                _stock("GOOD"),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "FRGN"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_type:mutual_fund"
 
     def test_zero_included_scan_fails_without_canonical(self, db_session):
         resp = AdapterResponse(
@@ -559,10 +615,11 @@ class TestHardenedFilter:
         assert not included
         assert reason == "not_actively_trading"
 
-    def test_non_us_excluded(self):
+    def test_non_us_requires_security_profile(self):
         included, reason = _classify(_stock(country="CA"))
         assert not included
-        assert reason == "country:CA"
+        assert reason == f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"
+        assert _requires_security_profile(included, reason)
 
     def test_otc_exchange_excluded(self):
         included, reason = _classify(_stock(exchange="OTC"))
@@ -795,11 +852,12 @@ class TestRunUniverseEntrypointHelpers:
         symbols = _required_profile_symbols([
             _stock("INCL", market_cap=75_000_000, price=5.0),
             _stock("ABCDX", market_cap=75_000_000, price=5.0),
+            _stock("FRGN", market_cap=75_000_000, price=5.0, country="CA"),
             _stock("ETF1", market_cap=75_000_000, price=25.0, is_etf=True),
             _stock("PENY", market_cap=75_000_000, price=1.0),
         ])
 
-        assert symbols == ["ABCDX", "INCL"]
+        assert symbols == ["ABCDX", "FRGN", "INCL"]
 
 
 # -----------------------------------------------------------------------

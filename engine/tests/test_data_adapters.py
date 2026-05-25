@@ -256,6 +256,9 @@ class TestFmpAdapter:
         assert resp.data[0].symbol == "ACME"
         assert resp.data[0].market_cap == 75000000
         assert resp.lineage.endpoint == "/stable/company-screener"
+        params = session.get.call_args.kwargs["params"]
+        assert "country" not in params
+        assert "isEtf" not in params
 
     def test_get_stock_screener_missing_market_cap_stays_none(self):
         session = MagicMock(spec=requests.Session)

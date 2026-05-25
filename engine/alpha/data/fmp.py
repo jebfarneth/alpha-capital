@@ -276,8 +276,8 @@ class FmpAdapter:
         self,
         market_cap_min: int = MCAP_MIN,
         market_cap_max: int = MCAP_MAX,
-        country: Optional[str] = "US",
-        is_etf: Optional[bool] = False,
+        country: Optional[str] = None,
+        is_etf: Optional[bool] = None,
         limit: int = 5000,
     ) -> AdapterResponse[List[FmpScreenerResult]]:
         endpoint = "/stable/company-screener"

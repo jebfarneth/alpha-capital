@@ -29,7 +29,11 @@ from alpha.db.engine import create_all_tables, get_session, reset_globals
 from alpha.db.models import Base
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import SecurityTypeEnrichmentJob
-from alpha.jobs.universe_builder import UniverseBuilderJob, _dedupe_screener_rows
+from alpha.jobs.universe_builder import (
+    UniverseBuilderJob,
+    _dedupe_screener_rows,
+    _requires_security_profile,
+)
 
 MOCK_SCREENER_DATA = [
     FmpScreenerResult(symbol="ACME", company_name="Acme Corp", market_cap=75_000_000, price=5.25, sector="Technology", exchange="NASDAQ", country="US", is_etf=False, is_actively_trading=True),
@@ -79,7 +83,7 @@ def _required_profile_symbols(stocks: list[FmpScreenerResult]) -> list[str]:
     return sorted({
         symbol
         for _, included, reason, symbol in deduped
-        if included or reason == "non_common_symbol_suffix"
+        if _requires_security_profile(included, reason)
     })
 
 

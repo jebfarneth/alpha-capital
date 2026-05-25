@@ -180,6 +180,36 @@ class TestClassifier:
         st, _ = classify_security_type(_profile(company_name="Blank Check Corp"))
         assert st == SPAC_OR_BLANK_CHECK
 
+    def test_spac_from_shell_company_industry(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Perceptive Capital Solutions Corp",
+                sector="Financial Services",
+                industry="Shell Companies",
+            )
+        )
+        assert st == SPAC_OR_BLANK_CHECK
+        assert reason == "industry:SHELL_COMPANIES"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Chenghe Acquisition III Co. Class A Ordinary Share",
+            "YHN Acquisition I Limited",
+            "Newbridge Acquisition Limited Class A Ordinary Share",
+            "Black Spade Acquisition III Co",
+        ],
+    )
+    def test_spac_from_acquisition_sequence_names(self, name):
+        st, reason = classify_security_type(_profile(company_name=name))
+        assert st == SPAC_OR_BLANK_CHECK
+        assert reason == "name_pattern:ACQUISITION_SEQUENCE"
+
+    def test_spac_from_investment_corp_sequence_name(self):
+        st, reason = classify_security_type(_profile(company_name="Origin Investment Corp I"))
+        assert st == SPAC_OR_BLANK_CHECK
+        assert reason == "name_pattern:INVESTMENT_CORP_SEQUENCE"
+
     def test_unknown_when_no_data(self):
         st, reason = classify_security_type(_profile(company_name="", exchange=None))
         assert st == UNKNOWN
