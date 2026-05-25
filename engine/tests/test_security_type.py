@@ -186,10 +186,65 @@ class TestClassifier:
                 company_name="Perceptive Capital Solutions Corp",
                 sector="Financial Services",
                 industry="Shell Companies",
+                raw={
+                    "description": (
+                        "Perceptive Capital Solutions Corp does not have "
+                        "significant operations and intends to effect a business "
+                        "combination with one or more businesses."
+                    ),
+                },
+            ),
+        )
+        assert st == SPAC_OR_BLANK_CHECK
+        assert reason == "industry_description:SHELL_COMPANIES+DOES_NOT_HAVE_SIGNIFICANT_OPERATIONS"
+
+    def test_shell_company_industry_without_shell_description_is_not_spac(self):
+        st, reason = classify_security_type(
+            _profile(
+                company_name="Central Plains Bancshares, Inc. Common Stock",
+                sector="Financial Services",
+                industry="Shell Companies",
+                raw={
+                    "description": (
+                        "Central Plains Bancshares, Inc. focuses on providing "
+                        "various banking products and services to retail customers, "
+                        "and small and medium-sized commercial customers."
+                    ),
+                },
+            )
+        )
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
+    @pytest.mark.parametrize(
+        ("name", "description"),
+        [
+            (
+                "Aimei Health Technology Co., Ltd",
+                "Aimei Health Technology Co., Ltd does not have significant operations. "
+                "It intends to effect a merger, share exchange, asset acquisition, "
+                "share purchase, recapitalization, reorganization, or similar business "
+                "combination with one or more businesses or entities.",
+            ),
+            (
+                "XFLH Capital Corporation",
+                "XFLH Capital Corporation focuses on a merger, share exchange, "
+                "asset acquisition, share purchase, reorganization or similar business "
+                "combination with one or more businesses.",
+            ),
+        ],
+    )
+    def test_shell_company_industry_with_shell_description_is_spac(self, name, description):
+        st, reason = classify_security_type(
+            _profile(
+                company_name=name,
+                sector="Financial Services",
+                industry="Shell Companies",
+                raw={"description": description},
             )
         )
         assert st == SPAC_OR_BLANK_CHECK
-        assert reason == "industry:SHELL_COMPANIES"
+        assert reason.startswith("industry_description:SHELL_COMPANIES+")
 
     @pytest.mark.parametrize(
         "name",

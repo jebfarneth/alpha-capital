@@ -380,7 +380,7 @@ class TestUniverseBuilder:
         db_session.add(SecurityProfile(
             symbol="SHEL",
             security_type=SPAC_OR_BLANK_CHECK,
-            classification_reason="industry:SHELL_COMPANIES",
+            classification_reason="industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
         ))
@@ -399,28 +399,28 @@ class TestUniverseBuilder:
         assert result.metrics["shell_company_exclusion_review_sample"] == [{
             "symbol": "SHEL",
             "company_name": "SHEL Corp",
-            "classification_reason": "industry:SHELL_COMPANIES",
+            "classification_reason": "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
         }]
         assert result.metrics["shell_company_exclusion_review_records"] == [{
             "symbol": "SHEL",
             "company_name": "SHEL Corp",
-            "classification_reason": "industry:SHELL_COMPANIES",
+            "classification_reason": "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
         }]
         assert result.metrics["spac_pattern_exclusion_count"] == 1
         assert result.metrics["spac_pattern_exclusion_symbols_sample"] == ["SHEL"]
         assert result.metrics["spac_pattern_exclusion_review_sample"] == [{
             "symbol": "SHEL",
             "company_name": "SHEL Corp",
-            "classification_reason": "industry:SHELL_COMPANIES",
+            "classification_reason": "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
         }]
         assert result.metrics["spac_pattern_exclusion_review_records"] == [{
             "symbol": "SHEL",
             "company_name": "SHEL Corp",
-            "classification_reason": "industry:SHELL_COMPANIES",
+            "classification_reason": "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
         }]
         assert (
             result.metrics["security_type_classification_reason_counts"][
-                "industry:SHELL_COMPANIES"
+                "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION"
             ]
             == 1
         )

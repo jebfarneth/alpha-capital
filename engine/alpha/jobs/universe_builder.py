@@ -51,6 +51,7 @@ PRICE_MIN = 3.0
 ALLOWED_EXCHANGES = frozenset({"NASDAQ", "NYSE", "AMEX"})
 COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX = "country_requires_security_profile"
 SHELL_COMPANY_CLASSIFICATION_REASON = "industry:SHELL_COMPANIES"
+SHELL_COMPANY_CLASSIFICATION_REASON_PREFIX = "industry_description:SHELL_COMPANIES"
 SPAC_PATTERN_CLASSIFICATION_REASONS = frozenset({
     SHELL_COMPANY_CLASSIFICATION_REASON,
     "name_pattern:ACQUISITION_SEQUENCE",
@@ -74,6 +75,20 @@ def _requires_security_profile(included: bool, reason: Optional[str]) -> bool:
         included
         or reason == "non_common_symbol_suffix"
         or _country_requires_security_profile(reason)
+    )
+
+
+def _is_shell_company_classification_reason(reason: str) -> bool:
+    return (
+        reason == SHELL_COMPANY_CLASSIFICATION_REASON
+        or reason.startswith(f"{SHELL_COMPANY_CLASSIFICATION_REASON_PREFIX}+")
+    )
+
+
+def _is_spac_pattern_classification_reason(reason: str) -> bool:
+    return (
+        _is_shell_company_classification_reason(reason)
+        or reason in SPAC_PATTERN_CLASSIFICATION_REASONS
     )
 
 
@@ -633,9 +648,9 @@ class UniverseBuilderJob(BaseJob):
                         symbol,
                         classification_reason,
                     )
-                    if classification_reason == SHELL_COMPANY_CLASSIFICATION_REASON:
+                    if _is_shell_company_classification_reason(classification_reason):
                         shell_company_exclusion_records.append(review_record)
-                    if classification_reason in SPAC_PATTERN_CLASSIFICATION_REASONS:
+                    if _is_spac_pattern_classification_reason(classification_reason):
                         spac_pattern_exclusion_records.append(review_record)
             else:
                 cache_miss_count += 1

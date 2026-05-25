@@ -43,7 +43,7 @@ SPAC_OR_BLANK_CHECK = "spac_or_blank_check"
 BUSINESS_DEVELOPMENT_COMPANY = "business_development_company"
 UNKNOWN = "unknown"
 
-CLASSIFIER_VERSION = "security_type_v2"
+CLASSIFIER_VERSION = "security_type_v3"
 
 REFRESH_STATUS_ENRICHED = "enriched"
 REFRESH_STATUS_NO_DATA = "no_data"
@@ -64,6 +64,16 @@ NON_COMMON_TYPES = frozenset({
 })
 
 BDC_INDUSTRIES = frozenset({"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"})
+SHELL_COMPANY_DESCRIPTION_PHRASES = (
+    "BLANK CHECK COMPANY",
+    "DOES NOT HAVE SIGNIFICANT OPERATIONS",
+    "BUSINESS COMBINATION",
+    "SHARE EXCHANGE",
+    "ASSET ACQUISITION",
+    "STOCK PURCHASE",
+    "SHARE PURCHASE",
+    "CAPITAL STOCK EXCHANGE",
+)
 SPAC_ACQUISITION_SEQUENCE_RE = re.compile(
     r"\bACQUISITION\s+(?:(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\s+)?"
     r"(?:CORP(?:ORATION)?|CO|LIMITED|LTD)\b"
@@ -261,7 +271,12 @@ def classify_security_type(
     if kw:
         return SPAC_OR_BLANK_CHECK, f"name_contains:{kw}"
     if industry == "SHELL COMPANIES":
-        return SPAC_OR_BLANK_CHECK, "industry:SHELL_COMPANIES"
+        kw = _has_any_phrase(raw_description, SHELL_COMPANY_DESCRIPTION_PHRASES)
+        if kw:
+            return SPAC_OR_BLANK_CHECK, (
+                "industry_description:SHELL_COMPANIES+"
+                f"{kw.replace(' ', '_')}"
+            )
     if SPAC_ACQUISITION_SEQUENCE_RE.search(name):
         return SPAC_OR_BLANK_CHECK, "name_pattern:ACQUISITION_SEQUENCE"
     if SPAC_INVESTMENT_CORP_SEQUENCE_RE.search(name):
