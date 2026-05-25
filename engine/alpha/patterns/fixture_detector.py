@@ -35,6 +35,7 @@ class FixtureDetector(BasePatternDetector):
     """Test-only detector that fires when fixture_score >= threshold."""
 
     pattern_id = "FIXTURE"
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.A
@@ -59,6 +60,14 @@ class FixtureDetector(BasePatternDetector):
         )
 
         features_dict = {"fixture_score": score, "price": price}
+        if score >= SIGNAL_THRESHOLD and has_primary:
+            identity_components = {
+                "pattern_id": self.pattern_id,
+                "ticker": inp.ticker,
+                "fixture_score": round(score, 6),
+            }
+            features_dict["signal_identity_components"] = identity_components
+            features_dict["signal_identity_hash"] = stable_hash(identity_components)
         features = PatternFeatures(
             features=features_dict,
             feature_manifest_version="fixture-v1",

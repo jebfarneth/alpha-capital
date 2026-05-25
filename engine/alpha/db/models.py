@@ -351,8 +351,15 @@ class SignalRegistry(Base):
     universe_snapshot_id = Column(
         String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
     )
+    trading_date = Column(String, nullable=True)
+    scan_id = Column(
+        String, ForeignKey("universe_scans.scan_id"), nullable=True
+    )
+    detector_version = Column(String, nullable=True)
+    point_in_time_passed = Column(Boolean, nullable=True)
+    lookahead_guard_passed = Column(Boolean, nullable=True)
     data_lineage_ids = Column(Text, nullable=True)  # JSON array
-    signal_identity_hash = Column(String, nullable=True)
+    signal_identity_hash = Column(String, nullable=False)
     forward_return = Column(Float, nullable=True)
     forward_return_status = Column(String, nullable=True)
     forward_return_attempts = Column(Integer, nullable=False, default=0)

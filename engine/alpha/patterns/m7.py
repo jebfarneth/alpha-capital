@@ -393,6 +393,7 @@ class M7Detector(BasePatternDetector):
     """M7 Pure Technical Multi-Day detector."""
 
     pattern_id = PatternId.M7
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.CONTINUATION
     route_class = RouteClass.A

@@ -648,6 +648,7 @@ class M6Detector(BasePatternDetector):
     """M6 Volatility-Compression Breakout detector."""
 
     pattern_id = PatternId.M6
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.C

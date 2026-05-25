@@ -1,28 +1,263 @@
 """
 Detector orchestration job.
 
-Runs implemented detectors over supplied PatternInput batches and persists
-every firing through the evidence bridge. Deduplicates tradable signals by
-(pattern_id, ticker, signal_identity_hash) when the detector emits a stable
-identity. Signals without identity are persisted but cannot be deduped.
+Runs implemented detectors over the canonical universe and persists every
+pattern-intrinsic firing with reproducible identity. Deduplicates by
+(pattern_id, ticker, signal_identity_hash). Refuses signals without
+required identity/lineage fields. Isolates per-detector failures.
 
 Per MeasurementSpine.md section 2.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+import importlib
+import inspect
+import pkgutil
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from alpha.db.models import SignalRegistry
+from alpha.data.contracts import stable_hash
+from alpha.db.models import (
+    CanonicalUniverseScan,
+    DataLineage,
+    SignalRegistry,
+    UniverseScan,
+    UniverseSnapshot,
+)
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
-from alpha.patterns.contracts import BasePatternDetector, PatternInput
+from alpha.patterns.contracts import (
+    BasePatternDetector,
+    PatternDetectionResult,
+    PatternInput,
+)
 from alpha.patterns.evidence_bridge import persist_detection_result
 
 
+# ---------------------------------------------------------------------------
+# Detector enumeration
+# ---------------------------------------------------------------------------
+
+def enumerate_callable_detectors() -> List[BasePatternDetector]:
+    """Discover implemented detector instances from the patterns package.
+
+    Only returns detectors that are instantiable and implement detect().
+    Does NOT rely on a doc-only roster.
+    """
+    import alpha.patterns as patterns_pkg
+
+    skipped_modules = {
+        "__init__",
+        "activation",
+        "contracts",
+        "evidence_bridge",
+        "fixture_detector",
+        "guards",
+    }
+    detector_classes = []
+    for module_info in pkgutil.iter_modules(patterns_pkg.__path__):
+        if module_info.name in skipped_modules or module_info.name.startswith("_"):
+            continue
+        module = importlib.import_module(f"{patterns_pkg.__name__}.{module_info.name}")
+        for _, attr in inspect.getmembers(module, inspect.isclass):
+            if (
+                attr.__module__ == module.__name__
+                and issubclass(attr, BasePatternDetector)
+                and attr is not BasePatternDetector
+            ):
+                detector_classes.append(attr)
+
+    instances: List[BasePatternDetector] = []
+    instantiation_errors: List[str] = []
+    for cls in sorted(detector_classes, key=lambda c: str(getattr(c, "pattern_id", c.__name__))):
+        try:
+            instances.append(cls())
+        except Exception as exc:
+            instantiation_errors.append(f"{cls.__module__}.{cls.__name__}: {exc}")
+
+    if instantiation_errors:
+        raise RuntimeError(
+            "detector enumeration found non-callable detector classes: "
+            + "; ".join(instantiation_errors)
+        )
+
+    return instances
+
+
+# ---------------------------------------------------------------------------
+# Signal identity computation
+# ---------------------------------------------------------------------------
+
+def compute_signal_identity_hash(
+    *,
+    detector_id: str,
+    detector_version: str,
+    ticker: str,
+    trading_date: str,
+    direction: str,
+    detector_signal_identity_hash: Optional[str] = None,
+    detector_signal_identity_components: Optional[Dict[str, Any]] = None,
+    route_class: Optional[str] = None,
+    signal_family: Optional[str] = None,
+    event_id: Optional[str] = None,
+    signal_horizon: Optional[str] = None,
+    signal_event_sequence: Optional[int] = None,
+) -> str:
+    """Deterministic content-based identity for a signal.
+
+    Includes only stable economic/setup identity. Excludes job_run_id,
+    UUIDs, wall-clock now(), insert timestamps, scheduler metadata.
+    """
+    components = {
+        "detector_id": detector_id,
+        "detector_version": detector_version,
+        "ticker": ticker,
+        "trading_date": trading_date,
+        "direction": direction,
+    }
+    if detector_signal_identity_hash is not None:
+        components["detector_signal_identity_hash"] = detector_signal_identity_hash
+    if detector_signal_identity_components is not None:
+        components["detector_signal_identity_components"] = detector_signal_identity_components
+    if route_class is not None:
+        components["route_class"] = route_class
+    if signal_family is not None:
+        components["signal_family"] = signal_family
+    if event_id is not None:
+        components["event_id"] = event_id
+    if signal_horizon is not None:
+        components["signal_horizon"] = signal_horizon
+    if signal_event_sequence is not None:
+        components["signal_event_sequence"] = signal_event_sequence
+    return stable_hash(components)
+
+
+# ---------------------------------------------------------------------------
+# Lookahead guard
+# ---------------------------------------------------------------------------
+
+def check_lookahead_guard(
+    inp: PatternInput,
+    trading_date: str,
+    *,
+    max_asof_timestamp: Optional[datetime] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Real lookahead guard — not hardcoded True.
+
+    Verifies that input data timestamps are not after the trading date cutoff.
+    Returns (passed, failure_reason).
+    """
+    if not inp.asof_timestamp:
+        return False, "missing_asof_timestamp"
+
+    if max_asof_timestamp is not None:
+        if _comparable_datetime(inp.asof_timestamp) > _comparable_datetime(
+            max_asof_timestamp
+        ):
+            return (
+                False,
+                "asof_timestamp "
+                f"{inp.asof_timestamp.isoformat()} is after canonical scan asof "
+                f"{max_asof_timestamp.isoformat()}",
+            )
+    else:
+        # Fallback for unit callers that do not have a scan-asof cutoff.
+        asof_date_str = inp.asof_timestamp.date().isoformat()
+        if asof_date_str > trading_date:
+            return (
+                False,
+                f"asof_timestamp {asof_date_str} is after trading_date {trading_date}",
+            )
+
+    # Check lineage hashes are present and nonblank — proves data provenance exists.
+    if not any(str(value or "").strip() for value in inp.lineage_hashes):
+        return False, "missing_lineage_hashes"
+
+    return True, None
+
+
+def _comparable_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _result_guard_passed(result: PatternDetectionResult) -> Tuple[bool, Optional[str]]:
+    """Require detector-emitted guard flags to agree with the orchestration guard."""
+    if result.features is None:
+        return False, "missing_features"
+    if result.features.point_in_time_passed is not True:
+        return False, "detector_point_in_time_guard_failed"
+    if result.features.lookahead_guard_passed is not True:
+        return False, "detector_lookahead_guard_failed"
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Per-detector diagnostics
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DetectorDiagnostics:
+    detector_id: str
+    detector_version: str
+    callable_status: str = "callable"
+    evaluated_count: int = 0
+    fired_count: int = 0
+    skipped_count: int = 0
+    error_count: int = 0
+    lookahead_failure_count: int = 0
+    duplicate_suppressed_count: int = 0
+    identity_refused_count: int = 0
+    detector_status: str = "finished"
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    input_lineage_hashes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "detector_id": self.detector_id,
+            "detector_version": self.detector_version,
+            "callable_status": self.callable_status,
+            "evaluated_count": self.evaluated_count,
+            "fired_count": self.fired_count,
+            "skipped_count": self.skipped_count,
+            "error_count": self.error_count,
+            "lookahead_failure_count": self.lookahead_failure_count,
+            "duplicate_suppressed_count": self.duplicate_suppressed_count,
+            "identity_refused_count": self.identity_refused_count,
+            "detector_status": self.detector_status,
+            "errors": self.errors,
+            "input_lineage_hashes": sorted(set(self.input_lineage_hashes)),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Orchestration job
+# ---------------------------------------------------------------------------
+
 class DetectorOrchestrationJob(BaseJob):
-    """Run detectors over inputs, persist signals, dedup by identity."""
+    """Run detectors over canonical universe, persist signals, dedup by identity.
+
+    Requires:
+    - canonical_universe_scans row for trading_date
+    - All detectors produce signal_identity_hash
+    - Lookahead guard passes for each input
+
+    Refuses:
+    - null signal_identity_hash
+    - null scan_id / universe_snapshot_id / feature_snapshot_id
+    - failed lookahead guard
+
+    Partial failure:
+    - One detector crash doesn't block others
+    - Status is partial_failed when any detector errors
+    - Reruns are idempotent (dedup by identity hash)
+    """
 
     job_name = "detector_orchestration"
     job_type = "detector_scan"
@@ -30,78 +265,404 @@ class DetectorOrchestrationJob(BaseJob):
     def __init__(
         self,
         session: Session,
-        detectors: List[BasePatternDetector],
-        inputs: List[PatternInput],
+        *,
+        detectors: Optional[List[BasePatternDetector]] = None,
+        trading_date: Optional[str] = None,
+        inputs: Optional[List[PatternInput]] = None,
     ):
         self._session = session
         self._detectors = detectors
+        self._trading_date = trading_date
         self._inputs = inputs
 
     def run(self, ctx: JobContext) -> JobResult:
-        signals_persisted = 0
-        duplicates_suppressed = 0
-        no_signal_count = 0
-        identity_missing_count = 0
-        errors: list = []
+        trading_date = self._trading_date or ctx.params.get("trading_date")
+        if not trading_date:
+            return JobResult(
+                status="failed",
+                errors=[{"stage": "params", "message": "trading_date is required"}],
+            )
 
-        for inp in self._inputs:
-            for detector in self._detectors:
-                try:
-                    result = detector.detect(inp)
-                except Exception as exc:
-                    errors.append({
-                        "pattern_id": detector.pattern_id,
-                        "ticker": inp.ticker,
-                        "error": str(exc),
-                    })
-                    continue
+        # 1. Load canonical universe
+        scan_id, scan_asof_timestamp, snapshots, error = self._load_canonical_universe(trading_date)
+        if error:
+            return JobResult(
+                status="failed",
+                errors=[{"stage": "canonical_universe", "message": error}],
+            )
 
-                if not result.has_signal:
-                    no_signal_count += 1
-                    continue
+        # 2. Enumerate detectors
+        try:
+            detectors = self._detectors or enumerate_callable_detectors()
+        except Exception as exc:
+            return JobResult(
+                status="failed",
+                errors=[{"stage": "detector_enumeration", "message": str(exc)}],
+            )
+        if not detectors:
+            return JobResult(
+                status="failed",
+                errors=[{"stage": "detector_enumeration", "message": "no callable detectors found"}],
+            )
 
-                identity_hash: Optional[str] = None
-                if result.features:
-                    identity_hash = result.features.features.get("signal_identity_hash")
+        # 3. Build inputs from universe snapshots if not injected
+        valid_snapshot_ids = {
+            snap.universe_snapshot_id
+            for snap in snapshots
+            if snap.universe_snapshot_id is not None
+        }
+        inputs = self._inputs or self._build_inputs_from_snapshots(snapshots, trading_date)
 
-                if identity_hash:
-                    existing = (
-                        self._session.query(SignalRegistry.signal_id)
-                        .filter(
-                            SignalRegistry.pattern_id == result.pattern_id,
-                            SignalRegistry.ticker == result.ticker,
-                            SignalRegistry.signal_identity_hash == identity_hash,
-                        )
-                        .first()
-                    )
-                    if existing:
-                        duplicates_suppressed += 1
-                        continue
-                else:
-                    identity_missing_count += 1
+        # 4. Run each detector with isolation
+        all_diagnostics: List[DetectorDiagnostics] = []
+        total_signals = 0
+        any_detector_failed = False
 
-                persisted = persist_detection_result(
-                    self._session,
-                    result,
-                    detector,
-                    job_run_id=ctx.job_run_id,
-                    universe_snapshot_id=inp.universe_snapshot_id,
-                    data_lineage_ids=inp.lineage_ids,
-                    code_commit_sha=ctx.app_commit_sha,
-                )
-                signals_persisted += len(persisted.signal_ids)
+        for detector in detectors:
+            diag = self._run_detector(
+                detector=detector,
+                inputs=inputs,
+                trading_date=trading_date,
+                scan_id=scan_id,
+                scan_asof_timestamp=scan_asof_timestamp,
+                valid_universe_snapshot_ids=valid_snapshot_ids,
+                job_run_id=ctx.job_run_id,
+                code_commit_sha=ctx.app_commit_sha,
+            )
+            all_diagnostics.append(diag)
+            total_signals += diag.fired_count
+            if diag.detector_status in {"failed", "partial_failed"}:
+                any_detector_failed = True
 
         self._session.flush()
 
+        # 5. Determine overall status
+        if any_detector_failed:
+            status = "partial_failed"
+        else:
+            status = "finished"
+
+        metrics = {
+            "trading_date": trading_date,
+            "scan_id": scan_id,
+            "universe_size": len(snapshots),
+            "detector_count": len(detectors),
+            "total_signals_persisted": total_signals,
+            "detector_diagnostics": [d.to_dict() for d in all_diagnostics],
+            "any_detector_failed": any_detector_failed,
+        }
+
+        errors = []
+        for diag in all_diagnostics:
+            if diag.errors:
+                errors.extend(diag.errors)
+
         return JobResult(
-            status="finished",
-            metrics={
-                "signals_persisted": signals_persisted,
-                "duplicates_suppressed": duplicates_suppressed,
-                "no_signal_evaluations": no_signal_count,
-                "identity_missing": identity_missing_count,
-                "detector_errors": len(errors),
-                "finished_with_errors": bool(errors),
-            },
-            errors=errors,
+            status=status,
+            metrics=metrics,
+            input_hashes={"scan_id": scan_id},
+            errors=errors if errors else [],
         )
+
+    def _load_canonical_universe(
+        self, trading_date: str
+    ) -> Tuple[Optional[str], Optional[datetime], List[UniverseSnapshot], Optional[str]]:
+        """Load canonical scan and included snapshots."""
+        canonical = (
+            self._session.query(CanonicalUniverseScan)
+            .filter(CanonicalUniverseScan.trading_date == trading_date)
+            .first()
+        )
+        if canonical is None:
+            return None, None, [], f"no canonical universe scan for trading_date={trading_date}"
+
+        scan = self._session.get(UniverseScan, canonical.scan_id)
+        if scan is None:
+            return None, None, [], f"canonical scan_id {canonical.scan_id} not found"
+
+        snapshots = (
+            self._session.query(UniverseSnapshot)
+            .filter(
+                UniverseSnapshot.scan_id == canonical.scan_id,
+                UniverseSnapshot.operating_universe_inclusion.is_(True),
+            )
+            .all()
+        )
+        return canonical.scan_id, scan.asof_timestamp, snapshots, None
+
+    def _build_inputs_from_snapshots(
+        self,
+        snapshots: List[UniverseSnapshot],
+        trading_date: str,
+    ) -> List[PatternInput]:
+        """Build PatternInput per included ticker from universe snapshots."""
+        inputs = []
+        lineage_hashes = {
+            snap.source_lineage_hash
+            for snap in snapshots
+            if snap.source_lineage_hash
+        }
+        lineage_by_hash: Dict[str, List[str]] = {}
+        if lineage_hashes:
+            rows = (
+                self._session.query(DataLineage.raw_payload_hash, DataLineage.data_lineage_id)
+                .filter(DataLineage.raw_payload_hash.in_(lineage_hashes))
+                .all()
+            )
+            for raw_payload_hash, data_lineage_id in rows:
+                lineage_by_hash.setdefault(raw_payload_hash, []).append(data_lineage_id)
+        for snap in snapshots:
+            lineage_ids = lineage_by_hash.get(snap.source_lineage_hash or "", [])
+            inp = PatternInput(
+                ticker=snap.ticker,
+                asof_timestamp=snap.asof_timestamp,
+                market_data={
+                    "price": snap.price,
+                    "market_cap": snap.market_cap,
+                    "primary_exchange": snap.primary_exchange,
+                    "security_type": snap.security_type,
+                    "trading_date": trading_date,
+                },
+                lineage_ids=lineage_ids,
+                lineage_hashes=[snap.source_lineage_hash] if snap.source_lineage_hash else [],
+                universe_snapshot_id=snap.universe_snapshot_id,
+            )
+            inputs.append(inp)
+        return inputs
+
+    def _run_detector(
+        self,
+        *,
+        detector: BasePatternDetector,
+        inputs: List[PatternInput],
+        trading_date: str,
+        scan_id: str,
+        scan_asof_timestamp: Optional[datetime],
+        valid_universe_snapshot_ids: set[str],
+        job_run_id: str,
+        code_commit_sha: Optional[str],
+    ) -> DetectorDiagnostics:
+        """Run a single detector across all inputs with full isolation."""
+        detector_version = getattr(detector, "version", None)
+        if not detector_version:
+            return DetectorDiagnostics(
+                detector_id=detector.pattern_id,
+                detector_version="missing",
+                detector_status="failed",
+                error_count=1,
+                errors=[{
+                    "detector_id": detector.pattern_id,
+                    "error": "missing_explicit_detector_version",
+                }],
+            )
+        diag = DetectorDiagnostics(
+            detector_id=detector.pattern_id,
+            detector_version=detector_version,
+        )
+
+        for inp in inputs:
+            diag.evaluated_count += 1
+
+            if inp.universe_snapshot_id not in valid_universe_snapshot_ids:
+                diag.identity_refused_count += 1
+                diag.skipped_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": "universe_snapshot_not_in_canonical_scan",
+                    "universe_snapshot_id": inp.universe_snapshot_id,
+                    "scan_id": scan_id,
+                })
+                continue
+
+            # Lookahead guard
+            pit_passed, pit_reason = check_lookahead_guard(
+                inp,
+                trading_date,
+                max_asof_timestamp=scan_asof_timestamp,
+            )
+            if not pit_passed:
+                diag.lookahead_failure_count += 1
+                diag.skipped_count += 1
+                continue
+
+            # Run detector
+            try:
+                result = detector.detect(inp)
+            except Exception as exc:
+                diag.error_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                continue
+
+            for lineage_hash in inp.lineage_hashes:
+                lineage_hash_str = str(lineage_hash or "").strip()
+                if lineage_hash_str:
+                    diag.input_lineage_hashes.append(lineage_hash_str)
+
+            if not result.has_signal:
+                diag.skipped_count += 1
+                continue
+
+            result_guard_passed, result_guard_reason = _result_guard_passed(result)
+            if not result_guard_passed:
+                diag.lookahead_failure_count += 1
+                diag.identity_refused_count += 1
+                diag.skipped_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": result_guard_reason,
+                })
+                continue
+
+            detector_identity_hash = result.features.features.get("signal_identity_hash")
+            detector_identity_components = result.features.features.get(
+                "signal_identity_components"
+            )
+            if not detector_identity_hash:
+                diag.identity_refused_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": "missing_detector_signal_identity_hash",
+                })
+                continue
+
+            if len(result.signals) != 1:
+                diag.identity_refused_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": "orchestration_requires_exactly_one_signal_per_result",
+                })
+                continue
+
+            signal = result.signals[0]
+
+            # Compute signal identity from detector-native setup identity plus
+            # canonical scan/date/version anchors. Do not replace the detector's
+            # economic setup identity with a ticker/date-only fallback.
+            identity_hash = compute_signal_identity_hash(
+                detector_id=detector.pattern_id,
+                detector_version=detector_version,
+                ticker=inp.ticker,
+                trading_date=trading_date,
+                direction=signal.direction,
+                detector_signal_identity_hash=detector_identity_hash,
+                detector_signal_identity_components=detector_identity_components,
+                route_class=signal.route_class or detector.route_class,
+                signal_horizon=signal.signal_horizon,
+                signal_event_sequence=1,
+            )
+
+            # Strict refusal: all required fields must be present
+            if not identity_hash:
+                diag.identity_refused_count += 1
+                continue
+            if not scan_id or not inp.universe_snapshot_id:
+                diag.identity_refused_count += 1
+                continue
+
+            # Dedup check
+            existing = (
+                self._session.query(SignalRegistry.signal_id)
+                .filter(
+                    SignalRegistry.pattern_id == detector.pattern_id,
+                    SignalRegistry.ticker == inp.ticker,
+                    SignalRegistry.signal_identity_hash == identity_hash,
+                )
+                .first()
+            )
+            if existing:
+                diag.duplicate_suppressed_count += 1
+                continue
+
+            # Inject identity into features for persistence
+            result.features.features["detector_signal_identity_hash"] = (
+                detector_identity_hash
+            )
+            result.features.features["detector_signal_identity_components"] = (
+                detector_identity_components
+            )
+            result.features.features["signal_identity_hash"] = identity_hash
+            result.features.features["signal_identity_components"] = {
+                "detector_id": detector.pattern_id,
+                "detector_version": detector_version,
+                "ticker": inp.ticker,
+                "trading_date": trading_date,
+                "direction": signal.direction,
+                "detector_signal_identity_hash": detector_identity_hash,
+                "detector_signal_identity_components": detector_identity_components,
+                "route_class": signal.route_class or detector.route_class,
+                "signal_horizon": signal.signal_horizon,
+                "signal_event_sequence": 1,
+            }
+            result.features.features["canonical_scan_id"] = scan_id
+
+            # Persist through evidence bridge
+            try:
+                with self._session.begin_nested():
+                    persisted = persist_detection_result(
+                        self._session,
+                        result,
+                        detector,
+                        job_run_id=job_run_id,
+                        universe_snapshot_id=inp.universe_snapshot_id,
+                        data_lineage_ids=inp.lineage_ids,
+                        code_commit_sha=code_commit_sha,
+                        trading_date=trading_date,
+                        scan_id=scan_id,
+                        detector_version=detector_version,
+                        point_in_time_passed=result.features.point_in_time_passed,
+                        lookahead_guard_passed=result.features.lookahead_guard_passed,
+                    )
+            except IntegrityError:
+                existing_after_race = (
+                    self._session.query(SignalRegistry.signal_id)
+                    .filter(
+                        SignalRegistry.pattern_id == detector.pattern_id,
+                        SignalRegistry.ticker == inp.ticker,
+                        SignalRegistry.signal_identity_hash == identity_hash,
+                    )
+                    .first()
+                )
+                if existing_after_race:
+                    diag.duplicate_suppressed_count += 1
+                    continue
+                diag.error_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": "integrity_error_without_existing_signal",
+                    "traceback": traceback.format_exc(),
+                })
+                continue
+            except Exception as exc:
+                diag.error_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                continue
+
+            if persisted.signal_ids:
+                diag.fired_count += len(persisted.signal_ids)
+            else:
+                diag.identity_refused_count += 1
+
+        failure_count = (
+            diag.error_count
+            + diag.identity_refused_count
+            + diag.lookahead_failure_count
+        )
+        if failure_count > 0:
+            diag.detector_status = "partial_failed" if diag.fired_count > 0 else "failed"
+
+        return diag

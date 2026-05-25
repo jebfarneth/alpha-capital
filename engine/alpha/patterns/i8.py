@@ -510,6 +510,7 @@ class I8Detector(BasePatternDetector):
     """I8 Opening Range Breakout detector."""
 
     pattern_id = PatternId.I8
+    version = "1.0"
     track = PatternTrack.INTRADAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.C

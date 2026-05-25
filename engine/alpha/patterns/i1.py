@@ -451,6 +451,7 @@ class I1Detector(BasePatternDetector):
     """I1 Gap and Go detector."""
 
     pattern_id = PatternId.I1
+    version = "1.0"
     track = PatternTrack.INTRADAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.C

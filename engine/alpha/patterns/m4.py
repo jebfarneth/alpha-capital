@@ -459,6 +459,7 @@ class M4Detector(BasePatternDetector):
     """M4 52-Week High Breakout detector."""
 
     pattern_id = PatternId.M4
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.A

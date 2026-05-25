@@ -102,6 +102,7 @@ class TestSignalLineage:
             route_class="A",
             fidelity_tier="FULL",
             data_lineage_ids=[lineage.data_lineage_id],
+            signal_identity_hash="writer-linkage-signal",
         )
 
         db_session.commit()
@@ -134,8 +135,25 @@ class TestSignalLineage:
                 raw_signal_strength=0.5,
                 raw_expected_edge=0.04,
                 feature_snapshot_id="nonexistent-id",
+                signal_identity_hash="missing-feature-signal",
             )
             db_session.commit()
+
+    def test_signal_requires_identity_hash(self, db_session):
+        """Signal identity is a writer-level invariant, not just orchestration policy."""
+        import pytest
+
+        with pytest.raises(ValueError):
+            record_signal(
+                db_session,
+                pattern_id="M4",
+                ticker="ACME",
+                direction="long",
+                signal_timestamp=_ts(),
+                raw_signal_strength=0.5,
+                raw_expected_edge=0.04,
+                feature_snapshot_id="nonexistent-id",
+            )
 
 
 # -------------------------------------------------------------------
@@ -168,6 +186,7 @@ class TestCandidatePersistence:
             raw_signal_strength=0.95,
             raw_expected_edge=0.06,
             feature_snapshot_id=feat.feature_snapshot_id,
+            signal_identity_hash="candidate-input-signal",
         )
         db_session.flush()
         return sig
@@ -576,12 +595,28 @@ class TestSchemaCompleteness:
             tables = set(inspect(engine).get_table_names())
             columns = {
                 table: {col["name"] for col in inspect(engine).get_columns(table)}
-                for table in ("trade_candidates", "shadow_positions", "real_positions")
+                for table in (
+                    "signal_registry",
+                    "trade_candidates",
+                    "shadow_positions",
+                    "real_positions",
+                )
+            }
+            signal_columns = {
+                col["name"]: col for col in inspect(engine).get_columns("signal_registry")
             }
         finally:
             engine.dispose()
 
         assert set(Base.metadata.tables.keys()) <= tables
+        assert {
+            "trading_date",
+            "scan_id",
+            "detector_version",
+            "point_in_time_passed",
+            "lookahead_guard_passed",
+        } <= columns["signal_registry"]
+        assert signal_columns["signal_identity_hash"]["nullable"] is False
         assert {
             "effective_hard_stop_pct",
             "base_risk_budget_pct",

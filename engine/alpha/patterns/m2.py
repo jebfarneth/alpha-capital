@@ -518,6 +518,7 @@ class M2Detector(BasePatternDetector):
     """M2 Insider Cluster detector."""
 
     pattern_id = PatternId.M2
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
     route_class = RouteClass.A

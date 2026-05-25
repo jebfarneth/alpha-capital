@@ -548,6 +548,7 @@ class M5Detector(BasePatternDetector):
     """M5 Failed Breakdown Reversal detector."""
 
     pattern_id = PatternId.M5
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.MEAN_REVERSION
     route_class = RouteClass.B

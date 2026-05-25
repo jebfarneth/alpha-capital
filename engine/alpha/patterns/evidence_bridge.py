@@ -49,6 +49,11 @@ def persist_detection_result(
     universe_snapshot_id: Optional[str] = None,
     data_lineage_ids: Optional[List[str]] = None,
     code_commit_sha: Optional[str] = None,
+    trading_date: Optional[str] = None,
+    scan_id: Optional[str] = None,
+    detector_version: Optional[str] = None,
+    point_in_time_passed: Optional[bool] = None,
+    lookahead_guard_passed: Optional[bool] = None,
 ) -> PersistedDetection:
     """
     Write a detection result into the evidence tables.
@@ -58,22 +63,36 @@ def persist_detection_result(
     persisted = PersistedDetection()
 
     if result.features is None:
+        if result.signals:
+            raise ValueError("signals require a feature snapshot and signal identity")
         return persisted
 
-    signal_identity_hash = result.features.features.get("signal_identity_hash") if result.features else None
-    if signal_identity_hash and result.signals:
-        existing_signal = (
+    signal_identity_hashes: List[str] = []
+    if result.signals:
+        signal_identity_hashes = _signal_identity_hashes(result, detector)
+    if result.signals and not signal_identity_hashes:
+        raise ValueError("signals require signal_identity_hash in features")
+
+    existing_by_hash = {}
+    if signal_identity_hashes:
+        existing_signals = (
             session.query(SignalRegistry)
             .filter(
                 SignalRegistry.pattern_id == result.pattern_id,
                 SignalRegistry.ticker == result.ticker,
-                SignalRegistry.signal_identity_hash == signal_identity_hash,
+                SignalRegistry.signal_identity_hash.in_(signal_identity_hashes),
             )
-            .first()
+            .all()
         )
-        if existing_signal:
-            persisted.feature_snapshot_id = existing_signal.feature_snapshot_id
-            persisted.signal_ids.append(existing_signal.signal_id)
+        existing_by_hash = {
+            row.signal_identity_hash: row
+            for row in existing_signals
+            if row.signal_identity_hash is not None
+        }
+        if len(existing_by_hash) == len(signal_identity_hashes):
+            first_existing = existing_signals[0]
+            persisted.feature_snapshot_id = first_existing.feature_snapshot_id
+            persisted.signal_ids.extend(row.signal_id for row in existing_signals)
             return persisted
 
     feat = record_feature_snapshot(
@@ -94,6 +113,11 @@ def persist_detection_result(
     persisted.feature_snapshot_id = feat.feature_snapshot_id
 
     for sequence, sig in enumerate(result.signals, start=1):
+        signal_identity_hash = signal_identity_hashes[sequence - 1]
+        existing_signal = existing_by_hash.get(signal_identity_hash)
+        if existing_signal is not None:
+            persisted.signal_ids.append(existing_signal.signal_id)
+            continue
         sr = record_signal(
             session,
             pattern_id=result.pattern_id,
@@ -112,9 +136,42 @@ def persist_detection_result(
             data_confidence=sig.data_confidence,
             data_lineage_ids=data_lineage_ids,
             universe_snapshot_id=universe_snapshot_id,
+            trading_date=trading_date,
+            scan_id=scan_id,
+            detector_version=detector_version,
+            point_in_time_passed=point_in_time_passed,
+            lookahead_guard_passed=lookahead_guard_passed,
             signal_event_sequence=sequence,
             signal_identity_hash=signal_identity_hash,
         )
         persisted.signal_ids.append(sr.signal_id)
 
     return persisted
+
+
+def _signal_identity_hashes(
+    result: PatternDetectionResult,
+    detector: BasePatternDetector,
+) -> List[str]:
+    raw_hashes = result.features.features.get("signal_identity_hashes")
+    if raw_hashes is not None:
+        hashes = [str(value).strip() for value in raw_hashes if str(value).strip()]
+        if len(hashes) != len(result.signals):
+            raise ValueError("signal_identity_hashes length must match signals")
+        return hashes
+
+    base_hash = str(result.features.features.get("signal_identity_hash") or "").strip()
+    if not base_hash:
+        return []
+    if len(result.signals) == 1:
+        return [base_hash]
+
+    hashes = []
+    for sequence, sig in enumerate(result.signals, start=1):
+        hashes.append(stable_hash({
+            "base_signal_identity_hash": base_hash,
+            "signal_event_sequence": sequence,
+            "route_class": sig.route_class or detector.route_class,
+            "signal_horizon": sig.signal_horizon,
+        }))
+    return hashes

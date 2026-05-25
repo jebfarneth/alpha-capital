@@ -474,6 +474,7 @@ class M1Detector(BasePatternDetector):
     """M1 Post-Earnings Announcement Drift detector."""
 
     pattern_id = PatternId.M1
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.EVENT_DRIFT
     route_class = RouteClass.A

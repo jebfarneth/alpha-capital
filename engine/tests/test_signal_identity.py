@@ -76,11 +76,13 @@ def test_m2_standard_identity_alias_uses_accessions_not_delivery_source():
     assert r1.features.features["signal_identity_source"] == "sec_accession_cluster"
 
 
-def test_m3_identity_only_when_upstream_snapshot_id_exists():
+def test_m3_identity_prefers_snapshot_id_and_falls_back_to_sector_features():
     det = M3Detector()
-    no_snapshot = det.detect(PatternInput(ticker="ACME", asof_timestamp=_m3_ts(), market_data=_m3_data(), lineage_hashes=["h"]))
-    assert no_snapshot.has_signal
-    assert "signal_identity_hash" not in no_snapshot.features.features
+    no_snapshot_1 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_m3_ts(), market_data=_m3_data(), lineage_hashes=["h"]))
+    no_snapshot_2 = det.detect(PatternInput(ticker="ACME", asof_timestamp=_m3_ts(), market_data=_m3_data(), lineage_hashes=["h"]))
+    assert no_snapshot_1.has_signal and no_snapshot_2.has_signal
+    assert _identity(no_snapshot_1) == _identity(no_snapshot_2)
+    assert no_snapshot_1.features.features["signal_identity_source"] == "sector_rank_features"
 
     d1 = _m3_data()
     d1["sector_rank_snapshot_id"] = "FMP-SECTOR-RANK-2026-05-20"

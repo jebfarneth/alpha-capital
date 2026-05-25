@@ -149,14 +149,25 @@ def _set_m3_signal_identity(feat_dict: Dict[str, Any], inp: PatternInput) -> Non
         or feat_dict.get("sector_return_formation_id")
         or feat_dict.get("sector_rank_formation_id")
     )
-    if snapshot_id is None:
-        return
+    if snapshot_id is not None:
+        components = {"sector_rank_snapshot_id": snapshot_id}
+        source = "upstream_sector_rank_snapshot"
+    else:
+        components = {
+            "sector": feat_dict.get("sector"),
+            "sector_rank_normalized": feat_dict.get("sector_rank_normalized"),
+            "sector_return_6mo": feat_dict.get("sector_return_6mo"),
+            "asof_date": inp.asof_timestamp.date().isoformat()
+            if inp.asof_timestamp is not None
+            else None,
+        }
+        source = "sector_rank_features"
     set_signal_identity(
         feat_dict,
         pattern_id=PatternId.M3,
         ticker=inp.ticker,
-        components={"sector_rank_snapshot_id": snapshot_id},
-        source="upstream_sector_rank_snapshot",
+        components=components,
+        source=source,
     )
 
 
@@ -312,6 +323,7 @@ class M3Detector(BasePatternDetector):
     """M3 Sector Rotation Beneficiary detector."""
 
     pattern_id = PatternId.M3
+    version = "1.0"
     track = PatternTrack.MULTI_DAY
     thesis_category = ThesisCategory.CONTINUATION
     route_class = RouteClass.A

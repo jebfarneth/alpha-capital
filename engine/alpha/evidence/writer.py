@@ -283,12 +283,19 @@ def record_signal(
     data_confidence: float | None = None,
     data_lineage_ids: list[str] | None = None,
     universe_snapshot_id: str | None = None,
+    trading_date: str | None = None,
+    scan_id: str | None = None,
+    detector_version: str | None = None,
+    point_in_time_passed: bool | None = None,
+    lookahead_guard_passed: bool | None = None,
     signal_event_sequence: int | None = None,
     signal_identity_hash: str | None = None,
     intended_entry_price: float | None = None,
     forward_return_status: str = "pending",
     forward_return_attempts: int = 0,
 ) -> SignalRegistry:
+    if not signal_identity_hash:
+        raise ValueError("signal_identity_hash is required")
     sig = SignalRegistry(
         signal_id=_uid(),
         job_run_id=job_run_id,
@@ -306,6 +313,11 @@ def record_signal(
         fidelity_tier=fidelity_tier,
         data_confidence=data_confidence,
         universe_snapshot_id=universe_snapshot_id,
+        trading_date=trading_date,
+        scan_id=scan_id,
+        detector_version=detector_version,
+        point_in_time_passed=point_in_time_passed,
+        lookahead_guard_passed=lookahead_guard_passed,
         signal_event_sequence=signal_event_sequence,
         data_lineage_ids=json.dumps(data_lineage_ids) if data_lineage_ids else None,
         signal_identity_hash=signal_identity_hash,

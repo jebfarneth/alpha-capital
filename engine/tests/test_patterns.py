@@ -428,7 +428,14 @@ class TestEvidenceBridge:
             pattern_id="FIXTURE",
             ticker="ACME",
             asof_timestamp=_ts(),
-            features=PatternFeatures(features={"x": 1.0}),
+            features=PatternFeatures(features={
+                "x": 1.0,
+                "signal_identity_hash": stable_hash({
+                    "pattern_id": "FIXTURE",
+                    "ticker": "ACME",
+                    "setup": "multi",
+                }),
+            }),
             signals=[
                 PatternSignal(
                     direction=SignalDirection.LONG,
