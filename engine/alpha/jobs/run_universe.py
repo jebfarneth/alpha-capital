@@ -30,6 +30,7 @@ from alpha.db.models import Base
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import SecurityTypeEnrichmentJob
 from alpha.jobs.universe_builder import (
+    PRICE_MIN,
     UniverseBuilderJob,
     _dedupe_screener_rows,
     _requires_security_profile,
@@ -184,6 +185,7 @@ def _run_live(args) -> int:
             "trading_date": args.trading_date,
             "mcap_min": MCAP_MIN,
             "mcap_max": MCAP_MAX,
+            "price_min": PRICE_MIN,
         },
     )
     _print_safe_error("Universe build", universe)
@@ -201,6 +203,7 @@ def _run_live(args) -> int:
     print(f"Slice limits:  {sliced.slice_limit_hits}")
     print(f"Country rescues: {metrics.get('country_profile_rescue_count', 0)}")
     print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
+    print(f"Price buckets: {metrics.get('included_price_bucket_counts', {})}")
     print(f"Countries:     {metrics.get('included_country_counts', {})}")
     print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
     print(f"Included shell-label names: {metrics.get('included_shell_company_count', 0)}")

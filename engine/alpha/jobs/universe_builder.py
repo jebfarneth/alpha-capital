@@ -3,7 +3,7 @@ Universe builder job.
 
 Builds the operating universe from screener data, applying vault rules:
   - Market cap in configured operating band, finite
-  - Price >= $3.00, finite
+  - Price >= $2.00, finite
   - US-listed on NASDAQ / NYSE / AMEX exchanges only
   - Non-US domicile requires profile-confirmed common_stock classification
   - Actively trading
@@ -47,7 +47,7 @@ from alpha.jobs.security_type import (
     UNKNOWN,
 )
 
-PRICE_MIN = 3.0
+PRICE_MIN = 2.0
 ALLOWED_EXCHANGES = frozenset({"NASDAQ", "NYSE", "AMEX"})
 COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX = "country_requires_security_profile"
 SHELL_COMPANY_CLASSIFICATION_REASON = "industry:SHELL_COMPANIES"
@@ -103,6 +103,24 @@ def _market_cap_bucket(market_cap: object) -> str:
     if cap < 200_000_000:
         return "100m_200m"
     return "200m_250m"
+
+
+def _price_floor_reason() -> str:
+    if float(PRICE_MIN).is_integer():
+        return f"price_below_{int(PRICE_MIN)}"
+    return f"price_below_{str(PRICE_MIN).replace('.', '_')}"
+
+
+def _price_bucket(price: object) -> str:
+    value = _finite_real(price)
+    if value is None:
+        return "unknown"
+    # Applied only after the inclusion price gate has enforced price >= PRICE_MIN.
+    if value < 3.0:
+        return "2_3"
+    if value < 5.0:
+        return "3_5"
+    return "5_plus"
 
 
 def _security_type_review_record(
@@ -237,7 +255,7 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     if price is None:
         return False, "price_missing_or_invalid"
     if price < PRICE_MIN:
-        return False, "price_below_3"
+        return False, _price_floor_reason()
 
     excluded, reason = _is_non_common_symbol(stock.symbol)
     if excluded:
@@ -592,6 +610,7 @@ class UniverseBuilderJob(BaseJob):
         country_profile_rescue_count = 0
         included_country_counts: Counter[str] = Counter()
         included_market_cap_bucket_counts: Counter[str] = Counter()
+        included_price_bucket_counts: Counter[str] = Counter()
         security_type_classification_reason_counts: Counter[str] = Counter()
         shell_company_exclusion_records: List[Dict[str, Optional[str]]] = []
         spac_pattern_exclusion_records: List[Dict[str, Optional[str]]] = []
@@ -697,6 +716,7 @@ class UniverseBuilderJob(BaseJob):
                     )
                 included_country_counts[_clean_symbol(stock.country) or "MISSING"] += 1
                 included_market_cap_bucket_counts[_market_cap_bucket(market_cap)] += 1
+                included_price_bucket_counts[_price_bucket(price)] += 1
 
             record_universe_snapshot(
                 self._session,
@@ -778,6 +798,7 @@ class UniverseBuilderJob(BaseJob):
             "excluded": excluded_count,
             "mcap_min": MCAP_MIN,
             "mcap_max": MCAP_MAX,
+            "price_min": PRICE_MIN,
             "exclusion_counts": dict(exclusion_counts),
             "security_profile_cache_hash": security_profile_cache_hash,
             "security_profile_cache_hit_count": cache_hit_count,
@@ -824,6 +845,7 @@ class UniverseBuilderJob(BaseJob):
             "country_profile_rescue_count": country_profile_rescue_count,
             "included_country_counts": dict(included_country_counts),
             "included_market_cap_bucket_counts": dict(included_market_cap_bucket_counts),
+            "included_price_bucket_counts": dict(included_price_bucket_counts),
             "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }
         if self._slice_diagnostics is not None:

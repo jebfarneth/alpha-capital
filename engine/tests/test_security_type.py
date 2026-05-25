@@ -696,7 +696,7 @@ class TestEnrichmentJob:
                 ticker="PENY",
                 asof_timestamp=_ts(),
                 operating_universe_inclusion=False,
-                exclusion_reason="price_below_3",
+                exclusion_reason="price_below_2",
             ),
         ])
         db_session.flush()
@@ -1061,7 +1061,7 @@ class TestBuilderCacheIntegration:
         db_session.flush()
 
         resp = AdapterResponse(
-            data=[_stock("PENY", price=1.0)],  # fails price_below_3
+            data=[_stock("PENY", price=1.0)],  # fails price_below_2
             lineage=_mock_lineage_screener(),
         )
         job = UniverseBuilderJob(session=db_session, screener_response=resp)
@@ -1071,7 +1071,7 @@ class TestBuilderCacheIntegration:
             UniverseSnapshot.ticker == "PENY"
         ).one()
         assert snap.operating_universe_inclusion is False
-        assert snap.exclusion_reason == "price_below_3"
+        assert snap.exclusion_reason == "price_below_2"
 
 
 # ===================================================================

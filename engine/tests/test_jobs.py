@@ -58,6 +58,8 @@ from alpha.jobs.universe_builder import (
     _dedupe_screener_rows,
     _is_non_common_symbol,
     _market_cap_bucket,
+    _price_bucket,
+    _price_floor_reason,
     _requires_security_profile,
     _upsert_canonical_universe_scan,
     get_canonical_universe_members,
@@ -266,12 +268,20 @@ class TestUniverseBuilder:
         assert result.metrics["excluded"] == 5
         assert result.metrics["mcap_min"] == MCAP_MIN
         assert result.metrics["mcap_max"] == MCAP_MAX
+        assert result.metrics["price_min"] == PRICE_MIN
         assert result.metrics["included_market_cap_bucket_counts"] == {
             "30m_100m": 1,
             "100m_200m": 1,
         }
+        assert result.metrics["included_price_bucket_counts"] == {
+            "5_plus": 2,
+        }
         assert (
             sum(result.metrics["included_market_cap_bucket_counts"].values())
+            == result.metrics["included"]
+        )
+        assert (
+            sum(result.metrics["included_price_bucket_counts"].values())
             == result.metrics["included"]
         )
         assert (
@@ -322,6 +332,14 @@ class TestUniverseBuilder:
         assert _market_cap_bucket(200_000_000) == "200m_250m"
         assert _market_cap_bucket(225_000_000) == "200m_250m"
         assert _market_cap_bucket(None) == "unknown"
+
+    def test_price_bucket_helper(self):
+        assert _price_bucket(2.0) == "2_3"
+        assert _price_bucket(2.99) == "2_3"
+        assert _price_bucket(3.0) == "3_5"
+        assert _price_bucket(4.99) == "3_5"
+        assert _price_bucket(5.0) == "5_plus"
+        assert _price_bucket(None) == "unknown"
 
     def test_non_us_common_stock_profile_is_included(self, db_session):
         db_session.add(SecurityProfile(
@@ -950,13 +968,13 @@ class TestHardenedFilter:
         assert included is True
         assert reason is None
 
-    def test_price_below_3_excluded(self):
-        included, reason = _classify(_stock(price=2.99))
+    def test_price_below_floor_excluded(self):
+        included, reason = _classify(_stock(price=PRICE_MIN - 0.01))
         assert not included
-        assert reason == "price_below_3"
+        assert reason == _price_floor_reason()
 
-    def test_price_exactly_3_included(self):
-        assert _classify(_stock(price=3.0))[0]
+    def test_price_exactly_floor_included(self):
+        assert _classify(_stock(price=PRICE_MIN))[0]
 
     def test_price_missing_excluded(self):
         included, reason = _classify(_stock(price=None))
