@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -57,6 +58,7 @@ SPAC_PATTERN_CLASSIFICATION_REASONS = frozenset({
     "name_pattern:ACQUISITION_SEQUENCE",
     "name_pattern:INVESTMENT_CORP_SEQUENCE",
 })
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 def _country_requires_security_profile_reason(country: str) -> str:
@@ -279,6 +281,31 @@ def _derive_trading_date(params: Dict[str, Any], asof: datetime) -> str:
         if cleaned:
             return date.fromisoformat(cleaned).isoformat()
     return asof.date().isoformat()
+
+
+def _market_date(value: datetime) -> date:
+    """Return the US market-local date for an adapter timestamp."""
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(MARKET_TIMEZONE).date()
+    return value.date()
+
+
+def _screener_asof_error(trading_date: str, asof: datetime) -> Optional[str]:
+    """Fail closed when a current-state screener payload is used for another date.
+
+    FMP's company screener does not accept a historical as-of parameter. Its payload is
+    therefore current as of the request/provider timestamp, not as of an arbitrary
+    backtest date. Treat a market-date mismatch as a point-in-time violation.
+    """
+    requested = date.fromisoformat(trading_date)
+    actual = _market_date(asof)
+    if actual == requested:
+        return None
+    return (
+        "company screener asof market date "
+        f"{actual.isoformat()} does not match trading_date {requested.isoformat()}; "
+        "live FMP screener cannot be used as a historical backfill input"
+    )
 
 
 def _datetime_order_key(value: datetime) -> datetime:
@@ -514,6 +541,16 @@ class UniverseBuilderJob(BaseJob):
     def run(self, ctx: JobContext) -> JobResult:
         resp = self._screener_response
         trading_date = _derive_trading_date(ctx.params, resp.lineage.asof_timestamp)
+        asof_error = _screener_asof_error(trading_date, resp.lineage.asof_timestamp)
+        if asof_error is not None:
+            return JobResult(
+                status="failed",
+                input_hashes={"screener": resp.lineage.raw_payload_hash},
+                errors=[{
+                    "stage": "screener_asof",
+                    "message": asof_error,
+                }],
+            )
 
         lineage = record_data_lineage(
             self._session,

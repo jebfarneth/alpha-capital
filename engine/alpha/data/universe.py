@@ -121,6 +121,8 @@ class SlicedUniverseFetcher:
             raw_payload_hash=stable_hash(unique_payload),
             source_authority="FMP_Ultimate",
             data_quality_flags={
+                "asof_source": "request_timestamp_no_historical_screener_asof",
+                "historical_backfill_supported": False,
                 "component_payload_hashes": sorted(payload_hashes),
                 "slice_diagnostics": [asdict(d) for d in diagnostics],
             },

@@ -1187,6 +1187,10 @@ class TestSlicedUniverseFetcher:
         assert result.response.ok
         assert result.slice_count == 22
         assert adapter.get_stock_screener.call_count == 22
+        assert result.response.lineage.data_quality_flags["asof_source"] == (
+            "request_timestamp_no_historical_screener_asof"
+        )
+        assert result.response.lineage.data_quality_flags["historical_backfill_supported"] is False
 
     def test_unions_and_dedups_symbols(self):
         """Same symbol in two slices appears once in results."""
@@ -1469,7 +1473,22 @@ class TestSlicedUniverseFetcher:
 
 class TestCanonicalUniverseScan:
     def _run_builder(self, db_session, trading_date="2026-05-20"):
-        resp = _mock_screener_response()
+        asof_date = date.fromisoformat(trading_date)
+        asof = datetime(
+            asof_date.year, asof_date.month, asof_date.day,
+            14, 30, tzinfo=timezone.utc,
+        )
+        resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=asof,
+                asof_timestamp=asof,
+                raw_payload_hash=f"mock-{trading_date}",
+                source_authority="mock",
+            ),
+        )
         job = UniverseBuilderJob(session=db_session, screener_response=resp)
         return run_job(db_session, job, params={"trading_date": trading_date})
 
@@ -1554,6 +1573,61 @@ class TestCanonicalUniverseScan:
         assert db_session.query(UniverseScan).filter(
             UniverseScan.trading_date == "2026-05-20"
         ).count() == 2
+
+    def test_screener_asof_must_match_trading_date_market_date(self, db_session):
+        resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=datetime(2026, 5, 25, 8, 3, tzinfo=timezone.utc),
+                asof_timestamp=datetime(2026, 5, 25, 8, 3, tzinfo=timezone.utc),
+                raw_payload_hash="late-live-screener",
+                source_authority="FMP_Ultimate",
+            ),
+        )
+
+        result = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp),
+            params={"trading_date": "2026-05-24"},
+        )
+
+        assert not result.ok
+        assert result.errors == [{
+            "stage": "screener_asof",
+            "message": (
+                "company screener asof market date 2026-05-25 does not match "
+                "trading_date 2026-05-24; live FMP screener cannot be used "
+                "as a historical backfill input"
+            ),
+        }]
+        assert db_session.query(DataLineage).count() == 0
+        assert db_session.query(UniverseScan).count() == 0
+        assert db_session.query(UniverseSnapshot).count() == 0
+        assert db_session.query(CanonicalUniverseScan).count() == 0
+
+    def test_screener_asof_uses_market_date_not_utc_date(self, db_session):
+        resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=datetime(2026, 5, 21, 0, 30, tzinfo=timezone.utc),
+                asof_timestamp=datetime(2026, 5, 21, 0, 30, tzinfo=timezone.utc),
+                raw_payload_hash="after-close-same-market-date",
+                source_authority="FMP_Ultimate",
+            ),
+        )
+
+        result = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp),
+            params={"trading_date": "2026-05-20"},
+        )
+
+        assert result.ok
+        assert get_canonical_universe_scan(db_session, "2026-05-20") is not None
 
     def test_failed_run_does_not_replace_canonical(self, db_session):
         r1 = self._run_builder(db_session)

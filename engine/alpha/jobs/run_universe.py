@@ -34,6 +34,7 @@ from alpha.jobs.universe_builder import (
     UniverseBuilderJob,
     _dedupe_screener_rows,
     _requires_security_profile,
+    _screener_asof_error,
 )
 
 MOCK_SCREENER_DATA = [
@@ -144,6 +145,15 @@ def _run_live(args) -> int:
             f"status={getattr(err, 'status_code', None)}",
             f"retryable={getattr(err, 'retryable', None)}",
         )
+        session.close()
+        return 1
+
+    asof_error = _screener_asof_error(
+        args.trading_date,
+        sliced.response.lineage.asof_timestamp,
+    )
+    if asof_error is not None:
+        print(f"Universe build refused: {asof_error}")
         session.close()
         return 1
 
