@@ -81,11 +81,31 @@ def _market_cap_bucket(market_cap: object) -> str:
     cap = _finite_real(market_cap)
     if cap is None:
         return "unknown"
+    # This helper is applied only after the inclusion mcap gate has already
+    # enforced MCAP_MIN <= cap <= MCAP_MAX.
     if cap < 100_000_000:
         return "30m_100m"
     if cap < 200_000_000:
         return "100m_200m"
     return "200m_250m"
+
+
+def _security_type_review_record(
+    stock: FmpScreenerResult,
+    symbol: str,
+    classification_reason: str,
+) -> Dict[str, Optional[str]]:
+    return {
+        "symbol": symbol,
+        "company_name": stock.company_name or None,
+        "classification_reason": classification_reason,
+    }
+
+
+def _sorted_review_records(
+    records: List[Dict[str, Optional[str]]],
+) -> List[Dict[str, Optional[str]]]:
+    return sorted(records, key=lambda row: row["symbol"] or "")
 
 
 def _clean_symbol(symbol: object) -> str:
@@ -537,8 +557,8 @@ class UniverseBuilderJob(BaseJob):
         included_country_counts: Counter[str] = Counter()
         included_market_cap_bucket_counts: Counter[str] = Counter()
         security_type_classification_reason_counts: Counter[str] = Counter()
-        shell_company_exclusion_symbols: list[str] = []
-        spac_pattern_exclusion_symbols: list[str] = []
+        shell_company_exclusion_records: List[Dict[str, Optional[str]]] = []
+        spac_pattern_exclusion_records: List[Dict[str, Optional[str]]] = []
 
         for stock, included, reason, symbol in deduped_rows:
             market_cap = _finite_real(stock.market_cap)
@@ -608,10 +628,15 @@ class UniverseBuilderJob(BaseJob):
                     security_type_classification_reason_counts[
                         classification_reason
                     ] += 1
+                    review_record = _security_type_review_record(
+                        stock,
+                        symbol,
+                        classification_reason,
+                    )
                     if classification_reason == SHELL_COMPANY_CLASSIFICATION_REASON:
-                        shell_company_exclusion_symbols.append(symbol)
+                        shell_company_exclusion_records.append(review_record)
                     if classification_reason in SPAC_PATTERN_CLASSIFICATION_REASONS:
-                        spac_pattern_exclusion_symbols.append(symbol)
+                        spac_pattern_exclusion_records.append(review_record)
             else:
                 cache_miss_count += 1
                 if profile_required:
@@ -670,6 +695,27 @@ class UniverseBuilderJob(BaseJob):
             )
         else:
             security_profile_coverage_ratio = 1.0
+        security_profile_coverage_required_count = math.ceil(
+            security_profile_required_count * self._min_security_profile_coverage
+        )
+        security_profile_coverage_headroom_count = (
+            security_profile_enriched_count
+            - security_profile_coverage_required_count
+        )
+        security_profile_coverage_shortfall_count = max(
+            0,
+            -security_profile_coverage_headroom_count,
+        )
+        security_profile_unenriched_required_count = (
+            security_profile_required_count
+            - security_profile_enriched_count
+        )
+        shell_company_review_records = _sorted_review_records(
+            shell_company_exclusion_records
+        )
+        spac_pattern_review_records = _sorted_review_records(
+            spac_pattern_exclusion_records
+        )
 
         metrics: Dict = {
             "raw_count": len(resp.data),
@@ -689,20 +735,28 @@ class UniverseBuilderJob(BaseJob):
             "security_type_classification_reason_counts": dict(
                 security_type_classification_reason_counts
             ),
-            "shell_company_exclusion_count": len(shell_company_exclusion_symbols),
-            "shell_company_exclusion_symbols_sample": sorted(
-                shell_company_exclusion_symbols
-            )[:25],
-            "spac_pattern_exclusion_count": len(spac_pattern_exclusion_symbols),
-            "spac_pattern_exclusion_symbols_sample": sorted(
-                spac_pattern_exclusion_symbols
-            )[:25],
+            "shell_company_exclusion_count": len(shell_company_exclusion_records),
+            "shell_company_exclusion_symbols_sample": [
+                row["symbol"] for row in shell_company_review_records[:25]
+            ],
+            "shell_company_exclusion_review_records": shell_company_review_records,
+            "shell_company_exclusion_review_sample": shell_company_review_records[:25],
+            "spac_pattern_exclusion_count": len(spac_pattern_exclusion_records),
+            "spac_pattern_exclusion_symbols_sample": [
+                row["symbol"] for row in spac_pattern_review_records[:25]
+            ],
+            "spac_pattern_exclusion_review_records": spac_pattern_review_records,
+            "spac_pattern_exclusion_review_sample": spac_pattern_review_records[:25],
             "security_type_unknown_count": security_type_unknown_count,
             "security_profile_unresolved_count": security_profile_unresolved_count,
             "security_profile_stale_count": security_profile_stale_count,
             "security_profile_required_count": security_profile_required_count,
             "security_profile_enriched_count": security_profile_enriched_count,
             "security_profile_coverage_ratio": security_profile_coverage_ratio,
+            "security_profile_coverage_required_count": security_profile_coverage_required_count,
+            "security_profile_coverage_headroom_count": security_profile_coverage_headroom_count,
+            "security_profile_coverage_shortfall_count": security_profile_coverage_shortfall_count,
+            "security_profile_unenriched_required_count": security_profile_unenriched_required_count,
             "require_security_profile_cache": self._require_security_profile_cache,
             "min_security_profile_coverage": self._min_security_profile_coverage,
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,

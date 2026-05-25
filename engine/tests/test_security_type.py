@@ -725,6 +725,10 @@ class TestBuilderCacheIntegration:
         assert result.metrics["security_profile_required_count"] == 1
         assert result.metrics["security_profile_enriched_count"] == 1
         assert result.metrics["security_profile_coverage_ratio"] == 1.0
+        assert result.metrics["security_profile_coverage_required_count"] == 1
+        assert result.metrics["security_profile_coverage_headroom_count"] == 0
+        assert result.metrics["security_profile_coverage_shortfall_count"] == 0
+        assert result.metrics["security_profile_unenriched_required_count"] == 0
         assert result.input_hashes["security_profile_cache"]
         scan = db_session.query(UniverseScan).one()
         assert scan.security_profile_cache_hash == result.input_hashes["security_profile_cache"]
@@ -767,6 +771,10 @@ class TestBuilderCacheIntegration:
         assert result.metrics["security_profile_cache_miss_included_count"] == 1
         assert result.metrics["security_profile_cache_miss_required_count"] == 1
         assert result.metrics["security_profile_coverage_ratio"] == 0.0
+        assert result.metrics["security_profile_coverage_required_count"] == 1
+        assert result.metrics["security_profile_coverage_headroom_count"] == -1
+        assert result.metrics["security_profile_coverage_shortfall_count"] == 1
+        assert result.metrics["security_profile_unenriched_required_count"] == 1
 
     def test_required_security_profile_coverage_blocks_canonical_on_miss(self, db_session):
         resp = AdapterResponse(data=[_stock("NOCACHE")], lineage=_mock_lineage_screener())
@@ -785,6 +793,10 @@ class TestBuilderCacheIntegration:
         assert result.metrics["security_profile_enriched_count"] == 0
         assert result.metrics["security_profile_coverage_ratio"] == 0.0
         assert result.metrics["security_profile_cache_miss_required_count"] == 1
+        assert result.metrics["security_profile_coverage_required_count"] == 1
+        assert result.metrics["security_profile_coverage_headroom_count"] == -1
+        assert result.metrics["security_profile_coverage_shortfall_count"] == 1
+        assert result.metrics["security_profile_unenriched_required_count"] == 1
 
         scan = db_session.query(UniverseScan).one()
         assert scan.run_status == "failed"
@@ -808,6 +820,10 @@ class TestBuilderCacheIntegration:
 
         assert result.ok
         assert result.metrics["security_profile_coverage_ratio"] == 1.0
+        assert result.metrics["security_profile_coverage_required_count"] == 1
+        assert result.metrics["security_profile_coverage_headroom_count"] == 0
+        assert result.metrics["security_profile_coverage_shortfall_count"] == 0
+        assert result.metrics["security_profile_unenriched_required_count"] == 0
         scan = db_session.query(UniverseScan).one()
         assert scan.run_status == "finished"
         assert db_session.query(CanonicalUniverseScan).count() == 1

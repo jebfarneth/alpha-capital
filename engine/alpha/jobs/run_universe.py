@@ -193,14 +193,25 @@ def _run_live(args) -> int:
     print(f"Included:      {metrics.get('included', 0)}")
     print(f"Excluded:      {metrics.get('excluded', 0)}")
     print(f"Coverage:      {metrics.get('security_profile_coverage_ratio')}")
+    print(
+        "Coverage headroom: "
+        f"{metrics.get('security_profile_coverage_headroom_count')} profiles"
+    )
     print(f"Slices:        {sliced.slice_count}")
     print(f"Slice limits:  {sliced.slice_limit_hits}")
     print(f"Country rescues: {metrics.get('country_profile_rescue_count', 0)}")
     print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
     print(f"Countries:     {metrics.get('included_country_counts', {})}")
     print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
-    print(f"SPAC pattern review: {metrics.get('spac_pattern_exclusion_symbols_sample', [])}")
+    shell_review = metrics.get("shell_company_exclusion_review_records", [])
+    spac_review = metrics.get("spac_pattern_exclusion_review_records", [])
+    print(f"Shell review preview: {shell_review[:25]}")
+    print(f"SPAC pattern review preview: {spac_review[:25]}")
     print(f"Security type exclusions: {metrics.get('security_type_exclusion_counts', {})}")
+    print(
+        "Security type reasons: "
+        f"{metrics.get('security_type_classification_reason_counts', {})}"
+    )
 
     exclusion_counts = metrics.get("exclusion_counts", {})
     if exclusion_counts:

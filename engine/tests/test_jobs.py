@@ -270,6 +270,14 @@ class TestUniverseBuilder:
             "30m_100m": 1,
             "100m_200m": 1,
         }
+        assert (
+            sum(result.metrics["included_market_cap_bucket_counts"].values())
+            == result.metrics["included"]
+        )
+        assert (
+            sum(result.metrics["included_country_counts"].values())
+            == result.metrics["included"]
+        )
 
         snaps = db_session.query(UniverseSnapshot).all()
         assert len(snaps) == 7
@@ -307,8 +315,11 @@ class TestUniverseBuilder:
         assert counts[f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"] == 1
 
     def test_market_cap_bucket_helper(self):
+        assert _market_cap_bucket(30_000_000) == "30m_100m"
         assert _market_cap_bucket(75_000_000) == "30m_100m"
+        assert _market_cap_bucket(100_000_000) == "100m_200m"
         assert _market_cap_bucket(150_000_000) == "100m_200m"
+        assert _market_cap_bucket(200_000_000) == "200m_250m"
         assert _market_cap_bucket(225_000_000) == "200m_250m"
         assert _market_cap_bucket(None) == "unknown"
 
@@ -385,14 +396,128 @@ class TestUniverseBuilder:
         assert result.ok
         assert result.metrics["shell_company_exclusion_count"] == 1
         assert result.metrics["shell_company_exclusion_symbols_sample"] == ["SHEL"]
+        assert result.metrics["shell_company_exclusion_review_sample"] == [{
+            "symbol": "SHEL",
+            "company_name": "SHEL Corp",
+            "classification_reason": "industry:SHELL_COMPANIES",
+        }]
+        assert result.metrics["shell_company_exclusion_review_records"] == [{
+            "symbol": "SHEL",
+            "company_name": "SHEL Corp",
+            "classification_reason": "industry:SHELL_COMPANIES",
+        }]
         assert result.metrics["spac_pattern_exclusion_count"] == 1
         assert result.metrics["spac_pattern_exclusion_symbols_sample"] == ["SHEL"]
+        assert result.metrics["spac_pattern_exclusion_review_sample"] == [{
+            "symbol": "SHEL",
+            "company_name": "SHEL Corp",
+            "classification_reason": "industry:SHELL_COMPANIES",
+        }]
+        assert result.metrics["spac_pattern_exclusion_review_records"] == [{
+            "symbol": "SHEL",
+            "company_name": "SHEL Corp",
+            "classification_reason": "industry:SHELL_COMPANIES",
+        }]
         assert (
             result.metrics["security_type_classification_reason_counts"][
                 "industry:SHELL_COMPANIES"
             ]
             == 1
         )
+        assert (
+            sum(result.metrics["security_type_classification_reason_counts"].values())
+            == sum(result.metrics["security_type_exclusion_counts"].values())
+        )
+
+    def test_spac_pattern_operational_metrics_cover_regex_reasons(self, db_session):
+        db_session.add_all([
+            SecurityProfile(
+                symbol="ACQ",
+                security_type=SPAC_OR_BLANK_CHECK,
+                classification_reason="name_pattern:ACQUISITION_SEQUENCE",
+                last_refreshed_at=_ts(),
+                refresh_status=REFRESH_STATUS_ENRICHED,
+            ),
+            SecurityProfile(
+                symbol="INVI",
+                security_type=SPAC_OR_BLANK_CHECK,
+                classification_reason="name_pattern:INVESTMENT_CORP_SEQUENCE",
+                last_refreshed_at=_ts(),
+                refresh_status=REFRESH_STATUS_ENRICHED,
+            ),
+        ])
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[
+                _stock("ACQ", company_name="Alpha Acquisition III Co"),
+                _stock("INVI", company_name="Origin Investment Corp I"),
+                _stock("GOOD"),
+            ],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["spac_pattern_exclusion_count"] == 2
+        assert result.metrics["shell_company_exclusion_count"] == 0
+        assert result.metrics["spac_pattern_exclusion_symbols_sample"] == [
+            "ACQ",
+            "INVI",
+        ]
+        assert result.metrics["spac_pattern_exclusion_review_sample"] == [
+            {
+                "symbol": "ACQ",
+                "company_name": "Alpha Acquisition III Co",
+                "classification_reason": "name_pattern:ACQUISITION_SEQUENCE",
+            },
+            {
+                "symbol": "INVI",
+                "company_name": "Origin Investment Corp I",
+                "classification_reason": "name_pattern:INVESTMENT_CORP_SEQUENCE",
+            },
+        ]
+        assert result.metrics["security_type_classification_reason_counts"] == {
+            "name_pattern:ACQUISITION_SEQUENCE": 1,
+            "name_pattern:INVESTMENT_CORP_SEQUENCE": 1,
+        }
+
+    def test_spac_pattern_review_records_are_exhaustive_beyond_preview_cap(self, db_session):
+        profiles = []
+        stocks = []
+        for idx in range(26):
+            symbol = f"S{idx:02d}"
+            profiles.append(SecurityProfile(
+                symbol=symbol,
+                security_type=SPAC_OR_BLANK_CHECK,
+                classification_reason="name_pattern:ACQUISITION_SEQUENCE",
+                last_refreshed_at=_ts(),
+                refresh_status=REFRESH_STATUS_ENRICHED,
+            ))
+            stocks.append(_stock(
+                symbol,
+                company_name=f"Sample Acquisition {idx} Co",
+            ))
+        db_session.add_all(profiles)
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[*stocks, _stock("GOOD")],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        assert result.metrics["spac_pattern_exclusion_count"] == 26
+        assert len(result.metrics["spac_pattern_exclusion_review_sample"]) == 25
+        assert len(result.metrics["spac_pattern_exclusion_review_records"]) == 26
+        assert result.metrics["spac_pattern_exclusion_review_records"][-1] == {
+            "symbol": "S25",
+            "company_name": "Sample Acquisition 25 Co",
+            "classification_reason": "name_pattern:ACQUISITION_SEQUENCE",
+        }
 
     def test_zero_included_scan_fails_without_canonical(self, db_session):
         resp = AdapterResponse(
