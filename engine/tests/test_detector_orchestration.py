@@ -626,6 +626,21 @@ class TestStrictRefusal:
         assert passed is False
         assert "after trading_date 2026-05-24" in reason
 
+    def test_utc_next_day_same_market_date_passes_without_scan_cutoff(self):
+        passed, reason = check_lookahead_guard(
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=datetime(2026, 5, 21, 0, 30, tzinfo=timezone.utc),
+                market_data={"price": 5.0},
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+            trading_date="2026-05-20",
+        )
+
+        assert passed is True
+        assert reason is None
+
     def test_detector_feature_guard_false_refuses_signal(self, db_session):
         _setup_canonical_universe(db_session)
 

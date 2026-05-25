@@ -179,15 +179,6 @@ def check_lookahead_guard(
                 f"{inp.asof_timestamp.isoformat()} is after canonical scan asof "
                 f"{max_asof_timestamp.isoformat()}",
             )
-    else:
-        # Fallback for unit callers that do not have a scan-asof cutoff.
-        asof_date_str = inp.asof_timestamp.date().isoformat()
-        if asof_date_str > trading_date:
-            return (
-                False,
-                f"asof_timestamp {asof_date_str} is after trading_date {trading_date}",
-            )
-
     # Check lineage hashes are present and nonblank — proves data provenance exists.
     if not any(str(value or "").strip() for value in inp.lineage_hashes):
         return False, "missing_lineage_hashes"

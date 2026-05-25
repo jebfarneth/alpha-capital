@@ -17,6 +17,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import List
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -1628,6 +1629,70 @@ class TestCanonicalUniverseScan:
 
         assert result.ok
         assert get_canonical_universe_scan(db_session, "2026-05-20") is not None
+
+    def test_null_screener_asof_is_typed_failure(self, db_session):
+        resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=_ts(),
+                asof_timestamp=None,
+                raw_payload_hash="missing-asof",
+                source_authority="mock",
+            ),
+        )
+
+        result = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp),
+            params={"trading_date": "2026-05-20"},
+        )
+
+        assert not result.ok
+        assert result.errors == [{
+            "stage": "screener_asof",
+            "message": "company screener asof_timestamp is missing",
+        }]
+        assert db_session.query(DataLineage).count() == 0
+        assert db_session.query(UniverseScan).count() == 0
+        assert db_session.query(UniverseSnapshot).count() == 0
+        assert db_session.query(CanonicalUniverseScan).count() == 0
+
+    def test_aware_et_screener_asof_persists_as_utc(self, db_session):
+        resp = AdapterResponse(
+            data=_mock_screener_data(),
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=datetime(
+                    2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")
+                ),
+                asof_timestamp=datetime(
+                    2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")
+                ),
+                raw_payload_hash="et-midnight",
+                source_authority="mock",
+            ),
+        )
+
+        result = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp),
+            params={"trading_date": "2026-05-20"},
+        )
+        db_session.expire_all()
+
+        assert result.ok
+        scan = db_session.query(UniverseScan).one()
+        assert scan.asof_timestamp == datetime(2026, 5, 20, 4, 0)
+        assert {
+            snap.asof_timestamp
+            for snap in db_session.query(UniverseSnapshot).all()
+        } == {datetime(2026, 5, 20, 4, 0)}
+        lineage = db_session.query(DataLineage).one()
+        assert lineage.asof_timestamp == datetime(2026, 5, 20, 4, 0)
+        assert lineage.request_timestamp == datetime(2026, 5, 20, 4, 0)
 
     def test_failed_run_does_not_replace_canonical(self, db_session):
         r1 = self._run_builder(db_session)

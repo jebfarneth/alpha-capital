@@ -269,7 +269,7 @@ def _classify(stock: FmpScreenerResult) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def _derive_trading_date(params: Dict[str, Any], asof: datetime) -> str:
+def _derive_trading_date(params: Dict[str, Any], asof: Optional[datetime]) -> str:
     """Extract trading_date from job params or derive from asof timestamp."""
     raw = params.get("trading_date")
     if isinstance(raw, datetime):
@@ -280,23 +280,34 @@ def _derive_trading_date(params: Dict[str, Any], asof: datetime) -> str:
         cleaned = raw.strip()
         if cleaned:
             return date.fromisoformat(cleaned).isoformat()
-    return asof.date().isoformat()
+    if asof is None:
+        raise ValueError(
+            "company screener asof_timestamp is missing and trading_date was not provided"
+        )
+    return _market_date(asof).isoformat()
+
+
+def _utc_aware_datetime(value: datetime) -> datetime:
+    """Normalize adapter/SQLite timestamps to aware UTC."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _market_date(value: datetime) -> date:
     """Return the US market-local date for an adapter timestamp."""
-    if value.tzinfo is not None and value.utcoffset() is not None:
-        return value.astimezone(MARKET_TIMEZONE).date()
-    return value.date()
+    return _utc_aware_datetime(value).astimezone(MARKET_TIMEZONE).date()
 
 
-def _screener_asof_error(trading_date: str, asof: datetime) -> Optional[str]:
+def _screener_asof_error(trading_date: str, asof: Optional[datetime]) -> Optional[str]:
     """Fail closed when a current-state screener payload is used for another date.
 
     FMP's company screener does not accept a historical as-of parameter. Its payload is
     therefore current as of the request/provider timestamp, not as of an arbitrary
     backtest date. Treat a market-date mismatch as a point-in-time violation.
     """
+    if asof is None:
+        return "company screener asof_timestamp is missing"
     requested = date.fromisoformat(trading_date)
     actual = _market_date(asof)
     if actual == requested:
@@ -540,8 +551,29 @@ class UniverseBuilderJob(BaseJob):
 
     def run(self, ctx: JobContext) -> JobResult:
         resp = self._screener_response
-        trading_date = _derive_trading_date(ctx.params, resp.lineage.asof_timestamp)
-        asof_error = _screener_asof_error(trading_date, resp.lineage.asof_timestamp)
+        raw_asof_timestamp = resp.lineage.asof_timestamp
+        asof_timestamp = (
+            _utc_aware_datetime(raw_asof_timestamp)
+            if raw_asof_timestamp is not None
+            else None
+        )
+        request_timestamp = (
+            _utc_aware_datetime(resp.lineage.request_timestamp)
+            if resp.lineage.request_timestamp is not None
+            else None
+        )
+        try:
+            trading_date = _derive_trading_date(ctx.params, asof_timestamp)
+        except ValueError as exc:
+            return JobResult(
+                status="failed",
+                input_hashes={"screener": resp.lineage.raw_payload_hash},
+                errors=[{
+                    "stage": "screener_asof",
+                    "message": str(exc),
+                }],
+            )
+        asof_error = _screener_asof_error(trading_date, asof_timestamp)
         if asof_error is not None:
             return JobResult(
                 status="failed",
@@ -556,9 +588,9 @@ class UniverseBuilderJob(BaseJob):
             self._session,
             provider=resp.lineage.provider,
             endpoint=resp.lineage.endpoint,
-            asof_timestamp=resp.lineage.asof_timestamp,
+            asof_timestamp=asof_timestamp,
             raw_payload_hash=resp.lineage.raw_payload_hash,
-            request_timestamp=resp.lineage.request_timestamp,
+            request_timestamp=request_timestamp,
             freshness_seconds=resp.lineage.freshness_seconds,
             source_authority=resp.lineage.source_authority,
             data_quality_flags=resp.lineage.data_quality_flags,
@@ -571,7 +603,7 @@ class UniverseBuilderJob(BaseJob):
                 scan_id=scan_id,
                 trading_date=trading_date,
                 job_run_id=ctx.job_run_id,
-                asof_timestamp=resp.lineage.asof_timestamp,
+                asof_timestamp=asof_timestamp,
                 provider=resp.lineage.provider,
                 raw_count=0,
                 deduped_count=0,
@@ -606,7 +638,7 @@ class UniverseBuilderJob(BaseJob):
             scan_id=scan_id,
             trading_date=trading_date,
             job_run_id=ctx.job_run_id,
-            asof_timestamp=resp.lineage.asof_timestamp,
+            asof_timestamp=asof_timestamp,
             provider=resp.lineage.provider,
             raw_count=0,
             deduped_count=0,
@@ -630,7 +662,7 @@ class UniverseBuilderJob(BaseJob):
         security_profile_cache_hash = _security_profile_cache_hash(
             profile_cache,
             [symbol for _, _, _, symbol in deduped_rows],
-            asof=resp.lineage.asof_timestamp,
+            asof=asof_timestamp,
             max_age_days=self._profile_cache_max_age_days,
         )
         cache_hit_count = 0
@@ -671,7 +703,7 @@ class UniverseBuilderJob(BaseJob):
                 refresh_status = cached_profile.refresh_status
                 stale = _security_profile_stale(
                     cached_profile,
-                    resp.lineage.asof_timestamp,
+                    asof_timestamp,
                     self._profile_cache_max_age_days,
                 )
                 if stale:
@@ -760,7 +792,7 @@ class UniverseBuilderJob(BaseJob):
                 job_run_id=ctx.job_run_id,
                 scan_id=scan_id,
                 ticker=symbol,
-                asof_timestamp=resp.lineage.asof_timestamp,
+                asof_timestamp=asof_timestamp,
                 source_provider=resp.lineage.provider,
                 market_cap=market_cap,
                 price=price,
