@@ -1,0 +1,1081 @@
+"""
+Feature assembly tests.
+
+Covers all acceptance criteria from Engineering/FeatureAssembly.md:
+  - Registry represents all 17 pattern ids with correct statuses.
+  - M4 daily assembler produces PatternInput objects with lineage from fixtures.
+  - Orchestration can produce feature_snapshots > 0 from M4 assembled inputs.
+  - Future-bar leak test fails closed.
+  - Missing/insufficient-history test proves no zero-fill.
+  - Existing orchestration behavior remains compatible.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List
+
+import pytest
+
+from alpha.assembly.framework import (
+    AssembledField,
+    AssemblyDiagnostic,
+    FieldPresence,
+    PatternAssemblyResult,
+    build_pattern_input,
+    validate_assembled_fields,
+)
+from alpha.assembly.m4_daily import (
+    DailyBar,
+    assemble_m4_daily,
+)
+from alpha.assembly.registry import AssemblerStatus, AssemblyRegistry
+from alpha.data.contracts import stable_hash
+from alpha.db.models import (
+    CanonicalUniverseScan,
+    FeatureSnapshot,
+    SignalRegistry,
+    UniverseScan,
+    UniverseSnapshot,
+)
+from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
+from alpha.jobs.runner import run_job
+from alpha.patterns.contracts import (
+    BasePatternDetector,
+    FidelityTier,
+    PatternDetectionResult,
+    PatternFeatures,
+    PatternId,
+    PatternInput,
+    PatternSignal,
+    PatternTrack,
+    RouteClass,
+    SignalDirection,
+    ThesisCategory,
+)
+from alpha.patterns.m4 import M4Detector
+from alpha.evidence.writer import record_data_lineage
+
+
+def _ts():
+    return datetime(2026, 5, 20, 14, 30, 0, tzinfo=timezone.utc)
+
+
+def _make_bars(
+    n: int = 252,
+    base_high: float = 9.0,
+    final_high: float = 10.0,
+    start_date: str = "2025-05-20",
+    source_ts: datetime | None = None,
+) -> List[DailyBar]:
+    """Generate exactly n daily bars with ascending weekday dates."""
+    from datetime import date as date_type
+
+    d = date_type.fromisoformat(start_date)
+    bars: List[DailyBar] = []
+    day_offset = 0
+    while len(bars) < n:
+        day = d + timedelta(days=day_offset)
+        day_offset += 1
+        if day.weekday() >= 5:
+            continue
+        high = base_high if len(bars) < n - 1 else final_high
+        bars.append(DailyBar(
+            date=day.isoformat(),
+            open=high - 0.5,
+            high=high,
+            low=high - 1.0,
+            close=high - 0.2,
+            volume=100_000,
+            adj_close=high,
+            source_timestamp=source_ts or _ts(),
+            source_provider="FMP",
+            lineage_hash="bar-lineage-hash",
+        ))
+    return bars
+
+
+def _make_breakout_bars(
+    n: int = 252,
+    high_52w: float = 10.0,
+    close_price: float = 10.5,
+    source_ts: datetime | None = None,
+) -> List[DailyBar]:
+    """Generate bars where the last bar's close is at or above the 52w high."""
+    bars = _make_bars(n=n, base_high=high_52w - 1.0, final_high=high_52w, source_ts=source_ts)
+    if bars:
+        bars[-1] = DailyBar(
+            date=bars[-1].date,
+            open=close_price - 0.3,
+            high=max(close_price, high_52w),
+            low=close_price - 0.5,
+            close=close_price,
+            volume=200_000,
+            adj_close=high_52w,
+            source_timestamp=source_ts or _ts(),
+            source_provider="FMP",
+            lineage_hash="bar-lineage-hash",
+        )
+    return bars
+
+
+def _make_snapshot(
+    ticker: str = "ACME",
+    price: float = 10.5,
+    universe_snapshot_id: str | None = None,
+) -> dict:
+    return {
+        "ticker": ticker,
+        "universe_snapshot_id": universe_snapshot_id or f"snap-{ticker}",
+        "asof_timestamp": _ts(),
+        "price": price,
+        "market_cap": 75_000_000,
+        "primary_exchange": "NASDAQ",
+        "security_type": "common_stock",
+        "operating_universe_inclusion": True,
+        "source_lineage_hash": "snap-lineage-hash",
+    }
+
+
+def _setup_canonical_universe(
+    db_session, trading_date="2026-05-20", tickers=None, prices=None,
+):
+    """Create canonical universe with included snapshots for test DB."""
+    if tickers is None:
+        tickers = ["ACME", "BETA"]
+    if prices is None:
+        prices = {t: 10.5 for t in tickers}
+
+    scan = UniverseScan(
+        scan_id="test-scan",
+        trading_date=trading_date,
+        asof_timestamp=_ts(),
+        raw_count=len(tickers),
+        deduped_count=len(tickers),
+        included_count=len(tickers),
+        excluded_count=0,
+        run_status="finished",
+        source_lineage_hash="screener-hash",
+    )
+    db_session.add(scan)
+    db_session.flush()
+
+    db_session.add(CanonicalUniverseScan(
+        trading_date=trading_date,
+        scan_id="test-scan",
+        selection_reason="test",
+    ))
+    db_session.flush()
+
+    snapshots = []
+    for ticker in tickers:
+        snap = UniverseSnapshot(
+            universe_snapshot_id=f"snap-{ticker}",
+            scan_id="test-scan",
+            ticker=ticker,
+            asof_timestamp=_ts(),
+            market_cap=75_000_000,
+            price=prices.get(ticker, 10.5),
+            primary_exchange="NASDAQ",
+            security_type="common_stock",
+            operating_universe_inclusion=True,
+            source_lineage_hash="snap-lineage-hash",
+        )
+        db_session.add(snap)
+        snapshots.append(snap)
+
+    db_session.flush()
+    return scan, snapshots
+
+
+# ===================================================================
+# 1. Registry: all 17 pattern ids with correct statuses
+# ===================================================================
+
+
+class TestAssemblyRegistry:
+    def test_all_17_patterns_represented(self):
+        registry = AssemblyRegistry()
+        entries = registry.all_entries()
+        assert len(entries) == 17
+        assert {e.pattern_id for e in entries} == set(PatternId.ALL)
+
+    def test_default_statuses_correct(self):
+        registry = AssemblyRegistry()
+        # No assemblers registered: all detectors are detector_only, rest reserved
+        detector_patterns = {"M1", "M2", "M3", "M4", "M5", "M6", "M7", "I1", "I8"}
+        reserved_patterns = set(PatternId.ALL) - detector_patterns
+
+        for pid in detector_patterns:
+            assert registry.status(pid) == AssemblerStatus.DETECTOR_ONLY, pid
+        for pid in reserved_patterns:
+            assert registry.status(pid) == AssemblerStatus.RESERVED, pid
+
+    def test_m4_implemented_when_assembler_registered(self):
+        registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
+        assert registry.status("M4") == AssemblerStatus.IMPLEMENTED
+        assert registry.get("M4").assembler is assemble_m4_daily
+
+    def test_disabled_overrides_everything(self):
+        registry = AssemblyRegistry(
+            assemblers={"M4": assemble_m4_daily},
+            disabled={"M4"},
+        )
+        assert registry.status("M4") == AssemblerStatus.DISABLED
+        assert registry.get("M4").assembler is None
+
+    def test_implemented_ids_returns_only_implemented(self):
+        registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
+        assert registry.implemented_ids() == ["M4"]
+
+    def test_diagnostics_returns_full_status_map(self):
+        registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
+        diag = registry.diagnostics()
+        assert len(diag) == 17
+        assert diag["M4"] == AssemblerStatus.IMPLEMENTED
+        assert diag["M1"] == AssemblerStatus.DETECTOR_ONLY
+        assert diag["I2"] == AssemblerStatus.RESERVED
+
+    def test_unknown_pattern_id_raises(self):
+        registry = AssemblyRegistry()
+        with pytest.raises(KeyError, match="unknown"):
+            registry.get("FAKE")
+
+
+# ===================================================================
+# 2. Framework: field-level lookahead enforcement
+# ===================================================================
+
+
+class TestFrameworkLookahead:
+    def test_present_field_before_cutoff_passes(self):
+        cutoff = datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc)
+        fields = [
+            AssembledField(
+                name="price", value=10.5,
+                presence=FieldPresence.PRESENT,
+                source_timestamp=datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc),
+                allowed_cutoff=cutoff,
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert validated == {"price": 10.5}
+        assert rejected == []
+
+    def test_present_field_after_cutoff_rejected(self):
+        cutoff = datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc)
+        fields = [
+            AssembledField(
+                name="price", value=10.5,
+                presence=FieldPresence.PRESENT,
+                source_timestamp=datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc),
+                allowed_cutoff=cutoff,
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert "price" not in validated
+        assert len(rejected) == 1
+        assert rejected[0].presence == FieldPresence.REJECTED_LOOKAHEAD
+        assert "after cutoff" in rejected[0].rejection_reason
+
+    def test_missing_field_goes_to_rejected(self):
+        cutoff = _ts()
+        fields = [
+            AssembledField(
+                name="high_52w", value=None,
+                presence=FieldPresence.MISSING,
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert "high_52w" not in validated
+        assert len(rejected) == 1
+
+    def test_unavailable_field_goes_to_rejected(self):
+        cutoff = _ts()
+        fields = [
+            AssembledField(
+                name="high_52w", value=None,
+                presence=FieldPresence.UNAVAILABLE,
+                rejection_reason="no_daily_bars_available",
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert "high_52w" not in validated
+        assert len(rejected) == 1
+
+    def test_present_field_without_timestamp_passes(self):
+        """Fields without source_timestamp (e.g. trading_date) pass through."""
+        cutoff = _ts()
+        fields = [
+            AssembledField(
+                name="trading_date", value="2026-05-20",
+                presence=FieldPresence.PRESENT,
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert validated == {"trading_date": "2026-05-20"}
+        assert rejected == []
+
+    def test_zero_value_preserved_not_coerced(self):
+        """0 means observed zero — must not be treated as missing."""
+        cutoff = _ts()
+        fields = [
+            AssembledField(
+                name="volume", value=0,
+                presence=FieldPresence.PRESENT,
+                source_timestamp=_ts() - timedelta(hours=1),
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, cutoff)
+        assert validated["volume"] == 0
+
+
+# ===================================================================
+# 3. M4 daily assembler: fixture-based assembly
+# ===================================================================
+
+
+class TestM4DailyAssembler:
+    def test_basic_assembly_produces_pattern_inputs(self):
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": _make_breakout_bars(n=252, high_52w=10.0, close_price=10.5)}
+        result = assemble_m4_daily(
+            snapshots=snapshots,
+            daily_bars=bars,
+            trading_date="2026-05-20",
+            cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        assert len(result.inputs) == 1
+
+        inp = result.inputs[0]
+        assert inp.ticker == "ACME"
+        assert inp.market_data["price"] == 10.5
+        assert inp.market_data["high_52w"] is not None
+        assert inp.market_data["n_sessions_in_window"] == 252
+        assert inp.market_data["operating_universe_inclusion"] is True
+        assert inp.market_data["trading_date"] == "2026-05-20"
+        assert inp.universe_snapshot_id == "snap-ACME"
+        assert len(inp.lineage_hashes) > 0
+
+    def test_deterministic_for_fixed_fixtures(self):
+        snapshots = [_make_snapshot("ACME")]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        r1 = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        r2 = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert len(r1.inputs) == len(r2.inputs)
+        assert r1.inputs[0].market_data == r2.inputs[0].market_data
+        assert r1.inputs[0].lineage_hashes == r2.inputs[0].lineage_hashes
+
+    def test_multiple_tickers_assembled(self):
+        snapshots = [
+            _make_snapshot("ACME", price=10.5),
+            _make_snapshot("BETA", price=8.0),
+        ]
+        bars = {
+            "ACME": _make_breakout_bars(n=252, high_52w=10.0, close_price=10.5),
+            "BETA": _make_breakout_bars(n=252, high_52w=7.5, close_price=8.0),
+        }
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 2
+        tickers = {inp.ticker for inp in result.inputs}
+        assert tickers == {"ACME", "BETA"}
+
+    def test_lineage_hashes_populated(self):
+        snapshots = [_make_snapshot("ACME")]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        inp = result.inputs[0]
+        assert "snap-lineage-hash" in inp.lineage_hashes
+        assert "bar-lineage-hash" in inp.lineage_hashes
+
+    def test_high_52w_date_populated_when_computable(self):
+        snapshots = [_make_snapshot("ACME")]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        inp = result.inputs[0]
+        assert "high_52w_date" in inp.market_data
+        assert inp.market_data["high_52w_date"] is not None
+
+    def test_security_type_and_exchange_included(self):
+        snapshots = [_make_snapshot("ACME")]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        inp = result.inputs[0]
+        assert inp.market_data["security_type"] == "common_stock"
+        assert inp.market_data["primary_exchange"] == "NASDAQ"
+
+    def test_high_52w_uses_adjusted_close_not_raw_high(self):
+        snapshots = [_make_snapshot("ACME", price=13.0)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-18",
+                open=98.0,
+                high=100.0,
+                low=95.0,
+                close=100.0,
+                volume=100_000,
+                adj_close=10.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-19",
+                open=11.0,
+                high=12.5,
+                low=10.5,
+                close=12.0,
+                volume=100_000,
+                adj_close=12.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        assert result.inputs[0].market_data["high_52w"] == 12.0
+        assert result.inputs[0].market_data["high_52w_basis"] == (
+            "adjusted_close_prior_252_sessions"
+        )
+
+    def test_trading_date_bar_excluded_from_high_52w(self):
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-19",
+                open=9.0,
+                high=10.0,
+                low=8.5,
+                close=10.0,
+                volume=100_000,
+                adj_close=10.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-20",
+                open=50.0,
+                high=99.0,
+                low=49.0,
+                close=99.0,
+                volume=100_000,
+                adj_close=99.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        assert result.inputs[0].market_data["high_52w"] == 10.0
+        assert result.inputs[0].market_data["high_52w_date"] == "2026-05-19"
+
+    def test_missing_adjusted_close_rejects_unadjusted_high(self):
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-19",
+                open=9.0,
+                high=100.0,
+                low=8.5,
+                close=100.0,
+                volume=100_000,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 0
+        assert result.rejected_count == 1
+        assert any(
+            d.diagnostic_type == "adjusted_close_unavailable"
+            for d in result.diagnostics
+        )
+
+
+# ===================================================================
+# 4. Future-bar leak test: fails closed
+# ===================================================================
+
+
+class TestFutureBarLeak:
+    def test_future_bar_rejected_produces_no_input(self):
+        """A daily bar with source_timestamp after the cutoff must be rejected.
+
+        This is the antagonistic M4 future-bar test required by the spec.
+        The framework must reject future-contaminated fields and produce
+        no detector input / feature snapshot from the contaminated data.
+        """
+        cutoff = datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc)
+        future_ts = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+        # All bars have a future source timestamp
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=10.5,
+            source_ts=future_ts,
+        )}
+
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=cutoff,
+        )
+
+        # The 52w high and related fields should be rejected by the framework
+        assert result.assembled_count == 0
+        assert len(result.inputs) == 0
+        assert result.rejected_count + result.insufficient_count > 0
+        # Verify diagnostic explains the rejection
+        has_diag = any(
+            d.diagnostic_type in ("insufficient_history", "field_rejected_lookahead")
+            for d in result.diagnostics
+        )
+        assert has_diag
+
+    def test_future_bar_date_rejected_even_with_allowed_source_timestamp(self):
+        """A bar dated after trading_date is lookahead even if sourced before cutoff."""
+        cutoff = datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc)
+        allowed_source_ts = datetime(2026, 5, 20, 19, 0, tzinfo=timezone.utc)
+
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-21",
+                open=10.0,
+                high=10.5,
+                low=9.8,
+                close=10.4,
+                volume=100_000,
+                adj_close=10.4,
+                source_timestamp=allowed_source_ts,
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+
+        result = assemble_m4_daily(
+            snapshots=snapshots,
+            daily_bars=bars,
+            trading_date="2026-05-20",
+            cutoff_timestamp=cutoff,
+        )
+
+        assert result.assembled_count == 0
+        assert len(result.inputs) == 0
+        assert result.rejected_count == 1
+        assert any(
+            d.diagnostic_type == "field_rejected_lookahead"
+            and "bar.date 2026-05-21 after trading_date 2026-05-20" in (d.detail or "")
+            for d in result.diagnostics
+        )
+
+    def test_future_bar_produces_no_feature_snapshot(self, db_session):
+        """End-to-end: future-dated daily bar produces 0 feature snapshots."""
+        _setup_canonical_universe(db_session, tickers=["ACME"], prices={"ACME": 10.5})
+
+        cutoff = datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc)
+        allowed_source_ts = datetime(2026, 5, 20, 19, 0, tzinfo=timezone.utc)
+
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-21",
+                open=10.0,
+                high=10.5,
+                low=9.8,
+                close=10.4,
+                volume=100_000,
+                adj_close=10.4,
+                source_timestamp=allowed_source_ts,
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+        snapshots = [_make_snapshot("ACME", price=10.5)]
+
+        assembly = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=cutoff,
+        )
+        assert len(assembly.inputs) == 0
+
+        # Even if we run orchestration, no feature snapshots should be produced
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert db_session.query(FeatureSnapshot).count() == 0
+        assert db_session.query(SignalRegistry).count() == 0
+
+
+# ===================================================================
+# 5. Missing/insufficient history: no zero-fill
+# ===================================================================
+
+
+class TestMissingData:
+    def test_no_bars_produces_insufficient_diagnostic(self):
+        """Ticker with no bar history gets an explicit diagnostic, not zero-fill."""
+        snapshots = [_make_snapshot("ACME")]
+        result = assemble_m4_daily(
+            snapshots=snapshots,
+            daily_bars={},  # No bars at all
+            trading_date="2026-05-20",
+            cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 0
+        assert result.insufficient_count == 1
+        assert len(result.inputs) == 0
+        diag = result.diagnostics[0]
+        assert diag.diagnostic_type == "insufficient_history"
+        assert "ACME" == diag.ticker
+
+    def test_missing_price_in_snapshot_produces_diagnostic(self):
+        """Snapshot with None price gets a missing_price diagnostic."""
+        snapshots = [_make_snapshot("ACME", price=None)]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 0
+        assert result.rejected_count == 1
+        diag = result.diagnostics[0]
+        assert diag.diagnostic_type == "missing_price"
+
+    def test_zero_price_is_not_treated_as_missing(self):
+        """price=0 in the snapshot is an observed zero, not missing data."""
+        snapshots = [_make_snapshot("ACME", price=0.0)]
+        bars = {"ACME": _make_breakout_bars(n=100)}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        # Price 0.0 is "present" — framework should not suppress it
+        assert result.assembled_count == 1
+        assert result.inputs[0].market_data["price"] == 0.0
+
+    def test_insufficient_history_not_zero_filled(self):
+        """Verify that n_sessions_in_window reflects actual sessions, not 252."""
+        snapshots = [_make_snapshot("ACME")]
+        bars = {"ACME": _make_breakout_bars(n=50)}  # only 50 sessions
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        inp = result.inputs[0]
+        assert inp.market_data["n_sessions_in_window"] == 50
+        assert any(
+            d.diagnostic_type == "short_history"
+            for d in result.diagnostics
+        )
+
+    def test_mixed_available_and_missing(self):
+        """One ticker has bars, another doesn't — both handled correctly."""
+        snapshots = [
+            _make_snapshot("ACME"),
+            _make_snapshot("BETA"),
+        ]
+        bars = {"ACME": _make_breakout_bars(n=100)}  # BETA has no bars
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        assert result.insufficient_count == 1
+        assert result.inputs[0].ticker == "ACME"
+
+
+# ===================================================================
+# 6. Orchestration integration: assembled inputs by pattern_id
+# ===================================================================
+
+
+class TestOrchestrationWithAssembly:
+    def test_assembled_m4_inputs_produce_feature_snapshots(self, db_session):
+        """M4 assembled inputs fed through orchestration produce feature_snapshots > 0."""
+        tickers = ["ACME"]
+        prices = {"ACME": 10.5}
+        _, db_snapshots = _setup_canonical_universe(
+            db_session, tickers=tickers, prices=prices,
+        )
+
+        # Assemble M4 inputs from fixtures
+        fixture_snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=10.5,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert len(assembly.inputs) == 1
+
+        # Run orchestration with assembled inputs
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        # Acceptance: feature_snapshots > 0
+        feat_count = db_session.query(FeatureSnapshot).count()
+        assert feat_count > 0, f"Expected feature_snapshots > 0, got {feat_count}"
+
+        # The feature snapshot should have M4 pattern_id
+        feat = db_session.query(FeatureSnapshot).first()
+        assert feat.pattern_id == "M4"
+        assert feat.ticker == "ACME"
+
+    def test_assembled_inputs_signal_fires_on_breakout(self, db_session):
+        """M4 should fire a signal when price >= high_52w."""
+        _, _ = _setup_canonical_universe(
+            db_session, tickers=["ACME"], prices={"ACME": 10.5},
+        )
+
+        fixture_snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=10.5,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert result.metrics["total_signals_persisted"] >= 1
+        sig = db_session.query(SignalRegistry).first()
+        assert sig is not None
+        assert sig.pattern_id == "M4"
+        assert sig.ticker == "ACME"
+
+    def test_assembled_inputs_no_signal_below_high(self, db_session):
+        """M4 should not fire when price < high_52w."""
+        _, _ = _setup_canonical_universe(
+            db_session, tickers=["ACME"], prices={"ACME": 9.0},
+        )
+
+        fixture_snapshots = [_make_snapshot("ACME", price=9.0)]
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=9.0,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert db_session.query(SignalRegistry).count() == 0
+        assert result.metrics["total_signals_persisted"] == 0
+        assert db_session.query(FeatureSnapshot).count() == 1
+
+        feat = db_session.query(FeatureSnapshot).one()
+        assert feat.pattern_id == "M4"
+        assert feat.ticker == "ACME"
+        feature_json = json.loads(feat.feature_json)
+        assert feature_json["rejection_reason"] == "below_high"
+        assert feature_json["signal_generated"] is False
+        assert feature_json["H_52w"] == 10.0
+        assert feature_json["P_close"] == 9.0
+
+        # Detector evaluated the input (not crashed, not skipped by guard)
+        diag = result.metrics["detector_diagnostics"][0]
+        assert diag["evaluated_count"] == 1
+        assert diag["feature_snapshot_count"] == 1
+        assert diag["skipped_count"] == 1  # no signal = skipped
+
+    def test_assembled_inputs_resolve_lineage_hashes_to_feature_snapshot_ids(
+        self, db_session,
+    ):
+        """Assembled lineage hashes must persist as data_lineage_ids when resolvable."""
+        _setup_canonical_universe(
+            db_session, tickers=["ACME"], prices={"ACME": 9.0},
+        )
+        lineage = record_data_lineage(
+            db_session,
+            provider="FMP",
+            endpoint="/stable/historical-price-eod/full",
+            asof_timestamp=_ts(),
+            raw_payload_hash="bar-lineage-hash",
+        )
+
+        fixture_snapshots = [_make_snapshot("ACME", price=9.0)]
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=9.0,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        feat = db_session.query(FeatureSnapshot).one()
+        assert lineage.data_lineage_id in json.loads(feat.data_lineage_ids)
+
+    def test_no_signal_feature_snapshot_dedupes_on_rerun(self, db_session):
+        """Same no-signal feature content should not duplicate feature snapshots."""
+        _setup_canonical_universe(
+            db_session, tickers=["ACME"], prices={"ACME": 9.0},
+        )
+
+        fixture_snapshots = [_make_snapshot("ACME", price=9.0)]
+        bars = {"ACME": _make_breakout_bars(
+            n=252, high_52w=10.0, close_price=9.0,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        for _ in range(2):
+            orch = DetectorOrchestrationJob(
+                db_session,
+                detectors=[M4Detector()],
+                trading_date="2026-05-20",
+                assembled_inputs={"M4": assembly.inputs},
+            )
+            run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert db_session.query(SignalRegistry).count() == 0
+        assert db_session.query(FeatureSnapshot).count() == 1
+
+
+# ===================================================================
+# 7. Orchestration compatibility with existing injected inputs
+# ===================================================================
+
+
+class AlwaysFiresDetector(BasePatternDetector):
+    """Test detector that fires on every input."""
+
+    pattern_id = "TEST_FIRES"
+    version = "1.0"
+    track = PatternTrack.MULTI_DAY
+    thesis_category = ThesisCategory.RIGHT_TAIL_CONVEX
+    route_class = RouteClass.A
+
+    def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        identity = stable_hash({
+            "pattern_id": self.pattern_id,
+            "ticker": inp.ticker,
+            "setup": "fixture",
+        })
+        features = PatternFeatures(
+            features={
+                "score": 0.95,
+                "price": inp.market_data.get("price", 0),
+                "signal_identity_hash": identity,
+                "signal_identity_components": {
+                    "pattern_id": self.pattern_id,
+                    "ticker": inp.ticker,
+                    "setup": "fixture",
+                },
+            },
+            feature_manifest_version="test-v1",
+            fidelity_tier=FidelityTier.FULL,
+            point_in_time_passed=True,
+            lookahead_guard_passed=True,
+        )
+        return PatternDetectionResult(
+            pattern_id=self.pattern_id,
+            ticker=inp.ticker,
+            asof_timestamp=inp.asof_timestamp,
+            features=features,
+            signals=[PatternSignal(
+                direction=SignalDirection.LONG,
+                raw_signal_strength=0.95,
+                raw_expected_edge=0.05,
+                signal_horizon="10d",
+            )],
+            input_hashes={"market_data": stable_hash(inp.market_data)},
+        )
+
+
+class TestOrchestrationCompatibility:
+    def test_injected_inputs_still_work(self, db_session):
+        """Existing flat injected-input path remains functional."""
+        _setup_canonical_universe(db_session)
+
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=_ts(),
+                market_data={"price": 5.0},
+                lineage_hashes=["lineage-hash"],
+                universe_snapshot_id="snap-ACME",
+            ),
+        ]
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+            inputs=inputs,
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert result.ok or result.status == "finished"
+        assert result.metrics["total_signals_persisted"] == 1
+
+    def test_assembly_mode_skips_detector_without_assembled_inputs(self, db_session):
+        """Assembly mode skips detectors without assembled inputs instead of falling back."""
+        _setup_canonical_universe(db_session)
+
+        # Assembled M4 input
+        fixture_snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": _make_breakout_bars(n=252, high_52w=10.0, close_price=10.5)}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector(), AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        # Both detectors are represented, but only M4 has assembly input.
+        assert result.metrics["detector_count"] == 2
+
+        diags = {d["detector_id"]: d for d in result.metrics["detector_diagnostics"]}
+        assert diags["M4"]["evaluated_count"] == 1
+        assert diags["TEST_FIRES"]["evaluated_count"] == 0
+        assert diags["TEST_FIRES"]["detector_status"] == "skipped"
+        assert diags["TEST_FIRES"]["callable_status"] == "assembly_missing_inputs"
+
+        # Assembly diagnostics show the missing assembler/input path.
+        assert any(
+            d["detector_id"] == "TEST_FIRES"
+            and d["diagnostic"] == "assembled_inputs_missing"
+            for d in result.metrics["assembly_diagnostics"]
+        )
+
+    def test_no_crash_when_assembled_inputs_empty(self, db_session):
+        """Empty assembled inputs for a pattern should not crash orchestration."""
+        _setup_canonical_universe(db_session)
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": []},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        # Should not crash, just produce no signals
+        assert result.status == "finished"
+        diag = result.metrics["detector_diagnostics"][0]
+        assert diag["evaluated_count"] == 0
+        assert diag["detector_status"] == "skipped"
+        assert diag["callable_status"] == "assembly_empty_inputs"
+        assert result.metrics["assembly_diagnostics"] == [{
+            "detector_id": "M4",
+            "diagnostic": "assembled_inputs_empty",
+        }]
+
+
+# ===================================================================
+# 8. Assembly registry integration: diagnostics for missing assemblers
+# ===================================================================
+
+
+class TestRegistryDiagnostics:
+    def test_detector_only_pattern_reports_diagnostic(self):
+        """Patterns with detectors but no assembler produce explicit diagnostic."""
+        registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
+        entry = registry.get("M1")
+        assert entry.status == AssemblerStatus.DETECTOR_ONLY
+        assert entry.assembler is None
+
+    def test_reserved_pattern_reports_diagnostic(self):
+        """Reserved patterns with no detector or assembler report reserved status."""
+        registry = AssemblyRegistry()
+        entry = registry.get("I2")
+        assert entry.status == AssemblerStatus.RESERVED
+        assert entry.assembler is None
+
+    def test_full_diagnostics_map(self):
+        """The full diagnostics map shows all 17 patterns."""
+        registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
+        diag = registry.diagnostics()
+        assert diag == {
+            "M1": "detector_only",
+            "M2": "detector_only",
+            "M3": "detector_only",
+            "M4": "implemented",
+            "M5": "detector_only",
+            "M6": "detector_only",
+            "M7": "detector_only",
+            "I1": "detector_only",
+            "I2": "reserved",
+            "I3": "reserved",
+            "I4": "reserved",
+            "I5": "reserved",
+            "I6": "reserved",
+            "I7": "reserved",
+            "I8": "detector_only",
+            "I9": "reserved",
+            "I10": "reserved",
+        }

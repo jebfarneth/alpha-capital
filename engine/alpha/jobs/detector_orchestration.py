@@ -225,6 +225,7 @@ class DetectorDiagnostics:
     callable_status: str = "callable"
     evaluated_count: int = 0
     fired_count: int = 0
+    feature_snapshot_count: int = 0
     skipped_count: int = 0
     error_count: int = 0
     lookahead_failure_count: int = 0
@@ -241,6 +242,7 @@ class DetectorDiagnostics:
             "callable_status": self.callable_status,
             "evaluated_count": self.evaluated_count,
             "fired_count": self.fired_count,
+            "feature_snapshot_count": self.feature_snapshot_count,
             "skipped_count": self.skipped_count,
             "error_count": self.error_count,
             "lookahead_failure_count": self.lookahead_failure_count,
@@ -285,11 +287,13 @@ class DetectorOrchestrationJob(BaseJob):
         detectors: Optional[List[BasePatternDetector]] = None,
         trading_date: Optional[str] = None,
         inputs: Optional[List[PatternInput]] = None,
+        assembled_inputs: Optional[Dict[str, List[PatternInput]]] = None,
     ):
         self._session = session
         self._detectors = detectors
         self._trading_date = trading_date
         self._inputs = inputs
+        self._assembled_inputs = assembled_inputs
 
     def run(self, ctx: JobContext) -> JobResult:
         trading_date = self._trading_date or ctx.params.get("trading_date")
@@ -331,17 +335,50 @@ class DetectorOrchestrationJob(BaseJob):
             for snap in snapshots
             if snap.universe_snapshot_id is not None
         }
-        inputs = self._inputs or self._build_inputs_from_snapshots(snapshots, trading_date)
+        assembled = self._assembled_inputs  # dict[pattern_id, list[PatternInput]] or None
+        assembly_mode = assembled is not None
+        flat_inputs = None
+        if not assembly_mode:
+            flat_inputs = (
+                self._inputs
+                if self._inputs is not None
+                else self._build_inputs_from_snapshots(snapshots, trading_date)
+            )
 
         # 4. Run each detector with isolation
         all_diagnostics: List[DetectorDiagnostics] = []
+        assembly_diagnostics: List[Dict[str, Any]] = []
         total_signals = 0
         any_detector_failed = False
 
         for detector in detectors:
+            if assembly_mode:
+                if detector.pattern_id not in assembled:
+                    assembly_diagnostics.append({
+                        "detector_id": detector.pattern_id,
+                        "diagnostic": "assembled_inputs_missing",
+                    })
+                    all_diagnostics.append(self._assembly_skip_diagnostic(
+                        detector, callable_status="assembly_missing_inputs"
+                    ))
+                    continue
+
+                detector_inputs = assembled[detector.pattern_id]
+                if not detector_inputs:
+                    assembly_diagnostics.append({
+                        "detector_id": detector.pattern_id,
+                        "diagnostic": "assembled_inputs_empty",
+                    })
+                    all_diagnostics.append(self._assembly_skip_diagnostic(
+                        detector, callable_status="assembly_empty_inputs"
+                    ))
+                    continue
+            else:
+                detector_inputs = flat_inputs or []
+
             diag = self._run_detector(
                 detector=detector,
-                inputs=inputs,
+                inputs=detector_inputs,
                 trading_date=trading_date,
                 scan_id=scan_id,
                 scan_asof_timestamp=scan_asof_timestamp,
@@ -370,6 +407,7 @@ class DetectorOrchestrationJob(BaseJob):
             "total_signals_persisted": total_signals,
             "detector_diagnostics": [d.to_dict() for d in all_diagnostics],
             "any_detector_failed": any_detector_failed,
+            "assembly_diagnostics": assembly_diagnostics,
         }
 
         errors = []
@@ -382,6 +420,19 @@ class DetectorOrchestrationJob(BaseJob):
             metrics=metrics,
             input_hashes={"scan_id": scan_id},
             errors=errors if errors else [],
+        )
+
+    def _assembly_skip_diagnostic(
+        self,
+        detector: BasePatternDetector,
+        *,
+        callable_status: str,
+    ) -> DetectorDiagnostics:
+        return DetectorDiagnostics(
+            detector_id=detector.pattern_id,
+            detector_version=getattr(detector, "version", None) or "missing",
+            callable_status=callable_status,
+            detector_status="skipped",
         )
 
     def _load_canonical_universe(
@@ -536,20 +587,61 @@ class DetectorOrchestrationJob(BaseJob):
                 if lineage_hash_str:
                     diag.input_lineage_hashes.append(lineage_hash_str)
 
-            if not result.has_signal:
-                diag.skipped_count += 1
+            if result.features is None:
+                if result.has_signal:
+                    diag.identity_refused_count += 1
+                    diag.errors.append({
+                        "detector_id": detector.pattern_id,
+                        "ticker": inp.ticker,
+                        "error": "missing_features",
+                    })
+                else:
+                    diag.skipped_count += 1
                 continue
 
             result_guard_passed, result_guard_reason = _result_guard_passed(result)
             if not result_guard_passed:
                 diag.lookahead_failure_count += 1
-                diag.identity_refused_count += 1
+                if result.has_signal:
+                    diag.identity_refused_count += 1
                 diag.skipped_count += 1
                 diag.errors.append({
                     "detector_id": detector.pattern_id,
                     "ticker": inp.ticker,
                     "error": result_guard_reason,
                 })
+                continue
+
+            if not result.has_signal:
+                try:
+                    with self._session.begin_nested():
+                        persisted = persist_detection_result(
+                            self._session,
+                            result,
+                            detector,
+                            job_run_id=job_run_id,
+                            universe_snapshot_id=inp.universe_snapshot_id,
+                            data_lineage_ids=self._resolved_input_lineage_ids(inp),
+                            code_commit_sha=code_commit_sha,
+                            trading_date=trading_date,
+                            scan_id=scan_id,
+                            detector_version=detector_version,
+                            point_in_time_passed=result.features.point_in_time_passed,
+                            lookahead_guard_passed=result.features.lookahead_guard_passed,
+                        )
+                except Exception as exc:
+                    diag.error_count += 1
+                    diag.errors.append({
+                        "detector_id": detector.pattern_id,
+                        "ticker": inp.ticker,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    })
+                    continue
+
+                if persisted.feature_snapshot_id:
+                    diag.feature_snapshot_count += 1
+                diag.skipped_count += 1
                 continue
 
             detector_identity_hash = result.features.features.get("signal_identity_hash")
@@ -634,7 +726,6 @@ class DetectorOrchestrationJob(BaseJob):
                 "signal_horizon": signal.signal_horizon,
                 "signal_event_sequence": 1,
             }
-            result.features.features["canonical_scan_id"] = scan_id
 
             # Persist through evidence bridge
             try:
@@ -645,7 +736,7 @@ class DetectorOrchestrationJob(BaseJob):
                         detector,
                         job_run_id=job_run_id,
                         universe_snapshot_id=inp.universe_snapshot_id,
-                        data_lineage_ids=inp.lineage_ids,
+                        data_lineage_ids=self._resolved_input_lineage_ids(inp),
                         code_commit_sha=code_commit_sha,
                         trading_date=trading_date,
                         scan_id=scan_id,
@@ -685,6 +776,8 @@ class DetectorOrchestrationJob(BaseJob):
                 continue
 
             if persisted.signal_ids:
+                if persisted.feature_snapshot_id:
+                    diag.feature_snapshot_count += 1
                 diag.fired_count += len(persisted.signal_ids)
             else:
                 diag.identity_refused_count += 1
@@ -698,3 +791,31 @@ class DetectorOrchestrationJob(BaseJob):
             diag.detector_status = "partial_failed" if diag.fired_count > 0 else "failed"
 
         return diag
+
+    def _resolved_input_lineage_ids(self, inp: PatternInput) -> List[str]:
+        """Resolve input lineage hashes to data_lineage IDs when rows exist."""
+        lineage_ids: List[str] = []
+        seen: set[str] = set()
+
+        for lineage_id in inp.lineage_ids:
+            if lineage_id and lineage_id not in seen:
+                lineage_ids.append(lineage_id)
+                seen.add(lineage_id)
+
+        lineage_hashes = [
+            str(value).strip()
+            for value in inp.lineage_hashes
+            if str(value or "").strip()
+        ]
+        if lineage_hashes:
+            rows = (
+                self._session.query(DataLineage.data_lineage_id)
+                .filter(DataLineage.raw_payload_hash.in_(lineage_hashes))
+                .all()
+            )
+            for (data_lineage_id,) in rows:
+                if data_lineage_id and data_lineage_id not in seen:
+                    lineage_ids.append(data_lineage_id)
+                    seen.add(data_lineage_id)
+
+        return lineage_ids

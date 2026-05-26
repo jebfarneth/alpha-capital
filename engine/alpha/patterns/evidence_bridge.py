@@ -73,6 +73,22 @@ def persist_detection_result(
     if result.signals and not signal_identity_hashes:
         raise ValueError("signals require signal_identity_hash in features")
 
+    if not result.signals:
+        feature_hash = stable_hash(result.features.features)
+        existing_feature = (
+            session.query(FeatureSnapshot)
+            .filter(
+                FeatureSnapshot.pattern_id == result.pattern_id,
+                FeatureSnapshot.ticker == result.ticker,
+                FeatureSnapshot.asof_timestamp == result.asof_timestamp,
+                FeatureSnapshot.feature_hash == feature_hash,
+            )
+            .first()
+        )
+        if existing_feature is not None:
+            persisted.feature_snapshot_id = existing_feature.feature_snapshot_id
+            return persisted
+
     existing_by_hash = {}
     if signal_identity_hashes:
         existing_signals = (

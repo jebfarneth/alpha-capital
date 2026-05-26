@@ -94,6 +94,10 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "m6_also_firing",
     "overlapping_pattern_ids",
     "high_52w_date",
+    "high_52w_basis",
+    "lookback_start",
+    "lookback_end",
+    "price_source",
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
