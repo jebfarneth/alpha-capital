@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy import or_
@@ -51,6 +51,7 @@ REFRESH_STATUS_ENRICHED = "enriched"
 REFRESH_STATUS_NO_DATA = "no_data"
 REFRESH_STATUS_RETRYABLE_ERROR = "retryable_error"
 REFRESH_STATUS_FAILED = "failed"
+DEFAULT_PROFILE_CACHE_MAX_AGE_DAYS = 7
 
 NON_COMMON_TYPES = frozenset({
     ETF,
@@ -63,6 +64,12 @@ NON_COMMON_TYPES = frozenset({
     RIGHT,
     SPAC_OR_BLANK_CHECK,
     BUSINESS_DEVELOPMENT_COMPANY,
+})
+
+REFRESH_STATUSES_REQUIRING_RETRY = frozenset({
+    REFRESH_STATUS_NO_DATA,
+    REFRESH_STATUS_RETRYABLE_ERROR,
+    REFRESH_STATUS_FAILED,
 })
 
 BDC_INDUSTRIES = frozenset({"ASSET MANAGEMENT", "FINANCIAL - CREDIT SERVICES"})
@@ -83,6 +90,104 @@ SPAC_ACQUISITION_SEQUENCE_RE = re.compile(
 SPAC_INVESTMENT_CORP_SEQUENCE_RE = re.compile(
     r"\bINVESTMENT\s+CORP(?:ORATION)?\s+(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\b"
 )
+
+
+def _datetime_order_key(value: datetime) -> datetime:
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _profile_stale(
+    profile: SecurityProfile,
+    *,
+    asof: datetime,
+    max_age_days: Optional[int],
+) -> bool:
+    if max_age_days is None:
+        return False
+    if profile.last_refreshed_at is None:
+        return True
+    cutoff = _datetime_order_key(asof) - timedelta(days=max_age_days)
+    return _datetime_order_key(profile.last_refreshed_at) < cutoff
+
+
+def _normalize_symbol(symbol: object) -> str:
+    if symbol is None:
+        return ""
+    return str(symbol).strip().upper()
+
+
+def profile_refresh_plan(
+    session: Session,
+    symbols: List[str],
+    *,
+    asof: datetime,
+    max_age_days: Optional[int] = DEFAULT_PROFILE_CACHE_MAX_AGE_DAYS,
+) -> tuple[List[str], Dict[str, int]]:
+    normalized_symbols = sorted({
+        normalized
+        for symbol in symbols
+        if (normalized := _normalize_symbol(symbol))
+    })
+    if not normalized_symbols:
+        return [], {
+            "required_symbol_count": 0,
+            "refresh_symbol_count": 0,
+            "fresh_cached_count": 0,
+            "missing_count": 0,
+            "stale_count": 0,
+            "classifier_version_mismatch_count": 0,
+            "unresolved_count": 0,
+        }
+
+    existing = {
+        row.symbol: row
+        for row in (
+            session.query(SecurityProfile)
+            .filter(SecurityProfile.symbol.in_(normalized_symbols))
+            .all()
+        )
+    }
+    refresh_symbols: list[str] = []
+    reason_counts: Counter = Counter()
+
+    for symbol in normalized_symbols:
+        profile = existing.get(symbol)
+        if profile is None:
+            refresh_symbols.append(symbol)
+            reason_counts["missing_count"] += 1
+            continue
+        if profile.classifier_version != CLASSIFIER_VERSION:
+            refresh_symbols.append(symbol)
+            reason_counts["classifier_version_mismatch_count"] += 1
+            continue
+        if (
+            profile.refresh_status in REFRESH_STATUSES_REQUIRING_RETRY
+            or profile.refresh_status != REFRESH_STATUS_ENRICHED
+            or profile.security_type == UNKNOWN
+        ):
+            refresh_symbols.append(symbol)
+            reason_counts["unresolved_count"] += 1
+            continue
+        if _profile_stale(profile, asof=asof, max_age_days=max_age_days):
+            refresh_symbols.append(symbol)
+            reason_counts["stale_count"] += 1
+            continue
+        reason_counts["fresh_cached_count"] += 1
+
+    metrics = {
+        "required_symbol_count": len(normalized_symbols),
+        "refresh_symbol_count": len(refresh_symbols),
+        "fresh_cached_count": reason_counts["fresh_cached_count"],
+        "missing_count": reason_counts["missing_count"],
+        "stale_count": reason_counts["stale_count"],
+        "classifier_version_mismatch_count": (
+            reason_counts["classifier_version_mismatch_count"]
+        ),
+        "unresolved_count": reason_counts["unresolved_count"],
+    }
+    return refresh_symbols, metrics
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +476,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
         retry_attempt_count = 0
         security_type_counts: Counter = Counter()
 
+        existing_profiles = self._load_existing_profiles(symbols)
         fetch_results = self._fetch_profiles(symbols)
 
         for symbol, resp, attempts, exc in sorted(
@@ -382,6 +488,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 self._mark_profile_failed(
                     symbol,
                     exc or RuntimeError("profile fetch returned no response"),
+                    existing_profiles=existing_profiles,
                 )
                 continue
 
@@ -400,6 +507,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
                     refresh_status = REFRESH_STATUS_FAILED
                     reason = f"profile_fetch_failed:{error_type}"
                 self._upsert_profile(
+                    existing_profiles=existing_profiles,
                     symbol=symbol,
                     security_type=UNKNOWN,
                     classification_reason=reason,
@@ -446,6 +554,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
             })
 
             self._upsert_profile(
+                existing_profiles=existing_profiles,
                 symbol=symbol,
                 security_type=security_type,
                 classification_reason=reason,
@@ -555,15 +664,35 @@ class SecurityTypeEnrichmentJob(BaseJob):
         )
         return [r[0] for r in rows]
 
-    def _mark_profile_failed(self, symbol: str, exc: Exception) -> None:
+    def _load_existing_profiles(self, symbols: List[str]) -> Dict[str, SecurityProfile]:
+        normalized_symbols = sorted({
+            normalized
+            for symbol in symbols
+            if (normalized := _normalize_symbol(symbol))
+        })
+        if not normalized_symbols:
+            return {}
+        with self._session.no_autoflush:
+            return {
+                row.symbol: row
+                for row in (
+                    self._session.query(SecurityProfile)
+                    .filter(SecurityProfile.symbol.in_(normalized_symbols))
+                    .all()
+                )
+            }
+
+    def _mark_profile_failed(
+        self,
+        symbol: str,
+        exc: Exception,
+        *,
+        existing_profiles: Dict[str, SecurityProfile],
+    ) -> None:
         normalized = symbol.strip().upper()
         if not normalized:
             return
-        existing = (
-            self._session.query(SecurityProfile)
-            .filter(SecurityProfile.symbol == normalized)
-            .first()
-        )
+        existing = existing_profiles.get(normalized)
         now = datetime.now(timezone.utc)
         reason = f"profile_fetch_exception:{exc.__class__.__name__}"
         output_hash = stable_hash({
@@ -581,7 +710,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
             existing.classification_output_hash = output_hash
             existing.classifier_version = CLASSIFIER_VERSION
         else:
-            self._session.add(SecurityProfile(
+            profile = SecurityProfile(
                 symbol=normalized,
                 security_type=UNKNOWN,
                 source_provider="FMP",
@@ -595,12 +724,14 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 refresh_status=REFRESH_STATUS_FAILED,
                 raw_profile_json=None,
                 classification_reason=reason,
-            ))
-        self._session.flush()
+            )
+            self._session.add(profile)
+            existing_profiles[normalized] = profile
 
     def _upsert_profile(
         self,
         *,
+        existing_profiles: Dict[str, SecurityProfile],
         symbol: str,
         security_type: str,
         classification_reason: str,
@@ -614,11 +745,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
         refresh_status: str,
     ) -> None:
         normalized = symbol.strip().upper()
-        existing = (
-            self._session.query(SecurityProfile)
-            .filter(SecurityProfile.symbol == normalized)
-            .first()
-        )
+        existing = existing_profiles.get(normalized)
         now = datetime.now(timezone.utc)
         if existing:
             existing.security_type = security_type
@@ -633,7 +760,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
             existing.refresh_status = refresh_status
             existing.last_refreshed_at = now
         else:
-            self._session.add(SecurityProfile(
+            profile = SecurityProfile(
                 symbol=normalized,
                 security_type=security_type,
                 source_provider="FMP",
@@ -647,5 +774,6 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 refresh_status=refresh_status,
                 raw_profile_json=raw_profile_json,
                 classification_reason=classification_reason,
-            ))
-        self._session.flush()
+            )
+            self._session.add(profile)
+            existing_profiles[normalized] = profile

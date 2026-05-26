@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -32,6 +32,7 @@ from alpha.db.models import (
     UniverseScan,
     UniverseSnapshot,
 )
+from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import (
     ADR,
@@ -54,6 +55,7 @@ from alpha.jobs.security_type import (
     REFRESH_STATUS_RETRYABLE_ERROR,
     SecurityTypeEnrichmentJob,
     classify_security_type,
+    profile_refresh_plan,
 )
 from alpha.jobs.universe_builder import UniverseBuilderJob, _security_profile_cache_hash
 
@@ -679,6 +681,85 @@ class TestEnrichmentJob:
         counts = result.metrics["security_type_counts"]
         assert counts[COMMON_STOCK] == 1
         assert counts[ETF] == 1
+
+    def test_profile_writes_flush_once_after_batch(self, db_session, monkeypatch):
+        adapter = MagicMock(spec=FmpAdapter)
+        adapter.get_company_profile.side_effect = lambda symbol: (
+            _mock_profile_response(_profile(symbol))
+        )
+        flush_count = 0
+        original_flush = db_session.flush
+
+        def tracking_flush(*args, **kwargs):
+            nonlocal flush_count
+            flush_count += 1
+            return original_flush(*args, **kwargs)
+
+        monkeypatch.setattr(db_session, "flush", tracking_flush)
+        job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=adapter,
+            symbols=["ACME", "BETA", "GAMA"],
+        )
+        result = job.run(JobContext(
+            job_id="job",
+            job_run_id="run",
+            started_at=_ts(),
+        ))
+
+        assert result.ok
+        assert result.metrics["enriched_count"] == 3
+        assert flush_count == 1
+
+    def test_profile_refresh_plan_selects_only_stale_or_unresolved(self, db_session):
+        asof = _ts()
+        db_session.add_all([
+            SecurityProfile(
+                symbol="FRESH",
+                security_type=COMMON_STOCK,
+                refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
+                last_refreshed_at=asof,
+            ),
+            SecurityProfile(
+                symbol="STALE",
+                security_type=COMMON_STOCK,
+                refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
+                last_refreshed_at=asof - timedelta(days=8),
+            ),
+            SecurityProfile(
+                symbol="OLDV",
+                security_type=COMMON_STOCK,
+                refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version="old-version",
+                last_refreshed_at=asof,
+            ),
+            SecurityProfile(
+                symbol="NODATA",
+                security_type=UNKNOWN,
+                refresh_status=REFRESH_STATUS_NO_DATA,
+                classifier_version=CLASSIFIER_VERSION,
+                last_refreshed_at=asof,
+            ),
+        ])
+        db_session.flush()
+
+        refresh_symbols, metrics = profile_refresh_plan(
+            db_session,
+            ["fresh", "stale", "oldv", "nodata", "missing"],
+            asof=asof,
+            max_age_days=7,
+        )
+
+        assert refresh_symbols == ["MISSING", "NODATA", "OLDV", "STALE"]
+        assert metrics["required_symbol_count"] == 5
+        assert metrics["refresh_symbol_count"] == 4
+        assert metrics["fresh_cached_count"] == 1
+        assert metrics["missing_count"] == 1
+        assert metrics["stale_count"] == 1
+        assert metrics["classifier_version_mismatch_count"] == 1
+        assert metrics["unresolved_count"] == 1
 
     def test_parallel_fetch_is_concurrent_and_metric_equivalent(self, db_session):
         symbols = ["ACME", "BETA", "GAMA", "DELT"]

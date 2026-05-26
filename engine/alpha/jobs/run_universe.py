@@ -29,6 +29,7 @@ from alpha.db.engine import create_all_tables, get_session, reset_globals
 from alpha.db.models import Base
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import SecurityTypeEnrichmentJob
+from alpha.jobs.security_type import profile_refresh_plan
 from alpha.jobs.universe_builder import (
     PRICE_MIN,
     UniverseBuilderJob,
@@ -132,7 +133,8 @@ def _run_live(args) -> int:
     if args.create_tables:
         create_all_tables()
 
-    adapter = FmpAdapter(FmpConfig.from_env())
+    config = FmpConfig.from_env()
+    adapter = FmpAdapter(config)
     fetcher = SlicedUniverseFetcher(adapter)
 
     print(f"Fetching sliced universe from FMP: ${MCAP_MIN:,}-${MCAP_MAX:,}...")
@@ -158,11 +160,24 @@ def _run_live(args) -> int:
         return 1
 
     symbols = _required_profile_symbols(sliced.response.data or [])
-    print(f"Refreshing required security profiles: {len(symbols)} symbols")
+    refresh_symbols, refresh_metrics = profile_refresh_plan(
+        session,
+        symbols,
+        asof=sliced.response.lineage.asof_timestamp,
+    )
+    print(
+        "Refreshing required security profiles: "
+        f"{len(refresh_symbols)} of {len(symbols)} symbols"
+    )
+    if refresh_metrics["fresh_cached_count"]:
+        print(
+            "Fresh cached profiles: "
+            f"{refresh_metrics['fresh_cached_count']}"
+        )
     enrichment_job = SecurityTypeEnrichmentJob(
         session=session,
         adapter=adapter,
-        symbols=symbols,
+        symbols=refresh_symbols,
         retry_backoff_seconds=args.retry_backoff_seconds,
         max_workers=args.profile_max_workers,
         max_profile_calls_per_minute=args.profile_rate_limit_per_minute,
@@ -175,6 +190,8 @@ def _run_live(args) -> int:
             "source": "fmp_profile",
             "trading_date": args.trading_date,
             "required_symbol_count": len(symbols),
+            "refresh_symbol_count": len(refresh_symbols),
+            "profile_refresh_plan": refresh_metrics,
         },
     )
     _print_safe_error("Security enrichment", enrichment)
