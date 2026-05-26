@@ -30,6 +30,10 @@ from alpha.data.contracts import (
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 
 PROVIDER = "FMP"
+HISTORICAL_PRICE_FULL_ENDPOINT = "/stable/historical-price-eod/full"
+HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT = (
+    "/stable/historical-price-eod/dividend-adjusted"
+)
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -75,6 +79,7 @@ class FmpBar:
     low: float
     close: float
     volume: int
+    split_adjusted_close: Optional[float] = None
     adj_close: Optional[float] = None
 
 
@@ -404,8 +409,15 @@ class FmpAdapter:
         ticker: str,
         from_date: Optional[date] = None,
         to_date: Optional[date] = None,
+        *,
+        adjusted: bool = False,
+        require_split_adjusted_close: bool = True,
+        require_adjusted_close: bool = False,
     ) -> AdapterResponse[List[FmpBar]]:
-        endpoint = "/stable/historical-price-eod/full"
+        endpoint = (
+            HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT
+            if adjusted else HISTORICAL_PRICE_FULL_ENDPOINT
+        )
         params: Dict[str, Any] = {"symbol": ticker}
         if from_date:
             params["from"] = from_date.isoformat()
@@ -423,18 +435,50 @@ class FmpAdapter:
             historical = resp.data
         else:
             historical = []
+
         bars = [
-            FmpBar(
-                date=b.get("date", ""),
-                open=b.get("open", 0.0),
-                high=b.get("high", 0.0),
-                low=b.get("low", 0.0),
-                close=b.get("close", 0.0),
-                volume=b.get("volume", 0),
-                adj_close=b.get("adjClose"),
-            )
+            _parse_fmp_bar(b, split_adjusted_close_from_close=not adjusted)
             for b in historical
         ]
+        if require_split_adjusted_close and any(
+            bar.split_adjusted_close is None for bar in bars
+        ):
+            missing_count = sum(
+                1 for bar in bars if bar.split_adjusted_close is None
+            )
+            return AdapterResponse(
+                data=None,
+                lineage=resp.lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=200,
+                    error_type="data_contract",
+                    message=(
+                        f"{ticker} historical daily response missing split-adjusted "
+                        f"close on {missing_count}/{len(bars)} rows; refusing "
+                        "dividend-adjusted/raw fallback"
+                    ),
+                    retryable=False,
+                ),
+            )
+        if require_adjusted_close and any(bar.adj_close is None for bar in bars):
+            missing_count = sum(1 for bar in bars if bar.adj_close is None)
+            return AdapterResponse(
+                data=None,
+                lineage=resp.lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=200,
+                    error_type="data_contract",
+                    message=(
+                        f"{ticker} historical daily response missing adjClose on "
+                        f"{missing_count}/{len(bars)} rows; refusing raw-close fallback"
+                    ),
+                    retryable=False,
+                ),
+            )
         return AdapterResponse(data=bars, lineage=resp.lineage)
 
     # --- SEC filings ---
@@ -463,3 +507,38 @@ class FmpAdapter:
             for f in (resp.data or [])
         ]
         return AdapterResponse(data=filings, lineage=resp.lineage)
+
+
+def _parse_fmp_bar(
+    row: Dict[str, Any],
+    *,
+    split_adjusted_close_from_close: bool,
+) -> FmpBar:
+    """Parse either full OHLC rows or dividend-adjusted EOD rows.
+
+    The stable adjusted endpoint returns adjOpen/adjHigh/adjLow/adjClose,
+    while the full endpoint returns split-adjusted open/high/low/close
+    without adjClose. M4 uses split_adjusted_close, not dividend-adjusted
+    adjClose.
+    """
+    adj_close = row.get("adjClose")
+    split_adjusted_close = (
+        row.get("close") if split_adjusted_close_from_close else None
+    )
+    return FmpBar(
+        date=row.get("date", ""),
+        open=_first_present(row, "open", "adjOpen", default=0.0),
+        high=_first_present(row, "high", "adjHigh", default=0.0),
+        low=_first_present(row, "low", "adjLow", default=0.0),
+        close=_first_present(row, "close", "adjClose", default=0.0),
+        volume=row.get("volume", 0),
+        split_adjusted_close=split_adjusted_close,
+        adj_close=adj_close,
+    )
+
+
+def _first_present(row: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if row.get(key) is not None:
+            return row[key]
+    return default

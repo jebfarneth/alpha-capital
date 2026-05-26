@@ -216,13 +216,24 @@ class TestFmpAdapter:
     def test_get_historical_price_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
-        json_data = {
-            "symbol": "ACME",
-            "historical": [
-                {"date": "2026-05-19", "open": 5.0, "high": 5.5, "low": 4.9, "close": 5.25, "volume": 100000, "adjClose": 5.25},
-                {"date": "2026-05-18", "open": 4.9, "high": 5.1, "low": 4.8, "close": 5.0, "volume": 90000, "adjClose": 5.0},
-            ],
-        }
+        json_data = [
+            {
+                "date": "2026-05-19",
+                "open": 5.0,
+                "high": 5.5,
+                "low": 4.9,
+                "close": 5.25,
+                "volume": 100000,
+            },
+            {
+                "date": "2026-05-18",
+                "open": 4.9,
+                "high": 5.1,
+                "low": 4.8,
+                "close": 5.0,
+                "volume": 90000,
+            },
+        ]
         session.get.return_value = _mock_response(200, json_data)
         adapter = self._adapter(session)
         resp = adapter.get_historical_price("ACME")
@@ -230,8 +241,65 @@ class TestFmpAdapter:
         assert resp.ok
         assert len(resp.data) == 2
         assert resp.data[0].close == 5.25
+        assert resp.data[0].split_adjusted_close == 5.25
+        assert resp.data[0].adj_close is None
         assert resp.lineage.provider == "FMP"
         assert resp.lineage.endpoint == "/stable/historical-price-eod/full"
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/historical-price-eod/full",
+            params={"symbol": "ACME"},
+            timeout=30,
+        )
+
+    def test_get_historical_price_missing_split_adjusted_close_is_contract_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "date": "2026-05-19",
+                "open": 5.0,
+                "high": 5.5,
+                "low": 4.9,
+                "adjClose": 5.25,
+                "volume": 100000,
+            },
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_historical_price("ACME")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "data_contract"
+        assert "missing split-adjusted close" in resp.error.message
+
+    def test_get_historical_price_dividend_adjusted_is_optional_analytics_feed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "date": "2026-05-19",
+                "adjOpen": 5.0,
+                "adjHigh": 5.5,
+                "adjLow": 4.9,
+                "adjClose": 5.25,
+                "volume": 100000,
+            },
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_historical_price(
+            "ACME",
+            adjusted=True,
+            require_split_adjusted_close=False,
+            require_adjusted_close=True,
+        )
+
+        assert resp.ok
+        assert resp.data[0].close == 5.25
+        assert resp.data[0].split_adjusted_close is None
+        assert resp.data[0].adj_close == 5.25
+        assert resp.lineage.endpoint == "/stable/historical-price-eod/dividend-adjusted"
 
     def test_get_historical_price_null_response_returns_empty_list(self):
         session = MagicMock(spec=requests.Session)

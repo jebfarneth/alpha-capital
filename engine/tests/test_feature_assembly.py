@@ -13,8 +13,9 @@ Covers all acceptance criteria from Engineering/FeatureAssembly.md:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Dict, List
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -56,6 +57,10 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.m4 import M4Detector
 from alpha.evidence.writer import record_data_lineage
+from alpha.market_calendar import (
+    is_us_equity_session,
+    resolve_us_equity_session,
+)
 
 
 def _ts():
@@ -66,21 +71,17 @@ def _make_bars(
     n: int = 252,
     base_high: float = 9.0,
     final_high: float = 10.0,
-    start_date: str = "2025-05-20",
+    evidence_date: str = "2026-05-20",
+    evidence_split_adjusted_close: float | None = None,
+    evidence_close: float | None = None,
     source_ts: datetime | None = None,
 ) -> List[DailyBar]:
-    """Generate exactly n daily bars with ascending weekday dates."""
-    from datetime import date as date_type
-
-    d = date_type.fromisoformat(start_date)
+    """Generate n prior-session bars plus one evidence-session bar."""
+    evidence_day = date_type.fromisoformat(evidence_date)
+    prior_days = _prior_weekdays(evidence_day, n)
     bars: List[DailyBar] = []
-    day_offset = 0
-    while len(bars) < n:
-        day = d + timedelta(days=day_offset)
-        day_offset += 1
-        if day.weekday() >= 5:
-            continue
-        high = base_high if len(bars) < n - 1 else final_high
+    for idx, day in enumerate(prior_days):
+        high = base_high if idx < n - 1 else final_high
         bars.append(DailyBar(
             date=day.isoformat(),
             open=high - 0.5,
@@ -88,11 +89,31 @@ def _make_bars(
             low=high - 1.0,
             close=high - 0.2,
             volume=100_000,
+            split_adjusted_close=high,
             adj_close=high,
             source_timestamp=source_ts or _ts(),
             source_provider="FMP",
             lineage_hash="bar-lineage-hash",
         ))
+    evidence_value = (
+        evidence_split_adjusted_close if evidence_split_adjusted_close is not None else final_high
+    )
+    evidence_raw_close = (
+        evidence_close if evidence_close is not None else evidence_value
+    )
+    bars.append(DailyBar(
+        date=evidence_date,
+        open=evidence_raw_close - 0.5,
+        high=max(evidence_raw_close, evidence_value),
+        low=evidence_raw_close - 1.0,
+        close=evidence_raw_close,
+        volume=200_000,
+        split_adjusted_close=evidence_value,
+        adj_close=evidence_value,
+        source_timestamp=source_ts or _ts(),
+        source_provider="FMP",
+        lineage_hash="bar-lineage-hash",
+    ))
     return bars
 
 
@@ -100,24 +121,29 @@ def _make_breakout_bars(
     n: int = 252,
     high_52w: float = 10.0,
     close_price: float = 10.5,
+    evidence_date: str = "2026-05-20",
     source_ts: datetime | None = None,
 ) -> List[DailyBar]:
-    """Generate bars where the last bar's close is at or above the 52w high."""
-    bars = _make_bars(n=n, base_high=high_52w - 1.0, final_high=high_52w, source_ts=source_ts)
-    if bars:
-        bars[-1] = DailyBar(
-            date=bars[-1].date,
-            open=close_price - 0.3,
-            high=max(close_price, high_52w),
-            low=close_price - 0.5,
-            close=close_price,
-            volume=200_000,
-            adj_close=high_52w,
-            source_timestamp=source_ts or _ts(),
-            source_provider="FMP",
-            lineage_hash="bar-lineage-hash",
-        )
-    return bars
+    """Generate bars where evidence-session split-adjusted close is the M4 price."""
+    return _make_bars(
+        n=n,
+        base_high=high_52w - 1.0,
+        final_high=high_52w,
+        evidence_date=evidence_date,
+        evidence_split_adjusted_close=close_price,
+        evidence_close=close_price,
+        source_ts=source_ts,
+    )
+
+
+def _prior_weekdays(end_day: date_type, n: int) -> List[date_type]:
+    days: List[date_type] = []
+    cursor = end_day - timedelta(days=1)
+    while len(days) < n:
+        if cursor.weekday() < 5:
+            days.append(cursor)
+        cursor -= timedelta(days=1)
+    return list(reversed(days))
 
 
 def _make_snapshot(
@@ -332,7 +358,48 @@ class TestFrameworkLookahead:
 
 
 # ===================================================================
-# 3. M4 daily assembler: fixture-based assembly
+# 3. Market calendar/session resolver
+# ===================================================================
+
+
+class TestMarketSessionResolver:
+    def test_memorial_day_2026_tuesday_premarket(self):
+        run_ts = datetime(
+            2026, 5, 26, 4, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.decision_date == "2026-05-26"
+        assert resolved.evidence_session_date == "2026-05-22"
+        assert resolved.next_execution_session == "2026-05-26"
+        assert resolved.is_premarket_decision_window is True
+        assert is_us_equity_session(date_type(2026, 5, 25)) is False
+
+    def test_weekday_after_close_uses_same_completed_session(self):
+        run_ts = datetime(
+            2026, 5, 20, 17, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.decision_date == "2026-05-20"
+        assert resolved.evidence_session_date == "2026-05-20"
+        assert resolved.next_execution_session == "2026-05-21"
+        assert resolved.is_premarket_decision_window is False
+
+    def test_weekday_before_open_uses_prior_completed_session(self):
+        run_ts = datetime(
+            2026, 5, 20, 4, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.decision_date == "2026-05-20"
+        assert resolved.evidence_session_date == "2026-05-19"
+        assert resolved.next_execution_session == "2026-05-20"
+        assert resolved.is_premarket_decision_window is True
+
+
+# ===================================================================
+# 4. M4 daily assembler: fixture-based assembly
 # ===================================================================
 
 
@@ -355,7 +422,10 @@ class TestM4DailyAssembler:
         assert inp.market_data["high_52w"] is not None
         assert inp.market_data["n_sessions_in_window"] == 252
         assert inp.market_data["operating_universe_inclusion"] is True
+        assert inp.market_data["decision_date"] == "2026-05-20"
+        assert inp.market_data["evidence_session_date"] == "2026-05-20"
         assert inp.market_data["trading_date"] == "2026-05-20"
+        assert inp.market_data["price_source"] == "evidence_session_split_adjusted_close"
         assert inp.universe_snapshot_id == "snap-ACME"
         assert len(inp.lineage_hashes) > 0
 
@@ -424,7 +494,7 @@ class TestM4DailyAssembler:
         assert inp.market_data["security_type"] == "common_stock"
         assert inp.market_data["primary_exchange"] == "NASDAQ"
 
-    def test_high_52w_uses_adjusted_close_not_raw_high(self):
+    def test_high_52w_uses_split_adjusted_close_not_raw_high(self):
         snapshots = [_make_snapshot("ACME", price=13.0)]
         bars = {"ACME": [
             DailyBar(
@@ -434,7 +504,8 @@ class TestM4DailyAssembler:
                 low=95.0,
                 close=100.0,
                 volume=100_000,
-                adj_close=10.0,
+                split_adjusted_close=10.0,
+                adj_close=80.0,
                 source_timestamp=_ts(),
                 source_provider="FMP",
                 lineage_hash="bar-lineage-hash",
@@ -446,7 +517,21 @@ class TestM4DailyAssembler:
                 low=10.5,
                 close=12.0,
                 volume=100_000,
-                adj_close=12.0,
+                split_adjusted_close=12.0,
+                adj_close=70.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-20",
+                open=13.0,
+                high=13.5,
+                low=12.5,
+                close=13.0,
+                volume=100_000,
+                split_adjusted_close=13.0,
+                adj_close=60.0,
                 source_timestamp=_ts(),
                 source_provider="FMP",
                 lineage_hash="bar-lineage-hash",
@@ -457,9 +542,52 @@ class TestM4DailyAssembler:
             trading_date="2026-05-20", cutoff_timestamp=_ts(),
         )
         assert result.assembled_count == 1
+        assert result.inputs[0].market_data["price"] == 13.0
         assert result.inputs[0].market_data["high_52w"] == 12.0
         assert result.inputs[0].market_data["high_52w_basis"] == (
-            "adjusted_close_prior_252_sessions"
+            "split_adjusted_close_prior_252_sessions"
+        )
+
+    def test_m4_price_uses_evidence_split_adjusted_close_not_snapshot_or_raw_close(self):
+        snapshots = [_make_snapshot("ACME", price=99.0)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-19",
+                open=9.0,
+                high=10.0,
+                low=8.5,
+                close=10.0,
+                volume=100_000,
+                split_adjusted_close=10.0,
+                adj_close=10.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-20",
+                open=20.0,
+                high=21.0,
+                low=19.0,
+                close=20.0,
+                volume=100_000,
+                split_adjusted_close=11.0,
+                adj_close=18.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+        result = assemble_m4_daily(
+            snapshots=snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+        assert result.assembled_count == 1
+        assert result.inputs[0].market_data["price"] == 11.0
+        assert result.inputs[0].market_data["snapshot_price"] == 99.0
+        assert result.inputs[0].market_data["evidence_close"] == 20.0
+        assert result.inputs[0].market_data["price_source"] == (
+            "evidence_session_split_adjusted_close"
         )
 
     def test_trading_date_bar_excluded_from_high_52w(self):
@@ -472,6 +600,7 @@ class TestM4DailyAssembler:
                 low=8.5,
                 close=10.0,
                 volume=100_000,
+                split_adjusted_close=10.0,
                 adj_close=10.0,
                 source_timestamp=_ts(),
                 source_provider="FMP",
@@ -484,6 +613,7 @@ class TestM4DailyAssembler:
                 low=49.0,
                 close=99.0,
                 volume=100_000,
+                split_adjusted_close=99.0,
                 adj_close=99.0,
                 source_timestamp=_ts(),
                 source_provider="FMP",
@@ -498,7 +628,55 @@ class TestM4DailyAssembler:
         assert result.inputs[0].market_data["high_52w"] == 10.0
         assert result.inputs[0].market_data["high_52w_date"] == "2026-05-19"
 
-    def test_missing_adjusted_close_rejects_unadjusted_high(self):
+    def test_memorial_day_decision_uses_friday_evidence_session(self):
+        snapshots = [_make_snapshot("ACME", price=99.0)]
+        bars = {"ACME": [
+            DailyBar(
+                date="2026-05-21",
+                open=9.5,
+                high=10.0,
+                low=9.0,
+                close=10.0,
+                volume=100_000,
+                split_adjusted_close=10.0,
+                adj_close=10.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-22",
+                open=11.0,
+                high=11.5,
+                low=10.5,
+                close=11.0,
+                volume=100_000,
+                split_adjusted_close=11.0,
+                adj_close=11.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+        ]}
+
+        result = assemble_m4_daily(
+            snapshots=snapshots,
+            daily_bars=bars,
+            decision_date="2026-05-26",
+            evidence_session_date="2026-05-22",
+            cutoff_timestamp=_ts(),
+        )
+
+        assert result.assembled_count == 1
+        inp = result.inputs[0]
+        assert inp.market_data["decision_date"] == "2026-05-26"
+        assert inp.market_data["evidence_session_date"] == "2026-05-22"
+        assert inp.market_data["price"] == 11.0
+        assert inp.market_data["high_52w"] == 10.0
+        assert inp.market_data["high_52w_date"] == "2026-05-21"
+        assert inp.market_data["lookback_end"] == "2026-05-21"
+
+    def test_missing_split_adjusted_close_rejects_unadjusted_high(self):
         snapshots = [_make_snapshot("ACME", price=10.5)]
         bars = {"ACME": [
             DailyBar(
@@ -508,6 +686,20 @@ class TestM4DailyAssembler:
                 low=8.5,
                 close=100.0,
                 volume=100_000,
+                adj_close=90.0,
+                source_timestamp=_ts(),
+                source_provider="FMP",
+                lineage_hash="bar-lineage-hash",
+            ),
+            DailyBar(
+                date="2026-05-20",
+                open=10.0,
+                high=10.5,
+                low=9.8,
+                close=10.4,
+                volume=100_000,
+                split_adjusted_close=10.4,
+                adj_close=10.4,
                 source_timestamp=_ts(),
                 source_provider="FMP",
                 lineage_hash="bar-lineage-hash",
@@ -520,7 +712,7 @@ class TestM4DailyAssembler:
         assert result.assembled_count == 0
         assert result.rejected_count == 1
         assert any(
-            d.diagnostic_type == "adjusted_close_unavailable"
+            d.diagnostic_type == "split_adjusted_close_unavailable"
             for d in result.diagnostics
         )
 
@@ -578,6 +770,7 @@ class TestFutureBarLeak:
                 low=9.8,
                 close=10.4,
                 volume=100_000,
+                split_adjusted_close=10.4,
                 adj_close=10.4,
                 source_timestamp=allowed_source_ts,
                 source_provider="FMP",
@@ -597,7 +790,10 @@ class TestFutureBarLeak:
         assert result.rejected_count == 1
         assert any(
             d.diagnostic_type == "field_rejected_lookahead"
-            and "bar.date 2026-05-21 after trading_date 2026-05-20" in (d.detail or "")
+            and (
+                "bar.date 2026-05-21 after evidence_session_date 2026-05-20"
+                in (d.detail or "")
+            )
             for d in result.diagnostics
         )
 
@@ -616,6 +812,7 @@ class TestFutureBarLeak:
                 low=9.8,
                 close=10.4,
                 volume=100_000,
+                split_adjusted_close=10.4,
                 adj_close=10.4,
                 source_timestamp=allowed_source_ts,
                 source_provider="FMP",
@@ -649,7 +846,7 @@ class TestFutureBarLeak:
 
 
 class TestMissingData:
-    def test_no_bars_produces_insufficient_diagnostic(self):
+    def test_no_bars_produces_evidence_session_diagnostic(self):
         """Ticker with no bar history gets an explicit diagnostic, not zero-fill."""
         snapshots = [_make_snapshot("ACME")]
         result = assemble_m4_daily(
@@ -659,34 +856,30 @@ class TestMissingData:
             cutoff_timestamp=_ts(),
         )
         assert result.assembled_count == 0
-        assert result.insufficient_count == 1
+        assert result.rejected_count == 1
         assert len(result.inputs) == 0
         diag = result.diagnostics[0]
-        assert diag.diagnostic_type == "insufficient_history"
+        assert diag.diagnostic_type == "evidence_session_bar_unavailable"
         assert "ACME" == diag.ticker
 
-    def test_missing_price_in_snapshot_produces_diagnostic(self):
-        """Snapshot with None price gets a missing_price diagnostic."""
+    def test_missing_price_in_snapshot_does_not_override_evidence_close(self):
         snapshots = [_make_snapshot("ACME", price=None)]
         bars = {"ACME": _make_breakout_bars(n=100)}
         result = assemble_m4_daily(
             snapshots=snapshots, daily_bars=bars,
             trading_date="2026-05-20", cutoff_timestamp=_ts(),
         )
-        assert result.assembled_count == 0
-        assert result.rejected_count == 1
-        diag = result.diagnostics[0]
-        assert diag.diagnostic_type == "missing_price"
+        assert result.assembled_count == 1
+        assert result.inputs[0].market_data["price"] == 10.5
 
-    def test_zero_price_is_not_treated_as_missing(self):
-        """price=0 in the snapshot is an observed zero, not missing data."""
+    def test_zero_evidence_split_adjusted_close_is_not_treated_as_missing(self):
+        """0 means observed zero, even though M4 detector later rejects it."""
         snapshots = [_make_snapshot("ACME", price=0.0)]
-        bars = {"ACME": _make_breakout_bars(n=100)}
+        bars = {"ACME": _make_breakout_bars(n=100, close_price=0.0)}
         result = assemble_m4_daily(
             snapshots=snapshots, daily_bars=bars,
             trading_date="2026-05-20", cutoff_timestamp=_ts(),
         )
-        # Price 0.0 is "present" — framework should not suppress it
         assert result.assembled_count == 1
         assert result.inputs[0].market_data["price"] == 0.0
 
@@ -718,8 +911,13 @@ class TestMissingData:
             trading_date="2026-05-20", cutoff_timestamp=_ts(),
         )
         assert result.assembled_count == 1
-        assert result.insufficient_count == 1
+        assert result.rejected_count == 1
         assert result.inputs[0].ticker == "ACME"
+        assert any(
+            d.ticker == "BETA"
+            and d.diagnostic_type == "evidence_session_bar_unavailable"
+            for d in result.diagnostics
+        )
 
 
 # ===================================================================
@@ -835,6 +1033,39 @@ class TestOrchestrationWithAssembly:
         assert diag["evaluated_count"] == 1
         assert diag["feature_snapshot_count"] == 1
         assert diag["skipped_count"] == 1  # no signal = skipped
+
+    def test_short_history_below_floor_persists_feature_without_signal(self, db_session):
+        """Tiny-history breakouts remain auditable but cannot write M4 signals."""
+        _, _ = _setup_canonical_universe(
+            db_session, tickers=["ACME"], prices={"ACME": 10.5},
+        )
+
+        fixture_snapshots = [_make_snapshot("ACME", price=10.5)]
+        bars = {"ACME": _make_breakout_bars(
+            n=3, high_52w=10.0, close_price=10.5,
+        )}
+        assembly = assemble_m4_daily(
+            snapshots=fixture_snapshots, daily_bars=bars,
+            trading_date="2026-05-20", cutoff_timestamp=_ts(),
+        )
+
+        orch = DetectorOrchestrationJob(
+            db_session,
+            detectors=[M4Detector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"M4": assembly.inputs},
+        )
+        result = run_job(db_session, orch, params={"trading_date": "2026-05-20"})
+
+        assert result.metrics["total_signals_persisted"] == 0
+        assert db_session.query(SignalRegistry).count() == 0
+        assert db_session.query(FeatureSnapshot).count() == 1
+        feature_json = json.loads(db_session.query(FeatureSnapshot).one().feature_json)
+        assert feature_json["signal_generated"] is False
+        assert feature_json["rejection_reason"] == "short_history_below_signal_floor"
+        assert feature_json["n_sessions_in_window"] == 3
+        assert feature_json["short_history_flag"] is True
+        assert feature_json["short_history_below_signal_floor"] is True
 
     def test_assembled_inputs_resolve_lineage_hashes_to_feature_snapshot_ids(
         self, db_session,

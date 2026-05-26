@@ -74,6 +74,9 @@ X_M4_CAP = 1.5
 LAMBDA_M4_MONTHLY = 0.011  # 1.1% per month (J&T 6/6 conservative)
 LAMBDA_M4_15TD = LAMBDA_M4_MONTHLY * 15.0 / 21.0  # ~0.00786
 SIGNAL_HORIZON = "15d"
+SESSIONS_52W = 252
+MIN_BASE_DAILY_SIGNAL_SESSIONS = 60
+SHORT_HISTORY_BELOW_SIGNAL_FLOOR_REASON = "short_history_below_signal_floor"
 BREAKOUT_COHORT_PERCENTILE = 0.70  # 70th pctl threshold for top3_decile_flag
 SMALL_COHORT_THRESHOLD = 10
 ENTRY_LANE_BASE = "base_daily"
@@ -93,11 +96,15 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "m5_also_firing",
     "m6_also_firing",
     "overlapping_pattern_ids",
+    "decision_date",
+    "evidence_session_date",
     "high_52w_date",
     "high_52w_basis",
     "lookback_start",
     "lookback_end",
     "price_source",
+    "evidence_close",
+    "evidence_split_adjusted_close",
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
@@ -159,9 +166,32 @@ def build_m4_source_features(
         },
         source="52w_high_setup",
     )
-    n_sessions = inp.market_data.get("n_sessions_in_window")
-    features["short_history_flag"] = n_sessions is not None and int(n_sessions) < 252
+    n_sessions = _session_count(inp.market_data.get("n_sessions_in_window"))
+    if n_sessions is not None:
+        features["n_sessions_in_window"] = n_sessions
+    features["short_history_flag"] = (
+        n_sessions is not None and n_sessions < SESSIONS_52W
+    )
+    features["min_signal_sessions"] = MIN_BASE_DAILY_SIGNAL_SESSIONS
+    features["short_history_below_signal_floor"] = (
+        n_sessions is not None and n_sessions < MIN_BASE_DAILY_SIGNAL_SESSIONS
+    )
     return features
+
+
+def _session_count(value: Any) -> int | None:
+    parsed = finite_float(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
+def _base_daily_short_history_rejection(feat: Dict[str, Any], entry_lane: str) -> str | None:
+    if entry_lane != ENTRY_LANE_BASE:
+        return None
+    if feat.get("short_history_below_signal_floor") is True:
+        return SHORT_HISTORY_BELOW_SIGNAL_FLOOR_REASON
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -504,9 +534,16 @@ class M4Detector(BasePatternDetector):
             inp.market_data, warnings, quality_flags, pattern_id=self.pattern_id,
         )
         pre_signal_rejection = market_data_quality_rejection(feat_dict, inp.market_data)
+        short_history_rejection = _base_daily_short_history_rejection(feat_dict, entry_lane)
         if pre_signal_rejection is not None:
             quality_flags["market_data_quality_rejected"] = True
             feat_dict["rejection_reason"] = pre_signal_rejection
+        if short_history_rejection is not None:
+            quality_flags["short_history_below_signal_floor"] = True
+            warnings.append(
+                "M4 base daily signal blocked: fewer than "
+                f"{MIN_BASE_DAILY_SIGNAL_SESSIONS} prior sessions"
+            )
 
         fidelity = classify_fidelity(
             has_primary_data=True, has_secondary_data=True,
@@ -524,6 +561,9 @@ class M4Detector(BasePatternDetector):
             feat_dict["rejection_reason"] = universe_rejection
             feat_dict["signal_generated"] = False
         elif pre_signal_rejection is not None:
+            feat_dict["signal_generated"] = False
+        elif short_history_rejection is not None:
+            feat_dict["rejection_reason"] = short_history_rejection
             feat_dict["signal_generated"] = False
         elif entry_lane == ENTRY_LANE_FRESH:
             self._apply_fresh_lane(inp, feat_dict, warnings, quality_flags, signals)

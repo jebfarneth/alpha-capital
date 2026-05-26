@@ -33,6 +33,8 @@ from alpha.patterns.m4 import (
     LAMBDA_M4_15TD,
     LAMBDA_M4_MONTHLY,
     M4Detector,
+    MIN_BASE_DAILY_SIGNAL_SESSIONS,
+    SHORT_HISTORY_BELOW_SIGNAL_FLOOR_REASON,
     X_M4_CAP,
     _classify_extension_tier,
     compute_m4_features,
@@ -344,6 +346,25 @@ class TestM4Firing:
             lineage_hashes=["hash1"],
         )
         assert det.detect(inp).signals[0].data_confidence == 0.855
+
+    def test_short_history_at_signal_floor_can_fire_with_flag(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data=_m4_base_data(
+                price=11.00,
+                high_52w=10.00,
+                n_sessions_in_window=MIN_BASE_DAILY_SIGNAL_SESSIONS,
+                cohort_extensions=_cohort_extensions(30, 0.15),
+            ),
+            lineage_hashes=["hash1"],
+        )
+        result = det.detect(inp)
+        assert result.has_signal
+        f = result.features.features
+        assert f["short_history_flag"] is True
+        assert f["short_history_below_signal_floor"] is False
+        assert f["min_signal_sessions"] == MIN_BASE_DAILY_SIGNAL_SESSIONS
 
 
 # -----------------------------------------------------------------------
@@ -700,6 +721,29 @@ class TestM4NoSignal:
         assert not result.has_signal
         assert result.quality_flags["operating_universe_not_computed"] is True
         assert result.features.features["rejection_reason"] == "missing_operating_universe"
+
+    def test_base_daily_short_history_below_floor_does_not_fire(self):
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=_m4_base_data(
+                price=11.00,
+                high_52w=10.00,
+                n_sessions_in_window=3,
+                cohort_extensions=_cohort_extensions(30, 0.15),
+            ),
+            lineage_hashes=["h"],
+        )
+        result = det.detect(inp)
+        assert not result.has_signal
+        assert result.quality_flags["short_history_below_signal_floor"] is True
+        f = result.features.features
+        assert f["signal_generated"] is False
+        assert f["short_history_flag"] is True
+        assert f["short_history_below_signal_floor"] is True
+        assert f["min_signal_sessions"] == MIN_BASE_DAILY_SIGNAL_SESSIONS
+        assert f["rejection_reason"] == SHORT_HISTORY_BELOW_SIGNAL_FLOOR_REASON
 
 
 # -----------------------------------------------------------------------
