@@ -976,6 +976,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="BADF", security_type=MUTUAL_FUND,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1045,6 +1046,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="ACME", security_type=COMMON_STOCK,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1071,6 +1073,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="MYSTK", security_type=UNKNOWN,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_NO_DATA,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1095,6 +1098,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="SLOW", security_type=UNKNOWN,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_RETRYABLE_ERROR,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1109,11 +1113,45 @@ class TestBuilderCacheIntegration:
         assert snap.exclusion_reason == "security_profile_unresolved:retryable_error"
         assert result.metrics["security_profile_unresolved_count"] == 1
 
+    def test_old_classifier_version_excludes_clean_symbol(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="OLDV", security_type=COMMON_STOCK,
+            last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version="security_type_v0",
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(data=[_stock("OLDV")], lineage=_mock_lineage_screener())
+        job = UniverseBuilderJob(
+            session=db_session,
+            screener_response=resp,
+            require_security_profile_cache=True,
+            min_security_profile_coverage=1.0,
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.status == "failed"
+        assert result.metrics["failure_stage"] == "security_profile_coverage"
+        assert result.metrics["security_profile_required_count"] == 1
+        assert result.metrics["security_profile_enriched_count"] == 0
+        assert (
+            result.metrics["security_profile_classifier_version_mismatch_count"]
+            == 1
+        )
+        assert result.metrics["security_profile_coverage_shortfall_count"] == 1
+        snap = db_session.query(UniverseSnapshot).filter(
+            UniverseSnapshot.ticker == "OLDV"
+        ).one()
+        assert snap.operating_universe_inclusion is False
+        assert snap.exclusion_reason == "security_profile_classifier_version_mismatch"
+        assert db_session.query(CanonicalUniverseScan).count() == 0
+
     def test_stale_profile_excludes_clean_symbol(self, db_session):
         db_session.add(SecurityProfile(
             symbol="OLD", security_type=COMMON_STOCK,
             last_refreshed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1137,6 +1175,7 @@ class TestBuilderCacheIntegration:
             symbol="ABCDX", security_type=MUTUAL_FUND,
             last_refreshed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1161,6 +1200,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="ABCDX", security_type=COMMON_STOCK,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1181,6 +1221,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="ASTSW", security_type=COMMON_STOCK,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1200,6 +1241,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="ABCDX", security_type=MUTUAL_FUND,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -1221,6 +1263,7 @@ class TestBuilderCacheIntegration:
             db_session.add(SecurityProfile(
                 symbol=sym, security_type=st,
                 last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
             ))
         db_session.flush()
 
@@ -1241,6 +1284,7 @@ class TestBuilderCacheIntegration:
         db_session.add(SecurityProfile(
             symbol="PENY", security_type=COMMON_STOCK,
             last_refreshed_at=_ts(), refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 

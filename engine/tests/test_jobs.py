@@ -42,8 +42,14 @@ from alpha.db.models import (
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
-from alpha.jobs.run_universe import _parse_args, _required_profile_symbols
+from alpha.jobs.run_universe import (
+    LIVE_UNIVERSE_ADVISORY_LOCK_KEY,
+    _live_universe_lock,
+    _parse_args,
+    _required_profile_symbols,
+)
 from alpha.jobs.security_type import (
+    CLASSIFIER_VERSION,
     COMMON_STOCK,
     MUTUAL_FUND,
     REFRESH_STATUS_ENRICHED,
@@ -354,6 +360,7 @@ class TestUniverseBuilder:
             security_type=COMMON_STOCK,
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -381,6 +388,7 @@ class TestUniverseBuilder:
             security_type=MUTUAL_FUND,
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -408,6 +416,7 @@ class TestUniverseBuilder:
             classification_reason="industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION",
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -470,6 +479,7 @@ class TestUniverseBuilder:
             }),
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -512,6 +522,7 @@ class TestUniverseBuilder:
             }),
             last_refreshed_at=_ts(),
             refresh_status=REFRESH_STATUS_ENRICHED,
+            classifier_version=CLASSIFIER_VERSION,
         ))
         db_session.flush()
 
@@ -546,6 +557,7 @@ class TestUniverseBuilder:
                 classification_reason="name_pattern:ACQUISITION_SEQUENCE",
                 last_refreshed_at=_ts(),
                 refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
             ),
             SecurityProfile(
                 symbol="INVI",
@@ -553,6 +565,7 @@ class TestUniverseBuilder:
                 classification_reason="name_pattern:INVESTMENT_CORP_SEQUENCE",
                 last_refreshed_at=_ts(),
                 refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
             ),
         ])
         db_session.flush()
@@ -603,6 +616,7 @@ class TestUniverseBuilder:
                 classification_reason="name_pattern:ACQUISITION_SEQUENCE",
                 last_refreshed_at=_ts(),
                 refresh_status=REFRESH_STATUS_ENRICHED,
+                classifier_version=CLASSIFIER_VERSION,
             ))
             stocks.append(_stock(
                 symbol,
@@ -1307,6 +1321,51 @@ class TestNonCommonSymbol:
 # -----------------------------------------------------------------------
 
 class TestRunUniverseEntrypointHelpers:
+    class _Dialect:
+        def __init__(self, name):
+            self.name = name
+
+    class _ScalarResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class _Connection:
+        def __init__(self, acquire_result):
+            self.acquire_result = acquire_result
+            self.execute_calls = []
+            self.closed = False
+
+        def execute(self, statement, params):
+            self.execute_calls.append((str(statement), params))
+            if "pg_try_advisory_lock" in str(statement):
+                return TestRunUniverseEntrypointHelpers._ScalarResult(
+                    self.acquire_result
+                )
+            return TestRunUniverseEntrypointHelpers._ScalarResult(True)
+
+        def close(self):
+            self.closed = True
+
+    class _Bind:
+        def __init__(self, dialect_name, connection=None):
+            self.dialect = TestRunUniverseEntrypointHelpers._Dialect(dialect_name)
+            self.connection = connection
+
+        def connect(self):
+            if self.connection is None:
+                raise AssertionError("non-Postgres lock should not open a connection")
+            return self.connection
+
+    class _Session:
+        def __init__(self, bind):
+            self._bind = bind
+
+        def get_bind(self):
+            return self._bind
+
     def test_live_cli_defaults_to_full_security_profile_coverage(self):
         args = _parse_args(["--live"])
 
@@ -1325,6 +1384,46 @@ class TestRunUniverseEntrypointHelpers:
         ])
 
         assert symbols == ["ABCDX", "FRGN", "INCL"]
+
+    def test_live_universe_lock_noops_for_sqlite(self):
+        bind = self._Bind("sqlite")
+
+        with _live_universe_lock(self._Session(bind)) as acquired:
+            assert acquired is True
+
+    def test_live_universe_lock_unlocks_postgres_lock(self):
+        connection = self._Connection(acquire_result=True)
+        bind = self._Bind("postgresql", connection)
+
+        with _live_universe_lock(self._Session(bind)) as acquired:
+            assert acquired is True
+
+        assert connection.closed is True
+        assert connection.execute_calls == [
+            (
+                "SELECT pg_try_advisory_lock(:key)",
+                {"key": LIVE_UNIVERSE_ADVISORY_LOCK_KEY},
+            ),
+            (
+                "SELECT pg_advisory_unlock(:key)",
+                {"key": LIVE_UNIVERSE_ADVISORY_LOCK_KEY},
+            ),
+        ]
+
+    def test_live_universe_lock_reports_busy_postgres_lock(self):
+        connection = self._Connection(acquire_result=False)
+        bind = self._Bind("postgresql", connection)
+
+        with _live_universe_lock(self._Session(bind)) as acquired:
+            assert acquired is False
+
+        assert connection.closed is True
+        assert connection.execute_calls == [
+            (
+                "SELECT pg_try_advisory_lock(:key)",
+                {"key": LIVE_UNIVERSE_ADVISORY_LOCK_KEY},
+            ),
+        ]
 
 
 # -----------------------------------------------------------------------

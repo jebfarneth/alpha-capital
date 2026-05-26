@@ -46,6 +46,7 @@ from alpha.evidence.writer import (
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.security_type import (
+    CLASSIFIER_VERSION,
     COMMON_STOCK,
     NON_COMMON_TYPES,
     REFRESH_STATUS_ENRICHED,
@@ -745,6 +746,7 @@ class UniverseBuilderJob(BaseJob):
         security_type_unknown_count = 0
         security_profile_unresolved_count = 0
         security_profile_stale_count = 0
+        security_profile_classifier_version_mismatch_count = 0
         security_profile_required_count = 0
         security_profile_enriched_count = 0
         security_profile_cache_miss_required_count = 0
@@ -781,7 +783,13 @@ class UniverseBuilderJob(BaseJob):
                     self._profile_cache_max_age_days,
                 )
                 profile_stale = stale
-                if stale:
+                if cached_profile.classifier_version != CLASSIFIER_VERSION:
+                    if profile_required:
+                        security_profile_classifier_version_mismatch_count += 1
+                    if included or _country_requires_security_profile(reason):
+                        included = False
+                        reason = "security_profile_classifier_version_mismatch"
+                elif stale:
                     if profile_required:
                         security_profile_stale_count += 1
                     if included or _country_requires_security_profile(reason):
@@ -990,6 +998,9 @@ class UniverseBuilderJob(BaseJob):
             "security_type_unknown_count": security_type_unknown_count,
             "security_profile_unresolved_count": security_profile_unresolved_count,
             "security_profile_stale_count": security_profile_stale_count,
+            "security_profile_classifier_version_mismatch_count": (
+                security_profile_classifier_version_mismatch_count
+            ),
             "security_profile_required_count": security_profile_required_count,
             "security_profile_enriched_count": security_profile_enriched_count,
             "security_profile_coverage_ratio": security_profile_coverage_ratio,

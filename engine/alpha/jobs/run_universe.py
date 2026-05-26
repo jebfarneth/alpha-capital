@@ -14,12 +14,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import os
 import sys
 from datetime import datetime
+from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import sessionmaker
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash, utcnow
@@ -47,6 +50,8 @@ MOCK_SCREENER_DATA = [
     FmpScreenerResult(symbol="ZETA", company_name="Zeta GmbH", market_cap=60_000_000, price=4.00, sector="Healthcare", exchange="XETRA", country="DE", is_etf=False, is_actively_trading=True),
     FmpScreenerResult(symbol="EETA", company_name="Eeta Dormant", market_cap=80_000_000, price=4.00, sector="Energy", exchange="NASDAQ", country="US", is_etf=False, is_actively_trading=False),
 ]
+
+LIVE_UNIVERSE_ADVISORY_LOCK_KEY = 2026052601
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -95,6 +100,35 @@ def _print_safe_error(label: str, result) -> None:
     if result.errors:
         for error in result.errors:
             print(f"  error_stage={error.get('stage')} message={error.get('message')}")
+
+
+@contextmanager
+def _live_universe_lock(session) -> Iterator[bool]:
+    """Hold one Postgres session-level lock across enrichment and build commits."""
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        yield True
+        return
+
+    connection: Connection = bind.connect()
+    acquired = False
+    try:
+        acquired = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": LIVE_UNIVERSE_ADVISORY_LOCK_KEY},
+            ).scalar()
+        )
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": LIVE_UNIVERSE_ADVISORY_LOCK_KEY},
+                )
+        finally:
+            connection.close()
 
 
 def _run_mock(args) -> int:
@@ -159,104 +193,116 @@ def _run_live(args) -> int:
         session.close()
         return 1
 
-    symbols = _required_profile_symbols(sliced.response.data or [])
-    refresh_symbols, refresh_metrics = profile_refresh_plan(
-        session,
-        symbols,
-        asof=sliced.response.lineage.asof_timestamp,
-    )
-    print(
-        "Refreshing required security profiles: "
-        f"{len(refresh_symbols)} of {len(symbols)} symbols"
-    )
-    if refresh_metrics["fresh_cached_count"]:
-        print(
-            "Fresh cached profiles: "
-            f"{refresh_metrics['fresh_cached_count']}"
+    with _live_universe_lock(session) as lock_acquired:
+        if not lock_acquired:
+            print("ERROR: another live universe/enrichment run is already active")
+            session.close()
+            return 1
+
+        symbols = _required_profile_symbols(sliced.response.data or [])
+        refresh_symbols, refresh_metrics = profile_refresh_plan(
+            session,
+            symbols,
+            asof=sliced.response.lineage.asof_timestamp,
         )
-    enrichment_job = SecurityTypeEnrichmentJob(
-        session=session,
-        adapter=adapter,
-        symbols=refresh_symbols,
-        retry_backoff_seconds=args.retry_backoff_seconds,
-        max_workers=args.profile_max_workers,
-        max_profile_calls_per_minute=args.profile_rate_limit_per_minute,
-        adapter_factory=lambda: FmpAdapter(config),
-    )
-    enrichment = run_job(
-        session,
-        enrichment_job,
-        params={
-            "source": "fmp_profile",
-            "trading_date": args.trading_date,
-            "required_symbol_count": len(symbols),
-            "refresh_symbol_count": len(refresh_symbols),
-            "profile_refresh_plan": refresh_metrics,
-        },
-    )
-    _print_safe_error("Security enrichment", enrichment)
-    print(f"Security enrichment metrics: {enrichment.metrics}")
-    if not enrichment.ok:
+        print(
+            "Refreshing required security profiles: "
+            f"{len(refresh_symbols)} of {len(symbols)} symbols"
+        )
+        if refresh_metrics["fresh_cached_count"]:
+            print(
+                "Fresh cached profiles: "
+                f"{refresh_metrics['fresh_cached_count']}"
+            )
+        enrichment_job = SecurityTypeEnrichmentJob(
+            session=session,
+            adapter=adapter,
+            symbols=refresh_symbols,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            max_workers=args.profile_max_workers,
+            max_profile_calls_per_minute=args.profile_rate_limit_per_minute,
+            adapter_factory=lambda: FmpAdapter(config),
+        )
+        enrichment = run_job(
+            session,
+            enrichment_job,
+            params={
+                "source": "fmp_profile",
+                "trading_date": args.trading_date,
+                "required_symbol_count": len(symbols),
+                "refresh_symbol_count": len(refresh_symbols),
+                "profile_refresh_plan": refresh_metrics,
+            },
+        )
+        _print_safe_error("Security enrichment", enrichment)
+        print(f"Security enrichment metrics: {enrichment.metrics}")
+        if not enrichment.ok:
+            session.close()
+            return 1
+
+        universe_job = UniverseBuilderJob(
+            session=session,
+            screener_response=sliced.response,
+            slice_diagnostics=sliced.slice_diagnostics,
+            require_security_profile_cache=not args.allow_incomplete_security_cache,
+            min_security_profile_coverage=args.min_security_profile_coverage,
+        )
+        universe = run_job(
+            session,
+            universe_job,
+            params={
+                "source": "fmp_sliced",
+                "trading_date": args.trading_date,
+                "mcap_min": MCAP_MIN,
+                "mcap_max": MCAP_MAX,
+                "price_min": PRICE_MIN,
+            },
+        )
+        _print_safe_error("Universe build", universe)
+
+        metrics = universe.metrics or {}
+        print(f"Raw unique:    {sliced.unique_raw_count}")
+        print(f"Included:      {metrics.get('included', 0)}")
+        print(f"Excluded:      {metrics.get('excluded', 0)}")
+        print(f"Coverage:      {metrics.get('security_profile_coverage_ratio')}")
+        print(
+            "Coverage headroom: "
+            f"{metrics.get('security_profile_coverage_headroom_count')} profiles"
+        )
+        print(f"Slices:        {sliced.slice_count}")
+        print(f"Slice limits:  {sliced.slice_limit_hits}")
+        print(f"Country rescues: {metrics.get('country_profile_rescue_count', 0)}")
+        print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
+        print(f"Price buckets: {metrics.get('included_price_bucket_counts', {})}")
+        print(f"Countries:     {metrics.get('included_country_counts', {})}")
+        print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
+        print(
+            "Included shell-label names: "
+            f"{metrics.get('included_shell_company_count', 0)}"
+        )
+        shell_review = metrics.get("shell_company_exclusion_review_records", [])
+        spac_review = metrics.get("spac_pattern_exclusion_review_records", [])
+        included_shell_review = metrics.get("included_shell_company_review_records", [])
+        print(f"Shell review preview: {shell_review[:25]}")
+        print(f"SPAC pattern review preview: {spac_review[:25]}")
+        print(f"Included shell-label review preview: {included_shell_review[:25]}")
+        print(f"Security type exclusions: {metrics.get('security_type_exclusion_counts', {})}")
+        print(
+            "Security type reasons: "
+            f"{metrics.get('security_type_classification_reason_counts', {})}"
+        )
+
+        exclusion_counts = metrics.get("exclusion_counts", {})
+        if exclusion_counts:
+            print("Top exclusion reasons:")
+            for reason, count in sorted(
+                exclusion_counts.items(),
+                key=lambda item: -item[1],
+            )[:12]:
+                print(f"  {reason}: {count}")
+
         session.close()
-        return 1
-
-    universe_job = UniverseBuilderJob(
-        session=session,
-        screener_response=sliced.response,
-        slice_diagnostics=sliced.slice_diagnostics,
-        require_security_profile_cache=not args.allow_incomplete_security_cache,
-        min_security_profile_coverage=args.min_security_profile_coverage,
-    )
-    universe = run_job(
-        session,
-        universe_job,
-        params={
-            "source": "fmp_sliced",
-            "trading_date": args.trading_date,
-            "mcap_min": MCAP_MIN,
-            "mcap_max": MCAP_MAX,
-            "price_min": PRICE_MIN,
-        },
-    )
-    _print_safe_error("Universe build", universe)
-
-    metrics = universe.metrics or {}
-    print(f"Raw unique:    {sliced.unique_raw_count}")
-    print(f"Included:      {metrics.get('included', 0)}")
-    print(f"Excluded:      {metrics.get('excluded', 0)}")
-    print(f"Coverage:      {metrics.get('security_profile_coverage_ratio')}")
-    print(
-        "Coverage headroom: "
-        f"{metrics.get('security_profile_coverage_headroom_count')} profiles"
-    )
-    print(f"Slices:        {sliced.slice_count}")
-    print(f"Slice limits:  {sliced.slice_limit_hits}")
-    print(f"Country rescues: {metrics.get('country_profile_rescue_count', 0)}")
-    print(f"Cap buckets:   {metrics.get('included_market_cap_bucket_counts', {})}")
-    print(f"Price buckets: {metrics.get('included_price_bucket_counts', {})}")
-    print(f"Countries:     {metrics.get('included_country_counts', {})}")
-    print(f"Shell exclusions: {metrics.get('shell_company_exclusion_count', 0)}")
-    print(f"Included shell-label names: {metrics.get('included_shell_company_count', 0)}")
-    shell_review = metrics.get("shell_company_exclusion_review_records", [])
-    spac_review = metrics.get("spac_pattern_exclusion_review_records", [])
-    included_shell_review = metrics.get("included_shell_company_review_records", [])
-    print(f"Shell review preview: {shell_review[:25]}")
-    print(f"SPAC pattern review preview: {spac_review[:25]}")
-    print(f"Included shell-label review preview: {included_shell_review[:25]}")
-    print(f"Security type exclusions: {metrics.get('security_type_exclusion_counts', {})}")
-    print(
-        "Security type reasons: "
-        f"{metrics.get('security_type_classification_reason_counts', {})}"
-    )
-
-    exclusion_counts = metrics.get("exclusion_counts", {})
-    if exclusion_counts:
-        print("Top exclusion reasons:")
-        for reason, count in sorted(exclusion_counts.items(), key=lambda item: -item[1])[:12]:
-            print(f"  {reason}: {count}")
-
-    session.close()
-    return 0 if universe.ok else 1
+        return 0 if universe.ok else 1
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
