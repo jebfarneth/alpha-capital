@@ -73,6 +73,7 @@ class TestSignalLineage:
             raw_payload={"close": [1.0, 2.0, 3.0]},
             job_run_id=run.job_run_id,
         )
+        assert json.loads(lineage.raw_payload_json) == {"close": [1.0, 2.0, 3.0]}
 
         feat = record_feature_snapshot(
             db_session,
@@ -552,13 +553,14 @@ class TestValidationHashes:
 
 
 # -------------------------------------------------------------------
-# Schema completeness: verify all 18 tables exist
+# Schema completeness: verify all evidence tables exist
 # -------------------------------------------------------------------
 
 class TestSchemaCompleteness:
     def test_all_tables_created_by_metadata(self, db_session):
         expected = {
             "security_profiles",
+            "security_profile_scan_snapshots",
             "universe_scans",
             "canonical_universe_scans",
             "universe_snapshots",
@@ -596,8 +598,11 @@ class TestSchemaCompleteness:
             columns = {
                 table: {col["name"] for col in inspect(engine).get_columns(table)}
                 for table in (
+                    "data_lineage",
+                    "security_profile_scan_snapshots",
                     "signal_registry",
                     "trade_candidates",
+                    "universe_snapshots",
                     "shadow_positions",
                     "real_positions",
                 )
@@ -617,6 +622,15 @@ class TestSchemaCompleteness:
             "lookahead_guard_passed",
         } <= columns["signal_registry"]
         assert signal_columns["signal_identity_hash"]["nullable"] is False
+        assert "raw_payload_json" in columns["data_lineage"]
+        assert "country" in columns["universe_snapshots"]
+        assert {
+            "scan_id",
+            "symbol",
+            "profile_required",
+            "cache_status",
+            "raw_profile_json",
+        } <= columns["security_profile_scan_snapshots"]
         assert {
             "effective_hard_stop_pct",
             "base_risk_budget_pct",

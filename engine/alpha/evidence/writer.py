@@ -30,6 +30,7 @@ from alpha.db.models import (
     OptimizerRun,
     OrderEvent,
     RealPosition,
+    SecurityProfileScanSnapshot,
     ShadowPosition,
     SignalRegistry,
     StbmLifecycleEvent,
@@ -133,6 +134,11 @@ def record_data_lineage(
 ) -> DataLineage:
     if raw_payload_hash is None:
         raw_payload_hash = _hash(raw_payload)
+    raw_payload_json = (
+        json.dumps(raw_payload, sort_keys=True, default=str)
+        if raw_payload is not None
+        else None
+    )
 
     lineage = DataLineage(
         data_lineage_id=_uid(),
@@ -141,6 +147,7 @@ def record_data_lineage(
         request_timestamp=request_timestamp or _now(),
         asof_timestamp=asof_timestamp,
         raw_payload_hash=raw_payload_hash,
+        raw_payload_json=raw_payload_json,
         freshness_seconds=freshness_seconds,
         source_authority=source_authority,
         data_quality_flags=(
@@ -172,6 +179,7 @@ def record_universe_snapshot(
     price: float | None = None,
     security_type: str | None = None,
     primary_exchange: str | None = None,
+    country: str | None = None,
     fractionable: bool | None = None,
     liquidity_score: float | None = None,
     median_dollar_volume_20d: float | None = None,
@@ -184,6 +192,7 @@ def record_universe_snapshot(
     dataset_version: str | None = None,
     schema_hash: str | None = None,
     source_lineage_hash: str | None = None,
+    flush: bool = True,
 ) -> UniverseSnapshot:
     snap = UniverseSnapshot(
         universe_snapshot_id=_uid(),
@@ -195,6 +204,7 @@ def record_universe_snapshot(
         source_provider=source_provider,
         market_cap=market_cap,
         price=price,
+        country=country,
         security_type=security_type,
         primary_exchange=primary_exchange,
         fractionable=fractionable,
@@ -212,7 +222,56 @@ def record_universe_snapshot(
         source_lineage_hash=source_lineage_hash,
     )
     session.add(snap)
-    session.flush()
+    if flush:
+        session.flush()
+    return snap
+
+
+def record_security_profile_scan_snapshot(
+    session: Session,
+    *,
+    scan_id: str,
+    symbol: str,
+    profile_required: bool,
+    cache_status: str,
+    job_run_id: str | None = None,
+    stale: bool | None = None,
+    security_type: str | None = None,
+    refresh_status: str | None = None,
+    classification_reason: str | None = None,
+    classifier_version: str | None = None,
+    classification_input_hash: str | None = None,
+    classification_output_hash: str | None = None,
+    source_lineage_hash: str | None = None,
+    profile_payload_hash: str | None = None,
+    profile_asof_timestamp: datetime | None = None,
+    last_refreshed_at: datetime | None = None,
+    raw_profile_json: str | None = None,
+    flush: bool = True,
+) -> SecurityProfileScanSnapshot:
+    snap = SecurityProfileScanSnapshot(
+        profile_scan_snapshot_id=_uid(),
+        scan_id=scan_id,
+        job_run_id=job_run_id,
+        symbol=symbol,
+        profile_required=profile_required,
+        cache_status=cache_status,
+        stale=stale,
+        security_type=security_type,
+        refresh_status=refresh_status,
+        classification_reason=classification_reason,
+        classifier_version=classifier_version,
+        classification_input_hash=classification_input_hash,
+        classification_output_hash=classification_output_hash,
+        source_lineage_hash=source_lineage_hash,
+        profile_payload_hash=profile_payload_hash,
+        profile_asof_timestamp=profile_asof_timestamp,
+        last_refreshed_at=last_refreshed_at,
+        raw_profile_json=raw_profile_json,
+    )
+    session.add(snap)
+    if flush:
+        session.flush()
     return snap
 
 

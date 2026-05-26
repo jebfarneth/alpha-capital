@@ -10,6 +10,8 @@ Security-type enrichment and classifier tests.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import MagicMock
@@ -677,6 +679,88 @@ class TestEnrichmentJob:
         counts = result.metrics["security_type_counts"]
         assert counts[COMMON_STOCK] == 1
         assert counts[ETF] == 1
+
+    def test_parallel_fetch_is_concurrent_and_metric_equivalent(self, db_session):
+        symbols = ["ACME", "BETA", "GAMA", "DELT"]
+
+        class SlowAdapter:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+
+            def get_company_profile(self, symbol):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    time.sleep(0.05)
+                    return _mock_profile_response(_profile(symbol))
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        serial_adapter = SlowAdapter()
+        serial_job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=serial_adapter,
+            symbols=symbols,
+            max_workers=1,
+        )
+        serial_start = time.perf_counter()
+        serial_result = run_job(db_session, serial_job)
+        serial_elapsed = time.perf_counter() - serial_start
+
+        db_session.query(SecurityProfile).delete()
+        db_session.flush()
+
+        parallel_adapter = SlowAdapter()
+        parallel_job = SecurityTypeEnrichmentJob(
+            session=db_session,
+            adapter=parallel_adapter,
+            symbols=symbols,
+            max_workers=4,
+        )
+        parallel_start = time.perf_counter()
+        parallel_result = run_job(db_session, parallel_job)
+        parallel_elapsed = time.perf_counter() - parallel_start
+
+        assert serial_adapter.max_active == 1
+        assert parallel_adapter.max_active > 1
+        assert parallel_elapsed < serial_elapsed * 0.75
+        assert parallel_result.metrics["enriched_count"] == serial_result.metrics["enriched_count"]
+        assert parallel_result.metrics["failed_count"] == serial_result.metrics["failed_count"]
+        assert parallel_result.metrics["security_type_counts"] == serial_result.metrics["security_type_counts"]
+
+    def test_parallel_fetch_keeps_db_writes_on_main_thread(self, db_session):
+        adapter_threads = set()
+
+        class ThreadTrackingAdapter:
+            def get_company_profile(self, symbol):
+                adapter_threads.add(threading.get_ident())
+                return _mock_profile_response(_profile(symbol))
+
+        writer_threads = set()
+        original_upsert = SecurityTypeEnrichmentJob._upsert_profile
+
+        def tracking_upsert(self, *args, **kwargs):
+            writer_threads.add(threading.get_ident())
+            return original_upsert(self, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(SecurityTypeEnrichmentJob, "_upsert_profile", tracking_upsert)
+            job = SecurityTypeEnrichmentJob(
+                session=db_session,
+                adapter=ThreadTrackingAdapter(),
+                symbols=["ACME", "BETA", "GAMA", "DELT"],
+                max_workers=4,
+            )
+            result = run_job(db_session, job)
+
+        assert result.ok
+        assert result.metrics["enriched_count"] == 4
+        assert writer_threads == {threading.get_ident()}
+        assert adapter_threads
 
     def test_derived_symbols_include_suffix_excluded_candidates(self, db_session):
         db_session.add_all([

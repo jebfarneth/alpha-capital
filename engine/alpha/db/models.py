@@ -181,6 +181,9 @@ class UniverseScan(Base):
     metric_json = Column(Text, nullable=True)
 
     snapshots = relationship("UniverseSnapshot", back_populates="scan")
+    security_profile_snapshots = relationship(
+        "SecurityProfileScanSnapshot", back_populates="scan"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +239,7 @@ class UniverseSnapshot(Base):
     source_provider = Column(String, nullable=True)
     market_cap = Column(Float, nullable=True)
     price = Column(Float, nullable=True)
+    country = Column(String, nullable=True)
     security_type = Column(String, nullable=True)
     primary_exchange = Column(String, nullable=True)
     fractionable = Column(Boolean, nullable=True)
@@ -256,6 +260,49 @@ class UniverseSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# security_profile_scan_snapshots
+# ---------------------------------------------------------------------------
+class SecurityProfileScanSnapshot(Base):
+    __tablename__ = "security_profile_scan_snapshots"
+    __table_args__ = (
+        Index(
+            "ux_security_profile_scan_snapshots_scan_symbol",
+            "scan_id", "symbol",
+            unique=True,
+        ),
+        Index(
+            "ix_security_profile_scan_snapshots_scan_required",
+            "scan_id", "profile_required",
+        ),
+    )
+
+    profile_scan_snapshot_id = Column(String, primary_key=True, default=_uuid)
+    scan_id = Column(
+        String, ForeignKey("universe_scans.scan_id"), nullable=False
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    symbol = Column(String, nullable=False)
+    profile_required = Column(Boolean, nullable=False, default=False)
+    cache_status = Column(String, nullable=False)
+    stale = Column(Boolean, nullable=True)
+    security_type = Column(String, nullable=True)
+    refresh_status = Column(String, nullable=True)
+    classification_reason = Column(String, nullable=True)
+    classifier_version = Column(String, nullable=True)
+    classification_input_hash = Column(String, nullable=True)
+    classification_output_hash = Column(String, nullable=True)
+    source_lineage_hash = Column(String, nullable=True)
+    profile_payload_hash = Column(String, nullable=True)
+    profile_asof_timestamp = Column(DateTime(timezone=True), nullable=True)
+    last_refreshed_at = Column(DateTime(timezone=True), nullable=True)
+    raw_profile_json = Column(Text, nullable=True)
+
+    scan = relationship("UniverseScan", back_populates="security_profile_snapshots")
+
+
+# ---------------------------------------------------------------------------
 # data_lineage
 # ---------------------------------------------------------------------------
 class DataLineage(Base):
@@ -268,6 +315,7 @@ class DataLineage(Base):
     provider_timestamp = Column(DateTime(timezone=True), nullable=True)
     asof_timestamp = Column(DateTime(timezone=True), nullable=False)
     raw_payload_hash = Column(String, nullable=False)
+    raw_payload_json = Column(Text, nullable=True)
     normalized_payload_hash = Column(String, nullable=True)
     freshness_seconds = Column(Float, nullable=True)
     source_authority = Column(String, nullable=True)

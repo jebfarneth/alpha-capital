@@ -39,7 +39,11 @@ from alpha.data.contracts import AdapterResponse, stable_hash
 from alpha.data.fmp import FmpScreenerResult
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 from alpha.db.models import CanonicalUniverseScan, SecurityProfile, UniverseScan, UniverseSnapshot
-from alpha.evidence.writer import record_data_lineage, record_universe_snapshot
+from alpha.evidence.writer import (
+    record_data_lineage,
+    record_security_profile_scan_snapshot,
+    record_universe_snapshot,
+)
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.security_type import (
     COMMON_STOCK,
@@ -141,6 +145,28 @@ def _sorted_review_records(
     records: List[Dict[str, Optional[str]]],
 ) -> List[Dict[str, Optional[str]]]:
     return sorted(records, key=lambda row: row["symbol"] or "")
+
+
+def _screener_payload(stocks: List[FmpScreenerResult]) -> List[Dict[str, Any]]:
+    return sorted(
+        (
+            {
+                "symbol": _clean_symbol(stock.symbol),
+                "company_name": stock.company_name,
+                "market_cap": stock.market_cap,
+                "price": stock.price,
+                "volume": stock.volume,
+                "sector": stock.sector,
+                "industry": stock.industry,
+                "exchange": stock.exchange,
+                "country": stock.country,
+                "is_etf": stock.is_etf,
+                "is_actively_trading": stock.is_actively_trading,
+            }
+            for stock in stocks
+        ),
+        key=lambda row: row["symbol"],
+    )
 
 
 def _raw_profile_payload(cached_profile) -> Dict[str, Any]:
@@ -368,6 +394,52 @@ def _security_profile_cache_hash(
     })
 
 
+def _record_security_profile_cache_snapshot(
+    session: Session,
+    *,
+    scan_id: str,
+    job_run_id: str,
+    symbol: str,
+    profile_required: bool,
+    cached_profile: Optional[SecurityProfile],
+    stale: Optional[bool],
+    flush: bool = True,
+) -> None:
+    if cached_profile is None:
+        record_security_profile_scan_snapshot(
+            session,
+            scan_id=scan_id,
+            job_run_id=job_run_id,
+            symbol=symbol,
+            profile_required=profile_required,
+            cache_status="missing",
+            flush=flush,
+        )
+        return
+
+    record_security_profile_scan_snapshot(
+        session,
+        scan_id=scan_id,
+        job_run_id=job_run_id,
+        symbol=symbol,
+        profile_required=profile_required,
+        cache_status="hit",
+        stale=stale,
+        security_type=cached_profile.security_type,
+        refresh_status=cached_profile.refresh_status,
+        classification_reason=cached_profile.classification_reason,
+        classifier_version=cached_profile.classifier_version,
+        classification_input_hash=cached_profile.classification_input_hash,
+        classification_output_hash=cached_profile.classification_output_hash,
+        source_lineage_hash=cached_profile.source_lineage_hash,
+        profile_payload_hash=cached_profile.profile_payload_hash,
+        profile_asof_timestamp=cached_profile.profile_asof_timestamp,
+        last_refreshed_at=cached_profile.last_refreshed_at,
+        raw_profile_json=cached_profile.raw_profile_json,
+        flush=flush,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
@@ -589,6 +661,7 @@ class UniverseBuilderJob(BaseJob):
             provider=resp.lineage.provider,
             endpoint=resp.lineage.endpoint,
             asof_timestamp=asof_timestamp,
+            raw_payload=_screener_payload(resp.data) if resp.data is not None else None,
             raw_payload_hash=resp.lineage.raw_payload_hash,
             request_timestamp=request_timestamp,
             freshness_seconds=resp.lineage.freshness_seconds,
@@ -697,6 +770,7 @@ class UniverseBuilderJob(BaseJob):
             security_type = None
             cached_profile = profile_cache.get(symbol)
             profile_usable = False
+            profile_stale: Optional[bool] = None
             if cached_profile is not None:
                 cache_hit_count += 1
                 security_type = cached_profile.security_type
@@ -706,6 +780,7 @@ class UniverseBuilderJob(BaseJob):
                     asof_timestamp,
                     self._profile_cache_max_age_days,
                 )
+                profile_stale = stale
                 if stale:
                     if profile_required:
                         security_profile_stale_count += 1
@@ -769,6 +844,17 @@ class UniverseBuilderJob(BaseJob):
                 if included:
                     cache_miss_included_count += 1
 
+            _record_security_profile_cache_snapshot(
+                self._session,
+                scan_id=scan_id,
+                job_run_id=ctx.job_run_id,
+                symbol=symbol,
+                profile_required=profile_required,
+                cached_profile=cached_profile,
+                stale=profile_stale,
+                flush=False,
+            )
+
             if included:
                 if (
                     profile_usable
@@ -796,11 +882,13 @@ class UniverseBuilderJob(BaseJob):
                 source_provider=resp.lineage.provider,
                 market_cap=market_cap,
                 price=price,
+                country=_clean_symbol(stock.country) or None,
                 primary_exchange=exchange or None,
                 security_type=security_type,
                 operating_universe_inclusion=included,
                 exclusion_reason=reason,
                 source_lineage_hash=lineage.raw_payload_hash,
+                flush=False,
             )
             snapshot_content.append({
                 "symbol": symbol,
@@ -870,6 +958,7 @@ class UniverseBuilderJob(BaseJob):
             "price_min": PRICE_MIN,
             "exclusion_counts": dict(exclusion_counts),
             "security_profile_cache_hash": security_profile_cache_hash,
+            "security_profile_scan_snapshot_count": len(deduped_rows),
             "security_profile_cache_hit_count": cache_hit_count,
             "security_profile_cache_miss_count": cache_miss_count,
             "security_profile_cache_miss_included_count": cache_miss_included_count,

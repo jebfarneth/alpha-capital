@@ -36,6 +36,7 @@ from alpha.db.models import (
     EvidenceJob,
     EvidenceJobRun,
     SecurityProfile,
+    SecurityProfileScanSnapshot,
     UniverseScan,
     UniverseSnapshot,
 )
@@ -300,6 +301,11 @@ class TestUniverseBuilder:
 
         included_tickers = {s.ticker for s in included}
         assert included_tickers == {"INCL1", "INCL2"}
+        included_country_counts = {}
+        for snap in included:
+            country = snap.country or "MISSING"
+            included_country_counts[country] = included_country_counts.get(country, 0) + 1
+        assert included_country_counts == result.metrics["included_country_counts"]
 
     def test_exclusion_reasons(self, db_session):
         resp = _mock_screener_response()
@@ -667,11 +673,196 @@ class TestUniverseBuilder:
         assert lineage_rows[0].job_run_id is not None
         assert lineage_rows[0].raw_payload_hash == resp.lineage.raw_payload_hash
         assert lineage_rows[0].source_authority == "mock"
+        raw_payload = json.loads(lineage_rows[0].raw_payload_json)
+        assert len(raw_payload) == 7
+        assert {row["symbol"] for row in raw_payload} == {
+            "DEAD", "ETF1", "FRGN", "HUGE", "INCL1", "INCL2", "TINY"
+        }
 
         snaps = db_session.query(UniverseSnapshot).all()
         assert {s.source_lineage_hash for s in snaps} == {
             resp.lineage.raw_payload_hash
         }
+
+    def test_screener_raw_payload_replays_lineage_hash(self, db_session):
+        data = [_stock("BETA"), _stock("ACME")]
+        expected_payload = [
+            {
+                "symbol": "ACME",
+                "company_name": "ACME Corp",
+                "market_cap": 75_000_000,
+                "price": 5.0,
+                "volume": None,
+                "sector": None,
+                "industry": None,
+                "exchange": "NASDAQ",
+                "country": "US",
+                "is_etf": False,
+                "is_actively_trading": True,
+            },
+            {
+                "symbol": "BETA",
+                "company_name": "BETA Corp",
+                "market_cap": 75_000_000,
+                "price": 5.0,
+                "volume": None,
+                "sector": None,
+                "industry": None,
+                "exchange": "NASDAQ",
+                "country": "US",
+                "is_etf": False,
+                "is_actively_trading": True,
+            },
+        ]
+        resp = AdapterResponse(
+            data=data,
+            lineage=LineageMeta(
+                provider="FMP",
+                endpoint="/stable/company-screener",
+                request_timestamp=_ts(),
+                asof_timestamp=_ts(),
+                raw_payload_hash=stable_hash(expected_payload),
+                source_authority="mock",
+            ),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        lineage = db_session.query(DataLineage).one()
+        raw_payload = json.loads(lineage.raw_payload_json)
+        assert raw_payload == expected_payload
+        assert stable_hash(raw_payload) == lineage.raw_payload_hash
+
+    def test_universe_builder_defers_per_row_flushes(self, db_session, monkeypatch):
+        import alpha.jobs.universe_builder as builder_module
+
+        original_snapshot_writer = builder_module.record_universe_snapshot
+        original_profile_snapshot_writer = (
+            builder_module.record_security_profile_scan_snapshot
+        )
+        universe_flush_flags = []
+        profile_flush_flags = []
+
+        def capture_universe_snapshot(*args, **kwargs):
+            universe_flush_flags.append(kwargs.get("flush", True))
+            return original_snapshot_writer(*args, **kwargs)
+
+        def capture_profile_snapshot(*args, **kwargs):
+            profile_flush_flags.append(kwargs.get("flush", True))
+            return original_profile_snapshot_writer(*args, **kwargs)
+
+        monkeypatch.setattr(
+            builder_module,
+            "record_universe_snapshot",
+            capture_universe_snapshot,
+        )
+        monkeypatch.setattr(
+            builder_module,
+            "record_security_profile_scan_snapshot",
+            capture_profile_snapshot,
+        )
+
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job)
+
+        assert result.ok
+        assert result.metrics["raw_count"] == 7
+        assert result.metrics["security_profile_scan_snapshot_count"] == 7
+        assert universe_flush_flags == [False] * 7
+        assert profile_flush_flags == [False] * 7
+
+    def test_profile_snapshot_failure_rolls_back_scan_rows(self, db_session, monkeypatch):
+        import alpha.jobs.universe_builder as builder_module
+
+        call_count = 0
+        original_writer = builder_module.record_security_profile_scan_snapshot
+
+        def failing_profile_snapshot(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("profile snapshot write failed")
+            return original_writer(*args, **kwargs)
+
+        monkeypatch.setattr(
+            builder_module,
+            "record_security_profile_scan_snapshot",
+            failing_profile_snapshot,
+        )
+
+        resp = _mock_screener_response()
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job)
+
+        assert result.status == "failed"
+        assert db_session.query(UniverseScan).count() == 0
+        assert db_session.query(UniverseSnapshot).count() == 0
+        assert db_session.query(SecurityProfileScanSnapshot).count() == 0
+        assert db_session.query(DataLineage).count() == 0
+        assert db_session.query(CanonicalUniverseScan).count() == 0
+
+    def test_security_profile_scan_snapshots_replay_cache_hash(self, db_session):
+        db_session.add(SecurityProfile(
+            symbol="INCL1",
+            security_type=COMMON_STOCK,
+            source_lineage_hash="profile-lineage",
+            profile_payload_hash="profile-payload",
+            classification_input_hash="input-hash",
+            classification_output_hash="output-hash",
+            classifier_version="classifier-v1",
+            profile_asof_timestamp=_ts(),
+            last_refreshed_at=_ts(),
+            refresh_status=REFRESH_STATUS_ENRICHED,
+            raw_profile_json=json.dumps({"industry": "Banks"}),
+            classification_reason="profile_fields_present",
+        ))
+        db_session.flush()
+
+        resp = AdapterResponse(
+            data=[_stock("INCL1"), _stock("MISS")],
+            lineage=_mock_lineage(),
+        )
+        job = UniverseBuilderJob(session=db_session, screener_response=resp)
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.ok
+        scan = db_session.query(UniverseScan).one()
+        rows = (
+            db_session.query(SecurityProfileScanSnapshot)
+            .filter(SecurityProfileScanSnapshot.scan_id == scan.scan_id)
+            .order_by(SecurityProfileScanSnapshot.symbol)
+            .all()
+        )
+        assert [row.symbol for row in rows] == ["INCL1", "MISS"]
+        assert [row.cache_status for row in rows] == ["hit", "missing"]
+        assert [row.profile_required for row in rows] == [True, True]
+        assert rows[0].raw_profile_json == json.dumps({"industry": "Banks"})
+
+        cache_rows = []
+        for row in rows:
+            if row.cache_status == "missing":
+                cache_rows.append({
+                    "symbol": row.symbol,
+                    "cache_status": "missing",
+                })
+            else:
+                cache_rows.append({
+                    "symbol": row.symbol,
+                    "cache_status": "hit",
+                    "security_type": row.security_type,
+                    "refresh_status": row.refresh_status,
+                    "classifier_version": row.classifier_version,
+                    "classification_input_hash": row.classification_input_hash,
+                    "classification_output_hash": row.classification_output_hash,
+                    "stale": row.stale,
+                })
+        recomputed = stable_hash({
+            "profile_cache_max_age_days": 7,
+            "security_profiles": cache_rows,
+        })
+        assert recomputed == scan.security_profile_cache_hash
+        assert result.metrics["security_profile_scan_snapshot_count"] == 2
 
     def test_deterministic_output_hash(self, db_session):
         resp = _mock_screener_response()
@@ -1121,6 +1312,8 @@ class TestRunUniverseEntrypointHelpers:
 
         assert args.min_security_profile_coverage == 1.0
         assert args.allow_incomplete_security_cache is False
+        assert args.profile_max_workers == 20
+        assert args.profile_rate_limit_per_minute == 2000
 
     def test_required_profile_symbols_include_included_and_suffix_excluded(self):
         symbols = _required_profile_symbols([

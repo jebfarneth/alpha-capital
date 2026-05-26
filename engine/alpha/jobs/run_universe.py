@@ -164,6 +164,9 @@ def _run_live(args) -> int:
         adapter=adapter,
         symbols=symbols,
         retry_backoff_seconds=args.retry_backoff_seconds,
+        max_workers=args.profile_max_workers,
+        max_profile_calls_per_minute=args.profile_rate_limit_per_minute,
+        adapter_factory=lambda: FmpAdapter(config),
     )
     enrichment = run_job(
         session,
@@ -271,6 +274,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Initial backoff for retryable FMP profile errors.",
+    )
+    parser.add_argument(
+        "--profile-max-workers",
+        type=int,
+        default=20,
+        help="Maximum concurrent FMP profile fetch workers.",
+    )
+    parser.add_argument(
+        "--profile-rate-limit-per-minute",
+        type=int,
+        default=2000,
+        help="Global cap for FMP profile calls per minute; leave headroom below provider limit.",
     )
     return parser.parse_args(argv)
 

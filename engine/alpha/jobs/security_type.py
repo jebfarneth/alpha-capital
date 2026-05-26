@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -324,17 +326,33 @@ class SecurityTypeEnrichmentJob(BaseJob):
         max_retries: int = 2,
         retry_backoff_seconds: float = 0.5,
         sleep_fn: Callable[[float], None] = time.sleep,
+        max_workers: int = 20,
+        max_profile_calls_per_minute: Optional[int] = None,
+        adapter_factory: Optional[Callable[[], FmpAdapter]] = None,
     ):
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
         if retry_backoff_seconds < 0:
             raise ValueError("retry_backoff_seconds must be non-negative")
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        if (
+            max_profile_calls_per_minute is not None
+            and max_profile_calls_per_minute < 1
+        ):
+            raise ValueError("max_profile_calls_per_minute must be positive")
         self._session = session
         self._adapter = adapter
         self._symbols = symbols
         self._max_retries = max_retries
         self._retry_backoff_seconds = retry_backoff_seconds
         self._sleep_fn = sleep_fn
+        self._max_workers = max_workers
+        self._max_profile_calls_per_minute = max_profile_calls_per_minute
+        self._adapter_factory = adapter_factory
+        self._worker_local = threading.local()
+        self._rate_lock = threading.Lock()
+        self._next_profile_call_at = 0.0
 
     def run(self, ctx: JobContext) -> JobResult:
         symbols = self._symbols
@@ -348,13 +366,18 @@ class SecurityTypeEnrichmentJob(BaseJob):
         retry_attempt_count = 0
         security_type_counts: Counter = Counter()
 
-        for symbol in symbols:
-            try:
-                resp, attempts = self._get_company_profile_with_retry(symbol)
-                retry_attempt_count += max(0, attempts - 1)
-            except Exception as exc:
+        fetch_results = self._fetch_profiles(symbols)
+
+        for symbol, resp, attempts, exc in sorted(
+            fetch_results, key=lambda row: row[0]
+        ):
+            retry_attempt_count += max(0, attempts - 1)
+            if exc is not None or resp is None:
                 failed_count += 1
-                self._mark_profile_failed(symbol, exc)
+                self._mark_profile_failed(
+                    symbol,
+                    exc or RuntimeError("profile fetch returned no response"),
+                )
                 continue
 
             if not resp.ok or resp.data is None:
@@ -446,14 +469,66 @@ class SecurityTypeEnrichmentJob(BaseJob):
                 "retry_attempt_count": retry_attempt_count,
                 "security_type_counts": dict(security_type_counts),
                 "classifier_version": CLASSIFIER_VERSION,
+                "max_workers": self._max_workers,
+                "max_profile_calls_per_minute": self._max_profile_calls_per_minute,
             },
         )
+
+    def _fetch_profiles(self, symbols: List[str]):
+        if not symbols:
+            return []
+
+        worker_count = min(self._max_workers, len(symbols))
+        if worker_count == 1:
+            return [self._fetch_profile(symbol) for symbol in symbols]
+
+        results = []
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = {
+                pool.submit(self._fetch_profile, symbol): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append((symbol, None, 0, exc))
+        return results
+
+    def _fetch_profile(self, symbol: str):
+        try:
+            resp, attempts = self._get_company_profile_with_retry(symbol)
+        except Exception as exc:
+            return symbol, None, 0, exc
+        return symbol, resp, attempts, None
+
+    def _worker_adapter(self) -> FmpAdapter:
+        if self._adapter_factory is None:
+            return self._adapter
+        adapter = getattr(self._worker_local, "adapter", None)
+        if adapter is None:
+            adapter = self._adapter_factory()
+            self._worker_local.adapter = adapter
+        return adapter
+
+    def _wait_for_profile_rate_limit(self) -> None:
+        if self._max_profile_calls_per_minute is None:
+            return
+        interval = 60.0 / self._max_profile_calls_per_minute
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_profile_call_at - now)
+            self._next_profile_call_at = max(now, self._next_profile_call_at) + interval
+        if wait_seconds > 0:
+            self._sleep_fn(wait_seconds)
 
     def _get_company_profile_with_retry(self, symbol: str):
         attempts = 0
         while True:
             attempts += 1
-            resp = self._adapter.get_company_profile(symbol)
+            self._wait_for_profile_rate_limit()
+            resp = self._worker_adapter().get_company_profile(symbol)
             if resp.ok or not (resp.error and resp.error.retryable):
                 return resp, attempts
             if attempts > self._max_retries:
