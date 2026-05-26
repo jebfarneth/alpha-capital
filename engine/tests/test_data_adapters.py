@@ -13,7 +13,7 @@ Tests verify:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -248,6 +248,42 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/historical-price-eod/full",
             params={"symbol": "ACME"},
+            timeout=30,
+        )
+
+    def test_get_historical_price_passes_date_window_and_asof(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "date": "2026-05-19",
+                "open": 5.0,
+                "high": 5.5,
+                "low": 4.9,
+                "close": 5.25,
+                "volume": 100000,
+            },
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        asof = datetime(2026, 5, 19, 20, 0, tzinfo=timezone.utc)
+
+        resp = adapter.get_historical_price(
+            "ACME",
+            from_date=date(2025, 3, 15),
+            to_date=date(2026, 5, 19),
+            asof=asof,
+        )
+
+        assert resp.ok
+        assert resp.lineage.asof_timestamp == asof
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/historical-price-eod/full",
+            params={
+                "symbol": "ACME",
+                "from": "2025-03-15",
+                "to": "2026-05-19",
+            },
             timeout=30,
         )
 

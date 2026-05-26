@@ -73,6 +73,7 @@ def assemble_m4_daily(
     snapshots: List[Any],
     daily_bars: Dict[str, List[DailyBar]],
     cutoff_timestamp: datetime,
+    universe_cutoff_timestamp: Optional[datetime] = None,
     trading_date: Optional[str] = None,
     decision_date: Optional[str] = None,
     evidence_session_date: Optional[str] = None,
@@ -99,7 +100,11 @@ def assemble_m4_daily(
         Backward-compatible alias used as decision_date/evidence_session_date when
         the explicit session dates are not supplied.
     cutoff_timestamp : datetime
-        Lookahead cutoff — all field source timestamps must be at or before this.
+        Daily-bar lookahead cutoff — bar field source timestamps must be at or before this.
+    universe_cutoff_timestamp : datetime, optional
+        Universe/snapshot field cutoff. Defaults to cutoff_timestamp for backward
+        compatibility. Production daily M4 uses evidence-session cutoff for bars
+        and canonical-scan as-of for universe membership fields.
     source_provider : str
         Provider name for lineage.
     source_lineage_hash : str, optional
@@ -115,6 +120,7 @@ def assemble_m4_daily(
 
     result = PatternAssemblyResult(pattern_id=PATTERN_ID)
     evidence_day = date.fromisoformat(resolved_evidence_date)
+    resolved_universe_cutoff = universe_cutoff_timestamp or cutoff_timestamp
 
     for snap in snapshots:
         ticker = _snap_attr(snap, "ticker")
@@ -221,6 +227,8 @@ def assemble_m4_daily(
             fields.append(AssembledField(
                 name="price", value=None,
                 presence=FieldPresence.UNAVAILABLE,
+                allowed_cutoff=cutoff_timestamp,
+                source_provider=source_provider,
                 rejection_reason=price_reason,
             ))
         if snapshot_price is not None:
@@ -228,7 +236,7 @@ def assemble_m4_daily(
                 name="snapshot_price", value=snapshot_price,
                 presence=FieldPresence.PRESENT,
                 source_timestamp=_ensure_aware(asof),
-                allowed_cutoff=cutoff_timestamp,
+                allowed_cutoff=resolved_universe_cutoff,
                 source_provider=source_provider,
                 lineage_hash=snap_lineage,
             ))
@@ -306,11 +314,15 @@ def assemble_m4_daily(
             fields.append(AssembledField(
                 name="high_52w", value=None,
                 presence=FieldPresence.UNAVAILABLE,
+                allowed_cutoff=cutoff_timestamp,
+                source_provider=source_provider,
                 rejection_reason=rejection_reason,
             ))
             fields.append(AssembledField(
                 name="n_sessions_in_window", value=0,
                 presence=FieldPresence.UNAVAILABLE,
+                allowed_cutoff=cutoff_timestamp,
+                source_provider=source_provider,
                 rejection_reason=rejection_reason,
             ))
 
@@ -326,7 +338,7 @@ def assemble_m4_daily(
                     name=field_name, value=val,
                     presence=FieldPresence.PRESENT,
                     source_timestamp=_ensure_aware(asof),
-                    allowed_cutoff=cutoff_timestamp,
+                    allowed_cutoff=resolved_universe_cutoff,
                     source_provider=source_provider,
                     lineage_hash=snap_lineage,
                 ))

@@ -305,6 +305,22 @@ class TestFrameworkLookahead:
         assert rejected[0].presence == FieldPresence.REJECTED_LOOKAHEAD
         assert "after cutoff" in rejected[0].rejection_reason
 
+    def test_field_specific_allowed_cutoff_overrides_global_cutoff(self):
+        bar_cutoff = datetime(2026, 5, 22, 20, 0, tzinfo=timezone.utc)
+        universe_cutoff = datetime(2026, 5, 26, 8, 30, tzinfo=timezone.utc)
+        fields = [
+            AssembledField(
+                name="operating_universe_inclusion",
+                value=True,
+                presence=FieldPresence.PRESENT,
+                source_timestamp=universe_cutoff,
+                allowed_cutoff=universe_cutoff,
+            ),
+        ]
+        validated, rejected = validate_assembled_fields(fields, bar_cutoff)
+        assert validated == {"operating_universe_inclusion": True}
+        assert rejected == []
+
     def test_missing_field_goes_to_rejected(self):
         cutoff = _ts()
         fields = [
@@ -849,11 +865,12 @@ class TestMissingData:
     def test_no_bars_produces_evidence_session_diagnostic(self):
         """Ticker with no bar history gets an explicit diagnostic, not zero-fill."""
         snapshots = [_make_snapshot("ACME")]
+        cutoff = _ts()
         result = assemble_m4_daily(
             snapshots=snapshots,
             daily_bars={},  # No bars at all
             trading_date="2026-05-20",
-            cutoff_timestamp=_ts(),
+            cutoff_timestamp=cutoff,
         )
         assert result.assembled_count == 0
         assert result.rejected_count == 1
@@ -861,6 +878,10 @@ class TestMissingData:
         diag = result.diagnostics[0]
         assert diag.diagnostic_type == "evidence_session_bar_unavailable"
         assert "ACME" == diag.ticker
+        rejected = {field.name: field for field in result.rejected_fields}
+        assert rejected["price"].allowed_cutoff == cutoff
+        assert rejected["high_52w"].allowed_cutoff == cutoff
+        assert rejected["n_sessions_in_window"].allowed_cutoff == cutoff
 
     def test_missing_price_in_snapshot_does_not_override_evidence_close(self):
         snapshots = [_make_snapshot("ACME", price=None)]

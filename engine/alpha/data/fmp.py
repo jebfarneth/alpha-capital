@@ -409,6 +409,7 @@ class FmpAdapter:
         ticker: str,
         from_date: Optional[date] = None,
         to_date: Optional[date] = None,
+        asof: Optional[datetime] = None,
         *,
         adjusted: bool = False,
         require_split_adjusted_close: bool = True,
@@ -423,7 +424,7 @@ class FmpAdapter:
             params["from"] = from_date.isoformat()
         if to_date:
             params["to"] = to_date.isoformat()
-        resp = self._request(endpoint, params=params)
+        resp = self._request(endpoint, params=params, asof=asof)
         if not resp.ok:
             return resp  # type: ignore[return-value]
 

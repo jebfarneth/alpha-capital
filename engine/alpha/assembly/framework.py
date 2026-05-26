@@ -83,10 +83,10 @@ def validate_assembled_fields(
     """
     validated: Dict[str, Any] = {}
     rejected: List[AssembledField] = []
-    cutoff_cmp = _comparable_utc(cutoff)
-
     for f in fields:
         if f.presence == FieldPresence.PRESENT:
+            field_cutoff = f.allowed_cutoff or cutoff
+            cutoff_cmp = _comparable_utc(field_cutoff)
             if f.source_timestamp is not None:
                 src_cmp = _comparable_utc(f.source_timestamp)
                 if src_cmp > cutoff_cmp:
@@ -100,7 +100,7 @@ def validate_assembled_fields(
                         lineage_hash=f.lineage_hash,
                         rejection_reason=(
                             f"source_timestamp {f.source_timestamp.isoformat()} "
-                            f"after cutoff {cutoff.isoformat()}"
+                            f"after cutoff {field_cutoff.isoformat()}"
                         ),
                     )
                     rejected.append(f)

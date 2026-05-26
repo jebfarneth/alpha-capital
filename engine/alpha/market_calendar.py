@@ -82,6 +82,17 @@ def next_us_equity_session(day: date) -> date:
     return cursor
 
 
+def us_equity_session_close_timestamp(day: date) -> datetime:
+    """Return the regular-session close timestamp for `day` in UTC.
+
+    The current resolver models regular 16:00 ET closes. Half days and
+    unscheduled closures remain explicit future work.
+    """
+    if not is_us_equity_session(day):
+        raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
+    return datetime.combine(day, MARKET_CLOSE_ET, EASTERN_TZ).astimezone(ZoneInfo("UTC"))
+
+
 def nyse_holidays(year: int) -> set[date]:
     """Regular NYSE holidays for modern U.S. equity sessions.
 
