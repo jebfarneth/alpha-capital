@@ -326,7 +326,7 @@ class SecurityTypeEnrichmentJob(BaseJob):
         max_retries: int = 2,
         retry_backoff_seconds: float = 0.5,
         sleep_fn: Callable[[float], None] = time.sleep,
-        max_workers: int = 20,
+        max_workers: int = 1,
         max_profile_calls_per_minute: Optional[int] = None,
         adapter_factory: Optional[Callable[[], FmpAdapter]] = None,
     ):
@@ -341,6 +341,11 @@ class SecurityTypeEnrichmentJob(BaseJob):
             and max_profile_calls_per_minute < 1
         ):
             raise ValueError("max_profile_calls_per_minute must be positive")
+        if max_workers > 1 and adapter_factory is None:
+            raise ValueError(
+                "parallel profile enrichment requires adapter_factory so worker "
+                "threads do not share one FmpAdapter/request session"
+            )
         self._session = session
         self._adapter = adapter
         self._symbols = symbols

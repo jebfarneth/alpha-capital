@@ -683,22 +683,28 @@ class TestEnrichmentJob:
     def test_parallel_fetch_is_concurrent_and_metric_equivalent(self, db_session):
         symbols = ["ACME", "BETA", "GAMA", "DELT"]
 
-        class SlowAdapter:
+        class SharedSlowState:
             def __init__(self):
                 self.lock = threading.Lock()
                 self.active = 0
                 self.max_active = 0
 
+        class SlowAdapter:
+            def __init__(self, state=None):
+                self.state = state or SharedSlowState()
+
             def get_company_profile(self, symbol):
-                with self.lock:
-                    self.active += 1
-                    self.max_active = max(self.max_active, self.active)
+                with self.state.lock:
+                    self.state.active += 1
+                    self.state.max_active = max(
+                        self.state.max_active, self.state.active
+                    )
                 try:
                     time.sleep(0.05)
                     return _mock_profile_response(_profile(symbol))
                 finally:
-                    with self.lock:
-                        self.active -= 1
+                    with self.state.lock:
+                        self.state.active -= 1
 
         serial_adapter = SlowAdapter()
         serial_job = SecurityTypeEnrichmentJob(
@@ -714,23 +720,35 @@ class TestEnrichmentJob:
         db_session.query(SecurityProfile).delete()
         db_session.flush()
 
-        parallel_adapter = SlowAdapter()
+        parallel_state = SharedSlowState()
         parallel_job = SecurityTypeEnrichmentJob(
             session=db_session,
-            adapter=parallel_adapter,
+            adapter=SlowAdapter(),
             symbols=symbols,
             max_workers=4,
+            adapter_factory=lambda: SlowAdapter(parallel_state),
         )
         parallel_start = time.perf_counter()
         parallel_result = run_job(db_session, parallel_job)
         parallel_elapsed = time.perf_counter() - parallel_start
 
-        assert serial_adapter.max_active == 1
-        assert parallel_adapter.max_active > 1
+        assert serial_adapter.state.max_active == 1
+        assert parallel_state.max_active > 1
         assert parallel_elapsed < serial_elapsed * 0.75
         assert parallel_result.metrics["enriched_count"] == serial_result.metrics["enriched_count"]
         assert parallel_result.metrics["failed_count"] == serial_result.metrics["failed_count"]
         assert parallel_result.metrics["security_type_counts"] == serial_result.metrics["security_type_counts"]
+
+    def test_parallel_requires_adapter_factory(self, db_session):
+        adapter = MagicMock(spec=FmpAdapter)
+
+        with pytest.raises(ValueError, match="adapter_factory"):
+            SecurityTypeEnrichmentJob(
+                session=db_session,
+                adapter=adapter,
+                symbols=["ACME", "BETA"],
+                max_workers=2,
+            )
 
     def test_parallel_fetch_keeps_db_writes_on_main_thread(self, db_session):
         adapter_threads = set()
@@ -754,6 +772,7 @@ class TestEnrichmentJob:
                 adapter=ThreadTrackingAdapter(),
                 symbols=["ACME", "BETA", "GAMA", "DELT"],
                 max_workers=4,
+                adapter_factory=ThreadTrackingAdapter,
             )
             result = run_job(db_session, job)
 
