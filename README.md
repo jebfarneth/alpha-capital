@@ -1,102 +1,118 @@
 # Alpha Capital
 
-A private quantitative trading system for US small-cap equities ($30M-$200M market cap). Designed, specified, and built by one person using agentic AI coding tools.
+Alpha Capital is a private systematic trading engine for US micro/small-cap common equities, focused on the $30M-$250M market-cap universe. It is built as a complete quant operating system: point-in-time data ingestion, feature assembly, pattern detection, portfolio allocation, execution, exit management, and continuous validation.
 
-## What This Is
+The system is designed for real capital from day one, starting around $1K and scaling only as live and shadow evidence justify it. It is not a dashboard-first app, a backtesting toy, or a discretionary alert feed.
 
-Alpha Capital detects breakout and momentum patterns in ~800-1,200 small-cap stocks, ranks them through a constrained portfolio optimizer, and executes trades via the Alpaca brokerage API. The system is grounded in 79 peer-reviewed academic papers across 50 research corpora.
+## Operating Model
 
-This is not a backtesting tool or a dashboard. It is a live trading engine designed to deploy real capital, starting at $1K and scaling through validation.
+Alpha Capital scans a live operating universe, assembles point-in-time feature inputs, runs a 17-pattern alpha registry, ranks candidates through a constrained optimizer, routes orders through Alpaca, manages exits through a synthetic triple-barrier manager, and records every decision into an evidence spine for validation.
+
+The completed system is designed around four principles:
+
+- **Right-tail capture:** preserve exposure to explosive microcap moves through terminal-tranche-heavy exits, wide trailing stops, and convexity locks.
+- **Pattern competition:** every eligible pattern can enter the king-of-the-hill allocator; validation changes confidence and sizing, not whether a pattern is allowed to produce evidence.
+- **Point-in-time accountability:** signals, features, data lineage, timestamps, universe membership, candidates, orders, positions, and exits are recorded so every claim can be audited after the fact.
+- **Small-AUM pragmatism:** the portfolio model accepts that a $1K-$10K account should optimize for asymmetric opportunity capture before institutional smoothness.
+
+## Pattern System
+
+The production design contains 17 patterns across two tracks.
+
+**Continuous-factor track:** M1, M2, M3, M4, M5, M6, M7, I1, I3, I5, I7, I8, I9, I10. These produce observable factor exposures and are validated with Fama-MacBeth regressions plus Newey-West HAC errors.
+
+**Event-trigger overlay track:** I2, I4, I6. These add event-window expected-return overlays and are validated with event-study CAR methodology.
+
+Core examples:
+
+| Pattern | Thesis | Anchor |
+|---|---|---|
+| M4 52-Week High | Right-tail-convex continuation after split-adjusted close breaks a prior high | Jegadeesh & Titman |
+| M6 Volatility Compression | Breakout from low-volatility regimes | Garman-Klass; Lo-Mamaysky-Wang |
+| I1 Gap and Go | Confirmed gap continuation | Lou, Polk & Skouras |
+| I8 Opening Range Breakout | Opening-window predictability | Heston, Korajczyk & Sadka |
+| M7 / I10 Pure Technical | ML-derived pattern recognition under Reality Check governance | Cakici-style technical features |
+
+The vault contains the full pattern roster, exit geometry, validation thresholds, and source literature.
 
 ## Architecture
 
-The system uses a factor-model methodology for return prediction and portfolio construction:
+The completed stack is backend-first and evidence-driven:
 
-- **17 pattern detectors** spanning multi-day momentum (M-track) and intraday breakout (I-track) strategies, each anchored to specific academic literature
-- **Evidence spine** — 18-table Postgres schema capturing every signal, candidate, order, position, and validation decision with full point-in-time lineage
-- **King-of-the-hill optimizer** — all implemented patterns compete for capital allocation; validation affects confidence weighting, not pattern admission
-- **Right-tail-convex exit geometry** — 20/20/60 tranche structure with trailing stops and convexity locks designed to capture explosive microcap moves
-- **Shadow + real validation tracks** — statistical validation (Fama-MacBeth + Newey-West HAC) runs continuously against shadow positions; real positions are monitored from day one
+1. **Universe Builder** - builds the tradable $30M-$250M operating universe with security-type, country, exchange, price, and liquidity controls.
+2. **Data Layer** - FMP for historical/fundamental data, Alpaca for live intraday and execution-time prices, and supplemental sources for short interest, filings, catalysts, halts, FDA events, and news.
+3. **Feature Assembly** - converts raw provider data into pattern-specific `PatternInput` objects with typed missing values, lookahead enforcement, lineage, and deterministic feature hashes.
+4. **Detector Registry** - runs callable pattern detectors against assembled inputs and records both signals and valid no-signal evidence.
+5. **Evidence Spine** - Postgres/Supabase schema for jobs, lineage, universe snapshots, feature snapshots, signals, candidates, orders, positions, exits, and validation telemetry.
+6. **Trade Candidate Builder** - merges co-firing signals, applies mutexes and vetoes, estimates net edge after costs, and emits auditable trade candidates.
+7. **King-of-the-Hill Optimizer** - allocates limited capital to the best candidates subject to AUM tier, reserve, correlation, liquidity, and risk constraints.
+8. **Execution Bridge** - routes orders through Alpaca using class-specific order semantics.
+9. **Synthetic Triple-Barrier Manager** - owns staged take-profits, stops, trailing stops, time barriers, framework exits, reconciliation, and recovery.
+10. **Validation Layer** - maintains shadow and real tracks, forward returns, factor returns, event CARs, pattern weights, confidence haircuts, and decay monitoring.
 
-## Academic Foundation
+## Current Build Frontier
 
-| Pattern | Academic Anchor | Key Finding |
-|---|---|---|
-| M4 52-Week High | Jegadeesh & Titman (1993, 2001) | 1.10%/month momentum premium persists post-publication |
-| M6 Vol Compression | Garman-Klass (1980), Lo-Mamaysky-Wang (2000) | Breakouts from GK-measured low-vol regimes produce directional continuation |
-| I1 Gap and Go | Lou, Polk & Skouras (2019) | +3.47%/month overnight alpha (t=16.83); confirmation gate filters reversals |
-| I8 Opening Range | Heston, Korajczyk & Sadka (2010) | Opening half-hour = ~6x mid-day predictability |
+The repository is being built toward the architecture above. The backend foundation is active: universe construction, evidence capture, detector orchestration, callable detector contracts, and the first M4 feature-assembly slice are in place. Production readiness is not declared from unit tests alone; each new boundary is validated through live scratch-schema audits before being trusted.
 
-Plus 13 additional patterns covering earnings drift, insider clusters, sector rotation, short squeezes, volatility expansion, FDA catalysts, and more.
+The immediate frontier is M4 daily production wiring: market-calendar-aware session resolution, split-adjusted close feature assembly, strict prior-session 52-week-high computation, hard short-history signal floors, feature persistence, lineage proof, and no-signal deduplication.
 
-## Tech Stack
+After that, the build sequence moves through the remaining feature assemblers, Trade Candidate Builder, optimizer, execution bridge, STBM exits, validation jobs, and operator dashboard.
 
-- **Engine:** Python 3.9 — pattern detectors, data adapters, evidence capture, job orchestration
-- **Database:** Supabase/Postgres (production), SQLite (tests)
-- **Broker:** Alpaca Trade API — paper and live execution
-- **Market Data:** FMP Ultimate (historical/fundamental), Alpaca (live intraday), Polygon (short interest)
-- **Dashboard:** React/TypeScript (planned, backend-first approach)
-- **Network:** Tailscale mesh VPN — no public exposure
+## Repository Layout
 
-## Specification System
+```text
+engine/   Python trading engine: data adapters, feature assembly, detectors, jobs, evidence, DB models
+client/   React/Vite dashboard scaffold
+server/   Node/Express API scaffold
+docs/     Repository documentation pointers
+```
 
-The `/Documents/AlphaCapital/` vault contains the engineering specification for every component:
+The complete engineering canon lives outside this repository in the Alpha Capital vault:
 
-- `Architecture.md` — portfolio construction, sizing, optimizer, framework contracts
-- `Patterns.md` — canonical 17-pattern roster with exit geometry
-- `Validation.md` — two-track statistical validation framework
-- `Engineering/Patterns/` — per-pattern SPEC, EXPOSURE, DATA, EXECUTION, VALIDATION contracts
-- `Engineering/Validation/` — evidence capture, schema, validation job contracts
-- `Engineering/RuntimeLayerStack.md` — runtime layer architecture
-- `Agentic Engineering.md` — 31-step build sequence for agentic coding recovery
+```text
+~/Documents/AlphaCapital/
+```
 
-Each pattern detector is implemented strictly from its vault specification. The vault is the source of truth; the code follows it.
+Important vault files:
 
-## Current Status
-
-**Detector layer (Layer 1 of 9):**
-- M4 52-Week High Breakout — complete (10/10)
-- M6 Volatility-Compression Breakout — complete (9/10)
-- I1 Gap and Go — complete (10/10)
-- I8 Opening Range Breakout — complete (10/10)
-- 13 patterns remaining
-
-**Shared infrastructure:**
-- Evidence spine (18 tables) — complete
-- Data adapters (FMP, Alpaca, Polygon) — complete
-- Job orchestration with evidence-backed runner — complete
-- Universe builder — complete
-- Shared detector guards (universe, data confidence, quotes, timestamps) — complete
-
-**Not yet built:** Trade Candidate Builder, KOTH optimizer, execution layer, STBM exit manager, shadow execution, validation jobs, performance telemetry, dashboard.
-
-**Test suite:** 328+ tests passing.
+- `Architecture.md` - portfolio construction, sizing, optimizer, and runtime contracts
+- `Patterns.md` - canonical 17-pattern roster and exit geometry
+- `Validation.md` - shadow/real validation framework
+- `Engineering/FeatureAssembly.md` - feature assembly contract
+- `Engineering/Patterns/` - per-pattern SPEC, EXPOSURE, DATA, EXECUTION, VALIDATION docs
+- `Engineering/RuntimeLayerStack.md` - runtime-layer build sequence
+- `CODEX.md` - high-density recovery context for AI coding agents
 
 ## Development
 
-```
+Engine setup:
+
+```bash
 cd engine
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q
+uv run pytest -q
 ```
 
-Environment variables (see `engine/.env.example`):
-```
-DATABASE_URL=sqlite:///alpha_capital.db
-FMP_API_KEY=
-ALPACA_API_KEY=
-ALPACA_SECRET_KEY=
-POLYGON_API_KEY=
+Full app scaffolds:
+
+```bash
+npm run install:all
+npm run dev
 ```
 
-No secrets are stored in this repository. No API keys are required to run tests.
+Environment variables are documented in:
 
-## Repository Hygiene
+```text
+engine/.env.example
+server/.env.example
+```
 
-- Private repository, public-ready at any time
-- No secrets, credentials, account IDs, or personal data in git history
-- `.env.example` documents required variables without values
-- All tests run against SQLite fixtures with no network calls
-- Python artifacts, databases, and caches excluded via `.gitignore`
+No secrets are committed. Tests are expected to run without live API keys unless a task explicitly invokes a live-data audit.
+
+## Production Standard
+
+Alpha Capital treats live-read and live-write audits as part of implementation, not afterthoughts. A feature is not production-ready because fixtures pass. It must prove, in scratch schemas and with real provider data, that it preserves point-in-time semantics, lineage, determinism, deduplication, and canonical/public isolation.
+
+That standard is deliberate: this system is meant to trade real money, preserve the right tail, and leave an evidence trail strong enough to debug both profits and mistakes.
