@@ -44,6 +44,8 @@ class ValidationScaffoldJob(BaseJob):
         self._minimum_sample = minimum_sample
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Summarize computed sample sufficiency by pattern."""
+
         pattern_stats = (
             self._session.query(
                 SignalRegistry.pattern_id,

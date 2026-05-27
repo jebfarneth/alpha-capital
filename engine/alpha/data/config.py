@@ -34,11 +34,15 @@ def _optional(key: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class FmpConfig:
+    """Configuration for the Financial Modeling Prep adapter."""
+
     api_key: str
     base_url: str = "https://financialmodelingprep.com"
 
     @classmethod
     def from_env(cls) -> FmpConfig:
+        """Build FMP configuration from process environment variables."""
+
         return cls(
             api_key=_require("FMP_API_KEY"),
             base_url=_optional("FMP_BASE_URL", cls.base_url),
@@ -47,12 +51,16 @@ class FmpConfig:
 
 @dataclass(frozen=True)
 class AlpacaConfig:
+    """Configuration for Alpaca broker and market-data adapters."""
+
     api_key: str
     secret_key: str
     base_url: str  # paper or live
 
     @classmethod
     def from_env(cls) -> AlpacaConfig:
+        """Build Alpaca configuration from process environment variables."""
+
         return cls(
             api_key=_require("ALPACA_API_KEY"),
             secret_key=_require("ALPACA_SECRET_KEY"),
@@ -64,11 +72,15 @@ class AlpacaConfig:
 
 @dataclass(frozen=True)
 class PolygonConfig:
+    """Configuration for Polygon/Massive reference-data adapters."""
+
     api_key: str
     base_url: str = "https://api.polygon.io"
 
     @classmethod
     def from_env(cls) -> PolygonConfig:
+        """Build Polygon configuration from process environment variables."""
+
         return cls(
             api_key=_require("POLYGON_API_KEY"),
             base_url=_optional("POLYGON_BASE_URL", cls.base_url),

@@ -463,6 +463,8 @@ class I1Detector(BasePatternDetector):
         self._lambda_i1_3td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an I1 gap-and-go setup from point-in-time inputs."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

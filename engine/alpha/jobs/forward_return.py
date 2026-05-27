@@ -120,6 +120,8 @@ LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON = (
 
 @dataclass(frozen=True)
 class M4ExitGeometry:
+    """M4 threshold and time-barrier geometry used for path telemetry."""
+
     pattern_id: str
     t1_return: float
     t2_return: float
@@ -145,6 +147,8 @@ RETURN_COMPARISON_EPSILON = 1e-12
 
 @dataclass(frozen=True)
 class M4ForwardReturnPlan:
+    """Resolved M4 entry, exit, maturity, and finality dates for one signal."""
+
     decision_date: date
     next_execution_session: Optional[date]
     entry_session_date: date
@@ -159,6 +163,8 @@ class M4ForwardReturnPlan:
 
 @dataclass(frozen=True)
 class PathTelemetry:
+    """Bounded-window MFE/MAE and barrier-touch measurements."""
+
     max_favorable_excursion: Optional[float] = None
     max_adverse_excursion: Optional[float] = None
     mfe_session_date: Optional[str] = None
@@ -174,6 +180,8 @@ class PathTelemetry:
 
 @dataclass(frozen=True)
 class SurvivorshipDecision:
+    """Outcome policy selected by the survivorship resolver."""
+
     status: str
     reason: str
     exit_price: Optional[float]
@@ -183,6 +191,8 @@ class SurvivorshipDecision:
 
 @dataclass(frozen=True)
 class SurvivorshipResolution:
+    """Survivorship resolver output with provider lineage and request metadata."""
+
     decision: SurvivorshipDecision
     data_lineage_ids: List[str]
     provider: Optional[str]
@@ -193,6 +203,8 @@ class SurvivorshipResolution:
 
 @dataclass(frozen=True)
 class ProductionPricingResult:
+    """Price-function result ready for observation/event persistence."""
+
     status: str
     reason: Optional[str]
     entry_price: Optional[float]
@@ -302,6 +314,8 @@ def m4_entry_exit_plan(
 
 
 def m4_forward_return_input_hash(sig: SignalRegistry, plan: M4ForwardReturnPlan) -> str:
+    """Compute deterministic input identity for an M4 forward-return attempt."""
+
     return stable_hash(_input_payload(sig, plan))
 
 
@@ -313,6 +327,8 @@ def m4_forward_return_outcome_hash(
     entry_payload_hash: Optional[str] = None,
     exit_payload_hash: Optional[str] = None,
 ) -> str:
+    """Compute deterministic outcome identity for an M4 pricing result."""
+
     payload = _input_payload(sig, plan)
     payload.update({
         "status": pricing.status,
@@ -429,6 +445,8 @@ class ForwardReturnJob(BaseJob):
         self._price_drift_rel_tol = price_drift_rel_tol
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Run either legacy injected pricing, M4 production pricing, or sweep mode."""
+
         if self._adapter is None:
             return self._run_injected_price_fn(ctx)
         if self._reconcile_computed:
@@ -1022,6 +1040,8 @@ class ForwardReturnJob(BaseJob):
             provider_request_payload: Optional[Dict[str, Any]] = None,
             data_lineage_ids: Optional[List[str]] = None,
         ) -> ProductionPricingResult:
+            """Build a pricing result using the current provider lineage by default."""
+
             telemetry = telemetry or PathTelemetry()
             return ProductionPricingResult(
                 status=status,

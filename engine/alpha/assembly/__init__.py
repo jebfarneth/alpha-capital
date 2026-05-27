@@ -1,3 +1,5 @@
+"""Feature assembly framework and pattern-specific assemblers."""
+
 from alpha.assembly.registry import AssemblyRegistry, AssemblerStatus
 from alpha.assembly.framework import (
     AssembledField,

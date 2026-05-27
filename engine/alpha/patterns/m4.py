@@ -371,6 +371,8 @@ def compute_m4_fresh_features(
     *, last_price: float, high_52w: float,
     intraday_range_confirmation: float, intraday_volume_confirmation: float,
 ) -> Dict[str, Any]:
+    """Compute M4 fresh-breakout activation features."""
+
     if high_52w <= 0:
         fresh_extension = 0.0
     else:
@@ -506,6 +508,8 @@ class M4Detector(BasePatternDetector):
         self._lambda_m4_15td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M4 52-week-high breakout setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

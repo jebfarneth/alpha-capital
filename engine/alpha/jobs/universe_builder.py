@@ -623,6 +623,8 @@ class UniverseBuilderJob(BaseJob):
         )
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Build and persist one point-in-time operating-universe scan."""
+
         resp = self._screener_response
         raw_asof_timestamp = resp.lineage.asof_timestamp
         asof_timestamp = (

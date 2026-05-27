@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 class PatternId:
+    """Canonical ids for all pattern slots."""
+
     M1 = "M1"
     M2 = "M2"
     M3 = "M3"
@@ -43,11 +45,15 @@ class PatternId:
 
 
 class PatternTrack:
+    """Detector time-horizon families."""
+
     MULTI_DAY = "multi_day"
     INTRADAY = "intraday"
 
 
 class ThesisCategory:
+    """Pattern thesis categories used by risk and validation layers."""
+
     RIGHT_TAIL_CONVEX = "right_tail_convex"
     CONTINUATION = "continuation"
     EVENT_DRIFT = "event_drift"
@@ -56,18 +62,24 @@ class ThesisCategory:
 
 
 class RouteClass:
+    """Execution-route class labels from the pattern contracts."""
+
     A = "A"
     B = "B"
     C = "C"
 
 
 class FidelityTier:
+    """Feature/data fidelity labels carried into evidence records."""
+
     FULL = "FULL"
     LITE = "LITE"
     UNAVAILABLE = "UNAVAILABLE"
 
 
 class SignalDirection:
+    """Supported signal directions."""
+
     LONG = "long"
     SHORT = "short"
 
@@ -132,6 +144,8 @@ class PatternDetectionResult:
 
     @property
     def has_signal(self) -> bool:
+        """Return True when the detector emitted at least one signal."""
+
         return len(self.signals) > 0
 
 
@@ -140,27 +154,38 @@ class PatternDetectionResult:
 # ---------------------------------------------------------------------------
 
 class BasePatternDetector(abc.ABC):
+    """Abstract interface every pattern detector must implement."""
 
     @property
     @abc.abstractmethod
     def pattern_id(self) -> str:
+        """Return the detector's canonical pattern id."""
+
         ...
 
     @property
     @abc.abstractmethod
     def track(self) -> str:
+        """Return whether the detector is multi-day or intraday."""
+
         ...
 
     @property
     @abc.abstractmethod
     def thesis_category(self) -> str:
+        """Return the detector's economic thesis category."""
+
         ...
 
     @property
     @abc.abstractmethod
     def route_class(self) -> str:
+        """Return the detector's execution-route class."""
+
         ...
 
     @abc.abstractmethod
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate one point-in-time input and return feature/signal evidence."""
+
         ...

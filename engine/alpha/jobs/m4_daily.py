@@ -47,6 +47,8 @@ class M4DailyAssemblyJob(BaseJob):
         self._lookback_calendar_days = lookback_calendar_days
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Run the production M4 daily assembly and orchestration path."""
+
         run_timestamp, timestamp_error = _resolve_run_timestamp(
             self._run_timestamp,
             ctx.params.get("run_timestamp"),

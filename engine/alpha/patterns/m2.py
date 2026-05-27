@@ -530,6 +530,8 @@ class M2Detector(BasePatternDetector):
         self._lambda_m2_20td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M2 insider-cluster setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

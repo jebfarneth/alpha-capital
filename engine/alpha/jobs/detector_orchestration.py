@@ -220,6 +220,8 @@ def _result_guard_passed(result: PatternDetectionResult) -> Tuple[bool, Optional
 
 @dataclass
 class DetectorDiagnostics:
+    """Per-detector execution counters persisted in orchestration metrics."""
+
     detector_id: str
     detector_version: str
     callable_status: str = "callable"
@@ -236,6 +238,8 @@ class DetectorDiagnostics:
     input_lineage_hashes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable diagnostic payload."""
+
         return {
             "detector_id": self.detector_id,
             "detector_version": self.detector_version,
@@ -296,6 +300,8 @@ class DetectorOrchestrationJob(BaseJob):
         self._assembled_inputs = assembled_inputs
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Run callable detectors over canonical or explicitly assembled inputs."""
+
         trading_date = self._trading_date or ctx.params.get("trading_date")
         if not trading_date:
             return JobResult(

@@ -105,16 +105,22 @@ ACTIVATION_STATE_FAILED = "activation_failed"
 # ---------------------------------------------------------------------------
 
 def compute_compression_depth(compression_ratio: float) -> float:
+    """Map a volatility-compression ratio into bounded M6 depth evidence."""
+
     return max(0.0, min((1.0 - compression_ratio) / 0.4, 2.5))
 
 
 def compute_breakout_extension(price: float, compression_high: float, sigma_20d: float) -> float:
+    """Measure price extension above compression high in volatility units."""
+
     if price <= compression_high or compression_high <= 0 or sigma_20d <= 0:
         return 0.0
     return max(0.0, min((price - compression_high) / compression_high / sigma_20d, 3.0))
 
 
 def compute_expansion_confirmation(expansion_ratio: float) -> float:
+    """Map realized range expansion into M6 confirmation tiers."""
+
     if expansion_ratio >= 2.0:
         return 1.5
     if expansion_ratio >= 1.5:
@@ -125,6 +131,8 @@ def compute_expansion_confirmation(expansion_ratio: float) -> float:
 
 
 def compute_volume_confirmation(volume_ratio: float) -> float:
+    """Map volume expansion into M6 confirmation tiers."""
+
     if volume_ratio >= 2.0:
         return 1.5
     if volume_ratio >= 1.5:
@@ -137,6 +145,8 @@ def compute_volume_confirmation(volume_ratio: float) -> float:
 def compute_expansion_ratio(
     session_high: float, session_low: float, gk_avg_5d: float,
 ) -> Optional[float]:
+    """Return Garman-Klass-style expansion ratio for the current session."""
+
     if session_high <= 0 or session_low <= 0 or session_high <= session_low:
         return None
     if gk_avg_5d is None or gk_avg_5d <= 0:
@@ -150,6 +160,8 @@ def compute_m6_data_confidence(
     *,
     field_confidence_sources: Optional[tuple] = None,
 ) -> float:
+    """Compute M6 data confidence from quality flags and GK warnings."""
+
     flags = dict(quality_flags)
     if gk_warning:
         flags["gk_low_transaction_warning"] = True
@@ -159,6 +171,8 @@ def compute_m6_data_confidence(
 def compute_effective_volume_confirmation(
     volume_ratio: Optional[float], latest_5m_ratio: Optional[float],
 ) -> float:
+    """Return the strongest available daily or intraday volume confirmation."""
+
     confirmations = []
     if volume_ratio is not None:
         confirmations.append(compute_volume_confirmation(volume_ratio))
@@ -660,6 +674,8 @@ class M6Detector(BasePatternDetector):
         self._lambda_m6_12td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M6 volatility-compression breakout setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

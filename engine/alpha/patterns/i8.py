@@ -522,6 +522,8 @@ class I8Detector(BasePatternDetector):
         self._lambda_i8_3td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an I8 opening-range breakout setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

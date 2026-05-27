@@ -560,6 +560,8 @@ class M5Detector(BasePatternDetector):
         self._lambda_m5_7td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M5 failed-breakdown mean-reversion setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

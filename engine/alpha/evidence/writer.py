@@ -58,6 +58,8 @@ def _hash(payload: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def create_job(session: Session, *, name: str, job_type: str, owner: str) -> EvidenceJob:
+    """Create an evidence job definition for a recurring or ad hoc process."""
+
     job = EvidenceJob(
         job_id=_uid(),
         job_name=name,
@@ -76,6 +78,8 @@ def start_run(
     params: dict | None = None,
     app_commit_sha: str | None = None,
 ) -> EvidenceJobRun:
+    """Start an evidence job run and persist its input parameters."""
+
     run = EvidenceJobRun(
         job_run_id=_uid(),
         job_id=job_id,
@@ -99,6 +103,8 @@ def finish_run(
     output_hashes: dict | None = None,
     error: dict | None = None,
 ) -> EvidenceJobRun:
+    """Close an evidence job run with metrics, hashes, and optional error data."""
+
     run.run_status = status
     run.ended_at = _now()
     if metrics:
@@ -132,6 +138,8 @@ def record_data_lineage(
     job_run_id: str | None = None,
     dataset_id: str | None = None,
 ) -> DataLineage:
+    """Persist lineage for an external or derived data payload."""
+
     if raw_payload_hash is None:
         raw_payload_hash = _hash(raw_payload)
     raw_payload_json = (
@@ -194,6 +202,8 @@ def record_universe_snapshot(
     source_lineage_hash: str | None = None,
     flush: bool = True,
 ) -> UniverseSnapshot:
+    """Persist one point-in-time universe membership row."""
+
     snap = UniverseSnapshot(
         universe_snapshot_id=_uid(),
         evidence_snapshot_id=evidence_snapshot_id,
@@ -249,6 +259,8 @@ def record_security_profile_scan_snapshot(
     raw_profile_json: str | None = None,
     flush: bool = True,
 ) -> SecurityProfileScanSnapshot:
+    """Persist the security-profile cache state used by a universe scan."""
+
     snap = SecurityProfileScanSnapshot(
         profile_scan_snapshot_id=_uid(),
         scan_id=scan_id,
@@ -296,6 +308,8 @@ def record_feature_snapshot(
     lookahead_guard_passed: bool | None = None,
     input_hashes: dict | None = None,
 ) -> FeatureSnapshot:
+    """Persist feature evidence and deterministic hashes for one pattern/ticker."""
+
     snap = FeatureSnapshot(
         feature_snapshot_id=_uid(),
         job_run_id=job_run_id,
@@ -354,6 +368,8 @@ def record_signal(
     forward_return_status: str = "pending",
     forward_return_attempts: int = 0,
 ) -> SignalRegistry:
+    """Persist a deterministic pattern signal firing."""
+
     if not signal_identity_hash:
         raise ValueError("signal_identity_hash is required")
     sig = SignalRegistry(
@@ -434,6 +450,8 @@ def record_candidate(
     settled_cash_required: float | None = None,
     constraint_reason: dict | None = None,
 ) -> TradeCandidate:
+    """Persist a candidate-stage decision whether entered, skipped, or vetoed."""
+
     cand = TradeCandidate(
         candidate_id=_uid(),
         job_run_id=job_run_id,
@@ -507,6 +525,8 @@ def append_order_event(
     reject_reason: str | None = None,
     cancel_reason: str | None = None,
 ) -> OrderEvent:
+    """Append one immutable broker/order lifecycle event."""
+
     evt = OrderEvent(
         order_event_id=_uid(),
         order_request_id=order_request_id,
@@ -562,6 +582,8 @@ def record_validation_run(
     output_hashes: dict | None = None,
     error: dict | None = None,
 ) -> ValidationRun:
+    """Persist a validation run with its evidence window and result hashes."""
+
     vr = ValidationRun(
         validation_run_id=_uid(),
         job_run_id=job_run_id,
@@ -605,6 +627,8 @@ def record_export_manifest(
     export_path: str | None = None,
     source_dataset_ids: list[str] | None = None,
 ) -> AgentExportManifest:
+    """Persist an audit/export manifest for agent-readable evidence bundles."""
+
     em = AgentExportManifest(
         export_id=_uid(),
         job_run_id=job_run_id,

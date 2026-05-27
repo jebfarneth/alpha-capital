@@ -335,6 +335,8 @@ class M3Detector(BasePatternDetector):
         self._lambda_m3_15td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M3 sector-rotation continuation setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

@@ -125,6 +125,8 @@ def profile_refresh_plan(
     asof: datetime,
     max_age_days: Optional[int] = DEFAULT_PROFILE_CACHE_MAX_AGE_DAYS,
 ) -> tuple[List[str], Dict[str, int]]:
+    """Return stale/missing profile symbols that should be refreshed now."""
+
     normalized_symbols = sorted({
         normalized
         for symbol in symbols
@@ -465,6 +467,8 @@ class SecurityTypeEnrichmentJob(BaseJob):
         self._next_profile_call_at = 0.0
 
     def run(self, ctx: JobContext) -> JobResult:
+        """Refresh required security profiles and persist cache/lineage updates."""
+
         symbols = self._symbols
         if symbols is None:
             symbols = self._derive_symbols()

@@ -41,6 +41,8 @@ class FixtureDetector(BasePatternDetector):
     route_class = RouteClass.A
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate fixture data and emit a test signal above threshold."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
 
         warnings = []

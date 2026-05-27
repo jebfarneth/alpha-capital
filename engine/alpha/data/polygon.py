@@ -35,6 +35,8 @@ PROVIDER = "Polygon"
 
 @dataclass
 class PolygonShortInterest:
+    """Normalized Polygon short-interest observation."""
+
     ticker: str
     settlement_date: str
     short_interest: Optional[int] = None
@@ -44,6 +46,8 @@ class PolygonShortInterest:
 
 @dataclass
 class PolygonTickerDetail:
+    """Reference metadata for one Polygon ticker detail response."""
+
     ticker: str
     name: str
     market_cap: Optional[float] = None
@@ -58,6 +62,8 @@ class PolygonTickerDetail:
 
 @dataclass
 class PolygonBar:
+    """Normalized Polygon aggregate daily bar."""
+
     timestamp: int
     open: float
     high: float
@@ -71,6 +77,8 @@ class PolygonBar:
 # --- Adapter ---
 
 class PolygonAdapter:
+    """Polygon REST adapter returning typed reference/market data with lineage."""
+
     def __init__(
         self, config: PolygonConfig, session: Optional[requests.Session] = None
     ):
@@ -231,6 +239,8 @@ class PolygonAdapter:
         ticker: str,
         date_str: Optional[str] = None,
     ) -> AdapterResponse[List[PolygonShortInterest]]:
+        """Fetch reported short interest for a ticker, optionally by settlement date."""
+
         endpoint = "/stocks/v1/short-interest"
         params: Dict[str, Any] = {"ticker": ticker}
         if date_str:
@@ -257,6 +267,8 @@ class PolygonAdapter:
     def get_ticker_details(
         self, ticker: str
     ) -> AdapterResponse[Optional[PolygonTickerDetail]]:
+        """Fetch reference details for one ticker."""
+
         endpoint = f"/v3/reference/tickers/{ticker}"
         resp = self._request(endpoint)
         if not resp.ok:
@@ -289,6 +301,8 @@ class PolygonAdapter:
         to_date: str,
         limit: int = 5000,
     ) -> AdapterResponse[List[PolygonBar]]:
+        """Fetch daily aggregate bars for a ticker and date range."""
+
         endpoint = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}"
         params: Dict[str, Any] = {"limit": limit, "sort": "asc"}
         resp = self._request(endpoint, params=params)

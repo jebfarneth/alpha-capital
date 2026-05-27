@@ -19,6 +19,8 @@ from alpha.patterns.contracts import PatternInput
 
 
 class FieldPresence:
+    """Typed presence states used by assemblers and lookahead validation."""
+
     PRESENT = "present"
     MISSING = "missing"
     UNAVAILABLE = "unavailable"

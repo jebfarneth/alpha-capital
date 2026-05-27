@@ -33,6 +33,8 @@ DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 
 @dataclass
 class SliceDiagnostic:
+    """Audit metadata for one market-cap screener slice."""
+
     lower: int
     upper: int
     returned_count: int
@@ -92,6 +94,8 @@ class SlicedUniverseFetcher:
         self._boundary_overlap = boundary_overlap
 
     def fetch(self) -> SlicedUniverseResult:
+        """Fetch, deduplicate, and lineage-stamp the configured universe band."""
+
         seen: Dict[str, FmpScreenerResult] = {}
         diagnostics: List[SliceDiagnostic] = []
         payload_hashes: List[str] = []

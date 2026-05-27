@@ -1,3 +1,5 @@
+"""SQLAlchemy engine/session helpers with optional scratch-schema routing."""
+
 from __future__ import annotations
 
 import os
@@ -36,6 +38,8 @@ def schema_connect_args(url: str, schema: str | None = None) -> dict:
 
 
 def get_engine(url: str | None = None, schema: str | None = None):
+    """Return the process-global SQLAlchemy engine for the configured database."""
+
     global _engine
     if _engine is None:
         url = url or os.environ.get(
@@ -51,6 +55,8 @@ def get_engine(url: str | None = None, schema: str | None = None):
 
 
 def get_session(url: str | None = None, schema: str | None = None) -> Session:
+    """Return a SQLAlchemy session bound to the process-global engine."""
+
     global _SessionLocal
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(bind=get_engine(url, schema=schema))
@@ -58,11 +64,15 @@ def get_session(url: str | None = None, schema: str | None = None) -> Session:
 
 
 def create_all_tables(engine=None):
+    """Create ORM tables for local smoke databases and isolated scratch schemas."""
+
     engine = engine or get_engine()
     Base.metadata.create_all(engine)
 
 
 def create_schema_if_missing(engine=None, schema: str | None = None) -> None:
+    """Create a PostgreSQL schema target when scratch setup requests it."""
+
     schema = schema or os.environ.get("ALPHA_DB_SCHEMA")
     if not schema:
         return

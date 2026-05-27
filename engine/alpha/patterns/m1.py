@@ -494,6 +494,8 @@ class M1Detector(BasePatternDetector):
         self._raw_edge_cap = parsed_cap
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M1 post-earnings-announcement drift setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

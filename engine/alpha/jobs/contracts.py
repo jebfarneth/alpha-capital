@@ -39,6 +39,8 @@ class JobResult:
 
     @property
     def ok(self) -> bool:
+        """Return True when the job completed with finished status."""
+
         return self.status == "finished"
 
 
@@ -48,17 +50,25 @@ class BaseJob(abc.ABC):
     @property
     @abc.abstractmethod
     def job_name(self) -> str:
+        """Stable job name persisted in evidence job metadata."""
+
         ...
 
     @property
     @abc.abstractmethod
     def job_type(self) -> str:
+        """High-level job category persisted for operations and audits."""
+
         ...
 
     @property
     def owner_component(self) -> str:
+        """Component owner recorded on evidence job rows."""
+
         return "alpha_engine"
 
     @abc.abstractmethod
     def run(self, ctx: JobContext) -> JobResult:
+        """Execute the job under the supplied evidence context."""
+
         ...

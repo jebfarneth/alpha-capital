@@ -1,3 +1,5 @@
+"""Pattern detector implementations and shared detector contracts."""
+
 from alpha.patterns.contracts import (
     BasePatternDetector,
     FidelityTier,

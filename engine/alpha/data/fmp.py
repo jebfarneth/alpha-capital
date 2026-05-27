@@ -58,6 +58,8 @@ def _bool_or_raw(value: Any) -> Any:
 
 @dataclass
 class FmpQuote:
+    """Normalized current quote fields from FMP quote endpoints."""
+
     symbol: str
     price: Optional[float]
     volume: Optional[int]
@@ -74,6 +76,8 @@ class FmpQuote:
 
 @dataclass
 class FmpBar:
+    """Normalized daily bar preserving the price basis used by callers."""
+
     date: str
     open: Optional[float]
     high: Optional[float]
@@ -86,6 +90,8 @@ class FmpBar:
 
 @dataclass
 class FmpCompanyProfile:
+    """Normalized FMP company profile used for universe/security typing."""
+
     symbol: str
     company_name: str
     market_cap: Optional[float] = None
@@ -101,6 +107,8 @@ class FmpCompanyProfile:
 
 @dataclass
 class FmpScreenerResult:
+    """One normalized row from the FMP company screener."""
+
     symbol: str
     company_name: str
     market_cap: Optional[float]
@@ -116,6 +124,8 @@ class FmpScreenerResult:
 
 @dataclass
 class FmpSecFiling:
+    """SEC filing metadata as returned through FMP's filing search."""
+
     symbol: str
     filing_date: str
     accepted_date: Optional[str] = None
@@ -127,6 +137,8 @@ class FmpSecFiling:
 
 @dataclass
 class FmpDelistedCompany:
+    """FMP delisted-company directory row used for survivorship review."""
+
     symbol: str
     company_name: Optional[str] = None
     exchange: Optional[str] = None
@@ -138,6 +150,8 @@ class FmpDelistedCompany:
 # --- Adapter ---
 
 class FmpAdapter:
+    """Financial Modeling Prep REST adapter with typed responses and lineage."""
+
     def __init__(self, config: FmpConfig, session: Optional[requests.Session] = None):
         self._config = config
         self._session = session or requests.Session()
@@ -319,6 +333,8 @@ class FmpAdapter:
         is_etf: Optional[bool] = None,
         limit: int = 5000,
     ) -> AdapterResponse[List[FmpScreenerResult]]:
+        """Fetch a bounded company-screener slice for universe construction."""
+
         endpoint = "/stable/company-screener"
         params = {
             "marketCapMoreThan": market_cap_min,
@@ -355,6 +371,8 @@ class FmpAdapter:
     def get_company_profile(
         self, ticker: str
     ) -> AdapterResponse[Optional[FmpCompanyProfile]]:
+        """Fetch one company's reference profile and security metadata."""
+
         endpoint = "/stable/profile"
         resp = self._request(endpoint, params={"symbol": ticker})
         if not resp.ok:
@@ -386,6 +404,8 @@ class FmpAdapter:
     # --- Quote / price history ---
 
     def get_quote(self, ticker: str) -> AdapterResponse[Optional[FmpQuote]]:
+        """Fetch the latest FMP quote for one ticker."""
+
         endpoint = "/stable/quote"
         resp = self._request(endpoint, params={"symbol": ticker})
         if not resp.ok:
@@ -426,6 +446,8 @@ class FmpAdapter:
         require_split_adjusted_close: bool = True,
         require_adjusted_close: bool = False,
     ) -> AdapterResponse[List[FmpBar]]:
+        """Fetch historical EOD bars with explicit adjustment-basis checks."""
+
         endpoint = (
             HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT
             if adjusted else HISTORICAL_PRICE_FULL_ENDPOINT
@@ -531,6 +553,8 @@ class FmpAdapter:
     def get_sec_filings(
         self, ticker: str, filing_type: Optional[str] = None, limit: int = 100
     ) -> AdapterResponse[List[FmpSecFiling]]:
+        """Fetch SEC filing metadata for one ticker through FMP."""
+
         endpoint = "/stable/sec-filings-search/symbol"
         params: Dict[str, Any] = {"symbol": ticker, "limit": limit}
         if filing_type:

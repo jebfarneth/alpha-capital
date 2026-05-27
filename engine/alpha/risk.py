@@ -24,6 +24,8 @@ M1_CATASTROPHE_FLOOR = 0.15
 
 @dataclass(frozen=True)
 class CostGateResult:
+    """Decision payload from the cost-to-edge gate."""
+
     ratio: float
     decision: str
     edge_multiplier: float
@@ -54,6 +56,8 @@ def cost_to_edge_ratio(
     validation_weight_multiplier: float,
     epsilon: float = 1e-12,
 ) -> float:
+    """Return expected cost as a share of gross optimizer edge."""
+
     denominator = gross_optimizer_edge(
         raw_expected_edge,
         pattern_weight=pattern_weight,
@@ -66,6 +70,8 @@ def cost_to_edge_ratio(
 
 
 def cost_gate_result(cost_ratio: float) -> CostGateResult:
+    """Classify a cost ratio as pass, haircut, or reject."""
+
     if cost_ratio > COST_TO_EDGE_HARD_REJECT:
         return CostGateResult(cost_ratio, "reject", 0.0)
     if cost_ratio > COST_TO_EDGE_HAIRCUT_THRESHOLD:
@@ -74,6 +80,8 @@ def cost_gate_result(cost_ratio: float) -> CostGateResult:
 
 
 def base_risk_budget_pct(nav: float) -> float:
+    """Return the default per-position risk budget for an NAV tier."""
+
     if nav <= 10_000:
         return 0.01
     if nav <= 50_000:
@@ -89,6 +97,8 @@ def candidate_base_risk_budget_pct(
     cost_ratio: float,
     lambda_source: str,
 ) -> float:
+    """Return the candidate's base risk budget before multiplicative controls."""
+
     base = base_risk_budget_pct(nav)
     if (
         nav <= 10_000
@@ -110,6 +120,8 @@ def adjusted_risk_budget_pct(
     concentration_multiplier: float,
     crisis_multiplier: float,
 ) -> float:
+    """Apply hazard, liquidity, fidelity, concentration, and crisis multipliers."""
+
     return (
         base_risk_budget
         * hazard_multiplier
@@ -125,6 +137,8 @@ def risk_sized_cap(
     adjusted_risk_budget: float,
     effective_hard_stop_pct: float,
 ) -> float:
+    """Convert risk budget into a position cap using the effective stop distance."""
+
     if effective_hard_stop_pct <= 0:
         return 0.0
     return adjusted_risk_budget / effective_hard_stop_pct
@@ -140,6 +154,8 @@ def final_position_cap(
     adv_liquidity_cap: float,
     deployable_cash_cap: float,
 ) -> float:
+    """Return the binding position cap across policy, risk, liquidity, and cash."""
+
     adjusted_tcb_cap = (
         tcb_max_position_pct * concentration_multiplier * crisis_multiplier
     )
@@ -153,11 +169,15 @@ def final_position_cap(
 
 
 def unstopped_heat_pct(position_weight: float, sigma_20d: float) -> float:
+    """Estimate stress heat contributed by a position without a hard stop."""
+
     stress_loss = min(0.20, max(0.05, 2.0 * sigma_20d))
     return position_weight * stress_loss
 
 
 def no_stop_heat_cap(nav: float) -> float:
+    """Return maximum aggregate unstopped heat allowed for an NAV tier."""
+
     if nav <= 10_000:
         return 0.02
     if nav <= 50_000:
@@ -172,6 +192,8 @@ def can_add_unstopped_position(
     sigma_20d: float,
     nav: float,
 ) -> bool:
+    """Return whether another unstopped position fits the heat cap."""
+
     return (
         current_unstopped_heat + unstopped_heat_pct(position_weight, sigma_20d)
         <= no_stop_heat_cap(nav)

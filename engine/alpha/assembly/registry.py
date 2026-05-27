@@ -15,6 +15,8 @@ from alpha.patterns.contracts import PatternId, PatternInput
 
 
 class AssemblerStatus:
+    """Lifecycle states for pattern feature assemblers."""
+
     IMPLEMENTED = "implemented"
     DETECTOR_ONLY = "detector_only"
     RESERVED = "reserved"
@@ -23,6 +25,8 @@ class AssemblerStatus:
 
 @dataclass
 class AssemblerRegistryEntry:
+    """Registry row describing one pattern's assembler availability."""
+
     pattern_id: str
     status: str
     assembler: Optional[Callable[..., Any]] = None
@@ -63,18 +67,26 @@ class AssemblyRegistry:
             )
 
     def get(self, pattern_id: str) -> AssemblerRegistryEntry:
+        """Return the registry entry for a known pattern id."""
+
         entry = self._entries.get(pattern_id)
         if entry is None:
             raise KeyError(f"unknown pattern_id: {pattern_id}")
         return entry
 
     def status(self, pattern_id: str) -> str:
+        """Return only the assembler status for a known pattern id."""
+
         return self.get(pattern_id).status
 
     def all_entries(self) -> List[AssemblerRegistryEntry]:
+        """Return all pattern entries in registry order."""
+
         return list(self._entries.values())
 
     def implemented_ids(self) -> List[str]:
+        """Return pattern ids with production assemblers available."""
+
         return [e.pattern_id for e in self._entries.values()
                 if e.status == AssemblerStatus.IMPLEMENTED]
 

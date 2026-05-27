@@ -26,6 +26,8 @@ def stable_hash(payload: Any) -> str:
 
 
 def utcnow() -> datetime:
+    """Return the current timezone-aware UTC timestamp."""
+
     return datetime.now(timezone.utc)
 
 
@@ -54,6 +56,8 @@ class LineageMeta:
 
 @dataclass(frozen=True)
 class ProviderError:
+    """Structured provider failure returned by data adapters."""
+
     provider: str
     endpoint: str
     status_code: Optional[int]
@@ -64,6 +68,8 @@ class ProviderError:
 
 @dataclass(frozen=True)
 class RateLimitInfo:
+    """Provider rate-limit metadata when an API exposes it."""
+
     calls_remaining: Optional[int] = None
     calls_limit: Optional[int] = None
     reset_at: Optional[datetime] = None
@@ -80,4 +86,6 @@ class AdapterResponse(Generic[T]):
 
     @property
     def ok(self) -> bool:
+        """Return True when the adapter call completed without ProviderError."""
+
         return self.error is None

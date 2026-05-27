@@ -405,6 +405,8 @@ class M7Detector(BasePatternDetector):
         self._lambda_m7_10td = parsed
 
     def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        """Evaluate an M7 pure-technical continuation setup."""
+
         asof = require_asof_timestamp(inp.asof_timestamp)
         warnings: List[str] = []
         quality_flags: Dict[str, Any] = {}

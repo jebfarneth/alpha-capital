@@ -354,6 +354,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for universe construction and security-type enrichment."""
+
     args = _parse_args(argv or sys.argv[1:])
     if args.live:
         return _run_live(args)

@@ -36,6 +36,8 @@ PROVIDER = "Alpaca"
 
 @dataclass
 class AlpacaAccount:
+    """Normalized account state returned by Alpaca's account endpoint."""
+
     account_id: str
     status: str
     cash: float
@@ -49,6 +51,8 @@ class AlpacaAccount:
 
 @dataclass
 class AlpacaAsset:
+    """Tradability and reference metadata for one Alpaca asset."""
+
     id: str
     symbol: str
     name: str
@@ -63,6 +67,8 @@ class AlpacaAsset:
 
 @dataclass
 class AlpacaOrder:
+    """Normalized Alpaca order payload used by execution-facing code."""
+
     id: str
     client_order_id: str
     symbol: str
@@ -87,6 +93,8 @@ class AlpacaOrder:
 # --- Adapter ---
 
 class AlpacaAdapter:
+    """Thin Alpaca REST adapter that returns typed payloads with lineage."""
+
     def __init__(
         self, config: AlpacaConfig, session: Optional[requests.Session] = None
     ):
@@ -265,6 +273,8 @@ class AlpacaAdapter:
     # --- Account ---
 
     def get_account(self) -> AdapterResponse[Optional[AlpacaAccount]]:
+        """Fetch the configured account's cash, buying power, and status."""
+
         resp = self._request("GET", "/v2/account")
         if not resp.ok:
             return resp  # type: ignore[return-value]
@@ -287,6 +297,8 @@ class AlpacaAdapter:
     def get_tradable_assets(
         self, status: str = "active", asset_class: str = "us_equity"
     ) -> AdapterResponse[List[AlpacaAsset]]:
+        """Return Alpaca assets that match the supplied status and asset class."""
+
         resp = self._request(
             "GET",
             "/v2/assets",
@@ -328,6 +340,8 @@ class AlpacaAdapter:
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
     ) -> AdapterResponse[Optional[AlpacaOrder]]:
+        """Submit an order after local shape validation."""
+
         body: Dict[str, Any] = {
             "symbol": symbol,
             "side": side,
@@ -367,6 +381,8 @@ class AlpacaAdapter:
         )
 
     def get_order(self, order_id: str) -> AdapterResponse[Optional[AlpacaOrder]]:
+        """Fetch the latest broker state for an order id."""
+
         resp = self._request("GET", f"/v2/orders/{order_id}")
         if not resp.ok:
             return resp  # type: ignore[return-value]
@@ -377,6 +393,8 @@ class AlpacaAdapter:
         )
 
     def cancel_order(self, order_id: str) -> AdapterResponse[bool]:
+        """Cancel an open Alpaca order and report whether the request succeeded."""
+
         resp = self._request("DELETE", f"/v2/orders/{order_id}")
         if resp.error:
             return AdapterResponse(

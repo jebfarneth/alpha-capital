@@ -36,6 +36,8 @@ def _utcnow() -> datetime:
 
 
 class Base(DeclarativeBase):
+    """Declarative base for all Alpha Capital ORM models."""
+
     pass
 
 
@@ -43,6 +45,8 @@ class Base(DeclarativeBase):
 # evidence_jobs
 # ---------------------------------------------------------------------------
 class EvidenceJob(Base):
+    """Registered evidence-producing job definition."""
+
     __tablename__ = "evidence_jobs"
 
     job_id = Column(String, primary_key=True, default=_uuid)
@@ -61,6 +65,8 @@ class EvidenceJob(Base):
 # evidence_job_runs
 # ---------------------------------------------------------------------------
 class EvidenceJobRun(Base):
+    """One execution attempt for an evidence-producing job."""
+
     __tablename__ = "evidence_job_runs"
 
     job_run_id = Column(String, primary_key=True, default=_uuid)
@@ -87,6 +93,8 @@ class EvidenceJobRun(Base):
 # evidence_datasets
 # ---------------------------------------------------------------------------
 class EvidenceDataset(Base):
+    """External or derived dataset metadata used by evidence records."""
+
     __tablename__ = "evidence_datasets"
 
     dataset_id = Column(String, primary_key=True, default=_uuid)
@@ -109,6 +117,8 @@ class EvidenceDataset(Base):
 # evidence_snapshots
 # ---------------------------------------------------------------------------
 class EvidenceSnapshot(Base):
+    """Immutable manifest for a captured evidence snapshot."""
+
     __tablename__ = "evidence_snapshots"
 
     evidence_snapshot_id = Column(String, primary_key=True, default=_uuid)
@@ -131,6 +141,8 @@ class EvidenceSnapshot(Base):
 # security_profiles
 # ---------------------------------------------------------------------------
 class SecurityProfile(Base):
+    """Cached security-type classification and source profile for a symbol."""
+
     __tablename__ = "security_profiles"
     __table_args__ = (
         Index("ix_security_profiles_security_type", "security_type"),
@@ -156,6 +168,8 @@ class SecurityProfile(Base):
 # universe_scans
 # ---------------------------------------------------------------------------
 class UniverseScan(Base):
+    """Immutable operating-universe scan summary."""
+
     __tablename__ = "universe_scans"
     __table_args__ = (
         Index("ix_universe_scans_trading_date", "trading_date"),
@@ -190,6 +204,8 @@ class UniverseScan(Base):
 # canonical_universe_scans
 # ---------------------------------------------------------------------------
 class CanonicalUniverseScan(Base):
+    """Pointer selecting the authoritative universe scan for a trading date."""
+
     __tablename__ = "canonical_universe_scans"
 
     trading_date = Column(String, primary_key=True)
@@ -207,6 +223,8 @@ class CanonicalUniverseScan(Base):
 # universe_snapshots
 # ---------------------------------------------------------------------------
 class UniverseSnapshot(Base):
+    """Point-in-time universe membership row for one ticker in one scan."""
+
     __tablename__ = "universe_snapshots"
     __table_args__ = (
         Index(
@@ -263,6 +281,8 @@ class UniverseSnapshot(Base):
 # security_profile_scan_snapshots
 # ---------------------------------------------------------------------------
 class SecurityProfileScanSnapshot(Base):
+    """Replayable view of the security-profile cache used by a universe scan."""
+
     __tablename__ = "security_profile_scan_snapshots"
     __table_args__ = (
         Index(
@@ -306,6 +326,8 @@ class SecurityProfileScanSnapshot(Base):
 # data_lineage
 # ---------------------------------------------------------------------------
 class DataLineage(Base):
+    """Persisted provenance for an external data payload or derived artifact."""
+
     __tablename__ = "data_lineage"
 
     data_lineage_id = Column(String, primary_key=True, default=_uuid)
@@ -333,6 +355,8 @@ class DataLineage(Base):
 # feature_snapshots
 # ---------------------------------------------------------------------------
 class FeatureSnapshot(Base):
+    """Pattern feature evidence captured before signal evaluation."""
+
     __tablename__ = "feature_snapshots"
 
     feature_snapshot_id = Column(String, primary_key=True, default=_uuid)
@@ -363,6 +387,8 @@ class FeatureSnapshot(Base):
 # signal_registry
 # ---------------------------------------------------------------------------
 class SignalRegistry(Base):
+    """Durable registry of pattern-intrinsic signal firings."""
+
     __tablename__ = "signal_registry"
     __table_args__ = (
         Index(
@@ -425,6 +451,8 @@ class SignalRegistry(Base):
 # forward_return_observations
 # ---------------------------------------------------------------------------
 class ForwardReturnObservation(Base):
+    """Latest canonical all-firings forward-return observation for a signal/input."""
+
     __tablename__ = "forward_return_observations"
     __table_args__ = (
         Index(
@@ -508,6 +536,8 @@ class ForwardReturnObservation(Base):
 # forward_return_observation_events (append-only)
 # ---------------------------------------------------------------------------
 class ForwardReturnObservationEvent(Base):
+    """Append-only attempt history for forward-return observation updates."""
+
     __tablename__ = "forward_return_observation_events"
     __table_args__ = (
         Index(
@@ -582,6 +612,8 @@ class ForwardReturnObservationEvent(Base):
 # trade_candidates
 # ---------------------------------------------------------------------------
 class TradeCandidate(Base):
+    """Candidate-stage trade decision record derived from a registered signal."""
+
     __tablename__ = "trade_candidates"
     __table_args__ = (
         CheckConstraint(
@@ -635,6 +667,8 @@ class TradeCandidate(Base):
 # optimizer_runs
 # ---------------------------------------------------------------------------
 class OptimizerRun(Base):
+    """KOTH/optimizer decision run and its auditable inputs/outputs."""
+
     __tablename__ = "optimizer_runs"
 
     optimizer_run_id = Column(String, primary_key=True, default=_uuid)
@@ -661,6 +695,8 @@ class OptimizerRun(Base):
 # order_events  (append-only)
 # ---------------------------------------------------------------------------
 class OrderEvent(Base):
+    """Broker/order lifecycle event persisted for execution reconstruction."""
+
     __tablename__ = "order_events"
 
     order_event_id = Column(String, primary_key=True, default=_uuid)
@@ -694,6 +730,8 @@ class OrderEvent(Base):
 # stbm_lifecycle_events  (append-only)
 # ---------------------------------------------------------------------------
 class StbmLifecycleEvent(Base):
+    """Synthetic triple-barrier manager lifecycle event."""
+
     __tablename__ = "stbm_lifecycle_events"
 
     stbm_event_id = Column(String, primary_key=True, default=_uuid)
@@ -721,6 +759,8 @@ class StbmLifecycleEvent(Base):
 # shadow_positions
 # ---------------------------------------------------------------------------
 class ShadowPosition(Base):
+    """Shadow-execution position outcome used to evaluate capture quality."""
+
     __tablename__ = "shadow_positions"
 
     shadow_position_id = Column(String, primary_key=True, default=_uuid)
@@ -757,6 +797,8 @@ class ShadowPosition(Base):
 # real_positions
 # ---------------------------------------------------------------------------
 class RealPosition(Base):
+    """Real broker position outcome and realized-return surface."""
+
     __tablename__ = "real_positions"
 
     real_position_id = Column(String, primary_key=True, default=_uuid)
@@ -793,6 +835,8 @@ class RealPosition(Base):
 # validation_runs
 # ---------------------------------------------------------------------------
 class ValidationRun(Base):
+    """Statistical validation run over mature all-firings outcomes."""
+
     __tablename__ = "validation_runs"
 
     validation_run_id = Column(String, primary_key=True, default=_uuid)
@@ -824,6 +868,8 @@ class ValidationRun(Base):
 # agent_export_manifests
 # ---------------------------------------------------------------------------
 class AgentExportManifest(Base):
+    """Manifest for agent-readable audit/export bundles."""
+
     __tablename__ = "agent_export_manifests"
 
     export_id = Column(String, primary_key=True, default=_uuid)
@@ -851,6 +897,8 @@ class AgentExportManifest(Base):
 # pattern_weights
 # ---------------------------------------------------------------------------
 class PatternWeight(Base):
+    """Runtime confidence and allocation weight for one pattern."""
+
     __tablename__ = "pattern_weights"
 
     pattern_id = Column(String, primary_key=True)
@@ -864,6 +912,8 @@ class PatternWeight(Base):
 # manual_overrides
 # ---------------------------------------------------------------------------
 class ManualOverride(Base):
+    """Operator override with reason and audit metadata."""
+
     __tablename__ = "manual_overrides"
 
     override_id = Column(String, primary_key=True, default=_uuid)
