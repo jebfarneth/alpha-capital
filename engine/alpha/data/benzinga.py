@@ -37,9 +37,13 @@ class BenzingaMergerAcquisition:
     target_ticker: Optional[str] = None
     target_name: Optional[str] = None
     target_exchange: Optional[str] = None
+    target_cusip: Optional[str] = None
+    target_isin: Optional[str] = None
     acquirer_ticker: Optional[str] = None
     acquirer_name: Optional[str] = None
     acquirer_exchange: Optional[str] = None
+    acquirer_cusip: Optional[str] = None
+    acquirer_isin: Optional[str] = None
     deal_type: Optional[str] = None
     deal_status: Optional[str] = None
     deal_payment_type: Optional[str] = None
@@ -222,19 +226,35 @@ class BenzingaAdapter:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         pagesize: int = 100,
+        page: Optional[int] = None,
+        importance: Optional[Union[int, str]] = None,
+        updated: Optional[Union[int, str]] = None,
+        date_sort: Optional[str] = None,
+        cusip: Optional[Union[str, Sequence[str]]] = None,
+        isin: Optional[Union[str, Sequence[str]]] = None,
         asof: Optional[datetime] = None,
     ) -> AdapterResponse[List[BenzingaMergerAcquisition]]:
         """Fetch Benzinga calendar M&A rows."""
 
         params: Dict[str, Any] = {"pagesize": pagesize}
+        if page is not None:
+            params["page"] = page
         if tickers:
-            params["parameters[tickers]"] = (
-                tickers if isinstance(tickers, str) else ",".join(tickers)
-            )
+            params["parameters[tickers]"] = _csv_param(tickers)
         if date_from:
             params["parameters[date_from]"] = date_from
         if date_to:
             params["parameters[date_to]"] = date_to
+        if importance is not None:
+            params["parameters[importance]"] = importance
+        if updated is not None:
+            params["parameters[updated]"] = updated
+        if date_sort is not None:
+            params["parameters[date_sort]"] = date_sort
+        if cusip:
+            params["parameters[cusip]"] = _csv_param(cusip)
+        if isin:
+            params["parameters[isin]"] = _csv_param(isin)
 
         resp = self._request(M_AND_A_ENDPOINT, params=params, asof=asof)
         if not resp.ok:
@@ -261,9 +281,37 @@ def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisit
         target_ticker=_string_or_none(row.get("target_ticker")),
         target_name=_string_or_none(row.get("target_name")),
         target_exchange=_string_or_none(row.get("target_exchange")),
+        target_cusip=_first_string(
+            row,
+            "target_cusip",
+            "target_cusip_number",
+            "target_security_cusip",
+            "target_cusips",
+        ),
+        target_isin=_first_string(
+            row,
+            "target_isin",
+            "target_isin_number",
+            "target_security_isin",
+            "target_isins",
+        ),
         acquirer_ticker=_string_or_none(row.get("acquirer_ticker")),
         acquirer_name=_string_or_none(row.get("acquirer_name")),
         acquirer_exchange=_string_or_none(row.get("acquirer_exchange")),
+        acquirer_cusip=_first_string(
+            row,
+            "acquirer_cusip",
+            "acquirer_cusip_number",
+            "acquirer_security_cusip",
+            "acquirer_cusips",
+        ),
+        acquirer_isin=_first_string(
+            row,
+            "acquirer_isin",
+            "acquirer_isin_number",
+            "acquirer_security_isin",
+            "acquirer_isins",
+        ),
         deal_type=_string_or_none(row.get("deal_type")),
         deal_status=_string_or_none(row.get("deal_status")),
         deal_payment_type=_string_or_none(row.get("deal_payment_type")),
@@ -278,6 +326,18 @@ def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisit
         updated=_int_or_none(row.get("updated")),
         raw=dict(row),
     )
+
+
+def _csv_param(value: Union[str, Sequence[str]]) -> str:
+    return value if isinstance(value, str) else ",".join(value)
+
+
+def _first_string(row: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = _string_or_none(row.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _string_or_none(value: Any) -> Optional[str]:

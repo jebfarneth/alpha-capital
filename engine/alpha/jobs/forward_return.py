@@ -9,8 +9,8 @@ spine tests and simple non-production fixtures.
 
 from __future__ import annotations
 
-import math
 import json
+import math
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -414,6 +414,7 @@ class ForwardReturnJob(BaseJob):
         pattern_id: str = M4_PATTERN_ID,
         max_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
         survivorship_resolver: Any = None,
+        survivorship_adapters: Optional[List[Any]] = None,
         finality_lag_sessions: int = DEFAULT_FINALITY_LAG_SESSIONS,
         reconcile_computed: bool = False,
         revision_window_sessions: int = DEFAULT_REVISION_WINDOW_SESSIONS,
@@ -438,6 +439,7 @@ class ForwardReturnJob(BaseJob):
         self._pattern_id = pattern_id
         self._max_attempts = max_attempts
         self._survivorship_resolver = survivorship_resolver
+        self._survivorship_adapters = list(survivorship_adapters or [])
         self._finality_lag_sessions = finality_lag_sessions
         self._reconcile_computed = reconcile_computed
         self._revision_window_sessions = revision_window_sessions
@@ -1353,6 +1355,7 @@ class ForwardReturnJob(BaseJob):
         return resolve_missing_exit_survivorship(
             session=self._session,
             adapter=self._adapter,
+            survivorship_adapters=self._survivorship_adapters,
             ticker=sig.ticker,
             entry_session_date=plan.entry_session_date,
             exit_session_date=plan.exit_session_date,
@@ -1866,6 +1869,7 @@ def resolve_missing_exit_survivorship(
     *,
     session: Session,
     adapter: Any,
+    survivorship_adapters: Optional[List[Any]] = None,
     ticker: str,
     entry_session_date: date,
     exit_session_date: date,
@@ -1877,10 +1881,61 @@ def resolve_missing_exit_survivorship(
 
     Standard FMP /full price bars are intentionally excluded here. The first
     source is a test/future-provider ``get_survivorship_events`` hook. The
-    production FMP source currently available is the paginated
-    ``/stable/delisted-companies`` directory, which can prove a delisting date
-    but not the economic reason; that lands in visible survivorship review.
+    production sources currently available are Benzinga M&A calendar rows
+    for corporate-action review and FMP's paginated
+    ``/stable/delisted-companies`` directory, which can prove a delisting
+    date but not the economic reason; that lands in visible survivorship
+    review.
     """
+    source_adapters = [
+        source for source in (survivorship_adapters or []) if source is not None
+    ]
+    source_attempts: List[Dict[str, Any]] = []
+    source_lineage_ids: List[str] = []
+
+    for source_adapter in source_adapters:
+        if not hasattr(source_adapter, "get_survivorship_events"):
+            continue
+        resolution = _resolve_from_survivorship_events(
+            session=session,
+            adapter=source_adapter,
+            ticker=ticker,
+            entry_session_date=entry_session_date,
+            exit_session_date=exit_session_date,
+            entry_price=entry_price,
+            asof=asof,
+            job_run_id=job_run_id,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
+        if resolution is not None:
+            return _with_survivorship_source_attempts(
+                resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+
+    for source_adapter in source_adapters:
+        if not hasattr(source_adapter, "get_mergers_acquisitions"):
+            continue
+        resolution = _resolve_from_benzinga_mergers_acquisitions(
+            session=session,
+            adapter=source_adapter,
+            ticker=ticker,
+            entry_session_date=entry_session_date,
+            exit_session_date=exit_session_date,
+            asof=asof,
+            job_run_id=job_run_id,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
+        if resolution is not None:
+            return _with_survivorship_source_attempts(
+                resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+
     if hasattr(adapter, "get_survivorship_events"):
         resolution = _resolve_from_survivorship_events(
             session=session,
@@ -1891,9 +1946,15 @@ def resolve_missing_exit_survivorship(
             entry_price=entry_price,
             asof=asof,
             job_run_id=job_run_id,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            return resolution
+            return _with_survivorship_source_attempts(
+                resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
 
     if hasattr(adapter, "get_delisted_companies"):
         resolution = _resolve_from_fmp_delisted_companies(
@@ -1906,10 +1967,17 @@ def resolve_missing_exit_survivorship(
             job_run_id=job_run_id,
         )
         if resolution is not None:
-            return resolution
+            return _with_survivorship_source_attempts(
+                resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
 
-    return _survivorship_unresolved(
-        reason="survivorship_resolver_no_supported_source",
+    resolution = _survivorship_unresolved(
+        reason=(
+            "survivorship_unresolved_no_source_event"
+            if source_attempts else "survivorship_resolver_no_supported_source"
+        ),
         provider_request={
             "ticker": ticker,
             "from": entry_session_date.isoformat(),
@@ -1917,6 +1985,11 @@ def resolve_missing_exit_survivorship(
             "event_basis": "missing_mature_exit_survivorship_review",
             "sources_attempted": [],
         },
+    )
+    return _with_survivorship_source_attempts(
+        resolution,
+        source_attempts=source_attempts,
+        source_lineage_ids=source_lineage_ids,
     )
 
 
@@ -1965,6 +2038,8 @@ def _resolve_from_survivorship_events(
     entry_price: float,
     asof: datetime,
     job_run_id: Optional[str],
+    source_attempts: Optional[List[Dict[str, Any]]] = None,
+    source_lineage_ids: Optional[List[str]] = None,
 ) -> Optional[SurvivorshipResolution]:
     provider_request = {
         "ticker": ticker,
@@ -1991,26 +2066,34 @@ def _resolve_from_survivorship_events(
         job_run_id=job_run_id,
     )
     lineage_ids = [lineage.data_lineage_id]
+    _append_survivorship_source_attempt(
+        source_attempts,
+        source_lineage_ids,
+        source="survivorship_events",
+        provider=resp.lineage.provider,
+        endpoint=resp.lineage.endpoint,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        lineage_id=lineage.data_lineage_id,
+        status="error" if not resp.ok else "fetched",
+        error=resp.error,
+    )
     if not resp.ok:
-        return _survivorship_unresolved(
-            reason=f"survivorship_source_error:{resp.error.error_type}",
-            provider=resp.lineage.provider,
-            endpoint=resp.lineage.endpoint,
-            provider_request=provider_request,
-            data_lineage_ids=lineage_ids,
-            primary_data_lineage_id=lineage.data_lineage_id,
-        )
+        return None
 
     event = _first_survivorship_source_event(resp.data)
     if not event:
-        return _survivorship_unresolved(
-            reason="survivorship_unresolved_no_source_event",
-            provider=resp.lineage.provider,
-            endpoint=resp.lineage.endpoint,
-            provider_request=provider_request,
-            data_lineage_ids=lineage_ids,
-            primary_data_lineage_id=lineage.data_lineage_id,
+        _mark_latest_survivorship_source_attempt(
+            source_attempts,
+            status="no_match",
         )
+        return None
+    _mark_latest_survivorship_source_attempt(
+        source_attempts,
+        status="matched",
+        matched_id=_event_value(event, "id") or _event_value(event, "event_id"),
+    )
     decision = _survivorship_decision(event, entry_price=entry_price)
     if decision is None:
         decision = SurvivorshipDecision(
@@ -2026,6 +2109,114 @@ def _resolve_from_survivorship_events(
         provider=resp.lineage.provider,
         endpoint=resp.lineage.endpoint,
         provider_request=provider_request,
+        primary_data_lineage_id=lineage.data_lineage_id,
+    )
+
+
+def _resolve_from_benzinga_mergers_acquisitions(
+    *,
+    session: Session,
+    adapter: Any,
+    ticker: str,
+    entry_session_date: date,
+    exit_session_date: date,
+    asof: datetime,
+    job_run_id: Optional[str],
+    source_attempts: Optional[List[Dict[str, Any]]] = None,
+    source_lineage_ids: Optional[List[str]] = None,
+) -> Optional[SurvivorshipResolution]:
+    provider_request = {
+        "ticker": ticker,
+        "from": entry_session_date.isoformat(),
+        "to": exit_session_date.isoformat(),
+        "event_basis": "missing_mature_exit_survivorship_review",
+        "endpoint": "get_mergers_acquisitions",
+        "source": "benzinga_calendar_ma",
+    }
+    resp = adapter.get_mergers_acquisitions(
+        tickers=ticker,
+        date_from=entry_session_date.isoformat(),
+        date_to=exit_session_date.isoformat(),
+        asof=asof,
+    )
+    payload = {
+        "request": provider_request,
+        "events": _jsonable_survivorship_payload(resp.data),
+        "error": _provider_error_payload(resp.error),
+    }
+    lineage = _record_survivorship_lineage(
+        session,
+        resp=resp,
+        raw_payload=payload,
+        job_run_id=job_run_id,
+    )
+    lineage_ids = [lineage.data_lineage_id]
+    _append_survivorship_source_attempt(
+        source_attempts,
+        source_lineage_ids,
+        source="benzinga_calendar_ma",
+        provider=resp.lineage.provider,
+        endpoint=resp.lineage.endpoint,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        lineage_id=lineage.data_lineage_id,
+        status="error" if not resp.ok else "fetched",
+        error=resp.error,
+    )
+    if not resp.ok:
+        return None
+
+    event = _first_benzinga_target_event(resp.data, ticker)
+    if event is None:
+        _mark_latest_survivorship_source_attempt(
+            source_attempts,
+            status="no_match",
+        )
+        return None
+
+    _mark_latest_survivorship_source_attempt(
+        source_attempts,
+        status="matched",
+        matched_id=_event_value(event, "id"),
+    )
+    event_date = _benzinga_event_date(event)
+    reason = "benzinga_merger_acquisition_review"
+    if event_date is None:
+        reason = "benzinga_merger_acquisition_date_unresolved_review"
+    elif event_date > exit_session_date:
+        reason = "benzinga_merger_acquisition_after_exit_window_review"
+
+    return SurvivorshipResolution(
+        decision=SurvivorshipDecision(
+            status=STATUS_CORPORATE_ACTION_REVIEW,
+            reason=reason,
+            exit_price=None,
+            exit_price_source=None,
+            exit_basis_proof=None,
+        ),
+        data_lineage_ids=lineage_ids,
+        provider=resp.lineage.provider,
+        endpoint=resp.lineage.endpoint,
+        provider_request={
+            **provider_request,
+            "matched_id": _event_value(event, "id"),
+            "matched_target_ticker": _event_value(event, "target_ticker"),
+            "matched_target_name": _event_value(event, "target_name"),
+            "matched_target_cusip": _event_value(event, "target_cusip"),
+            "matched_target_isin": _event_value(event, "target_isin"),
+            "matched_acquirer_ticker": _event_value(event, "acquirer_ticker"),
+            "matched_acquirer_name": _event_value(event, "acquirer_name"),
+            "matched_acquirer_cusip": _event_value(event, "acquirer_cusip"),
+            "matched_acquirer_isin": _event_value(event, "acquirer_isin"),
+            "deal_type": _event_value(event, "deal_type"),
+            "deal_status": _event_value(event, "deal_status"),
+            "deal_payment_type": _event_value(event, "deal_payment_type"),
+            "date_completed": _event_value(event, "date_completed"),
+            "date_expected": _event_value(event, "date_expected"),
+            "deal_terms_extra": _event_value(event, "deal_terms_extra"),
+            "economic_classification": "review_required",
+        },
         primary_data_lineage_id=lineage.data_lineage_id,
     )
 
@@ -2202,6 +2393,79 @@ def _survivorship_unresolved(
         provider_request=provider_request or {},
         primary_data_lineage_id=primary_data_lineage_id,
     )
+
+
+def _with_survivorship_source_attempts(
+    resolution: SurvivorshipResolution,
+    *,
+    source_attempts: List[Dict[str, Any]],
+    source_lineage_ids: List[str],
+) -> SurvivorshipResolution:
+    if not source_attempts and not source_lineage_ids:
+        return resolution
+    provider_request = dict(resolution.provider_request or {})
+    if source_attempts:
+        provider_request["source_attempts"] = list(source_attempts)
+        provider_request["source_attempt_count"] = len(source_attempts)
+        provider_request["sources_attempted"] = [
+            attempt.get("source") for attempt in source_attempts
+        ]
+    merged_lineage_ids = _dedupe_list(
+        list(source_lineage_ids) + list(resolution.data_lineage_ids or [])
+    )
+    return replace(
+        resolution,
+        provider_request=provider_request,
+        data_lineage_ids=merged_lineage_ids,
+        primary_data_lineage_id=(
+            resolution.primary_data_lineage_id
+            or (merged_lineage_ids[0] if merged_lineage_ids else None)
+        ),
+    )
+
+
+def _append_survivorship_source_attempt(
+    source_attempts: Optional[List[Dict[str, Any]]],
+    source_lineage_ids: Optional[List[str]],
+    *,
+    source: str,
+    provider: str,
+    endpoint: str,
+    ticker: str,
+    entry_session_date: date,
+    exit_session_date: date,
+    lineage_id: str,
+    status: str,
+    error: Any = None,
+) -> None:
+    if source_lineage_ids is not None:
+        source_lineage_ids.append(lineage_id)
+    if source_attempts is None:
+        return
+    source_attempts.append({
+        "source": source,
+        "provider": provider,
+        "endpoint": endpoint,
+        "ticker": ticker,
+        "from": entry_session_date.isoformat(),
+        "to": exit_session_date.isoformat(),
+        "status": status,
+        "lineage_id": lineage_id,
+        "error": _provider_error_payload(error),
+    })
+
+
+def _mark_latest_survivorship_source_attempt(
+    source_attempts: Optional[List[Dict[str, Any]]],
+    *,
+    status: str,
+    matched_id: Optional[Any] = None,
+) -> None:
+    if not source_attempts:
+        return
+    source_attempts[-1]["status"] = status
+    if matched_id is not None:
+        source_attempts[-1]["matched_id"] = matched_id
 
 
 def _find_bar(bars: List[FmpBar], session_date: date) -> Optional[FmpBar]:
@@ -2835,6 +3099,29 @@ def _first_survivorship_source_event(raw_events: Any) -> Dict[str, Any]:
             if isinstance(event, dict):
                 return event
     return {}
+
+
+def _first_benzinga_target_event(raw_events: Any, ticker: str) -> Optional[Any]:
+    normalized_ticker = ticker.upper()
+    events = raw_events if isinstance(raw_events, list) else [raw_events]
+    for event in events:
+        target_ticker = _event_value(event, "target_ticker")
+        if str(target_ticker or "").upper() == normalized_ticker:
+            return event
+    return None
+
+
+def _benzinga_event_date(event: Any) -> Optional[date]:
+    for key in ("date_completed", "date_expected", "date"):
+        if parsed := _safe_parse_date(_event_value(event, key)):
+            return parsed
+    return None
+
+
+def _event_value(event: Any, key: str) -> Any:
+    if isinstance(event, dict):
+        return event.get(key)
+    return getattr(event, key, None)
 
 
 def _jsonable_survivorship_payload(payload: Any) -> Any:

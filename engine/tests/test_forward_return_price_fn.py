@@ -139,6 +139,53 @@ class FakeHistoricalAdapter:
         return AdapterResponse(data=events, lineage=lineage)
 
 
+class FakeBenzingaAdapter:
+    def __init__(
+        self,
+        events_by_ticker: Optional[Dict[str, object]] = None,
+        errors_by_ticker: Optional[Dict[str, ProviderError]] = None,
+    ):
+        self.events_by_ticker = events_by_ticker or {}
+        self.errors_by_ticker = errors_by_ticker or {}
+        self.calls = []
+
+    def get_mergers_acquisitions(
+        self,
+        tickers=None,
+        date_from=None,
+        date_to=None,
+        asof=None,
+        **kwargs,
+    ):
+        self.calls.append({
+            "tickers": tickers,
+            "date_from": date_from,
+            "date_to": date_to,
+            "asof": asof,
+            "kwargs": kwargs,
+        })
+        raw_events = self.events_by_ticker.get(tickers, [])
+        if isinstance(raw_events, dict):
+            events = [raw_events]
+        else:
+            events = list(raw_events or [])
+        lineage = LineageMeta(
+            provider="Benzinga",
+            endpoint="/api/v2.1/calendar/ma",
+            request_timestamp=REQUEST_TS,
+            asof_timestamp=asof,
+            raw_payload_hash=stable_hash(events),
+            source_authority="Benzinga",
+        )
+        if tickers in self.errors_by_ticker:
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=self.errors_by_ticker[tickers],
+            )
+        return AdapterResponse(data=events, lineage=lineage)
+
+
 def _bar(
     day: date,
     open_price,
@@ -229,12 +276,14 @@ def _run_job(
     revision_window_sessions=10,
     price_drift_abs_tol=0.01,
     price_drift_rel_tol=0.0005,
+    survivorship_adapters=None,
 ):
     return run_job(
         db_session,
         ForwardReturnJob(
             session=db_session,
             adapter=adapter,
+            survivorship_adapters=survivorship_adapters,
             run_timestamp=run_ts,
             max_attempts=max_attempts,
             finality_lag_sessions=finality_lag_sessions,
@@ -725,6 +774,134 @@ def test_unresolved_corporate_action_requires_review(db_session):
     assert sig.forward_return_status == "corporate_action_review"
     assert sig.outcome_unavailable_reason == "corporate_action_review"
     assert _obs(db_session).status == "corporate_action_review"
+
+
+def test_benzinga_merger_acquisition_routes_missing_exit_to_review(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    benzinga = FakeBenzingaAdapter(
+        {
+            "ACME": {
+                "id": "deal-42",
+                "target_ticker": "ACME",
+                "target_name": "Acme Corp",
+                "target_cusip": "004397105",
+                "target_isin": "US0043971052",
+                "acquirer_ticker": "BUY",
+                "acquirer_name": "Buyer Inc",
+                "acquirer_cusip": "124857202",
+                "acquirer_isin": "US1248572026",
+                "deal_type": "Merger",
+                "deal_status": "Completed",
+                "deal_payment_type": "Cash",
+                "date_completed": EXIT_DATE.isoformat(),
+                "deal_terms_extra": "$14.00 per share in cash",
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    survivorship_request = provider_request["survivorship_request"]
+
+    assert benzinga.calls[0]["tickers"] == "ACME"
+    assert benzinga.calls[0]["date_from"] == ENTRY_DATE.isoformat()
+    assert benzinga.calls[0]["date_to"] == EXIT_DATE.isoformat()
+    assert adapter.survivorship_calls == []
+    assert sig.forward_return_status == "corporate_action_review"
+    assert sig.outcome_unavailable_reason == "benzinga_merger_acquisition_review"
+    assert obs.status == "corporate_action_review"
+    assert obs.provider == "Benzinga"
+    assert obs.endpoint == "/api/v2.1/calendar/ma"
+    assert json.loads(obs.data_lineage_ids)
+    assert survivorship_request["source"] == "benzinga_calendar_ma"
+    assert survivorship_request["matched_id"] == "deal-42"
+    assert survivorship_request["matched_target_ticker"] == "ACME"
+    assert survivorship_request["matched_target_cusip"] == "004397105"
+    assert survivorship_request["matched_target_isin"] == "US0043971052"
+    assert survivorship_request["matched_acquirer_ticker"] == "BUY"
+    assert survivorship_request["matched_acquirer_cusip"] == "124857202"
+    assert survivorship_request["matched_acquirer_isin"] == "US1248572026"
+    assert survivorship_request["economic_classification"] == "review_required"
+    assert survivorship_request["source_attempts"][0]["source"] == "benzinga_calendar_ma"
+    assert survivorship_request["source_attempts"][0]["status"] == "matched"
+
+
+def test_benzinga_no_match_attempt_is_preserved_when_fallback_handles_row(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        survivorship_by_ticker={
+            "ACME": {
+                "type": "acquisition",
+                "realized_payoff": 14.0,
+                "source_backed": True,
+            }
+        },
+    )
+    benzinga = FakeBenzingaAdapter({"ACME": []})
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    survivorship_request = provider_request["survivorship_request"]
+    attempts = survivorship_request["source_attempts"]
+
+    assert sig.forward_return_status == "computed"
+    assert obs.forward_return == 0.4
+    assert attempts[0]["source"] == "benzinga_calendar_ma"
+    assert attempts[0]["status"] == "no_match"
+    assert attempts[1]["source"] == "survivorship_events"
+    assert attempts[1]["status"] == "matched"
+    assert len(json.loads(obs.data_lineage_ids)) == 3
+
+
+def test_benzinga_source_error_does_not_block_survivorship_fallback(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        survivorship_by_ticker={
+            "ACME": {
+                "type": "acquisition",
+                "realized_payoff": 14.0,
+                "source_backed": True,
+            }
+        },
+    )
+    benzinga = FakeBenzingaAdapter(
+        errors_by_ticker={
+            "ACME": ProviderError(
+                provider="Benzinga",
+                endpoint="/api/v2.1/calendar/ma",
+                status_code=429,
+                error_type="rate_limit",
+                message="rate limited",
+                retryable=True,
+            )
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+
+    assert sig.forward_return_status == "computed"
+    assert sig.forward_return == 0.4
+    assert attempts[0]["source"] == "benzinga_calendar_ma"
+    assert attempts[0]["status"] == "error"
+    assert attempts[0]["error"]["error_type"] == "rate_limit"
+    assert attempts[1]["source"] == "survivorship_events"
+    assert attempts[1]["status"] == "matched"
 
 
 def test_acquisition_realized_payoff_computes_return(db_session):

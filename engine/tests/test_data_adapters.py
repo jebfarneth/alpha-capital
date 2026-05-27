@@ -1108,9 +1108,13 @@ class TestBenzingaAdapter:
                     "target_ticker": "ACME",
                     "target_name": "Acme Corp",
                     "target_exchange": "NASDAQ",
+                    "target_cusip": "004397105",
+                    "target_isin": "US0043971052",
                     "acquirer_ticker": "BUY",
                     "acquirer_name": "Buyer Inc",
                     "acquirer_exchange": "NYSE",
+                    "acquirer_cusip": "124857202",
+                    "acquirer_isin": "US1248572026",
                     "deal_type": "Merger",
                     "deal_status": "Completed",
                     "deal_payment_type": "Cash",
@@ -1135,7 +1139,11 @@ class TestBenzingaAdapter:
         deal = resp.data[0]
         assert deal.id == "deal-1"
         assert deal.target_ticker == "ACME"
+        assert deal.target_cusip == "004397105"
+        assert deal.target_isin == "US0043971052"
         assert deal.acquirer_ticker == "BUY"
+        assert deal.acquirer_cusip == "124857202"
+        assert deal.acquirer_isin == "US1248572026"
         assert deal.deal_payment_type == "Cash"
         assert deal.deal_terms_extra == "$7.50 per share in cash"
         assert deal.raw["target_exchange"] == "NASDAQ"
@@ -1161,6 +1169,12 @@ class TestBenzingaAdapter:
             ["ACME", "BETA"],
             date_from="2026-01-01",
             date_to="2026-05-31",
+            page=2,
+            importance=5,
+            updated=1779307200,
+            date_sort="desc",
+            cusip=["004397105", "08160H101"],
+            isin="US0043971052",
         )
 
         assert resp.ok
@@ -1169,6 +1183,12 @@ class TestBenzingaAdapter:
         assert params["parameters[tickers]"] == "ACME,BETA"
         assert params["parameters[date_from]"] == "2026-01-01"
         assert params["parameters[date_to]"] == "2026-05-31"
+        assert params["page"] == 2
+        assert params["parameters[importance]"] == 5
+        assert params["parameters[updated]"] == 1779307200
+        assert params["parameters[date_sort]"] == "desc"
+        assert params["parameters[cusip]"] == "004397105,08160H101"
+        assert params["parameters[isin]"] == "US0043971052"
         assert params["token"] == "test-benzinga-key"
 
     def test_get_mergers_acquisitions_accepts_list_payload(self):

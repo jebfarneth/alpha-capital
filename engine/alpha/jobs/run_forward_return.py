@@ -14,7 +14,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from alpha.data.config import FmpConfig
+from alpha.data.benzinga import BenzingaAdapter
+from alpha.data.config import BenzingaConfig, FmpConfig
 from alpha.data.fmp import FmpAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
 from alpha.jobs.forward_return import (
@@ -99,9 +100,18 @@ def _run_live(args: argparse.Namespace) -> int:
 
     try:
         adapter = FmpAdapter(FmpConfig.from_env())
+        survivorship_adapters = []
+        if os.environ.get("BENZINGA_API_KEY") or os.environ.get("BENZINGA_TOKEN"):
+            survivorship_adapters.append(BenzingaAdapter(BenzingaConfig.from_env()))
+        survivorship_source_names = ["fmp_delisted_companies"] + [
+            "benzinga_calendar_ma"
+            for _source in survivorship_adapters
+            if isinstance(_source, BenzingaAdapter)
+        ]
         job = ForwardReturnJob(
             session=session,
             adapter=adapter,
+            survivorship_adapters=survivorship_adapters,
             run_timestamp=_parse_timestamp(args.run_timestamp),
             max_attempts=args.max_attempts,
             pattern_id=args.pattern_id,
@@ -116,6 +126,7 @@ def _run_live(args: argparse.Namespace) -> int:
             job,
             params={
                 "source": "fmp_full",
+                "survivorship_sources": survivorship_source_names,
                 "run_timestamp": args.run_timestamp,
                 "max_attempts": args.max_attempts,
                 "pattern_id": args.pattern_id,
@@ -132,6 +143,7 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Mode:                    {metrics.get('mode')}")
         print(f"Pattern:                 {metrics.get('pattern_id')}")
         print(f"Schema:                  {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
+        print(f"Survivorship sources:    {survivorship_source_names}")
         print(f"Eligible signals:        {metrics.get('total_eligible')}")
         print(f"Computed:                {metrics.get('computed')}")
         print(f"Pending:                 {metrics.get('pending')}")
