@@ -99,6 +99,9 @@ def _run_live(args: argparse.Namespace) -> int:
             run_timestamp=_parse_timestamp(args.run_timestamp),
             max_attempts=args.max_attempts,
             pattern_id=args.pattern_id,
+            finality_lag_sessions=args.finality_lag_sessions,
+            price_drift_abs_tol=args.price_drift_abs_tol,
+            price_drift_rel_tol=args.price_drift_rel_tol,
         )
         result = run_job(
             session,
@@ -108,6 +111,9 @@ def _run_live(args: argparse.Namespace) -> int:
                 "run_timestamp": args.run_timestamp,
                 "max_attempts": args.max_attempts,
                 "pattern_id": args.pattern_id,
+                "finality_lag_sessions": args.finality_lag_sessions,
+                "price_drift_abs_tol": args.price_drift_abs_tol,
+                "price_drift_rel_tol": args.price_drift_rel_tol,
                 "schema": args.schema,
             },
         )
@@ -119,6 +125,8 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Eligible signals:        {metrics.get('total_eligible')}")
         print(f"Computed:                {metrics.get('computed')}")
         print(f"Pending:                 {metrics.get('pending')}")
+        print(f"Finality pending:        {metrics.get('price_finality_pending')}")
+        print(f"Price drift review:      {metrics.get('price_drift_review')}")
         print(f"Retryable unavailable:   {metrics.get('retryable_unavailable')}")
         print(f"Terminal unavailable:    {metrics.get('terminal_unavailable')}")
         print(f"Observations upserted:   {metrics.get('observations_upserted')}")
@@ -161,6 +169,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=3,
         help="Terminalize retryable unavailable outcomes at this attempt count.",
+    )
+    parser.add_argument(
+        "--finality-lag-sessions",
+        type=int,
+        default=1,
+        help=(
+            "Regular U.S. equity sessions to wait after the exit session before "
+            "finalizing M4 forward returns."
+        ),
+    )
+    parser.add_argument(
+        "--price-drift-abs-tol",
+        type=float,
+        default=0.01,
+        help="Absolute provider-row drift tolerance for price reconciliation.",
+    )
+    parser.add_argument(
+        "--price-drift-rel-tol",
+        type=float,
+        default=0.0005,
+        help="Relative provider-row drift tolerance for price reconciliation.",
     )
     parser.add_argument(
         "--create-tables",

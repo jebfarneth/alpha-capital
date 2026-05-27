@@ -38,7 +38,7 @@ SIGNAL_TS = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
 REQUEST_TS = datetime(2026, 6, 16, 21, 1, tzinfo=timezone.utc)
 PAST_ENTRY_DATE = date(2026, 5, 5)
 PAST_EXIT_DATE = date(2026, 5, 26)
-PAST_MATURE_RUN_TS = datetime(2026, 5, 27, 14, 0, tzinfo=timezone.utc)
+PAST_MATURE_RUN_TS = datetime(2026, 5, 27, 21, 0, tzinfo=timezone.utc)
 
 
 class FakeHistoricalAdapter:
@@ -216,7 +216,16 @@ def _make_signal(
     return sig.signal_id
 
 
-def _run_job(db_session, adapter, *, run_ts=MATURE_RUN_TS, max_attempts=3):
+def _run_job(
+    db_session,
+    adapter,
+    *,
+    run_ts=MATURE_RUN_TS,
+    max_attempts=3,
+    finality_lag_sessions=1,
+    price_drift_abs_tol=0.01,
+    price_drift_rel_tol=0.0005,
+):
     return run_job(
         db_session,
         ForwardReturnJob(
@@ -224,8 +233,16 @@ def _run_job(db_session, adapter, *, run_ts=MATURE_RUN_TS, max_attempts=3):
             adapter=adapter,
             run_timestamp=run_ts,
             max_attempts=max_attempts,
+            finality_lag_sessions=finality_lag_sessions,
+            price_drift_abs_tol=price_drift_abs_tol,
+            price_drift_rel_tol=price_drift_rel_tol,
         ),
-        params={"run_timestamp": run_ts.isoformat()},
+        params={
+            "run_timestamp": run_ts.isoformat(),
+            "finality_lag_sessions": finality_lag_sessions,
+            "price_drift_abs_tol": price_drift_abs_tol,
+            "price_drift_rel_tol": price_drift_rel_tol,
+        },
     )
 
 
@@ -329,6 +346,130 @@ def test_immature_signal_stays_pending_and_does_not_fetch(db_session):
     assert obs.attempts == 0
 
 
+def test_exit_complete_before_finality_lag_stores_provisional_prices(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    exit_after_close_ts = datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc)
+
+    result = _run_job(db_session, adapter, run_ts=exit_after_close_ts)
+
+    sig = db_session.get(SignalRegistry, sid)
+    assert result.metrics["price_finality_pending"] == 1
+    assert len(adapter.calls) == 1
+    assert adapter.survivorship_calls == []
+    assert sig.forward_return_status == "price_finality_pending"
+    assert sig.forward_return is None
+    obs = _obs(db_session)
+    assert obs.status == "price_finality_pending"
+    assert obs.reason == "finality_lag_not_elapsed"
+    assert obs.entry_price == 10.0
+    assert obs.exit_price == 12.0
+    assert obs.forward_return is None
+    assert obs.entry_data_lineage_id
+    assert obs.exit_data_lineage_id
+    payload = json.loads(obs.provider_request_json)
+    assert payload["price_finality"]["status"] == "price_finality_pending"
+    assert payload["price_finality"]["finality_lag_sessions"] == 1
+
+
+def test_finality_lag_elapsed_reconciles_matching_provisional_lineage(db_session):
+    sid = _make_signal(db_session)
+    provisional = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.0)
+    })
+    final = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.0)
+    })
+
+    _run_job(
+        db_session,
+        provisional,
+        run_ts=datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc),
+    )
+    first_obs_id = _obs(db_session).forward_return_observation_id
+    result = _run_job(db_session, final, run_ts=MATURE_RUN_TS)
+
+    sig = db_session.get(SignalRegistry, sid)
+    assert result.metrics["computed"] == 1
+    assert sig.forward_return_status == "computed"
+    assert sig.forward_return == 0.2
+    assert db_session.query(ForwardReturnObservation).count() == 1
+    assert db_session.query(ForwardReturnObservationEvent).count() == 2
+    obs = _obs(db_session)
+    assert obs.forward_return_observation_id == first_obs_id
+    assert obs.status == "computed"
+    assert obs.forward_return == 0.2
+    payload = json.loads(obs.provider_request_json)
+    finality = payload["price_finality"]
+    assert finality["status"] == "reconciled"
+    assert finality["provisional_observation_found"] is True
+    assert finality["material_drift"] is False
+    assert len(json.loads(obs.data_lineage_ids)) == 2
+
+
+def test_finality_lag_elapsed_with_material_drift_requires_review(db_session):
+    sid = _make_signal(db_session)
+    provisional = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.0)
+    })
+    revised = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.2)
+    })
+
+    _run_job(
+        db_session,
+        provisional,
+        run_ts=datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc),
+    )
+    _run_job(db_session, revised, run_ts=MATURE_RUN_TS)
+
+    sig = db_session.get(SignalRegistry, sid)
+    assert sig.forward_return_status == "price_drift_review"
+    assert sig.forward_return is None
+    assert sig.outcome_unavailable_reason == "provider_price_drift_exceeds_tolerance"
+    obs = _obs(db_session)
+    assert obs.status == "price_drift_review"
+    assert obs.forward_return is None
+    assert obs.entry_price == 10.0
+    assert obs.exit_price == 12.0
+    payload = json.loads(obs.provider_request_json)
+    finality = payload["price_finality"]
+    assert finality["status"] == "price_drift_review"
+    assert finality["material_drift"] is True
+    assert finality["original"]["exit_open"] == 12.0
+    assert finality["current"]["exit_open"] == 12.2
+    assert finality["drift"]["material_drift_count"] >= 1
+    assert len(json.loads(obs.data_lineage_ids)) == 2
+    assert db_session.query(ForwardReturnObservationEvent).count() == 2
+
+
+def test_finality_lag_elapsed_with_tolerated_drift_computes(db_session):
+    sid = _make_signal(db_session)
+    provisional = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.0)
+    })
+    revised = FakeHistoricalAdapter({
+        "ACME": _bars(entry_open=10.0, exit_open=12.005)
+    })
+
+    _run_job(
+        db_session,
+        provisional,
+        run_ts=datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc),
+    )
+    _run_job(db_session, revised, run_ts=MATURE_RUN_TS)
+
+    sig = db_session.get(SignalRegistry, sid)
+    assert sig.forward_return_status == "computed"
+    assert round(sig.forward_return, 6) == 0.2005
+    obs = _obs(db_session)
+    assert obs.status == "computed"
+    assert round(obs.forward_return, 6) == 0.2005
+    payload = json.loads(obs.provider_request_json)
+    assert payload["price_finality"]["status"] == "reconciled"
+    assert payload["price_finality"]["material_drift"] is False
+
+
 def test_computed_mature_signal_uses_full_open_prices_and_updates_summary(db_session):
     sid = _make_signal(db_session)
     adapter = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
@@ -373,7 +514,12 @@ def test_computed_mature_signal_uses_full_open_prices_and_updates_summary(db_ses
     assert payload["request"]["basis"] == "split_adjusted_ohlcv_full_endpoint"
     event = db_session.query(ForwardReturnObservationEvent).one()
     assert event.provider == "FMP"
-    assert json.loads(event.provider_request_json)["price_field"] == "open"
+    request_payload = json.loads(event.provider_request_json)
+    assert request_payload["price_request"]["price_field"] == "open"
+    assert (
+        request_payload["price_finality"]["status"]
+        == "no_provisional_lineage_first_final_run"
+    )
 
 
 def test_mature_past_signal_computes_endpoint_and_path_telemetry(db_session):

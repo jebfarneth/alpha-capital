@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import json
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
@@ -25,6 +25,7 @@ from alpha.data.fmp import (
     HISTORICAL_PRICE_FULL_ENDPOINT,
 )
 from alpha.db.models import (
+    DataLineage,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     SignalRegistry,
@@ -49,6 +50,9 @@ STATUS_INVALID_EXIT_PRICE_RETRY = "invalid_exit_price_retry"
 STATUS_HALTED_PENDING = "halted_pending"
 STATUS_CORPORATE_ACTION_REVIEW = "corporate_action_review"
 STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW = "survivorship_unresolved_review"
+STATUS_PRICE_FINALITY_PENDING = "price_finality_pending"
+STATUS_PROVIDER_REVISION_REVIEW = "provider_revision_review"
+STATUS_PRICE_DRIFT_REVIEW = "price_drift_review"
 STATUS_OUTCOME_UNAVAILABLE = "outcome_unavailable"
 
 # Legacy fixture-only status retained so existing scaffold tests keep working.
@@ -64,6 +68,9 @@ RETRYABLE_FORWARD_RETURN_STATUSES = (
     STATUS_MISSING_EXIT_PRICE_RETRY,
     STATUS_HALTED_PENDING,
     STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+    STATUS_PRICE_FINALITY_PENDING,
+    STATUS_PROVIDER_REVISION_REVIEW,
+    STATUS_PRICE_DRIFT_REVIEW,
 )
 
 PRODUCTION_RETRYABLE_STATUSES = (
@@ -75,6 +82,9 @@ PRODUCTION_RETRYABLE_STATUSES = (
     STATUS_MISSING_EXIT_PRICE_RETRY,
     STATUS_HALTED_PENDING,
     STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+    STATUS_PRICE_FINALITY_PENDING,
+    STATUS_PROVIDER_REVISION_REVIEW,
+    STATUS_PRICE_DRIFT_REVIEW,
 )
 
 REQUIRED_FORWARD_RETURN_STATUSES = (
@@ -88,6 +98,9 @@ REQUIRED_FORWARD_RETURN_STATUSES = (
     STATUS_HALTED_PENDING,
     STATUS_CORPORATE_ACTION_REVIEW,
     STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+    STATUS_PRICE_FINALITY_PENDING,
+    STATUS_PROVIDER_REVISION_REVIEW,
+    STATUS_PRICE_DRIFT_REVIEW,
     STATUS_OUTCOME_UNAVAILABLE,
 )
 
@@ -96,6 +109,9 @@ M4_SIGNAL_HORIZON = "15d"
 M4_PRICE_SOURCE = "fmp_full_split_adjusted_regular_session_open"
 M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF = "fmp_full_ohlc_split_adjusted_contract_open"
 MAX_FORWARD_RETURN_ATTEMPTS = 3
+DEFAULT_FINALITY_LAG_SESSIONS = 1
+PRICE_DRIFT_ABS_TOL = 0.01
+PRICE_DRIFT_REL_TOL = 0.0005
 LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON = (
     "legacy_next_execution_session_fallback"
 )
@@ -136,6 +152,8 @@ class M4ForwardReturnPlan:
     mature: bool
     entry_resolution_reason: Optional[str] = None
     pending_reason: Optional[str] = None
+    finality_lag_sessions: int = 0
+    finality_session_date: Optional[date] = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +359,11 @@ def _input_payload(sig: SignalRegistry, plan: M4ForwardReturnPlan) -> Dict[str, 
         "entry_session_date": plan.entry_session_date.isoformat(),
         "exit_session_date": plan.exit_session_date.isoformat(),
         "horizon_sessions": M4_EXIT_GEOMETRY.time_barrier_sessions,
+        "finality_lag_sessions": plan.finality_lag_sessions,
+        "finality_session_date": (
+            plan.finality_session_date.isoformat()
+            if plan.finality_session_date is not None else None
+        ),
         "exit_geometry_source": M4_EXIT_GEOMETRY.source_contract,
         "entry_price_source": M4_PRICE_SOURCE,
         "exit_price_source": M4_PRICE_SOURCE,
@@ -374,11 +397,18 @@ class ForwardReturnJob(BaseJob):
         pattern_id: str = M4_PATTERN_ID,
         max_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
         survivorship_resolver: Any = None,
+        finality_lag_sessions: int = DEFAULT_FINALITY_LAG_SESSIONS,
+        price_drift_abs_tol: float = PRICE_DRIFT_ABS_TOL,
+        price_drift_rel_tol: float = PRICE_DRIFT_REL_TOL,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if price_fn is None and adapter is None:
             raise ValueError("ForwardReturnJob requires price_fn or adapter")
+        if finality_lag_sessions < 0:
+            raise ValueError("finality_lag_sessions must be >= 0")
+        if price_drift_abs_tol < 0 or price_drift_rel_tol < 0:
+            raise ValueError("price drift tolerances must be >= 0")
         self._session = session
         self._price_fn = price_fn
         self._maturity_fn = maturity_fn
@@ -387,6 +417,9 @@ class ForwardReturnJob(BaseJob):
         self._pattern_id = pattern_id
         self._max_attempts = max_attempts
         self._survivorship_resolver = survivorship_resolver
+        self._finality_lag_sessions = finality_lag_sessions
+        self._price_drift_abs_tol = price_drift_abs_tol
+        self._price_drift_rel_tol = price_drift_rel_tol
 
     def run(self, ctx: JobContext) -> JobResult:
         if self._adapter is None:
@@ -414,6 +447,8 @@ class ForwardReturnJob(BaseJob):
 
         computed = 0
         pending = 0
+        price_finality_pending = 0
+        price_drift_review = 0
         retryable_unavailable = 0
         terminal_unavailable = 0
         pricing_errors = 0
@@ -452,6 +487,15 @@ class ForwardReturnJob(BaseJob):
                 observations_upserted += 1
                 continue
 
+            plan = replace(
+                plan,
+                finality_lag_sessions=self._finality_lag_sessions,
+                finality_session_date=_m4_finality_session_date(
+                    plan.exit_session_date,
+                    self._finality_lag_sessions,
+                ),
+            )
+
             if not plan.mature:
                 pricing = ProductionPricingResult(
                     status=STATUS_PENDING,
@@ -472,7 +516,13 @@ class ForwardReturnJob(BaseJob):
                 continue
 
             attempts = (sig.forward_return_attempts or 0) + 1
-            pricing, payload_hash = self._price_m4_signal(sig, plan, ctx.job_run_id)
+            previous_observation = self._existing_observation(sig, plan)
+            pricing, payload_hash = self._price_m4_signal(
+                sig,
+                plan,
+                ctx.job_run_id,
+                previous_observation=previous_observation,
+            )
             if pricing.status not in (STATUS_COMPUTED, STATUS_PENDING):
                 final_status = _terminalize_if_needed(
                     pricing.status, attempts, self._max_attempts,
@@ -492,6 +542,15 @@ class ForwardReturnJob(BaseJob):
 
             if pricing.status == STATUS_COMPUTED:
                 computed += 1
+            elif pricing.status == STATUS_PRICE_FINALITY_PENDING:
+                price_finality_pending += 1
+                retryable_unavailable += 1
+            elif pricing.status in (
+                STATUS_PROVIDER_REVISION_REVIEW,
+                STATUS_PRICE_DRIFT_REVIEW,
+            ):
+                price_drift_review += 1
+                retryable_unavailable += 1
             elif pricing.status == STATUS_OUTCOME_UNAVAILABLE:
                 terminal_unavailable += 1
             else:
@@ -516,6 +575,8 @@ class ForwardReturnJob(BaseJob):
                 "total_eligible": len(signals),
                 "computed": computed,
                 "pending": pending,
+                "price_finality_pending": price_finality_pending,
+                "price_drift_review": price_drift_review,
                 "retryable_unavailable": retryable_unavailable,
                 "terminal_unavailable": terminal_unavailable,
                 "pricing_errors": pricing_errors,
@@ -542,6 +603,21 @@ class ForwardReturnJob(BaseJob):
                 ),
             )
             .order_by(SignalRegistry.signal_timestamp, SignalRegistry.ticker)
+        )
+
+    def _existing_observation(
+        self,
+        sig: SignalRegistry,
+        plan: M4ForwardReturnPlan,
+    ) -> Optional[ForwardReturnObservation]:
+        return (
+            self._session.query(ForwardReturnObservation)
+            .filter(
+                ForwardReturnObservation.signal_id == sig.signal_id,
+                ForwardReturnObservation.input_hash
+                == m4_forward_return_input_hash(sig, plan),
+            )
+            .first()
         )
 
     def _plan_for_signal(
@@ -581,8 +657,16 @@ class ForwardReturnJob(BaseJob):
         sig: SignalRegistry,
         plan: M4ForwardReturnPlan,
         job_run_id: Optional[str],
+        *,
+        previous_observation: Optional[ForwardReturnObservation] = None,
     ) -> Tuple[ProductionPricingResult, Optional[str]]:
         asof = us_equity_session_close_timestamp(plan.exit_session_date)
+        finality_session_date = (
+            plan.finality_session_date or plan.exit_session_date
+        )
+        finality_ready = (
+            plan.current_evidence_session_date >= finality_session_date
+        )
         provider_request = _provider_request_payload(
             ticker=sig.ticker,
             from_date=plan.entry_session_date,
@@ -738,6 +822,46 @@ class ForwardReturnJob(BaseJob):
             geometry=M4_EXIT_GEOMETRY,
         )
 
+        if not finality_ready:
+            provisional_exit_price = None
+            provisional_exit_source = None
+            provisional_exit_basis = None
+            if exit_bar is not None and exit_bar.open is not None:
+                provisional_exit_price = _finite_price(exit_bar.open)
+                provisional_exit_basis = _split_adjusted_open_basis_proof(exit_bar)
+                if provisional_exit_basis is not None:
+                    provisional_exit_source = M4_PRICE_SOURCE
+            provider_request_payload = {
+                "price_request": provider_request,
+                "price_finality": {
+                    "status": STATUS_PRICE_FINALITY_PENDING,
+                    "reason": "finality_lag_not_elapsed",
+                    "finality_lag_sessions": plan.finality_lag_sessions,
+                    "finality_session_date": finality_session_date.isoformat(),
+                    "current_evidence_session_date": (
+                        plan.current_evidence_session_date.isoformat()
+                    ),
+                    "provisional_data_lineage_id": lineage.data_lineage_id,
+                    "reconciliation_possible": False,
+                },
+            }
+            return (
+                build_result(
+                    status=STATUS_PRICE_FINALITY_PENDING,
+                    reason="finality_lag_not_elapsed",
+                    entry_price=entry_price,
+                    exit_price=provisional_exit_price,
+                    forward_return=None,
+                    entry_price_source=M4_PRICE_SOURCE,
+                    exit_price_source=provisional_exit_source,
+                    entry_basis_proof=entry_basis_proof,
+                    exit_basis_proof=provisional_exit_basis,
+                    telemetry=telemetry,
+                    provider_request_payload=provider_request_payload,
+                ),
+                payload_hash,
+            )
+
         if exit_bar is None or exit_bar.open is None:
             survivorship = self._resolve_missing_exit_survivorship(
                 sig=sig,
@@ -813,6 +937,58 @@ class ForwardReturnJob(BaseJob):
                 payload_hash,
             )
 
+        finality_payload = self._price_finality_payload(
+            previous_observation=previous_observation,
+            current_lineage_id=lineage.data_lineage_id,
+            current_payload=lineage_payload,
+            provider_request=provider_request,
+            finality_session_date=finality_session_date,
+            current_evidence_session_date=plan.current_evidence_session_date,
+        )
+        if finality_payload["price_finality"].get("material_drift"):
+            original = finality_payload["price_finality"].get("original") or {}
+            original_entry_price = _finite_price(
+                original.get("entry_open")
+            ) or entry_price
+            original_exit_price = _finite_price(
+                original.get("exit_open")
+            ) or exit_price
+            original_telemetry = _telemetry_from_observation(
+                previous_observation
+            ) if previous_observation is not None else telemetry
+            original_lineage_ids = _observation_lineage_ids(
+                previous_observation
+            )
+            return (
+                build_result(
+                    status=STATUS_PRICE_DRIFT_REVIEW,
+                    reason="provider_price_drift_exceeds_tolerance",
+                    entry_price=original_entry_price,
+                    exit_price=original_exit_price,
+                    forward_return=None,
+                    entry_price_source=M4_PRICE_SOURCE,
+                    exit_price_source=M4_PRICE_SOURCE,
+                    entry_basis_proof=entry_basis_proof,
+                    exit_basis_proof=exit_basis_proof,
+                    entry_data_lineage_id=(
+                        previous_observation.entry_data_lineage_id
+                        if previous_observation is not None
+                        else lineage.data_lineage_id
+                    ),
+                    exit_data_lineage_id=(
+                        previous_observation.exit_data_lineage_id
+                        if previous_observation is not None
+                        else lineage.data_lineage_id
+                    ),
+                    telemetry=original_telemetry,
+                    provider_request_payload=finality_payload,
+                    data_lineage_ids=_dedupe_list(
+                        original_lineage_ids + lineage_ids
+                    ),
+                ),
+                payload_hash,
+            )
+
         forward_return = (exit_price - entry_price) / entry_price
         return (
             build_result(
@@ -826,6 +1002,10 @@ class ForwardReturnJob(BaseJob):
                 entry_basis_proof=entry_basis_proof,
                 exit_basis_proof=exit_basis_proof,
                 telemetry=telemetry,
+                provider_request_payload=finality_payload,
+                data_lineage_ids=_dedupe_list(
+                    _observation_lineage_ids(previous_observation) + lineage_ids
+                ),
             ),
             payload_hash,
         )
@@ -860,6 +1040,83 @@ class ForwardReturnJob(BaseJob):
             asof=asof,
             job_run_id=job_run_id,
         )
+
+    def _price_finality_payload(
+        self,
+        *,
+        previous_observation: Optional[ForwardReturnObservation],
+        current_lineage_id: str,
+        current_payload: Dict[str, Any],
+        provider_request: Dict[str, Any],
+        finality_session_date: date,
+        current_evidence_session_date: date,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "price_request": provider_request,
+            "price_finality": {
+                "status": "no_provisional_lineage_first_final_run",
+                "finality_lag_sessions": self._finality_lag_sessions,
+                "finality_session_date": finality_session_date.isoformat(),
+                "current_evidence_session_date": (
+                    current_evidence_session_date.isoformat()
+                ),
+                "current_data_lineage_id": current_lineage_id,
+                "provisional_observation_found": False,
+                "material_drift": False,
+                "drift_tolerance": {
+                    "abs_tol": self._price_drift_abs_tol,
+                    "rel_tol": self._price_drift_rel_tol,
+                    "rel_tol_bps": self._price_drift_rel_tol * 10_000,
+                },
+            },
+        }
+        if previous_observation is None or previous_observation.status not in (
+            STATUS_PRICE_FINALITY_PENDING,
+            STATUS_PRICE_DRIFT_REVIEW,
+            STATUS_PROVIDER_REVISION_REVIEW,
+        ):
+            return payload
+
+        original_lineage_id = (
+            previous_observation.entry_data_lineage_id
+            or previous_observation.exit_data_lineage_id
+        )
+        original_payload = _load_price_lineage_payload(
+            self._session,
+            original_lineage_id,
+        )
+        finality = payload["price_finality"]
+        finality.update({
+            "status": "reconciled",
+            "provisional_observation_found": True,
+            "original_data_lineage_id": original_lineage_id,
+            "original_observation_status": previous_observation.status,
+        })
+        if original_payload is None:
+            finality.update({
+                "status": STATUS_PROVIDER_REVISION_REVIEW,
+                "material_drift": True,
+                "reason": "original_provisional_lineage_unavailable",
+            })
+            return payload
+
+        drift = _compare_price_payloads(
+            original_payload,
+            current_payload,
+            abs_tol=self._price_drift_abs_tol,
+            rel_tol=self._price_drift_rel_tol,
+        )
+        finality.update({
+            "status": (
+                STATUS_PRICE_DRIFT_REVIEW
+                if drift["material_drift"] else "reconciled"
+            ),
+            "material_drift": drift["material_drift"],
+            "drift": drift,
+            "original": _entry_exit_open_summary(original_payload),
+            "current": _entry_exit_open_summary(current_payload),
+        })
+        return payload
 
     def _persist_production_outcome(
         self,
@@ -1258,6 +1515,9 @@ def _terminalize_if_needed(status: str, attempts: int, max_attempts: int) -> str
         STATUS_HALTED_PENDING,
         STATUS_CORPORATE_ACTION_REVIEW,
         STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+        STATUS_PRICE_FINALITY_PENDING,
+        STATUS_PROVIDER_REVISION_REVIEW,
+        STATUS_PRICE_DRIFT_REVIEW,
     ):
         return status
     if attempts >= max_attempts:
@@ -1520,6 +1780,212 @@ def _find_bar(bars: List[FmpBar], session_date: date) -> Optional[FmpBar]:
         if bar.date == wanted:
             return bar
     return None
+
+
+def _m4_finality_session_date(exit_session_date: date, lag_sessions: int) -> date:
+    if lag_sessions < 0:
+        raise ValueError("lag_sessions must be >= 0")
+    cursor = exit_session_date
+    for _ in range(lag_sessions):
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return cursor
+
+
+def _load_price_lineage_payload(
+    session: Session,
+    lineage_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not lineage_id:
+        return None
+    lineage = session.get(DataLineage, lineage_id)
+    if lineage is None or not lineage.raw_payload_json:
+        return None
+    try:
+        payload = json.loads(lineage.raw_payload_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _observation_lineage_ids(
+    observation: Optional[ForwardReturnObservation],
+) -> List[str]:
+    if observation is None:
+        return []
+    ids: List[str] = []
+    for value in (
+        observation.entry_data_lineage_id,
+        observation.exit_data_lineage_id,
+    ):
+        if value:
+            ids.append(value)
+    if observation.data_lineage_ids:
+        try:
+            parsed = json.loads(observation.data_lineage_ids)
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            ids.extend(str(value) for value in parsed if value)
+    return _dedupe_list(ids)
+
+
+def _dedupe_list(values: List[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _telemetry_from_observation(
+    observation: Optional[ForwardReturnObservation],
+) -> PathTelemetry:
+    if observation is None:
+        return PathTelemetry()
+    return PathTelemetry(
+        max_favorable_excursion=observation.max_favorable_excursion,
+        max_adverse_excursion=observation.max_adverse_excursion,
+        mfe_session_date=observation.mfe_session_date,
+        mae_session_date=observation.mae_session_date,
+        max_close_return=observation.max_close_return,
+        min_close_return=observation.min_close_return,
+        hit_t1_intraday=observation.hit_t1_intraday,
+        hit_t2_intraday=observation.hit_t2_intraday,
+        hit_t3_intraday=observation.hit_t3_intraday,
+        hit_stop_intraday=observation.hit_stop_intraday,
+        same_day_barrier_ambiguity=observation.same_day_barrier_ambiguity,
+    )
+
+
+def _entry_exit_open_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    bars = _payload_bars_by_date(payload)
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    entry_day = str(request.get("from") or "")
+    exit_day = str(request.get("to") or "")
+    entry = bars.get(entry_day, {})
+    exit_ = bars.get(exit_day, {})
+    return {
+        "entry_date": entry_day or None,
+        "entry_open": entry.get("open"),
+        "exit_date": exit_day or None,
+        "exit_open": exit_.get("open"),
+    }
+
+
+def _payload_bars_by_date(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw_bars = payload.get("bars") if isinstance(payload, dict) else []
+    if not isinstance(raw_bars, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for raw in raw_bars:
+        if not isinstance(raw, dict):
+            continue
+        day = raw.get("date")
+        if day:
+            out[str(day)] = raw
+    return out
+
+
+def _compare_price_payloads(
+    original_payload: Dict[str, Any],
+    current_payload: Dict[str, Any],
+    *,
+    abs_tol: float,
+    rel_tol: float,
+) -> Dict[str, Any]:
+    fields = ("open", "high", "low", "close", "split_adjusted_close")
+    original = _payload_bars_by_date(original_payload)
+    current = _payload_bars_by_date(current_payload)
+    dates = sorted(set(original) | set(current))
+    samples = []
+    material_count = 0
+    drift_count = 0
+    compared_count = 0
+    max_abs_drift = 0.0
+    max_rel_drift = 0.0
+
+    for day in dates:
+        old_bar = original.get(day)
+        new_bar = current.get(day)
+        if old_bar is None or new_bar is None:
+            material_count += 1
+            samples.append({
+                "date": day,
+                "field": "__bar__",
+                "original": "present" if old_bar is not None else None,
+                "current": "present" if new_bar is not None else None,
+                "material": True,
+                "reason": "bar_missing_or_added",
+            })
+            continue
+        for field in fields:
+            old_value = old_bar.get(field)
+            new_value = new_bar.get(field)
+            old_price = _finite_price(old_value)
+            new_price = _finite_price(new_value)
+            if old_price is None and new_price is None:
+                continue
+            compared_count += 1
+            if old_price is None or new_price is None:
+                material = True
+                abs_drift = None
+                rel_drift = None
+            else:
+                abs_drift = abs(new_price - old_price)
+                denominator = max(abs(old_price), abs(new_price), 1e-12)
+                rel_drift = abs_drift / denominator
+                max_abs_drift = max(max_abs_drift, abs_drift)
+                max_rel_drift = max(max_rel_drift, rel_drift)
+                material = _price_drift_exceeds(
+                    old_price,
+                    new_price,
+                    abs_tol=abs_tol,
+                    rel_tol=rel_tol,
+                )
+                if abs_drift > 0:
+                    drift_count += 1
+            if material:
+                material_count += 1
+            if (material or old_value != new_value) and len(samples) < 25:
+                samples.append({
+                    "date": day,
+                    "field": field,
+                    "original": old_value,
+                    "current": new_value,
+                    "abs_drift": abs_drift,
+                    "rel_drift": rel_drift,
+                    "material": material,
+                })
+
+    return {
+        "material_drift": material_count > 0,
+        "material_drift_count": material_count,
+        "drift_count": drift_count,
+        "compared_field_count": compared_count,
+        "bar_count_original": len(original),
+        "bar_count_current": len(current),
+        "max_abs_drift": max_abs_drift,
+        "max_rel_drift": max_rel_drift,
+        "samples": samples,
+    }
+
+
+def _price_drift_exceeds(
+    original: float,
+    current: float,
+    *,
+    abs_tol: float,
+    rel_tol: float,
+) -> bool:
+    abs_drift = abs(current - original)
+    denominator = max(abs(original), abs(current), 1e-12)
+    threshold = max(abs_tol, rel_tol * denominator)
+    return abs_drift > threshold
 
 
 def _provider_request_payload(
