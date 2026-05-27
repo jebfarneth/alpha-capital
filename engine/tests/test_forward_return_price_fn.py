@@ -81,6 +81,7 @@ class FakeHistoricalAdapter:
                 "high": bar.high,
                 "low": bar.low,
                 "close": bar.close,
+                "volume": bar.volume,
                 "split_adjusted_close": bar.split_adjusted_close,
                 "adj_close": bar.adj_close,
             }
@@ -147,6 +148,7 @@ def _bar(
     close=None,
     split_adjusted_close=None,
     adj_close=None,
+    volume=1000,
 ) -> FmpBar:
     if split_adjusted_close == "missing":
         split_adjusted_value = None
@@ -160,7 +162,7 @@ def _bar(
         high=open_price if high is None else high,
         low=open_price if low is None else low,
         close=open_price if close is None else close,
-        volume=1000,
+        volume=volume,
         split_adjusted_close=split_adjusted_value,
         adj_close=adj_close,
     )
@@ -621,6 +623,24 @@ def test_missing_entry_price_is_retryable(db_session):
     assert _obs(db_session).status == "missing_entry_price_retry"
 
 
+def test_max_attempts_one_terminalizes_retryable_on_first_attempt(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(EXIT_DATE, 12.0)]})
+
+    _run_job(db_session, adapter, max_attempts=1)
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    assert sig.forward_return_status == "outcome_unavailable"
+    assert sig.outcome_unavailable_reason == "missing_entry_price"
+    assert sig.forward_return_attempts == 1
+    assert obs.status == "outcome_unavailable"
+    assert obs.reason == "missing_entry_price"
+    assert event.status == "outcome_unavailable"
+    assert event.reason == "missing_entry_price"
+
+
 def test_missing_exit_price_runs_survivorship_resolver_and_requires_review(db_session):
     sid = _make_signal(db_session)
     adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
@@ -767,6 +787,21 @@ def test_invalid_entry_price_is_retryable(db_session):
     assert sig.forward_return is None
 
 
+def test_negative_zero_entry_price_is_invalid(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": _bars(entry_open=-0.0, exit_open=12.0)})
+
+    _run_job(db_session, adapter)
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    assert sig.forward_return_status == "invalid_entry_price_retry"
+    assert sig.outcome_unavailable_reason == "invalid_entry_price"
+    assert sig.forward_return is None
+    assert obs.entry_price == -0.0
+    assert obs.forward_return is None
+
+
 def test_invalid_exit_price_is_retryable(db_session):
     sid = _make_signal(db_session)
     adapter = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=-1.0)})
@@ -832,6 +867,40 @@ def test_zero_exit_price_computes_minus_one_hundred_percent(db_session):
     assert sig.forward_return_status == "computed"
     assert sig.forward_return == -1.0
     assert _obs(db_session).exit_price == 0.0
+
+
+def test_negative_zero_exit_price_is_terminal_mark(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=-0.0)})
+
+    _run_job(db_session, adapter)
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    assert sig.forward_return_status == "computed"
+    assert sig.forward_return == -1.0
+    assert obs.exit_price == -0.0
+    assert obs.forward_return == -1.0
+
+
+def test_zero_volume_bars_with_valid_ohlc_remain_priceable(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, volume=0),
+            _bar(EXIT_DATE, 12.0, volume=0),
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    lineage = db_session.get(DataLineage, obs.entry_data_lineage_id)
+    lineage_payload = json.loads(lineage.raw_payload_json)
+    assert sig.forward_return_status == "computed"
+    assert sig.forward_return == 0.2
+    assert {bar["volume"] for bar in lineage_payload["bars"]} == {0}
 
 
 def test_path_telemetry_and_same_day_barrier_ambiguity_persist(db_session):
@@ -1027,6 +1096,36 @@ def test_reconcile_computed_mode_appends_pass_event_and_keeps_return(db_session)
     assert len(json.loads(event.data_lineage_ids)) == 2
 
 
+def test_reconcile_computed_mode_includes_exact_revision_window_boundary(db_session):
+    _make_signal(db_session)
+    initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    revision = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+
+    _run_job(db_session, initial)
+    result = _run_job(
+        db_session,
+        revision,
+        run_ts=MATURE_RUN_TS,
+        reconcile_computed=True,
+        revision_window_sessions=0,
+    )
+
+    assert result.metrics["total_computed"] == 1
+    assert result.metrics["reconciliation_passed"] == 1
+    assert result.metrics["skipped_outside_window"] == 0
+    assert len(revision.calls) == 1
+    event = (
+        db_session.query(ForwardReturnObservationEvent)
+        .filter(ForwardReturnObservationEvent.reason == "reconciliation_passed")
+        .one()
+    )
+    revision_payload = json.loads(event.provider_request_json)[
+        "post_compute_reconciliation"
+    ]
+    assert revision_payload["current_evidence_session_date"] == "2026-06-16"
+    assert revision_payload["revision_window_end"] == "2026-06-16"
+
+
 def test_reconcile_computed_mode_ignores_rows_outside_revision_window(db_session):
     _make_signal(db_session)
     initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
@@ -1046,6 +1145,39 @@ def test_reconcile_computed_mode_ignores_rows_outside_revision_window(db_session
     assert revision.calls == []
     assert _obs(db_session).status == "computed"
     assert db_session.query(ForwardReturnObservationEvent).count() == 1
+
+
+def test_reconcile_computed_mode_can_load_original_payload_from_exit_lineage(
+    db_session,
+):
+    _make_signal(db_session)
+    initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    revision = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+
+    _run_job(db_session, initial)
+    obs = _obs(db_session)
+    assert obs.exit_data_lineage_id
+    obs.entry_data_lineage_id = None
+    obs.data_lineage_ids = json.dumps([])
+    db_session.flush()
+
+    result = _run_job(
+        db_session,
+        revision,
+        run_ts=datetime(2026, 6, 17, 21, 0, tzinfo=timezone.utc),
+        reconcile_computed=True,
+    )
+
+    assert result.metrics["reconciliation_passed"] == 1
+    assert result.metrics["events_appended"] == 1
+    event = (
+        db_session.query(ForwardReturnObservationEvent)
+        .filter(ForwardReturnObservationEvent.reason == "reconciliation_passed")
+        .one()
+    )
+    lineage_ids = json.loads(event.data_lineage_ids)
+    assert obs.exit_data_lineage_id in lineage_ids
+    assert len(lineage_ids) == 2
 
 
 def test_reconcile_computed_mode_moves_material_drift_to_review(db_session):
