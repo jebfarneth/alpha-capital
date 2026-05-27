@@ -3,11 +3,12 @@ import sys
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 # Make alpha package importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from alpha.db.engine import schema_connect_args
 from alpha.db.models import Base
 
 config = context.config
@@ -26,9 +27,19 @@ def run_migrations_offline():
 
 def run_migrations_online():
     url = os.environ.get("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
-    connectable = create_engine(url)
+    schema = os.environ.get("ALPHA_DB_SCHEMA")
+    connectable = create_engine(url, **schema_connect_args(url, schema))
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        if schema:
+            connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            connection.commit()
+            connection.exec_driver_sql(f'SET search_path TO "{schema}", public')
+            connection.commit()
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            version_table_schema=schema,
+        )
         with context.begin_transaction():
             context.run_migrations()
 

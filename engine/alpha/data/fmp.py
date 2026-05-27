@@ -34,6 +34,7 @@ HISTORICAL_PRICE_FULL_ENDPOINT = "/stable/historical-price-eod/full"
 HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT = (
     "/stable/historical-price-eod/dividend-adjusted"
 )
+DELISTED_COMPANIES_ENDPOINT = "/stable/delisted-companies"
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -74,10 +75,10 @@ class FmpQuote:
 @dataclass
 class FmpBar:
     date: str
-    open: float
-    high: float
-    low: float
-    close: float
+    open: Optional[float]
+    high: Optional[float]
+    low: Optional[float]
+    close: Optional[float]
     volume: int
     split_adjusted_close: Optional[float] = None
     adj_close: Optional[float] = None
@@ -122,6 +123,16 @@ class FmpSecFiling:
     filing_type: Optional[str] = None
     link: Optional[str] = None
     final_link: Optional[str] = None
+
+
+@dataclass
+class FmpDelistedCompany:
+    symbol: str
+    company_name: Optional[str] = None
+    exchange: Optional[str] = None
+    ipo_date: Optional[str] = None
+    delisted_date: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
 
 
 # --- Adapter ---
@@ -482,6 +493,39 @@ class FmpAdapter:
             )
         return AdapterResponse(data=bars, lineage=resp.lineage)
 
+    def get_delisted_companies(
+        self,
+        *,
+        page: int = 0,
+        limit: int = 100,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[FmpDelistedCompany]]:
+        """Return FMP's delisted-company directory page.
+
+        The stable endpoint is paginated and, as of the current provider
+        contract, does not filter by symbol. Callers must search returned
+        pages and persist the page request lineage they relied on.
+        """
+        params = {"page": page, "limit": limit}
+        resp = self._request(DELISTED_COMPANIES_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        rows = resp.data if isinstance(resp.data, list) else []
+        delisted = [
+            FmpDelistedCompany(
+                symbol=row.get("symbol", ""),
+                company_name=row.get("companyName") or row.get("name"),
+                exchange=row.get("exchange"),
+                ipo_date=row.get("ipoDate"),
+                delisted_date=row.get("delistedDate"),
+                raw=dict(row),
+            )
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return AdapterResponse(data=delisted, lineage=resp.lineage)
+
     # --- SEC filings ---
 
     def get_sec_filings(
@@ -528,10 +572,10 @@ def _parse_fmp_bar(
     )
     return FmpBar(
         date=row.get("date", ""),
-        open=_first_present(row, "open", "adjOpen", default=0.0),
-        high=_first_present(row, "high", "adjHigh", default=0.0),
-        low=_first_present(row, "low", "adjLow", default=0.0),
-        close=_first_present(row, "close", "adjClose", default=0.0),
+        open=_first_present(row, "open", "adjOpen"),
+        high=_first_present(row, "high", "adjHigh"),
+        low=_first_present(row, "low", "adjLow"),
+        close=_first_present(row, "close", "adjClose"),
         volume=row.get("volume", 0),
         split_adjusted_close=split_adjusted_close,
         adj_close=adj_close,

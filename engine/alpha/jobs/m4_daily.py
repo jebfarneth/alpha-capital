@@ -163,6 +163,7 @@ class M4DailyAssemblyJob(BaseJob):
             universe_cutoff_timestamp=scan_asof_timestamp,
             decision_date=decision_date,
             evidence_session_date=evidence_session_date,
+            next_execution_session=session_resolution.next_execution_session,
             source_provider="FMP",
         )
 

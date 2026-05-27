@@ -98,6 +98,7 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "overlapping_pattern_ids",
     "decision_date",
     "evidence_session_date",
+    "next_execution_session",
     "high_52w_date",
     "high_52w_basis",
     "lookback_start",

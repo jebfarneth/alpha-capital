@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Daily M4 production entrypoint.
+"""Production forward-return entrypoint.
 
 Usage:
     cd engine
-    uv run python -m alpha.jobs.run_m4_daily --live --run-timestamp 2026-05-26T08:00:00+00:00
+    uv run python -m alpha.jobs.run_forward_return --live --run-timestamp 2026-06-16T17:00:00-04:00
 """
 
 from __future__ import annotations
@@ -11,14 +11,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from alpha.data.config import FmpConfig
 from alpha.data.fmp import FmpAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
-from alpha.jobs.m4_daily import M4DailyAssemblyJob
+from alpha.jobs.forward_return import ForwardReturnJob
 from alpha.jobs.runner import run_job
+
+LIVE_RUN_TIMESTAMP_SKEW_TOLERANCE = timedelta(minutes=5)
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -39,6 +41,35 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _live_timestamp_error(
+    value: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+    tolerance: timedelta = LIVE_RUN_TIMESTAMP_SKEW_TOLERANCE,
+) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = _parse_timestamp(value)
+    except ValueError:
+        return f"invalid run_timestamp: {value}"
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return "live run_timestamp must be timezone-aware"
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    if parsed > now + tolerance:
+        return (
+            "live run_timestamp is in the future; use explicit audited "
+            "historical/backfill mode instead of --live time travel"
+        )
+    return None
+
+
 def _run_live(args: argparse.Namespace) -> int:
     _load_dotenv()
     if args.database_url:
@@ -47,6 +78,10 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
+    timestamp_error = _live_timestamp_error(args.run_timestamp)
+    if timestamp_error:
+        print(f"ERROR: {timestamp_error}")
+        return 1
     if not os.environ.get("FMP_API_KEY"):
         print("ERROR: FMP_API_KEY not set")
         return 1
@@ -58,11 +93,12 @@ def _run_live(args: argparse.Namespace) -> int:
 
     try:
         adapter = FmpAdapter(FmpConfig.from_env())
-        job = M4DailyAssemblyJob(
+        job = ForwardReturnJob(
             session=session,
             adapter=adapter,
             run_timestamp=_parse_timestamp(args.run_timestamp),
-            lookback_calendar_days=args.lookback_calendar_days,
+            max_attempts=args.max_attempts,
+            pattern_id=args.pattern_id,
         )
         result = run_job(
             session,
@@ -70,24 +106,23 @@ def _run_live(args: argparse.Namespace) -> int:
             params={
                 "source": "fmp_full",
                 "run_timestamp": args.run_timestamp,
-                "lookback_calendar_days": args.lookback_calendar_days,
+                "max_attempts": args.max_attempts,
+                "pattern_id": args.pattern_id,
                 "schema": args.schema,
             },
         )
         metrics = result.metrics or {}
-        orchestration = metrics.get("orchestration") or {}
-        assembly = metrics.get("assembly") or {}
-        print(f"Status:                 {result.status}")
-        print(f"Decision date:          {metrics.get('decision_date')}")
-        print(f"Evidence session date:  {metrics.get('evidence_session_date')}")
-        print(f"Schema:                 {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
-        print(f"Fetch through date:     {metrics.get('fetch_to_date')}")
-        print(f"Included universe:      {metrics.get('included_universe_size')}")
-        print(f"Fetched symbols:        {metrics.get('fetched_symbol_count')}")
-        print(f"Fetched bars:           {metrics.get('fetched_bar_count')}")
-        print(f"Fetch errors:           {metrics.get('fetch_error_count')}")
-        print(f"Assembled M4 inputs:    {assembly.get('assembled_count')}")
-        print(f"M4 signals persisted:   {orchestration.get('total_signals_persisted')}")
+        print(f"Status:                  {result.status}")
+        print(f"Mode:                    {metrics.get('mode')}")
+        print(f"Pattern:                 {metrics.get('pattern_id')}")
+        print(f"Schema:                  {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
+        print(f"Eligible signals:        {metrics.get('total_eligible')}")
+        print(f"Computed:                {metrics.get('computed')}")
+        print(f"Pending:                 {metrics.get('pending')}")
+        print(f"Retryable unavailable:   {metrics.get('retryable_unavailable')}")
+        print(f"Terminal unavailable:    {metrics.get('terminal_unavailable')}")
+        print(f"Observations upserted:   {metrics.get('observations_upserted')}")
+        print(f"Fetch errors:            {metrics.get('fetch_error_count')}")
         if result.errors:
             print("Errors:")
             for error in result.errors[:20]:
@@ -98,7 +133,7 @@ def _run_live(args: argparse.Namespace) -> int:
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run daily M4 production wiring.")
+    parser = argparse.ArgumentParser(description="Run forward-return population.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="Run live FMP workflow")
     parser.add_argument("--database-url", help="Override DATABASE_URL for this run")
@@ -112,20 +147,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--run-timestamp",
         help=(
-            "Timezone-aware timestamp used for market-session resolution. "
+            "Timezone-aware timestamp used for maturity/session resolution. "
             "Defaults to the evidence job run start time."
         ),
     )
     parser.add_argument(
-        "--lookback-calendar-days",
+        "--pattern-id",
+        default="M4",
+        help="Pattern id to price. First production slice supports M4.",
+    )
+    parser.add_argument(
+        "--max-attempts",
         type=int,
-        default=430,
-        help="Calendar days to request before the evidence session.",
+        default=3,
+        help="Terminalize retryable unavailable outcomes at this attempt count.",
     )
     parser.add_argument(
         "--create-tables",
         action="store_true",
-        help="Create tables from SQLAlchemy metadata before running. Use only for local smoke DBs; production should use Alembic.",
+        help="Create tables from SQLAlchemy metadata before running local smoke DBs.",
     )
     return parser.parse_args(argv)
 

@@ -82,6 +82,20 @@ def next_us_equity_session(day: date) -> date:
     return cursor
 
 
+def nth_us_equity_session(day: date, n: int) -> date:
+    """Return the nth regular session on or after `day`.
+
+    `n=1` returns the first regular session on or after `day`. This is useful
+    for time barriers that count the entry session as day one.
+    """
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    cursor = next_us_equity_session(day)
+    for _ in range(n - 1):
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return cursor
+
+
 def us_equity_session_close_timestamp(day: date) -> datetime:
     """Return the regular-session close timestamp for `day` in UTC.
 
@@ -91,6 +105,13 @@ def us_equity_session_close_timestamp(day: date) -> datetime:
     if not is_us_equity_session(day):
         raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
     return datetime.combine(day, MARKET_CLOSE_ET, EASTERN_TZ).astimezone(ZoneInfo("UTC"))
+
+
+def us_equity_session_open_timestamp(day: date) -> datetime:
+    """Return the regular-session open timestamp for `day` in UTC."""
+    if not is_us_equity_session(day):
+        raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
+    return datetime.combine(day, MARKET_OPEN_ET, EASTERN_TZ).astimezone(ZoneInfo("UTC"))
 
 
 def nyse_holidays(year: int) -> set[date]:

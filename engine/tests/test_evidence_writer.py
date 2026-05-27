@@ -571,6 +571,8 @@ class TestSchemaCompleteness:
             "data_lineage",
             "feature_snapshots",
             "signal_registry",
+            "forward_return_observations",
+            "forward_return_observation_events",
             "trade_candidates",
             "optimizer_runs",
             "order_events",
@@ -620,6 +622,7 @@ class TestSchemaCompleteness:
             "detector_version",
             "point_in_time_passed",
             "lookahead_guard_passed",
+            "next_execution_session",
         } <= columns["signal_registry"]
         assert signal_columns["signal_identity_hash"]["nullable"] is False
         assert "raw_payload_json" in columns["data_lineage"]

@@ -177,6 +177,9 @@ def test_m4_production_job_caps_fetch_at_evidence_session_and_persists(db_sessio
     signal = db_session.query(SignalRegistry).filter_by(ticker="LCUT").one()
     assert signal.pattern_id == "M4"
     assert signal.feature_snapshot_id == feature.feature_snapshot_id
+    assert signal.trading_date == "2026-05-26"
+    assert signal.next_execution_session == "2026-05-26"
+    assert json.loads(feature.feature_json)["next_execution_session"] == "2026-05-26"
 
 
 def test_m4_production_job_refuses_trading_date_that_bypasses_resolver(db_session):

@@ -72,6 +72,10 @@ def persist_detection_result(
         signal_identity_hashes = _signal_identity_hashes(result, detector)
     if result.signals and not signal_identity_hashes:
         raise ValueError("signals require signal_identity_hash in features")
+    next_execution_session = result.features.features.get("next_execution_session")
+    next_execution_session = (
+        str(next_execution_session) if next_execution_session is not None else None
+    )
 
     if not result.signals:
         feature_hash = stable_hash(result.features.features)
@@ -106,6 +110,10 @@ def persist_detection_result(
             if row.signal_identity_hash is not None
         }
         if len(existing_by_hash) == len(signal_identity_hashes):
+            if next_execution_session:
+                for row in existing_signals:
+                    if row.next_execution_session is None:
+                        row.next_execution_session = next_execution_session
             first_existing = existing_signals[0]
             persisted.feature_snapshot_id = first_existing.feature_snapshot_id
             persisted.signal_ids.extend(row.signal_id for row in existing_signals)
@@ -153,6 +161,7 @@ def persist_detection_result(
             data_lineage_ids=data_lineage_ids,
             universe_snapshot_id=universe_snapshot_id,
             trading_date=trading_date,
+            next_execution_session=next_execution_session,
             scan_id=scan_id,
             detector_version=detector_version,
             point_in_time_passed=point_in_time_passed,

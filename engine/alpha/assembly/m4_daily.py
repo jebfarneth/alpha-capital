@@ -77,6 +77,7 @@ def assemble_m4_daily(
     trading_date: Optional[str] = None,
     decision_date: Optional[str] = None,
     evidence_session_date: Optional[str] = None,
+    next_execution_session: Optional[str] = None,
     source_provider: str = "FMP",
     source_lineage_hash: Optional[str] = None,
 ) -> PatternAssemblyResult:
@@ -96,6 +97,10 @@ def assemble_m4_daily(
     evidence_session_date : str
         ISO date of the completed market session whose close is being evaluated.
         high_52w is computed from sessions strictly before this date.
+    next_execution_session : str, optional
+        ISO date of the intended first regular execution session after the
+        decision. Persisted for price_fn so it does not re-derive entry from
+        an ambiguous trading date.
     trading_date : str, optional
         Backward-compatible alias used as decision_date/evidence_session_date when
         the explicit session dates are not supplied.
@@ -351,6 +356,11 @@ def assemble_m4_daily(
             name="evidence_session_date", value=resolved_evidence_date,
             presence=FieldPresence.PRESENT,
         ))
+        if next_execution_session is not None:
+            fields.append(AssembledField(
+                name="next_execution_session", value=next_execution_session,
+                presence=FieldPresence.PRESENT,
+            ))
 
         # Backward-compatible alias for existing detector inputs. New callers
         # should consume decision_date/evidence_session_date explicitly.

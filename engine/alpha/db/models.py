@@ -400,6 +400,7 @@ class SignalRegistry(Base):
         String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
     )
     trading_date = Column(String, nullable=True)
+    next_execution_session = Column(String, nullable=True)
     scan_id = Column(
         String, ForeignKey("universe_scans.scan_id"), nullable=True
     )
@@ -415,6 +416,166 @@ class SignalRegistry(Base):
     intended_entry_price = Column(Float, nullable=True)
 
     feature_snapshot = relationship("FeatureSnapshot", back_populates="signals")
+    forward_return_observations = relationship(
+        "ForwardReturnObservation", back_populates="signal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# forward_return_observations
+# ---------------------------------------------------------------------------
+class ForwardReturnObservation(Base):
+    __tablename__ = "forward_return_observations"
+    __table_args__ = (
+        Index(
+            "ux_forward_return_observations_signal_input",
+            "signal_id",
+            "input_hash",
+            unique=True,
+        ),
+        Index(
+            "ix_forward_return_observations_pattern_status",
+            "pattern_id",
+            "status",
+        ),
+        Index(
+            "ix_forward_return_observations_ticker",
+            "ticker",
+        ),
+    )
+
+    forward_return_observation_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), nullable=False
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    direction = Column(String, nullable=False)
+    signal_timestamp = Column(DateTime(timezone=True), nullable=False)
+    signal_horizon = Column(String, nullable=True)
+    next_execution_session = Column(String, nullable=True)
+    entry_session_date = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    entry_price_source = Column(String, nullable=True)
+    entry_basis_proof = Column(String, nullable=True)
+    entry_data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    exit_session_date = Column(String, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    exit_price_source = Column(String, nullable=True)
+    exit_basis_proof = Column(String, nullable=True)
+    exit_data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    forward_return = Column(Float, nullable=True)
+    max_favorable_excursion = Column(Float, nullable=True)
+    max_adverse_excursion = Column(Float, nullable=True)
+    mfe_session_date = Column(String, nullable=True)
+    mae_session_date = Column(String, nullable=True)
+    max_close_return = Column(Float, nullable=True)
+    min_close_return = Column(Float, nullable=True)
+    hit_t1_intraday = Column(Boolean, nullable=True)
+    hit_t2_intraday = Column(Boolean, nullable=True)
+    hit_t3_intraday = Column(Boolean, nullable=True)
+    hit_stop_intraday = Column(Boolean, nullable=True)
+    same_day_barrier_ambiguity = Column(Boolean, nullable=True)
+    status = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=False)
+    outcome_hash = Column(String, nullable=False)
+    data_lineage_ids = Column(Text, nullable=True)
+    provider = Column(String, nullable=True)
+    endpoint = Column(String, nullable=True)
+    provider_request_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal = relationship("SignalRegistry", back_populates="forward_return_observations")
+    events = relationship(
+        "ForwardReturnObservationEvent",
+        back_populates="observation",
+    )
+
+
+# ---------------------------------------------------------------------------
+# forward_return_observation_events (append-only)
+# ---------------------------------------------------------------------------
+class ForwardReturnObservationEvent(Base):
+    __tablename__ = "forward_return_observation_events"
+    __table_args__ = (
+        Index(
+            "ix_forward_return_observation_events_signal_attempt",
+            "signal_id",
+            "attempts",
+        ),
+        Index(
+            "ix_forward_return_observation_events_observation",
+            "forward_return_observation_id",
+        ),
+    )
+
+    forward_return_observation_event_id = Column(String, primary_key=True, default=_uuid)
+    forward_return_observation_id = Column(
+        String,
+        ForeignKey("forward_return_observations.forward_return_observation_id"),
+        nullable=True,
+    )
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), nullable=False
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    direction = Column(String, nullable=False)
+    signal_timestamp = Column(DateTime(timezone=True), nullable=False)
+    signal_horizon = Column(String, nullable=True)
+    next_execution_session = Column(String, nullable=True)
+    entry_session_date = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    entry_price_source = Column(String, nullable=True)
+    entry_basis_proof = Column(String, nullable=True)
+    entry_data_lineage_id = Column(String, nullable=True)
+    exit_session_date = Column(String, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    exit_price_source = Column(String, nullable=True)
+    exit_basis_proof = Column(String, nullable=True)
+    exit_data_lineage_id = Column(String, nullable=True)
+    forward_return = Column(Float, nullable=True)
+    max_favorable_excursion = Column(Float, nullable=True)
+    max_adverse_excursion = Column(Float, nullable=True)
+    mfe_session_date = Column(String, nullable=True)
+    mae_session_date = Column(String, nullable=True)
+    max_close_return = Column(Float, nullable=True)
+    min_close_return = Column(Float, nullable=True)
+    hit_t1_intraday = Column(Boolean, nullable=True)
+    hit_t2_intraday = Column(Boolean, nullable=True)
+    hit_t3_intraday = Column(Boolean, nullable=True)
+    hit_stop_intraday = Column(Boolean, nullable=True)
+    same_day_barrier_ambiguity = Column(Boolean, nullable=True)
+    status = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=False)
+    outcome_hash = Column(String, nullable=False)
+    data_lineage_ids = Column(Text, nullable=True)
+    provider = Column(String, nullable=True)
+    endpoint = Column(String, nullable=True)
+    provider_request_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    observation = relationship(
+        "ForwardReturnObservation",
+        back_populates="events",
+    )
 
 
 # ---------------------------------------------------------------------------
