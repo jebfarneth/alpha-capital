@@ -85,3 +85,26 @@ class PolygonConfig:
             api_key=_require("POLYGON_API_KEY"),
             base_url=_optional("POLYGON_BASE_URL", cls.base_url),
         )
+
+
+@dataclass(frozen=True)
+class BenzingaConfig:
+    """Configuration for Benzinga event-data adapters."""
+
+    api_key: str
+    base_url: str = "https://api.benzinga.com"
+
+    @classmethod
+    def from_env(cls) -> BenzingaConfig:
+        """Build Benzinga configuration from process environment variables."""
+
+        api_key = os.environ.get("BENZINGA_API_KEY") or os.environ.get("BENZINGA_TOKEN")
+        if not api_key:
+            raise ConfigError(
+                "Required environment variable 'BENZINGA_API_KEY' or "
+                "'BENZINGA_TOKEN' is not set. See engine/.env.example for the full list."
+            )
+        return cls(
+            api_key=api_key,
+            base_url=_optional("BENZINGA_BASE_URL", cls.base_url),
+        )

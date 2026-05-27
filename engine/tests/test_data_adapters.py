@@ -21,7 +21,14 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 
-from alpha.data.config import AlpacaConfig, ConfigError, FmpConfig, PolygonConfig
+from alpha.data.benzinga import BenzingaAdapter
+from alpha.data.config import (
+    AlpacaConfig,
+    BenzingaConfig,
+    ConfigError,
+    FmpConfig,
+    PolygonConfig,
+)
 from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
@@ -72,6 +79,10 @@ def _alpaca_config():
 
 def _polygon_config():
     return PolygonConfig(api_key="test-polygon-key")
+
+
+def _benzinga_config():
+    return BenzingaConfig(api_key="test-benzinga-key")
 
 
 def _fixture_json(name: str):
@@ -128,6 +139,12 @@ class TestConfig:
         with pytest.raises(ConfigError, match="POLYGON_API_KEY"):
             PolygonConfig.from_env()
 
+    def test_benzinga_missing_key_raises(self, monkeypatch):
+        monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+        monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+        with pytest.raises(ConfigError, match="BENZINGA_API_KEY"):
+            BenzingaConfig.from_env()
+
     def test_fmp_from_env_success(self, monkeypatch):
         monkeypatch.setenv("FMP_API_KEY", "my-key")
         cfg = FmpConfig.from_env()
@@ -139,6 +156,19 @@ class TestConfig:
         monkeypatch.delenv("ALPACA_BASE_URL", raising=False)
         cfg = AlpacaConfig.from_env()
         assert "paper" in cfg.base_url
+
+    def test_benzinga_from_env_success(self, monkeypatch):
+        monkeypatch.setenv("BENZINGA_API_KEY", "bz-key")
+        monkeypatch.setenv("BENZINGA_BASE_URL", "https://benzinga.test")
+        cfg = BenzingaConfig.from_env()
+        assert cfg.api_key == "bz-key"
+        assert cfg.base_url == "https://benzinga.test"
+
+    def test_benzinga_token_alias_from_env_success(self, monkeypatch):
+        monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+        monkeypatch.setenv("BENZINGA_TOKEN", "bz-token")
+        cfg = BenzingaConfig.from_env()
+        assert cfg.api_key == "bz-token"
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1092,199 @@ class TestPolygonAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Benzinga adapter
+# ---------------------------------------------------------------------------
+
+class TestBenzingaAdapter:
+    def _adapter(self, mock_session):
+        return BenzingaAdapter(_benzinga_config(), session=mock_session)
+
+    def test_get_mergers_acquisitions_ok(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "ma": [
+                {
+                    "id": "deal-1",
+                    "target_ticker": "ACME",
+                    "target_name": "Acme Corp",
+                    "target_exchange": "NASDAQ",
+                    "acquirer_ticker": "BUY",
+                    "acquirer_name": "Buyer Inc",
+                    "acquirer_exchange": "NYSE",
+                    "deal_type": "Merger",
+                    "deal_status": "Completed",
+                    "deal_payment_type": "Cash",
+                    "deal_size": "125000000",
+                    "currency": "USD",
+                    "date": "2026-05-01",
+                    "date_completed": "2026-05-20",
+                    "date_expected": "2026-05-31",
+                    "deal_terms_extra": "$7.50 per share in cash",
+                    "notes": "Definitive agreement announced.",
+                    "importance": 5,
+                    "updated": 1779307200,
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME", pagesize=25)
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        deal = resp.data[0]
+        assert deal.id == "deal-1"
+        assert deal.target_ticker == "ACME"
+        assert deal.acquirer_ticker == "BUY"
+        assert deal.deal_payment_type == "Cash"
+        assert deal.deal_terms_extra == "$7.50 per share in cash"
+        assert deal.raw["target_exchange"] == "NASDAQ"
+        assert resp.lineage.provider == "Benzinga"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/ma"
+        assert resp.lineage.source_authority == "Benzinga"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v2.1/calendar/ma",
+            params={
+                "pagesize": 25,
+                "parameters[tickers]": "ACME",
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
+    def test_get_mergers_acquisitions_date_window_and_ticker_list(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"ma": []})
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions(
+            ["ACME", "BETA"],
+            date_from="2026-01-01",
+            date_to="2026-05-31",
+        )
+
+        assert resp.ok
+        assert resp.data == []
+        params = session.get.call_args.kwargs["params"]
+        assert params["parameters[tickers]"] == "ACME,BETA"
+        assert params["parameters[date_from]"] == "2026-01-01"
+        assert params["parameters[date_to]"] == "2026-05-31"
+        assert params["token"] == "test-benzinga-key"
+
+    def test_get_mergers_acquisitions_accepts_list_payload(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = [
+            {
+                "id": 42,
+                "target_ticker": "ACME",
+                "deal_status": "Announced",
+                "importance": "3",
+                "updated": "1779307200",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions()
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].id == "42"
+        assert resp.data[0].importance == 3
+        assert resp.data[0].updated == 1779307200
+
+    def test_get_mergers_acquisitions_empty_unexpected_payload_is_empty(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"unexpected": []})
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+
+    def test_auth_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(403, text="Forbidden")
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "auth"
+        assert resp.error.retryable is False
+
+    def test_rate_limit_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(429, text="Rate limit")
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "rate_limit"
+        assert resp.error.retryable is True
+
+    def test_timeout_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = requests.exceptions.Timeout("timed out")
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "timeout"
+        assert resp.error.retryable is True
+
+    def test_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        resp_mock = _mock_response(200, text="not json")
+        resp_mock.json.side_effect = ValueError("parse fail")
+        session.get.return_value = resp_mock
+        adapter = self._adapter(session)
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+
+    def test_lineage_hash_stability(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {"ma": [{"id": "deal-1", "target_ticker": "ACME"}]}
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp1 = adapter.get_mergers_acquisitions("ACME")
+        resp2 = adapter.get_mergers_acquisitions("ACME")
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
+    def test_request_converts_aware_asof_to_utc(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"ma": []})
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/api/v2.1/calendar/ma",
+            asof=datetime(2026, 5, 20, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        assert resp.ok
+        assert resp.lineage.asof_timestamp == datetime(
+            2026, 5, 20, 4, 0, tzinfo=timezone.utc
+        )
+        _assert_aware_utc(resp.lineage.request_timestamp)
+
+    def test_request_rejects_naive_asof(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = adapter._request(
+            "/api/v2.1/calendar/ma",
+            asof=datetime(2026, 5, 20, 14, 30),
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Benzinga adapter asof timestamp must be timezone-aware datetime"
+        session.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Cross-adapter: lineage metadata completeness
 # ---------------------------------------------------------------------------
 
@@ -1081,11 +1304,13 @@ class TestLineageMetadata:
         fmp = FmpAdapter(_fmp_config(), session=session)
         alpaca = AlpacaAdapter(_alpaca_config(), session=session)
         polygon = PolygonAdapter(_polygon_config(), session=session)
+        benzinga = BenzingaAdapter(_benzinga_config(), session=session)
 
         for resp in [
             fmp.get_quote("ACME"),
             alpaca.get_account(),
             polygon.get_short_interest("ACME"),
+            benzinga.get_mergers_acquisitions("ACME"),
         ]:
             assert resp.lineage.provider != ""
             assert resp.lineage.endpoint != ""
@@ -1106,11 +1331,13 @@ class TestLineageMetadata:
         fmp = FmpAdapter(_fmp_config(), session=session)
         alpaca = AlpacaAdapter(_alpaca_config(), session=session)
         polygon = PolygonAdapter(_polygon_config(), session=session)
+        benzinga = BenzingaAdapter(_benzinga_config(), session=session)
 
         for resp in [
             fmp.get_quote("ACME"),
             alpaca.get_account(),
             polygon.get_short_interest("ACME"),
+            benzinga.get_mergers_acquisitions("ACME"),
         ]:
             assert not resp.ok
             assert resp.lineage.provider != ""
