@@ -252,9 +252,23 @@ class BenzingaAdapter:
         if date_sort is not None:
             params["parameters[date_sort]"] = date_sort
         if cusip:
-            params["parameters[cusip]"] = _csv_param(cusip)
+            normalized_cusip = _identifier_csv_param(cusip, kind="cusip")
+            if normalized_cusip is None:
+                return _validation_error_response(
+                    M_AND_A_ENDPOINT,
+                    "Benzinga M&A CUSIP parameters must be 9-character alphanumeric identifiers",
+                    asof=asof,
+                )
+            params["parameters[cusip]"] = normalized_cusip
         if isin:
-            params["parameters[isin]"] = _csv_param(isin)
+            normalized_isin = _identifier_csv_param(isin, kind="isin")
+            if normalized_isin is None:
+                return _validation_error_response(
+                    M_AND_A_ENDPOINT,
+                    "Benzinga M&A ISIN parameters must be 12-character alphanumeric identifiers",
+                    asof=asof,
+                )
+            params["parameters[isin]"] = normalized_isin
 
         resp = self._request(M_AND_A_ENDPOINT, params=params, asof=asof)
         if not resp.ok:
@@ -281,36 +295,40 @@ def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisit
         target_ticker=_string_or_none(row.get("target_ticker")),
         target_name=_string_or_none(row.get("target_name")),
         target_exchange=_string_or_none(row.get("target_exchange")),
-        target_cusip=_first_string(
+        target_cusip=_first_identifier(
             row,
             "target_cusip",
             "target_cusip_number",
             "target_security_cusip",
             "target_cusips",
+            kind="cusip",
         ),
-        target_isin=_first_string(
+        target_isin=_first_identifier(
             row,
             "target_isin",
             "target_isin_number",
             "target_security_isin",
             "target_isins",
+            kind="isin",
         ),
         acquirer_ticker=_string_or_none(row.get("acquirer_ticker")),
         acquirer_name=_string_or_none(row.get("acquirer_name")),
         acquirer_exchange=_string_or_none(row.get("acquirer_exchange")),
-        acquirer_cusip=_first_string(
+        acquirer_cusip=_first_identifier(
             row,
             "acquirer_cusip",
             "acquirer_cusip_number",
             "acquirer_security_cusip",
             "acquirer_cusips",
+            kind="cusip",
         ),
-        acquirer_isin=_first_string(
+        acquirer_isin=_first_identifier(
             row,
             "acquirer_isin",
             "acquirer_isin_number",
             "acquirer_security_isin",
             "acquirer_isins",
+            kind="isin",
         ),
         deal_type=_string_or_none(row.get("deal_type")),
         deal_status=_string_or_none(row.get("deal_status")),
@@ -332,11 +350,43 @@ def _csv_param(value: Union[str, Sequence[str]]) -> str:
     return value if isinstance(value, str) else ",".join(value)
 
 
+def _identifier_csv_param(
+    value: Union[str, Sequence[str]],
+    *,
+    kind: str,
+) -> Optional[str]:
+    values = [value] if isinstance(value, str) else list(value)
+    normalized = [_normalize_identifier(item, kind=kind) for item in values]
+    if any(item is None for item in normalized):
+        return None
+    return ",".join(item for item in normalized if item)
+
+
+def _first_identifier(row: Dict[str, Any], *keys: str, kind: str) -> Optional[str]:
+    for key in keys:
+        value = _normalize_identifier(row.get(key), kind=kind)
+        if value is not None:
+            return value
+    return None
+
+
 def _first_string(row: Dict[str, Any], *keys: str) -> Optional[str]:
     for key in keys:
         value = _string_or_none(row.get(key))
         if value is not None:
             return value
+    return None
+
+
+def _normalize_identifier(value: Any, *, kind: str) -> Optional[str]:
+    text = _string_or_none(value)
+    if text is None:
+        return None
+    normalized = text.strip().upper().replace("-", "").replace(" ", "")
+    if kind == "cusip":
+        return normalized if len(normalized) == 9 and normalized.isalnum() else None
+    if kind == "isin":
+        return normalized if len(normalized) == 12 and normalized.isalnum() else None
     return None
 
 
@@ -354,3 +404,34 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _validation_error_response(
+    endpoint: str,
+    message: str,
+    *,
+    asof: Optional[datetime],
+) -> AdapterResponse[List[BenzingaMergerAcquisition]]:
+    request_ts = utcnow()
+    asof_ts = aware_utc_or_none(asof) if asof is not None else request_ts
+    if asof_ts is None:
+        asof_ts = request_ts
+    return AdapterResponse(
+        data=None,
+        lineage=LineageMeta(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            request_timestamp=request_ts,
+            asof_timestamp=asof_ts,
+            raw_payload_hash="",
+            source_authority="Benzinga",
+        ),
+        error=ProviderError(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            status_code=None,
+            error_type="validation",
+            message=message,
+            retryable=False,
+        ),
+    )

@@ -1191,6 +1191,45 @@ class TestBenzingaAdapter:
         assert params["parameters[isin]"] == "US0043971052"
         assert params["token"] == "test-benzinga-key"
 
+    def test_get_mergers_acquisitions_rejects_malformed_identifier_params(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        bad_cusip = adapter.get_mergers_acquisitions(cusip="00439710")
+        bad_isin = adapter.get_mergers_acquisitions(isin="US004397105")
+
+        assert not bad_cusip.ok
+        assert bad_cusip.error.error_type == "validation"
+        assert not bad_isin.ok
+        assert bad_isin.error.error_type == "validation"
+        session.get.assert_not_called()
+
+    def test_get_mergers_acquisitions_canonicalizes_identifier_fields(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "ma": [
+                {
+                    "id": "deal-1",
+                    "target_ticker": "ACME",
+                    "target_cusip": " 004397-105 ",
+                    "target_isin": " us0043971052 ",
+                    "acquirer_cusip": "00439710",
+                    "acquirer_isin": "US004397105",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_mergers_acquisitions("ACME")
+
+        assert resp.ok
+        deal = resp.data[0]
+        assert deal.target_cusip == "004397105"
+        assert deal.target_isin == "US0043971052"
+        assert deal.acquirer_cusip is None
+        assert deal.acquirer_isin is None
+
     def test_get_mergers_acquisitions_accepts_list_payload(self):
         session = MagicMock(spec=requests.Session)
         json_data = [

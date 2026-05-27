@@ -9,7 +9,12 @@ from typing import Dict, List, Optional
 import pytest
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
-from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.data.fmp import (
+    DELISTED_COMPANIES_ENDPOINT,
+    FmpBar,
+    FmpDelistedCompany,
+    HISTORICAL_PRICE_FULL_ENDPOINT,
+)
 from alpha.db.engine import schema_connect_args
 from alpha.db.models import (
     DataLineage,
@@ -186,6 +191,37 @@ class FakeBenzingaAdapter:
         return AdapterResponse(data=events, lineage=lineage)
 
 
+class FakeDelistedAdapter(FakeHistoricalAdapter):
+    def __init__(
+        self,
+        bars_by_ticker: Optional[Dict[str, List[FmpBar]]] = None,
+        delisted_rows_by_page: Optional[Dict[int, List[FmpDelistedCompany]]] = None,
+    ):
+        super().__init__(bars_by_ticker)
+        self.delisted_rows_by_page = delisted_rows_by_page or {}
+        self.delisted_calls = []
+
+    def get_delisted_companies(self, page=0, limit=100, asof=None):
+        self.delisted_calls.append({"page": page, "limit": limit, "asof": asof})
+        rows = self.delisted_rows_by_page.get(page, [])
+        lineage = LineageMeta(
+            provider="FMP",
+            endpoint=DELISTED_COMPANIES_ENDPOINT,
+            request_timestamp=REQUEST_TS,
+            asof_timestamp=asof,
+            raw_payload_hash=stable_hash([
+                {
+                    "symbol": row.symbol,
+                    "company_name": row.company_name,
+                    "delisted_date": row.delisted_date,
+                }
+                for row in rows
+            ]),
+            source_authority="FMP",
+        )
+        return AdapterResponse(data=rows, lineage=lineage)
+
+
 def _bar(
     day: date,
     open_price,
@@ -235,10 +271,13 @@ def _make_signal(
     next_execution_session="2026-05-26",
     trading_date="2026-05-26",
     signal_timestamp=SIGNAL_TS,
+    security_identity: Optional[Dict[str, str]] = None,
 ) -> str:
     features = {"decision_date": trading_date, "signal_generated": True}
     if next_execution_session is not None:
         features["next_execution_session"] = next_execution_session
+    if security_identity:
+        features["security_identity"] = dict(security_identity)
     feat = record_feature_snapshot(
         db_session,
         pattern_id="M4",
@@ -777,7 +816,13 @@ def test_unresolved_corporate_action_requires_review(db_session):
 
 
 def test_benzinga_merger_acquisition_routes_missing_exit_to_review(db_session):
-    sid = _make_signal(db_session)
+    sid = _make_signal(
+        db_session,
+        security_identity={
+            "cusip": "004397105",
+            "isin": "US0043971052",
+        },
+    )
     adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
     benzinga = FakeBenzingaAdapter(
         {
@@ -811,7 +856,7 @@ def test_benzinga_merger_acquisition_routes_missing_exit_to_review(db_session):
     assert benzinga.calls[0]["tickers"] == "ACME"
     assert benzinga.calls[0]["date_from"] == ENTRY_DATE.isoformat()
     assert benzinga.calls[0]["date_to"] == EXIT_DATE.isoformat()
-    assert adapter.survivorship_calls == []
+    assert adapter.survivorship_calls[0]["ticker"] == "ACME"
     assert sig.forward_return_status == "corporate_action_review"
     assert sig.outcome_unavailable_reason == "benzinga_merger_acquisition_review"
     assert obs.status == "corporate_action_review"
@@ -829,6 +874,43 @@ def test_benzinga_merger_acquisition_routes_missing_exit_to_review(db_session):
     assert survivorship_request["economic_classification"] == "review_required"
     assert survivorship_request["source_attempts"][0]["source"] == "benzinga_calendar_ma"
     assert survivorship_request["source_attempts"][0]["status"] == "matched"
+    assert survivorship_request["source_attempts"][0]["match_basis"] == "target_cusip"
+    assert survivorship_request["source_attempts"][1]["source"] == "survivorship_events"
+    assert survivorship_request["source_attempts"][1]["status"] == "no_match"
+
+
+def test_benzinga_recycled_ticker_identity_mismatch_does_not_match(db_session):
+    sid = _make_signal(
+        db_session,
+        ticker="XYZ",
+        security_identity={"cusip": "A11111111"},
+    )
+    adapter = FakeHistoricalAdapter({"XYZ": [_bar(ENTRY_DATE, 10.0)]})
+    benzinga = FakeBenzingaAdapter(
+        {
+            "XYZ": {
+                "id": "wrong-company-deal",
+                "target_ticker": "XYZ",
+                "target_cusip": "B22222222",
+                "acquirer_ticker": "BUY",
+                "date_completed": EXIT_DATE.isoformat(),
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    attempts = json.loads(event.provider_request_json)["survivorship_request"][
+        "source_attempts"
+    ]
+
+    assert sig.forward_return_status == "survivorship_unresolved_review"
+    assert obs.provider != "Benzinga"
+    assert attempts[0]["source"] == "benzinga_calendar_ma"
+    assert attempts[0]["status"] == "identity_mismatch"
 
 
 def test_benzinga_no_match_attempt_is_preserved_when_fallback_handles_row(db_session):
@@ -861,6 +943,101 @@ def test_benzinga_no_match_attempt_is_preserved_when_fallback_handles_row(db_ses
     assert attempts[1]["source"] == "survivorship_events"
     assert attempts[1]["status"] == "matched"
     assert len(json.loads(obs.data_lineage_ids)) == 3
+
+
+def test_fmp_delisted_fallback_uses_uniform_source_attempts(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeDelistedAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={
+            0: [
+                FmpDelistedCompany(
+                    symbol="ACME",
+                    company_name="Acme Corp",
+                    delisted_date=EXIT_DATE.isoformat(),
+                )
+            ]
+        },
+    )
+    benzinga = FakeBenzingaAdapter({"ACME": []})
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert sig.forward_return_status == "survivorship_unresolved_review"
+    assert survivorship_request["source"] == DELISTED_COMPANIES_ENDPOINT
+    assert attempts[0]["source"] == "benzinga_calendar_ma"
+    assert attempts[0]["status"] == "no_match"
+    assert attempts[1]["source"] == "survivorship_events"
+    assert attempts[1]["status"] == "no_match"
+    assert attempts[2]["source"] == "fmp_delisted_companies"
+    assert attempts[2]["status"] == "matched"
+    assert attempts[2]["matched_id"] == "ACME"
+
+
+def test_benzinga_fmp_authority_conflict_is_surfaced(db_session):
+    sid = _make_signal(
+        db_session,
+        ticker="TCON",
+        security_identity={"cusip": "004397105"},
+    )
+    adapter = FakeDelistedAdapter(
+        {"TCON": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={
+            0: [
+                FmpDelistedCompany(
+                    symbol="TCON",
+                    company_name="Ticker Conflict Corp",
+                    delisted_date=EXIT_DATE.isoformat(),
+                )
+            ]
+        },
+    )
+    benzinga = FakeBenzingaAdapter(
+        {
+            "TCON": {
+                "id": "deal-conflict",
+                "target_ticker": "TCON",
+                "target_cusip": "004397105",
+                "acquirer_ticker": "BUY",
+                "date_completed": EXIT_DATE.isoformat(),
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert sig.forward_return_status == "corporate_action_review"
+    assert obs.provider == "Benzinga"
+    assert survivorship_request["authority_conflict"]["provider"] == "FMP"
+    assert (
+        survivorship_request["authority_conflict"]["reason"]
+        == "delisting_unclassified_survivorship_review"
+    )
+    assert [attempt["source"] for attempt in attempts] == [
+        "benzinga_calendar_ma",
+        "survivorship_events",
+        "fmp_delisted_companies",
+    ]
+    assert [attempt["status"] for attempt in attempts] == [
+        "matched",
+        "no_match",
+        "matched",
+    ]
 
 
 def test_benzinga_source_error_does_not_block_survivorship_fallback(db_session):

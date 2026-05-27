@@ -1357,6 +1357,7 @@ class ForwardReturnJob(BaseJob):
             adapter=self._adapter,
             survivorship_adapters=self._survivorship_adapters,
             ticker=sig.ticker,
+            signal_identity=_signal_security_identity(sig),
             entry_session_date=plan.entry_session_date,
             exit_session_date=plan.exit_session_date,
             entry_price=entry_price,
@@ -1871,6 +1872,7 @@ def resolve_missing_exit_survivorship(
     adapter: Any,
     survivorship_adapters: Optional[List[Any]] = None,
     ticker: str,
+    signal_identity: Optional[Dict[str, str]] = None,
     entry_session_date: date,
     exit_session_date: date,
     entry_price: float,
@@ -1892,6 +1894,7 @@ def resolve_missing_exit_survivorship(
     ]
     source_attempts: List[Dict[str, Any]] = []
     source_lineage_ids: List[str] = []
+    pending_benzinga_resolution: Optional[SurvivorshipResolution] = None
 
     for source_adapter in source_adapters:
         if not hasattr(source_adapter, "get_survivorship_events"):
@@ -1922,6 +1925,7 @@ def resolve_missing_exit_survivorship(
             session=session,
             adapter=source_adapter,
             ticker=ticker,
+            signal_identity=signal_identity,
             entry_session_date=entry_session_date,
             exit_session_date=exit_session_date,
             asof=asof,
@@ -1930,11 +1934,8 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            return _with_survivorship_source_attempts(
-                resolution,
-                source_attempts=source_attempts,
-                source_lineage_ids=source_lineage_ids,
-            )
+            pending_benzinga_resolution = resolution
+            break
 
     if hasattr(adapter, "get_survivorship_events"):
         resolution = _resolve_from_survivorship_events(
@@ -1965,13 +1966,38 @@ def resolve_missing_exit_survivorship(
             exit_session_date=exit_session_date,
             asof=asof,
             job_run_id=job_run_id,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
+            if pending_benzinga_resolution is not None:
+                if (
+                    resolution.decision.reason
+                    != "survivorship_unresolved_no_source_event"
+                ):
+                    pending_benzinga_resolution = (
+                        _add_survivorship_conflict_summary(
+                            pending_benzinga_resolution,
+                            conflicting=resolution,
+                        )
+                    )
+                return _with_survivorship_source_attempts(
+                    pending_benzinga_resolution,
+                    source_attempts=source_attempts,
+                    source_lineage_ids=source_lineage_ids,
+                )
             return _with_survivorship_source_attempts(
                 resolution,
                 source_attempts=source_attempts,
                 source_lineage_ids=source_lineage_ids,
             )
+
+    if pending_benzinga_resolution is not None:
+        return _with_survivorship_source_attempts(
+            pending_benzinga_resolution,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
 
     resolution = _survivorship_unresolved(
         reason=(
@@ -2118,6 +2144,7 @@ def _resolve_from_benzinga_mergers_acquisitions(
     session: Session,
     adapter: Any,
     ticker: str,
+    signal_identity: Optional[Dict[str, str]],
     entry_session_date: date,
     exit_session_date: date,
     asof: datetime,
@@ -2167,11 +2194,15 @@ def _resolve_from_benzinga_mergers_acquisitions(
     if not resp.ok:
         return None
 
-    event = _first_benzinga_target_event(resp.data, ticker)
+    event, match_status = _first_benzinga_target_event(
+        resp.data,
+        ticker=ticker,
+        signal_identity=signal_identity,
+    )
     if event is None:
         _mark_latest_survivorship_source_attempt(
             source_attempts,
-            status="no_match",
+            status=match_status,
         )
         return None
 
@@ -2179,6 +2210,7 @@ def _resolve_from_benzinga_mergers_acquisitions(
         source_attempts,
         status="matched",
         matched_id=_event_value(event, "id"),
+        match_basis=_benzinga_match_basis(event, signal_identity or {}),
     )
     event_date = _benzinga_event_date(event)
     reason = "benzinga_merger_acquisition_review"
@@ -2232,6 +2264,8 @@ def _resolve_from_fmp_delisted_companies(
     job_run_id: Optional[str],
     max_pages: int = 10,
     page_limit: int = 100,
+    source_attempts: Optional[List[Dict[str, Any]]] = None,
+    source_lineage_ids: Optional[List[str]] = None,
 ) -> Optional[SurvivorshipResolution]:
     lineage_ids: List[str] = []
     primary_lineage_id: Optional[str] = None
@@ -2271,6 +2305,20 @@ def _resolve_from_fmp_delisted_companies(
         lineage_ids.append(lineage.data_lineage_id)
         primary_lineage_id = primary_lineage_id or lineage.data_lineage_id
         pages_examined.append({"page": page, "limit": page_limit})
+        _append_survivorship_source_attempt(
+            source_attempts,
+            source_lineage_ids,
+            source="fmp_delisted_companies",
+            provider=provider,
+            endpoint=endpoint,
+            ticker=ticker,
+            entry_session_date=entry_session_date,
+            exit_session_date=exit_session_date,
+            lineage_id=lineage.data_lineage_id,
+            status="error" if not resp.ok else "fetched",
+            error=resp.error,
+            extra={"page": page, "limit": page_limit},
+        )
 
         if not resp.ok:
             return _survivorship_unresolved(
@@ -2295,6 +2343,11 @@ def _resolve_from_fmp_delisted_companies(
             if symbol != normalized_ticker:
                 continue
             delisted_date = _safe_parse_date(getattr(row, "delisted_date", None))
+            _mark_latest_survivorship_source_attempt(
+                source_attempts,
+                status="matched",
+                matched_id=symbol,
+            )
             reason = "delisting_unclassified_survivorship_review"
             if delisted_date is not None and delisted_date > exit_session_date:
                 reason = "delisting_after_exit_window_survivorship_review"
@@ -2325,10 +2378,18 @@ def _resolve_from_fmp_delisted_companies(
                 primary_data_lineage_id=primary_lineage_id,
             )
 
+        _mark_latest_survivorship_source_attempt(
+            source_attempts,
+            status="no_match",
+        )
         if not rows:
             break
         oldest = _oldest_delisted_date(rows)
         if oldest is not None and oldest < entry_session_date:
+            _mark_latest_survivorship_source_attempt(
+                source_attempts,
+                status="no_match",
+            )
             break
 
     return _survivorship_unresolved(
@@ -2424,6 +2485,85 @@ def _with_survivorship_source_attempts(
     )
 
 
+def _add_survivorship_conflict_summary(
+    resolution: SurvivorshipResolution,
+    *,
+    conflicting: SurvivorshipResolution,
+) -> SurvivorshipResolution:
+    provider_request = dict(resolution.provider_request or {})
+    provider_request["authority_conflict"] = {
+        "status": conflicting.decision.status,
+        "reason": conflicting.decision.reason,
+        "provider": conflicting.provider,
+        "endpoint": conflicting.endpoint,
+        "provider_request": conflicting.provider_request,
+    }
+    return replace(resolution, provider_request=provider_request)
+
+
+def _signal_security_identity(sig: SignalRegistry) -> Dict[str, str]:
+    feature_snapshot = getattr(sig, "feature_snapshot", None)
+    feature_json = getattr(feature_snapshot, "feature_json", None)
+    payload: Dict[str, Any] = {}
+    if feature_json:
+        try:
+            parsed = json.loads(feature_json)
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            payload = parsed
+    return _security_identity_from_payload(payload)
+
+
+def _security_identity_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
+    search: List[Dict[str, Any]] = [payload]
+    for nested_key in (
+        "security_identity",
+        "identity",
+        "security",
+        "reference_data",
+        "source_features",
+    ):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            search.append(nested)
+    identity: Dict[str, str] = {}
+    for item in search:
+        if "cusip" not in identity:
+            cusip = _canonical_cusip(
+                _first_payload_value(
+                    item,
+                    "cusip",
+                    "security_cusip",
+                    "target_cusip",
+                    "issuer_cusip",
+                )
+            )
+            if cusip is not None:
+                identity["cusip"] = cusip
+        if "isin" not in identity:
+            isin = _canonical_isin(
+                _first_payload_value(
+                    item,
+                    "isin",
+                    "security_isin",
+                    "target_isin",
+                    "issuer_isin",
+                )
+            )
+            if isin is not None:
+                identity["isin"] = isin
+    return identity
+
+
+def _first_payload_value(payload: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _append_survivorship_source_attempt(
     source_attempts: Optional[List[Dict[str, Any]]],
     source_lineage_ids: Optional[List[str]],
@@ -2437,12 +2577,13 @@ def _append_survivorship_source_attempt(
     lineage_id: str,
     status: str,
     error: Any = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     if source_lineage_ids is not None:
         source_lineage_ids.append(lineage_id)
     if source_attempts is None:
         return
-    source_attempts.append({
+    attempt = {
         "source": source,
         "provider": provider,
         "endpoint": endpoint,
@@ -2452,7 +2593,10 @@ def _append_survivorship_source_attempt(
         "status": status,
         "lineage_id": lineage_id,
         "error": _provider_error_payload(error),
-    })
+    }
+    if extra:
+        attempt.update(extra)
+    source_attempts.append(attempt)
 
 
 def _mark_latest_survivorship_source_attempt(
@@ -2460,12 +2604,15 @@ def _mark_latest_survivorship_source_attempt(
     *,
     status: str,
     matched_id: Optional[Any] = None,
+    match_basis: Optional[str] = None,
 ) -> None:
     if not source_attempts:
         return
     source_attempts[-1]["status"] = status
     if matched_id is not None:
         source_attempts[-1]["matched_id"] = matched_id
+    if match_basis is not None:
+        source_attempts[-1]["match_basis"] = match_basis
 
 
 def _find_bar(bars: List[FmpBar], session_date: date) -> Optional[FmpBar]:
@@ -3101,14 +3248,79 @@ def _first_survivorship_source_event(raw_events: Any) -> Dict[str, Any]:
     return {}
 
 
-def _first_benzinga_target_event(raw_events: Any, ticker: str) -> Optional[Any]:
+def _first_benzinga_target_event(
+    raw_events: Any,
+    *,
+    ticker: str,
+    signal_identity: Optional[Dict[str, str]],
+) -> Tuple[Optional[Any], str]:
     normalized_ticker = ticker.upper()
+    if raw_events is None:
+        return None, "no_match"
     events = raw_events if isinstance(raw_events, list) else [raw_events]
+    if not events:
+        return None, "no_match"
+    identity = signal_identity or {}
+    if not identity:
+        return None, "identity_unavailable"
+    saw_ticker = False
+    saw_identity_mismatch = False
     for event in events:
         target_ticker = _event_value(event, "target_ticker")
-        if str(target_ticker or "").upper() == normalized_ticker:
-            return event
+        ticker_matches = str(target_ticker or "").upper() == normalized_ticker
+        saw_ticker = saw_ticker or ticker_matches
+        identity_matches = _benzinga_target_identity_matches(event, identity)
+        if identity_matches and (not target_ticker or ticker_matches):
+            return event, "matched"
+        if ticker_matches:
+            saw_identity_mismatch = True
+    if saw_identity_mismatch:
+        return None, "identity_mismatch"
+    if saw_ticker:
+        return None, "identity_unavailable"
+    return None, "no_match"
+
+
+def _benzinga_target_identity_matches(event: Any, identity: Dict[str, str]) -> bool:
+    event_cusip = _canonical_cusip(_event_value(event, "target_cusip"))
+    event_isin = _canonical_isin(_event_value(event, "target_isin"))
+    return bool(
+        (event_cusip and event_cusip == identity.get("cusip"))
+        or (event_isin and event_isin == identity.get("isin"))
+    )
+
+
+def _benzinga_match_basis(event: Any, identity: Dict[str, str]) -> Optional[str]:
+    event_cusip = _canonical_cusip(_event_value(event, "target_cusip"))
+    if event_cusip and event_cusip == identity.get("cusip"):
+        return "target_cusip"
+    event_isin = _canonical_isin(_event_value(event, "target_isin"))
+    if event_isin and event_isin == identity.get("isin"):
+        return "target_isin"
     return None
+
+
+def _canonical_cusip(value: Any) -> Optional[str]:
+    text = _stringish(value)
+    if text is None:
+        return None
+    normalized = text.strip().upper().replace("-", "").replace(" ", "")
+    return normalized if len(normalized) == 9 and normalized.isalnum() else None
+
+
+def _canonical_isin(value: Any) -> Optional[str]:
+    text = _stringish(value)
+    if text is None:
+        return None
+    normalized = text.strip().upper().replace("-", "").replace(" ", "")
+    return normalized if len(normalized) == 12 and normalized.isalnum() else None
+
+
+def _stringish(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
 
 
 def _benzinga_event_date(event: Any) -> Optional[date]:
