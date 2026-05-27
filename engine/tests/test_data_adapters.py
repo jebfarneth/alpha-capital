@@ -1090,6 +1090,214 @@ class TestPolygonAdapter:
         assert resp.error.message == "Polygon adapter asof timestamp must be timezone-aware datetime"
         session.get.assert_not_called()
 
+    def test_get_tickers_bulk_paginates_and_parses_identity(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "name": "Apple Inc.",
+                    "market": "stocks",
+                    "locale": "us",
+                    "primary_exchange": "XNAS",
+                    "type": "CS",
+                    "active": True,
+                    "cik": "320193",
+                    "composite_figi": "BBG000B9XRY4",
+                    "share_class_figi": "BBG001S5N8V8",
+                    "list_date": "1980-12-12",
+                }
+            ],
+            "next_url": "https://api.polygon.io/v3/reference/tickers?cursor=abc",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "ticker": "META",
+                    "name": "Meta Platforms Inc.",
+                    "market": "stocks",
+                    "locale": "us",
+                    "primary_exchange": "XNAS",
+                    "type": "CS",
+                    "active": True,
+                    "cik": "1326801",
+                    "composite_figi": "BBG000MM2P62",
+                    "share_class_figi": "BBG001SQCQC5",
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers(limit=1000)
+
+        assert resp.ok
+        assert len(resp.data) == 2
+        assert resp.data[0].results[0].ticker == "AAPL"
+        assert resp.data[0].results[0].cik == "0000320193"
+        assert resp.data[1].results[0].ticker == "META"
+        assert resp.data[1].results[0].cik == "0001326801"
+        assert resp.data[0].next_url == "/v3/reference/tickers"
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[0].kwargs["params"]["limit"] == 1000
+
+    def test_get_tickers_no_data_is_successful_empty_page(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers()
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].results == []
+
+    def test_get_tickers_rate_limit_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(429, text="Too many requests")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers()
+
+        assert not resp.ok
+        assert resp.error.error_type == "rate_limit"
+        assert resp.error.retryable is True
+
+    def test_get_tickers_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, text="not json")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers()
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+
+
+    def test_get_ticker_details_with_cik_figi(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "ticker": "AAPL",
+                "name": "Apple Inc.",
+                "market": "stocks",
+                "locale": "us",
+                "primary_exchange": "XNAS",
+                "type": "CS",
+                "active": True,
+                "cik": "0000320193",
+                "composite_figi": "BBG000B9XRY4",
+                "share_class_figi": "BBG001S5N8V8",
+                "list_date": "1980-12-12",
+                "market_cap": 3200000000000,
+                "sic_code": "3571",
+                "sic_description": "Electronic Computers",
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_details("AAPL")
+
+        assert resp.ok
+        assert resp.data.ticker == "AAPL"
+        assert resp.data.cik == "0000320193"
+        assert resp.data.composite_figi == "BBG000B9XRY4"
+        assert resp.data.share_class_figi == "BBG001S5N8V8"
+        assert resp.data.active is True
+        assert resp.data.list_date == "1980-12-12"
+        assert resp.data.market == "stocks"
+        assert resp.data.sic_code == "3571"
+
+    def test_get_ticker_details_no_data(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": {}})
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_details("FAKE")
+
+        assert resp.ok
+        assert resp.data is None
+
+    def test_get_ticker_details_delisted(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "ticker": "FORA",
+                "name": "Forian Inc",
+                "active": False,
+                "delisted_utc": "2025-11-15T00:00:00Z",
+                "cik": "0001831097",
+                "composite_figi": "BBG012JMR4P3",
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_details("FORA")
+
+        assert resp.ok
+        assert resp.data.active is False
+        assert resp.data.delisted_utc == "2025-11-15T00:00:00Z"
+        assert resp.data.cik == "0001831097"
+
+    def test_get_ticker_events_ticker_change(self):
+        from alpha.data.polygon import PolygonTickerEvent
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "name": "Meta Platforms",
+                "events": [
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-09",
+                        "ticker_change": {"ticker": "FB"},
+                    }
+                ],
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        ev = resp.data[0]
+        assert ev.event_type == "ticker_change"
+        assert ev.date == "2022-06-09"
+        assert ev.old_ticker == "FB"
+        assert ev.identifier_queried == "META"
+
+    def test_get_ticker_events_no_events(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {"results": {"name": "Acme", "events": []}}
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_events("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+
+    def test_get_ticker_events_403_not_accessible(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(403, text="Forbidden")
+        adapter = self._adapter(session)
+        resp = adapter.get_ticker_events("META")
+
+        assert not resp.ok
+        assert resp.error.error_type == "auth"
+        assert resp.error.status_code == 403
+
 
 # ---------------------------------------------------------------------------
 # Benzinga adapter

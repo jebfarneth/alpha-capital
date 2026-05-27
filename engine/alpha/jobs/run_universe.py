@@ -26,9 +26,15 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import sessionmaker
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash, utcnow
+from alpha.data.config import PolygonConfig
 from alpha.data.fmp import FmpScreenerResult
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
-from alpha.db.engine import create_all_tables, get_session, reset_globals
+from alpha.db.engine import (
+    create_all_tables,
+    create_schema_if_missing,
+    get_session,
+    reset_globals,
+)
 from alpha.db.models import Base
 from alpha.jobs.runner import run_job
 from alpha.jobs.security_type import SecurityTypeEnrichmentJob
@@ -159,12 +165,22 @@ def _run_live(args) -> int:
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
         reset_globals()
+    if args.schema:
+        os.environ["ALPHA_DB_SCHEMA"] = args.schema
+        reset_globals()
     if not os.environ.get("FMP_API_KEY"):
         print("ERROR: FMP_API_KEY not set")
+        return 1
+    if args.skip_identity_enrichment and args.require_identity_enrichment:
+        print("ERROR: --require-identity-enrichment cannot be combined with --skip-identity-enrichment")
+        return 1
+    if not 0.0 <= args.min_identity_coverage <= 1.0:
+        print("ERROR: --min-identity-coverage must be between 0.0 and 1.0")
         return 1
 
     session = get_session()
     if args.create_tables:
+        create_schema_if_missing(schema=args.schema)
         create_all_tables()
 
     config = FmpConfig.from_env()
@@ -229,6 +245,7 @@ def _run_live(args) -> int:
             params={
                 "source": "fmp_profile",
                 "trading_date": args.trading_date,
+                "schema": args.schema,
                 "required_symbol_count": len(symbols),
                 "refresh_symbol_count": len(refresh_symbols),
                 "profile_refresh_plan": refresh_metrics,
@@ -253,6 +270,7 @@ def _run_live(args) -> int:
             params={
                 "source": "fmp_sliced",
                 "trading_date": args.trading_date,
+                "schema": args.schema,
                 "mcap_min": MCAP_MIN,
                 "mcap_max": MCAP_MAX,
                 "price_min": PRICE_MIN,
@@ -301,6 +319,75 @@ def _run_live(args) -> int:
             )[:12]:
                 print(f"  {reason}: {count}")
 
+        # --- Polygon identity enrichment ---
+        scan_id = metrics.get("scan_id")
+        included_tickers = metrics.get("included_tickers", [])
+        if scan_id and included_tickers and not args.skip_identity_enrichment:
+            try:
+                from alpha.data.polygon import PolygonAdapter
+                from alpha.jobs.identity_enrichment import PolygonIdentityEnrichmentJob
+
+                polygon_adapter = PolygonAdapter(PolygonConfig.from_env())
+                identity_job = PolygonIdentityEnrichmentJob(
+                    session=session,
+                    adapter=polygon_adapter,
+                    scan_id=scan_id,
+                    tickers=included_tickers,
+                    max_exception_lookups=args.identity_max_exception_lookups,
+                    ticker_event_probes=_csv_arg(args.identity_ticker_event_probes),
+                    bulk_limit=args.identity_bulk_limit,
+                )
+                identity_result = run_job(
+                    session,
+                    identity_job,
+                    params={
+                        "source": "polygon_identity",
+                        "trading_date": args.trading_date,
+                        "schema": args.schema,
+                        "scan_id": scan_id,
+                        "max_exception_lookups": args.identity_max_exception_lookups,
+                        "ticker_event_probes": _csv_arg(args.identity_ticker_event_probes),
+                        "bulk_limit": args.identity_bulk_limit,
+                    },
+                )
+                id_metrics = identity_result.metrics or {}
+                print(f"Polygon identity attempted: {id_metrics.get('identity_attempted_count')}")
+                print(f"Polygon identity present:   {id_metrics.get('identity_present_count')}")
+                print(f"Polygon identity no data:   {id_metrics.get('identity_no_data_count')}")
+                print(f"Polygon identity errors:    {id_metrics.get('identity_error_count')}")
+                print(f"Polygon exception lookups:  {id_metrics.get('identity_exception_lookup_count')}")
+                print(f"Polygon ticker events tried:{id_metrics.get('ticker_event_attempted_count')}")
+                print(f"Polygon ticker events rows: {id_metrics.get('ticker_event_present_count')}")
+                print(f"Polygon CIK present:        {id_metrics.get('cik_present_count')}")
+                print(f"Polygon composite FIGI:     {id_metrics.get('composite_figi_present_count')}")
+                print(f"Polygon share-class FIGI:   {id_metrics.get('share_class_figi_present_count')}")
+                print(f"Polygon coverage ratio:     {id_metrics.get('identity_coverage_ratio')}")
+                print(f"Polygon bulk pages:         {id_metrics.get('bulk_pages_fetched')}")
+                print(f"Polygon API calls:          {id_metrics.get('polygon_api_call_count')}")
+                strict_error = _identity_strict_error(
+                    args,
+                    id_metrics,
+                    included_tickers,
+                    identity_result_ok=identity_result.ok,
+                )
+                if strict_error is not None:
+                    print(f"ERROR: Polygon identity enrichment strict check failed: {strict_error}")
+                    session.close()
+                    return 1
+            except Exception as exc:
+                print(f"Polygon identity enrichment skipped: {exc}")
+                if args.require_identity_enrichment:
+                    print("ERROR: Polygon identity enrichment is required")
+                    session.close()
+                    return 1
+        elif args.require_identity_enrichment:
+            print(
+                "ERROR: Polygon identity enrichment is required but the universe "
+                "build did not produce a scan_id and included tickers"
+            )
+            session.close()
+            return 1
+
         session.close()
         return 0 if universe.ok else 1
 
@@ -316,6 +403,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Market trading date for the scan (YYYY-MM-DD). Defaults to US/Eastern date.",
     )
     parser.add_argument("--database-url", help="Override DATABASE_URL for this run")
+    parser.add_argument(
+        "--schema",
+        help=(
+            "PostgreSQL schema/search_path target for scratch audits. "
+            "Requires the schema to exist or --create-tables to create it."
+        ),
+    )
     parser.add_argument(
         "--create-tables",
         action="store_true",
@@ -350,6 +444,52 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=2000,
         help="Global cap for FMP profile calls per minute; leave headroom below provider limit.",
     )
+    parser.add_argument(
+        "--skip-identity-enrichment",
+        action="store_true",
+        help="Skip Polygon identity enrichment step.",
+    )
+    parser.add_argument(
+        "--require-identity-enrichment",
+        action="store_true",
+        help=(
+            "Fail the live universe run if Polygon identity enrichment is skipped, "
+            "errors before completion, or does not attempt every included ticker."
+        ),
+    )
+    parser.add_argument(
+        "--min-identity-coverage",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum required Polygon identity_present/attempted coverage when "
+            "--require-identity-enrichment is set. Defaults to 0.0 so explicit "
+            "no_data/provider_error rows remain allowed."
+        ),
+    )
+    parser.add_argument(
+        "--identity-max-exception-lookups",
+        type=int,
+        default=25,
+        help=(
+            "Maximum per-ticker Polygon detail lookups after bulk reference misses. "
+            "Bulk reference remains the primary path."
+        ),
+    )
+    parser.add_argument(
+        "--identity-ticker-event-probes",
+        default="",
+        help=(
+            "Comma-separated targeted tickers for Polygon ticker-events probes. "
+            "Ticker events are not called for every universe symbol by default."
+        ),
+    )
+    parser.add_argument(
+        "--identity-bulk-limit",
+        type=int,
+        default=1000,
+        help="Polygon /v3/reference/tickers page size, capped at provider max 1000.",
+    )
     return parser.parse_args(argv)
 
 
@@ -360,6 +500,46 @@ def main(argv: list[str] | None = None) -> int:
     if args.live:
         return _run_live(args)
     return _run_mock(args)
+
+
+def _csv_arg(value: str) -> list[str]:
+    """Parse a comma-separated CLI option into normalized symbols."""
+
+    return [
+        item.strip().upper()
+        for item in str(value or "").split(",")
+        if item.strip()
+    ]
+
+
+def _identity_strict_error(
+    args: argparse.Namespace,
+    metrics: dict,
+    included_tickers: list[str],
+    *,
+    identity_result_ok: bool,
+) -> str | None:
+    """Return the strict-mode failure reason, or None when the run is acceptable."""
+
+    if not getattr(args, "require_identity_enrichment", False):
+        return None
+    if not identity_result_ok:
+        return "identity enrichment job returned a failed status"
+
+    expected = len(included_tickers)
+    attempted = int(metrics.get("identity_attempted_count") or 0)
+    if attempted != expected:
+        return f"attempted {attempted} of {expected} included tickers"
+
+    min_coverage = float(getattr(args, "min_identity_coverage", 0.0) or 0.0)
+    present = int(metrics.get("identity_present_count") or 0)
+    coverage = present / attempted if attempted else 0.0
+    if coverage < min_coverage:
+        return (
+            f"coverage {coverage:.4f} below required "
+            f"{min_coverage:.4f}"
+        )
+    return None
 
 
 if __name__ == "__main__":

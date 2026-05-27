@@ -25,6 +25,11 @@ from alpha.market_calendar import (
     us_equity_session_close_timestamp,
 )
 from alpha.patterns.m4 import M4Detector
+from alpha.security_identity import (
+    load_security_identity_by_ticker,
+    security_identity_lineage_ids,
+    security_identity_payload,
+)
 
 
 class M4DailyAssemblyJob(BaseJob):
@@ -169,6 +174,17 @@ class M4DailyAssemblyJob(BaseJob):
             source_provider="FMP",
         )
 
+        identity_by_ticker = load_security_identity_by_ticker(self._session, scan_id)
+        identity_injected = 0
+        for inp in assembly.inputs:
+            identity = identity_by_ticker.get(inp.ticker.upper())
+            inp.market_data["security_identity"] = security_identity_payload(identity)
+            if identity is not None and identity.identity_status == "present":
+                identity_injected += 1
+            for lineage_id in security_identity_lineage_ids(identity):
+                if lineage_id not in inp.lineage_ids:
+                    inp.lineage_ids.append(lineage_id)
+
         if not assembly.inputs:
             return JobResult(
                 status="failed",
@@ -216,6 +232,8 @@ class M4DailyAssemblyJob(BaseJob):
             "fetch_error_count": len(fetch_errors),
             "fetch_errors": fetch_errors[:50],
             "assembly": _assembly_metrics(assembly),
+            "security_identity_present_count": identity_injected,
+            "security_identity_snapshot_count": len(identity_by_ticker),
             "orchestration": orchestration_result.metrics,
         }
 

@@ -957,7 +957,14 @@ class UniverseBuilderJob(BaseJob):
             included_shell_company_records
         )
 
+        included_tickers = sorted(
+            row["symbol"]
+            for row in snapshot_content
+            if row.get("included")
+        )
         metrics: Dict = {
+            "scan_id": scan_id,
+            "included_tickers": included_tickers,
             "raw_count": len(resp.data),
             "deduped_count": len(deduped_rows),
             "duplicate_symbol_count": duplicate_symbol_count,

@@ -323,6 +323,77 @@ class SecurityProfileScanSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# security_identity_snapshots
+# ---------------------------------------------------------------------------
+class SecurityIdentitySnapshot(Base):
+    """Point-in-time identity evidence from Polygon ticker details/events."""
+
+    __tablename__ = "security_identity_snapshots"
+    __table_args__ = (
+        Index(
+            "ux_security_identity_snapshots_scan_ticker",
+            "scan_id", "ticker",
+            unique=True,
+        ),
+        Index(
+            "ix_security_identity_snapshots_cik",
+            "cik",
+        ),
+        Index(
+            "ix_security_identity_snapshots_composite_figi",
+            "composite_figi",
+        ),
+        Index(
+            "ix_security_identity_snapshots_share_class_figi",
+            "share_class_figi",
+        ),
+    )
+
+    security_identity_snapshot_id = Column(String, primary_key=True, default=_uuid)
+    scan_id = Column(
+        String, ForeignKey("universe_scans.scan_id"), nullable=False
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    cik = Column(String, nullable=True)
+    composite_figi = Column(String, nullable=True)
+    share_class_figi = Column(String, nullable=True)
+    active = Column(Boolean, nullable=True)
+    delisted_utc = Column(String, nullable=True)
+    list_date = Column(String, nullable=True)
+    polygon_type = Column(String, nullable=True)
+    polygon_market = Column(String, nullable=True)
+    polygon_locale = Column(String, nullable=True)
+    polygon_primary_exchange = Column(String, nullable=True)
+    polygon_name = Column(String, nullable=True)
+    sic_code = Column(String, nullable=True)
+    sic_description = Column(String, nullable=True)
+    ticker_events_json = Column(Text, nullable=True)
+    identity_status = Column(String, nullable=False)
+    identity_reason = Column(String, nullable=True)
+    identity_hash = Column(String, nullable=True)
+    source_provider = Column(String, nullable=True)
+    source_endpoint = Column(String, nullable=True)
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    events_data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    data_lineage_ids = Column(Text, nullable=True)  # JSON array
+    raw_payload_hash = Column(String, nullable=True)
+    asof_timestamp = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    scan = relationship("UniverseScan")
+
+
+# ---------------------------------------------------------------------------
 # data_lineage
 # ---------------------------------------------------------------------------
 class DataLineage(Base):

@@ -106,6 +106,7 @@ DIAGNOSTIC_SOURCE_KEYS = (
     "price_source",
     "evidence_close",
     "evidence_split_adjusted_close",
+    "security_identity",
 )
 QUOTE_FIELDS = DEFAULT_QUOTE_FIELDS
 FRESH_QUOTE_FIELDS = (*QUOTE_FIELDS, "quote_freshness_max_ms")
