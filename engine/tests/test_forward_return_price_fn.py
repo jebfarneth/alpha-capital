@@ -223,6 +223,8 @@ def _run_job(
     run_ts=MATURE_RUN_TS,
     max_attempts=3,
     finality_lag_sessions=1,
+    reconcile_computed=False,
+    revision_window_sessions=10,
     price_drift_abs_tol=0.01,
     price_drift_rel_tol=0.0005,
 ):
@@ -234,12 +236,16 @@ def _run_job(
             run_timestamp=run_ts,
             max_attempts=max_attempts,
             finality_lag_sessions=finality_lag_sessions,
+            reconcile_computed=reconcile_computed,
+            revision_window_sessions=revision_window_sessions,
             price_drift_abs_tol=price_drift_abs_tol,
             price_drift_rel_tol=price_drift_rel_tol,
         ),
         params={
             "run_timestamp": run_ts.isoformat(),
             "finality_lag_sessions": finality_lag_sessions,
+            "reconcile_computed": reconcile_computed,
+            "revision_window_sessions": revision_window_sessions,
             "price_drift_abs_tol": price_drift_abs_tol,
             "price_drift_rel_tol": price_drift_rel_tol,
         },
@@ -974,6 +980,116 @@ def test_idempotent_rerun_does_not_duplicate_observation_or_signal_summary(db_se
     assert db_session.query(ForwardReturnObservation).count() == 1
     assert db_session.query(ForwardReturnObservationEvent).count() == 1
     assert db_session.query(SignalRegistry).one().forward_return_status == "computed"
+
+
+def test_reconcile_computed_mode_appends_pass_event_and_keeps_return(db_session):
+    sid = _make_signal(db_session)
+    initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    revision = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+
+    _run_job(db_session, initial)
+    first_obs = _obs(db_session)
+    first_obs_id = first_obs.forward_return_observation_id
+    first_outcome_hash = first_obs.outcome_hash
+    result = _run_job(
+        db_session,
+        revision,
+        run_ts=datetime(2026, 6, 17, 21, 0, tzinfo=timezone.utc),
+        reconcile_computed=True,
+    )
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    assert result.metrics["mode"] == "computed_reconciliation_m4"
+    assert result.metrics["total_computed"] == 1
+    assert result.metrics["reconciliation_passed"] == 1
+    assert result.metrics["events_appended"] == 1
+    assert len(revision.calls) == 1
+    assert sig.forward_return_status == "computed"
+    assert sig.forward_return == 0.2
+    assert obs.forward_return_observation_id == first_obs_id
+    assert obs.status == "computed"
+    assert obs.forward_return == 0.2
+    assert obs.outcome_hash == first_outcome_hash
+    assert db_session.query(ForwardReturnObservation).count() == 1
+    assert db_session.query(ForwardReturnObservationEvent).count() == 2
+    event = (
+        db_session.query(ForwardReturnObservationEvent)
+        .filter(ForwardReturnObservationEvent.reason == "reconciliation_passed")
+        .one()
+    )
+    payload = json.loads(event.provider_request_json)
+    revision_payload = payload["post_compute_reconciliation"]
+    assert revision_payload["status"] == "reconciliation_passed"
+    assert revision_payload["material_drift"] is False
+    assert revision_payload["original"]["exit_open"] == 12.0
+    assert revision_payload["current"]["exit_open"] == 12.0
+    assert len(json.loads(event.data_lineage_ids)) == 2
+
+
+def test_reconcile_computed_mode_ignores_rows_outside_revision_window(db_session):
+    _make_signal(db_session)
+    initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    revision = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.2)})
+
+    _run_job(db_session, initial)
+    result = _run_job(
+        db_session,
+        revision,
+        run_ts=datetime(2026, 7, 10, 21, 0, tzinfo=timezone.utc),
+        reconcile_computed=True,
+    )
+
+    assert result.metrics["total_computed"] == 1
+    assert result.metrics["skipped_outside_window"] == 1
+    assert result.metrics["events_appended"] == 0
+    assert revision.calls == []
+    assert _obs(db_session).status == "computed"
+    assert db_session.query(ForwardReturnObservationEvent).count() == 1
+
+
+def test_reconcile_computed_mode_moves_material_drift_to_review(db_session):
+    sid = _make_signal(db_session)
+    initial = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.0)})
+    revised = FakeHistoricalAdapter({"ACME": _bars(entry_open=10.0, exit_open=12.2)})
+
+    _run_job(db_session, initial)
+    first_obs_id = _obs(db_session).forward_return_observation_id
+    result = _run_job(
+        db_session,
+        revised,
+        run_ts=datetime(2026, 6, 17, 21, 0, tzinfo=timezone.utc),
+        reconcile_computed=True,
+    )
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    assert result.metrics["price_drift_review"] == 1
+    assert result.metrics["events_appended"] == 1
+    assert len(revised.calls) == 1
+    assert sig.forward_return_status == "price_drift_review"
+    assert sig.forward_return is None
+    assert sig.outcome_unavailable_reason == "provider_price_drift_exceeds_tolerance"
+    assert obs.forward_return_observation_id == first_obs_id
+    assert obs.status == "price_drift_review"
+    assert obs.reason == "provider_price_drift_exceeds_tolerance"
+    assert obs.forward_return is None
+    assert obs.entry_price == 10.0
+    assert obs.exit_price == 12.0
+    assert db_session.query(ForwardReturnObservation).count() == 1
+    assert db_session.query(ForwardReturnObservationEvent).count() == 2
+    payload = json.loads(obs.provider_request_json)
+    revision_payload = payload["post_compute_reconciliation"]
+    assert revision_payload["status"] == "price_drift_review"
+    assert revision_payload["material_drift"] is True
+    assert revision_payload["original"]["exit_open"] == 12.0
+    assert revision_payload["current"]["exit_open"] == 12.2
+    assert revision_payload["drift"]["material_drift_count"] >= 1
+    lineage_ids = json.loads(obs.data_lineage_ids)
+    assert len(lineage_ids) == 2
+    assert db_session.query(DataLineage).filter(
+        DataLineage.data_lineage_id.in_(lineage_ids)
+    ).count() == 2
 
 
 def test_postgres_schema_connect_args_sets_scratch_search_path():

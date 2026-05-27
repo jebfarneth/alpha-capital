@@ -110,6 +110,7 @@ M4_PRICE_SOURCE = "fmp_full_split_adjusted_regular_session_open"
 M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF = "fmp_full_ohlc_split_adjusted_contract_open"
 MAX_FORWARD_RETURN_ATTEMPTS = 3
 DEFAULT_FINALITY_LAG_SESSIONS = 1
+DEFAULT_REVISION_WINDOW_SESSIONS = 10
 PRICE_DRIFT_ABS_TOL = 0.01
 PRICE_DRIFT_REL_TOL = 0.0005
 LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON = (
@@ -398,6 +399,8 @@ class ForwardReturnJob(BaseJob):
         max_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
         survivorship_resolver: Any = None,
         finality_lag_sessions: int = DEFAULT_FINALITY_LAG_SESSIONS,
+        reconcile_computed: bool = False,
+        revision_window_sessions: int = DEFAULT_REVISION_WINDOW_SESSIONS,
         price_drift_abs_tol: float = PRICE_DRIFT_ABS_TOL,
         price_drift_rel_tol: float = PRICE_DRIFT_REL_TOL,
     ):
@@ -407,6 +410,8 @@ class ForwardReturnJob(BaseJob):
             raise ValueError("ForwardReturnJob requires price_fn or adapter")
         if finality_lag_sessions < 0:
             raise ValueError("finality_lag_sessions must be >= 0")
+        if revision_window_sessions < 0:
+            raise ValueError("revision_window_sessions must be >= 0")
         if price_drift_abs_tol < 0 or price_drift_rel_tol < 0:
             raise ValueError("price drift tolerances must be >= 0")
         self._session = session
@@ -418,12 +423,16 @@ class ForwardReturnJob(BaseJob):
         self._max_attempts = max_attempts
         self._survivorship_resolver = survivorship_resolver
         self._finality_lag_sessions = finality_lag_sessions
+        self._reconcile_computed = reconcile_computed
+        self._revision_window_sessions = revision_window_sessions
         self._price_drift_abs_tol = price_drift_abs_tol
         self._price_drift_rel_tol = price_drift_rel_tol
 
     def run(self, ctx: JobContext) -> JobResult:
         if self._adapter is None:
             return self._run_injected_price_fn(ctx)
+        if self._reconcile_computed:
+            return self._run_computed_reconciliation(ctx)
         return self._run_production_m4(ctx)
 
     # ------------------------------------------------------------------
@@ -587,6 +596,83 @@ class ForwardReturnJob(BaseJob):
             },
         )
 
+    def _run_computed_reconciliation(self, ctx: JobContext) -> JobResult:
+        run_timestamp, timestamp_error = _resolve_run_timestamp(
+            self._run_timestamp,
+            ctx.params.get("run_timestamp"),
+            ctx.started_at,
+        )
+        if timestamp_error:
+            return JobResult(
+                status="failed",
+                errors=[{"stage": "params", "message": timestamp_error}],
+            )
+
+        session_resolution = resolve_us_equity_session(run_timestamp)
+        current_evidence_date = _parse_date(session_resolution.evidence_session_date)
+        observations = self._computed_observation_query().all()
+
+        reconciliation_passed = 0
+        price_drift_review = 0
+        provider_revision_review = 0
+        skipped_before_finality = 0
+        skipped_outside_window = 0
+        skipped_invalid = 0
+        fetch_errors: List[Dict[str, Any]] = []
+        events_appended = 0
+
+        for obs in observations:
+            outcome = self._reconcile_computed_observation(
+                obs,
+                current_evidence_date=current_evidence_date,
+                job_run_id=ctx.job_run_id,
+            )
+            if outcome == "reconciliation_passed":
+                reconciliation_passed += 1
+                events_appended += 1
+            elif outcome == STATUS_PRICE_DRIFT_REVIEW:
+                price_drift_review += 1
+                events_appended += 1
+            elif outcome == STATUS_PROVIDER_REVISION_REVIEW:
+                provider_revision_review += 1
+                events_appended += 1
+            elif outcome == "before_finality":
+                skipped_before_finality += 1
+            elif outcome == "outside_revision_window":
+                skipped_outside_window += 1
+            elif outcome == "fetch_error":
+                fetch_errors.append({
+                    "ticker": obs.ticker,
+                    "reason": "reconciliation_fetch_unavailable",
+                })
+                events_appended += 1
+            else:
+                skipped_invalid += 1
+
+        self._session.flush()
+
+        return JobResult(
+            status="finished",
+            metrics={
+                "mode": "computed_reconciliation_m4",
+                "pattern_id": self._pattern_id,
+                "decision_evidence_session_date": (
+                    session_resolution.evidence_session_date
+                ),
+                "revision_window_sessions": self._revision_window_sessions,
+                "total_computed": len(observations),
+                "reconciliation_passed": reconciliation_passed,
+                "price_drift_review": price_drift_review,
+                "provider_revision_review": provider_revision_review,
+                "skipped_before_finality": skipped_before_finality,
+                "skipped_outside_window": skipped_outside_window,
+                "skipped_invalid": skipped_invalid,
+                "events_appended": events_appended,
+                "fetch_error_count": len(fetch_errors),
+                "fetch_errors": fetch_errors[:50],
+            },
+        )
+
     def _production_signal_query(self):
         if self._pattern_id != M4_PATTERN_ID:
             return self._session.query(SignalRegistry).filter(False)
@@ -604,6 +690,220 @@ class ForwardReturnJob(BaseJob):
             )
             .order_by(SignalRegistry.signal_timestamp, SignalRegistry.ticker)
         )
+
+    def _computed_observation_query(self):
+        if self._pattern_id != M4_PATTERN_ID:
+            return self._session.query(ForwardReturnObservation).filter(False)
+        return (
+            self._session.query(ForwardReturnObservation)
+            .filter(
+                ForwardReturnObservation.pattern_id == M4_PATTERN_ID,
+                ForwardReturnObservation.signal_horizon == M4_SIGNAL_HORIZON,
+                ForwardReturnObservation.status == STATUS_COMPUTED,
+                ForwardReturnObservation.forward_return.isnot(None),
+                ForwardReturnObservation.entry_price_source == M4_PRICE_SOURCE,
+                ForwardReturnObservation.exit_price_source == M4_PRICE_SOURCE,
+            )
+            .order_by(
+                ForwardReturnObservation.exit_session_date,
+                ForwardReturnObservation.ticker,
+            )
+        )
+
+    def _reconcile_computed_observation(
+        self,
+        obs: ForwardReturnObservation,
+        *,
+        current_evidence_date: date,
+        job_run_id: Optional[str],
+    ) -> str:
+        sig = self._session.get(SignalRegistry, obs.signal_id)
+        if sig is None:
+            return "invalid_observation"
+        try:
+            entry_session_date = _parse_date(str(obs.entry_session_date))
+            exit_session_date = _parse_date(str(obs.exit_session_date))
+        except ValueError:
+            return "invalid_observation"
+
+        finality_session_date = _observation_finality_session_date(
+            obs,
+            exit_session_date=exit_session_date,
+            default_lag_sessions=self._finality_lag_sessions,
+        )
+        if current_evidence_date < finality_session_date:
+            return "before_finality"
+        revision_window_end = _m4_revision_window_end(
+            finality_session_date,
+            self._revision_window_sessions,
+        )
+        if current_evidence_date > revision_window_end:
+            return "outside_revision_window"
+
+        original_lineage_id, original_payload = _load_observation_price_payload(
+            self._session,
+            obs,
+        )
+        provider_request = _provider_request_payload(
+            ticker=obs.ticker,
+            from_date=entry_session_date,
+            to_date=exit_session_date,
+        )
+        asof = us_equity_session_close_timestamp(exit_session_date)
+        resp = self._adapter.get_historical_price(
+            obs.ticker,
+            from_date=entry_session_date,
+            to_date=exit_session_date,
+            asof=asof,
+            adjusted=False,
+            require_split_adjusted_close=True,
+        )
+        current_payload = _price_lineage_payload(
+            resp.data,
+            ticker=obs.ticker,
+            from_date=entry_session_date,
+            to_date=exit_session_date,
+        )
+        current_payload_hash = stable_hash(current_payload)
+        current_lineage = record_data_lineage(
+            self._session,
+            provider=resp.lineage.provider,
+            endpoint=resp.lineage.endpoint,
+            asof_timestamp=resp.lineage.asof_timestamp,
+            raw_payload=current_payload,
+            raw_payload_hash=resp.lineage.raw_payload_hash or current_payload_hash,
+            request_timestamp=resp.lineage.request_timestamp,
+            freshness_seconds=resp.lineage.freshness_seconds,
+            source_authority=resp.lineage.source_authority,
+            data_quality_flags=resp.lineage.data_quality_flags,
+            job_run_id=job_run_id,
+        )
+        current_lineage_id = current_lineage.data_lineage_id
+        lineage_ids = _dedupe_list(
+            _observation_lineage_ids(obs) + [current_lineage_id]
+        )
+
+        if not resp.ok:
+            payload = _post_compute_reconciliation_payload(
+                status="reconciliation_fetch_unavailable",
+                reason="reconciliation_fetch_unavailable",
+                provider_request=provider_request,
+                revision_window_sessions=self._revision_window_sessions,
+                finality_session_date=finality_session_date,
+                revision_window_end=revision_window_end,
+                current_evidence_session_date=current_evidence_date,
+                original_lineage_id=original_lineage_id,
+                current_lineage_id=current_lineage_id,
+                original_payload=original_payload,
+                current_payload=current_payload,
+                drift=None,
+                original_forward_return=obs.forward_return,
+                abs_tol=self._price_drift_abs_tol,
+                rel_tol=self._price_drift_rel_tol,
+            )
+            self._append_reconciliation_event(
+                sig=sig,
+                obs=obs,
+                status=obs.status,
+                reason="reconciliation_fetch_unavailable",
+                attempts=(obs.attempts or 0) + 1,
+                job_run_id=job_run_id,
+                provider=resp.lineage.provider,
+                endpoint=resp.lineage.endpoint,
+                provider_request=payload,
+                data_lineage_ids=lineage_ids,
+            )
+            return "fetch_error"
+
+        if original_payload is None:
+            payload = _post_compute_reconciliation_payload(
+                status=STATUS_PROVIDER_REVISION_REVIEW,
+                reason="original_computed_lineage_unavailable",
+                provider_request=provider_request,
+                revision_window_sessions=self._revision_window_sessions,
+                finality_session_date=finality_session_date,
+                revision_window_end=revision_window_end,
+                current_evidence_session_date=current_evidence_date,
+                original_lineage_id=original_lineage_id,
+                current_lineage_id=current_lineage_id,
+                original_payload=None,
+                current_payload=current_payload,
+                drift=None,
+                original_forward_return=obs.forward_return,
+                abs_tol=self._price_drift_abs_tol,
+                rel_tol=self._price_drift_rel_tol,
+            )
+            self._transition_computed_observation_to_review(
+                sig=sig,
+                obs=obs,
+                status=STATUS_PROVIDER_REVISION_REVIEW,
+                reason="original_computed_lineage_unavailable",
+                job_run_id=job_run_id,
+                provider=resp.lineage.provider,
+                endpoint=resp.lineage.endpoint,
+                provider_request=payload,
+                data_lineage_ids=lineage_ids,
+            )
+            return STATUS_PROVIDER_REVISION_REVIEW
+
+        drift = _compare_price_payloads(
+            original_payload,
+            current_payload,
+            abs_tol=self._price_drift_abs_tol,
+            rel_tol=self._price_drift_rel_tol,
+        )
+        status = (
+            STATUS_PRICE_DRIFT_REVIEW
+            if drift["material_drift"] else "reconciliation_passed"
+        )
+        reason = (
+            "provider_price_drift_exceeds_tolerance"
+            if drift["material_drift"] else "reconciliation_passed"
+        )
+        payload = _post_compute_reconciliation_payload(
+            status=status,
+            reason=reason,
+            provider_request=provider_request,
+            revision_window_sessions=self._revision_window_sessions,
+            finality_session_date=finality_session_date,
+            revision_window_end=revision_window_end,
+            current_evidence_session_date=current_evidence_date,
+            original_lineage_id=original_lineage_id,
+            current_lineage_id=current_lineage_id,
+            original_payload=original_payload,
+            current_payload=current_payload,
+            drift=drift,
+            original_forward_return=obs.forward_return,
+            abs_tol=self._price_drift_abs_tol,
+            rel_tol=self._price_drift_rel_tol,
+        )
+        if drift["material_drift"]:
+            self._transition_computed_observation_to_review(
+                sig=sig,
+                obs=obs,
+                status=STATUS_PRICE_DRIFT_REVIEW,
+                reason="provider_price_drift_exceeds_tolerance",
+                job_run_id=job_run_id,
+                provider=resp.lineage.provider,
+                endpoint=resp.lineage.endpoint,
+                provider_request=payload,
+                data_lineage_ids=lineage_ids,
+            )
+            return STATUS_PRICE_DRIFT_REVIEW
+
+        self._append_reconciliation_event(
+            sig=sig,
+            obs=obs,
+            status=STATUS_COMPUTED,
+            reason="reconciliation_passed",
+            attempts=(obs.attempts or 0) + 1,
+            job_run_id=job_run_id,
+            provider=resp.lineage.provider,
+            endpoint=resp.lineage.endpoint,
+            provider_request=payload,
+            data_lineage_ids=lineage_ids,
+        )
+        return "reconciliation_passed"
 
     def _existing_observation(
         self,
@@ -1275,6 +1575,116 @@ class ForwardReturnJob(BaseJob):
         )
         self._session.add(event)
 
+    def _transition_computed_observation_to_review(
+        self,
+        *,
+        sig: SignalRegistry,
+        obs: ForwardReturnObservation,
+        status: str,
+        reason: str,
+        job_run_id: Optional[str],
+        provider: Optional[str],
+        endpoint: Optional[str],
+        provider_request: Dict[str, Any],
+        data_lineage_ids: List[str],
+    ) -> None:
+        obs.status = status
+        obs.reason = reason
+        obs.forward_return = None
+        obs.attempts = (obs.attempts or 0) + 1
+        obs.job_run_id = job_run_id
+        obs.provider = provider
+        obs.endpoint = endpoint
+        obs.provider_request_json = json.dumps(
+            provider_request, sort_keys=True, default=str
+        )
+        obs.data_lineage_ids = json.dumps(data_lineage_ids)
+        obs.outcome_hash = _post_compute_revision_outcome_hash(
+            observation=obs,
+            status=status,
+            reason=reason,
+            provider_request=provider_request,
+        )
+
+        sig.forward_return = None
+        sig.forward_return_status = status
+        sig.forward_return_attempts = obs.attempts
+        sig.outcome_unavailable_reason = reason
+        sig.intended_entry_price = obs.entry_price
+
+        self._append_reconciliation_event(
+            sig=sig,
+            obs=obs,
+            status=status,
+            reason=reason,
+            attempts=obs.attempts,
+            job_run_id=job_run_id,
+            provider=provider,
+            endpoint=endpoint,
+            provider_request=provider_request,
+            data_lineage_ids=data_lineage_ids,
+        )
+
+    def _append_reconciliation_event(
+        self,
+        *,
+        sig: SignalRegistry,
+        obs: ForwardReturnObservation,
+        status: str,
+        reason: Optional[str],
+        attempts: int,
+        job_run_id: Optional[str],
+        provider: Optional[str],
+        endpoint: Optional[str],
+        provider_request: Dict[str, Any],
+        data_lineage_ids: List[str],
+    ) -> None:
+        event = ForwardReturnObservationEvent(
+            forward_return_observation_id=obs.forward_return_observation_id,
+            signal_id=sig.signal_id,
+            pattern_id=sig.pattern_id,
+            ticker=sig.ticker,
+            direction=sig.direction,
+            signal_timestamp=sig.signal_timestamp,
+            signal_horizon=sig.signal_horizon,
+            next_execution_session=obs.next_execution_session,
+            entry_session_date=obs.entry_session_date,
+            entry_price=obs.entry_price,
+            entry_price_source=obs.entry_price_source,
+            entry_basis_proof=obs.entry_basis_proof,
+            entry_data_lineage_id=obs.entry_data_lineage_id,
+            exit_session_date=obs.exit_session_date,
+            exit_price=obs.exit_price,
+            exit_price_source=obs.exit_price_source,
+            exit_basis_proof=obs.exit_basis_proof,
+            exit_data_lineage_id=obs.exit_data_lineage_id,
+            forward_return=obs.forward_return,
+            max_favorable_excursion=obs.max_favorable_excursion,
+            max_adverse_excursion=obs.max_adverse_excursion,
+            mfe_session_date=obs.mfe_session_date,
+            mae_session_date=obs.mae_session_date,
+            max_close_return=obs.max_close_return,
+            min_close_return=obs.min_close_return,
+            hit_t1_intraday=obs.hit_t1_intraday,
+            hit_t2_intraday=obs.hit_t2_intraday,
+            hit_t3_intraday=obs.hit_t3_intraday,
+            hit_stop_intraday=obs.hit_stop_intraday,
+            same_day_barrier_ambiguity=obs.same_day_barrier_ambiguity,
+            status=status,
+            reason=reason,
+            attempts=attempts,
+            job_run_id=job_run_id,
+            input_hash=obs.input_hash,
+            outcome_hash=obs.outcome_hash,
+            data_lineage_ids=json.dumps(data_lineage_ids),
+            provider=provider,
+            endpoint=endpoint,
+            provider_request_json=json.dumps(
+                provider_request, sort_keys=True, default=str
+            ),
+        )
+        self._session.add(event)
+
     # ------------------------------------------------------------------
     # Legacy injected-price scaffold path
     # ------------------------------------------------------------------
@@ -1791,6 +2201,43 @@ def _m4_finality_session_date(exit_session_date: date, lag_sessions: int) -> dat
     return cursor
 
 
+def _m4_revision_window_end(
+    finality_session_date: date,
+    window_sessions: int,
+) -> date:
+    if window_sessions < 0:
+        raise ValueError("window_sessions must be >= 0")
+    cursor = finality_session_date
+    for _ in range(window_sessions):
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return cursor
+
+
+def _observation_finality_session_date(
+    observation: ForwardReturnObservation,
+    *,
+    exit_session_date: date,
+    default_lag_sessions: int,
+) -> date:
+    if observation.provider_request_json:
+        try:
+            payload = json.loads(observation.provider_request_json)
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict):
+            for key in ("price_finality", "post_compute_reconciliation"):
+                section = payload.get(key)
+                if not isinstance(section, dict):
+                    continue
+                raw_date = section.get("finality_session_date")
+                if raw_date:
+                    try:
+                        return _parse_date(str(raw_date))
+                    except ValueError:
+                        pass
+    return _m4_finality_session_date(exit_session_date, default_lag_sessions)
+
+
 def _load_price_lineage_payload(
     session: Session,
     lineage_id: Optional[str],
@@ -1807,6 +2254,25 @@ def _load_price_lineage_payload(
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _load_observation_price_payload(
+    session: Session,
+    observation: ForwardReturnObservation,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    for lineage_id in _observation_lineage_ids(observation):
+        payload = _load_price_lineage_payload(session, lineage_id)
+        if payload is None:
+            continue
+        request = payload.get("request")
+        if not isinstance(request, dict):
+            continue
+        if request.get("endpoint") != HISTORICAL_PRICE_FULL_ENDPOINT:
+            continue
+        if not _payload_bars_by_date(payload):
+            continue
+        return lineage_id, payload
+    return None, None
 
 
 def _observation_lineage_ids(
@@ -1889,6 +2355,88 @@ def _payload_bars_by_date(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if day:
             out[str(day)] = raw
     return out
+
+
+def _post_compute_reconciliation_payload(
+    *,
+    status: str,
+    reason: str,
+    provider_request: Dict[str, Any],
+    revision_window_sessions: int,
+    finality_session_date: date,
+    revision_window_end: date,
+    current_evidence_session_date: date,
+    original_lineage_id: Optional[str],
+    current_lineage_id: Optional[str],
+    original_payload: Optional[Dict[str, Any]],
+    current_payload: Optional[Dict[str, Any]],
+    drift: Optional[Dict[str, Any]],
+    original_forward_return: Optional[float],
+    abs_tol: float,
+    rel_tol: float,
+) -> Dict[str, Any]:
+    return {
+        "price_request": provider_request,
+        "post_compute_reconciliation": {
+            "status": status,
+            "reason": reason,
+            "revision_window_sessions": revision_window_sessions,
+            "finality_session_date": finality_session_date.isoformat(),
+            "revision_window_end": revision_window_end.isoformat(),
+            "current_evidence_session_date": (
+                current_evidence_session_date.isoformat()
+            ),
+            "original_data_lineage_id": original_lineage_id,
+            "current_data_lineage_id": current_lineage_id,
+            "original_forward_return": original_forward_return,
+            "original": (
+                _entry_exit_open_summary(original_payload)
+                if original_payload is not None else None
+            ),
+            "current": (
+                _entry_exit_open_summary(current_payload)
+                if current_payload is not None else None
+            ),
+            "drift": drift,
+            "material_drift": (
+                bool(drift.get("material_drift"))
+                if isinstance(drift, dict) else None
+            ),
+            "drift_tolerance": {
+                "abs_tol": abs_tol,
+                "rel_tol": rel_tol,
+                "rel_tol_bps": rel_tol * 10_000,
+            },
+        },
+    }
+
+
+def _post_compute_revision_outcome_hash(
+    *,
+    observation: ForwardReturnObservation,
+    status: str,
+    reason: str,
+    provider_request: Dict[str, Any],
+) -> str:
+    revision = provider_request.get("post_compute_reconciliation", {})
+    return stable_hash({
+        "layer": "price_fn_post_compute_revision",
+        "input_hash": observation.input_hash,
+        "pattern_id": observation.pattern_id,
+        "ticker": observation.ticker,
+        "direction": observation.direction,
+        "signal_timestamp": _iso(_ensure_aware(observation.signal_timestamp)),
+        "signal_horizon": observation.signal_horizon,
+        "entry_session_date": observation.entry_session_date,
+        "exit_session_date": observation.exit_session_date,
+        "status": status,
+        "reason": reason,
+        "original_forward_return": revision.get("original_forward_return"),
+        "original": revision.get("original"),
+        "current": revision.get("current"),
+        "drift": revision.get("drift"),
+        "drift_tolerance": revision.get("drift_tolerance"),
+    })
 
 
 def _compare_price_payloads(

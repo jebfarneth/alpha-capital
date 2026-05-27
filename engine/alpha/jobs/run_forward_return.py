@@ -17,7 +17,13 @@ from typing import Optional
 from alpha.data.config import FmpConfig
 from alpha.data.fmp import FmpAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
-from alpha.jobs.forward_return import ForwardReturnJob
+from alpha.jobs.forward_return import (
+    DEFAULT_FINALITY_LAG_SESSIONS,
+    DEFAULT_REVISION_WINDOW_SESSIONS,
+    PRICE_DRIFT_ABS_TOL,
+    PRICE_DRIFT_REL_TOL,
+    ForwardReturnJob,
+)
 from alpha.jobs.runner import run_job
 
 LIVE_RUN_TIMESTAMP_SKEW_TOLERANCE = timedelta(minutes=5)
@@ -100,6 +106,8 @@ def _run_live(args: argparse.Namespace) -> int:
             max_attempts=args.max_attempts,
             pattern_id=args.pattern_id,
             finality_lag_sessions=args.finality_lag_sessions,
+            reconcile_computed=args.reconcile_computed,
+            revision_window_sessions=args.revision_window_sessions,
             price_drift_abs_tol=args.price_drift_abs_tol,
             price_drift_rel_tol=args.price_drift_rel_tol,
         )
@@ -112,6 +120,8 @@ def _run_live(args: argparse.Namespace) -> int:
                 "max_attempts": args.max_attempts,
                 "pattern_id": args.pattern_id,
                 "finality_lag_sessions": args.finality_lag_sessions,
+                "reconcile_computed": args.reconcile_computed,
+                "revision_window_sessions": args.revision_window_sessions,
                 "price_drift_abs_tol": args.price_drift_abs_tol,
                 "price_drift_rel_tol": args.price_drift_rel_tol,
                 "schema": args.schema,
@@ -127,9 +137,13 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Pending:                 {metrics.get('pending')}")
         print(f"Finality pending:        {metrics.get('price_finality_pending')}")
         print(f"Price drift review:      {metrics.get('price_drift_review')}")
+        print(f"Reconciliation passed:   {metrics.get('reconciliation_passed')}")
+        print(f"Provider revision review:{metrics.get('provider_revision_review')}")
+        print(f"Skipped outside window:  {metrics.get('skipped_outside_window')}")
         print(f"Retryable unavailable:   {metrics.get('retryable_unavailable')}")
         print(f"Terminal unavailable:    {metrics.get('terminal_unavailable')}")
         print(f"Observations upserted:   {metrics.get('observations_upserted')}")
+        print(f"Events appended:         {metrics.get('events_appended')}")
         print(f"Fetch errors:            {metrics.get('fetch_error_count')}")
         if result.errors:
             print("Errors:")
@@ -173,22 +187,39 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--finality-lag-sessions",
         type=int,
-        default=1,
+        default=DEFAULT_FINALITY_LAG_SESSIONS,
         help=(
             "Regular U.S. equity sessions to wait after the exit session before "
             "finalizing M4 forward returns."
         ),
     )
     parser.add_argument(
+        "--reconcile-computed",
+        action="store_true",
+        help=(
+            "Explicit post-compute provider-revision sweep for recently "
+            "computed M4 forward-return rows."
+        ),
+    )
+    parser.add_argument(
+        "--revision-window-sessions",
+        type=int,
+        default=DEFAULT_REVISION_WINDOW_SESSIONS,
+        help=(
+            "Regular U.S. equity sessions after finality during which computed "
+            "rows are eligible for provider-revision reconciliation."
+        ),
+    )
+    parser.add_argument(
         "--price-drift-abs-tol",
         type=float,
-        default=0.01,
+        default=PRICE_DRIFT_ABS_TOL,
         help="Absolute provider-row drift tolerance for price reconciliation.",
     )
     parser.add_argument(
         "--price-drift-rel-tol",
         type=float,
-        default=0.0005,
+        default=PRICE_DRIFT_REL_TOL,
         help="Relative provider-row drift tolerance for price reconciliation.",
     )
     parser.add_argument(
