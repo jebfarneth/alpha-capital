@@ -4792,6 +4792,7 @@ class TestBenzingaAdapter:
 
         assert resp.ok
         assert resp.data == []
+        assert resp.lineage.data_quality_flags["bare_list_payload"] is True
 
     @pytest.mark.parametrize("status_code", [401, 403])
     def test_get_news_auth_error(self, status_code):
@@ -4867,13 +4868,71 @@ class TestBenzingaAdapter:
         session.get.return_value = _mock_response(200, json_data)
         adapter = self._adapter(session)
 
-        resp = adapter.get_news()
+        resp = adapter.get_news("ACME")
 
         assert resp.ok
         article = resp.data[0]
         assert article.created == datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
         assert article.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
         assert article.published == datetime(2026, 5, 27, 12, 15, tzinfo=timezone.utc)
+
+    def test_get_news_future_knowledge_timestamps_are_nulled_and_flagged(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "news": [
+                    {
+                        "id": "future-news",
+                        "created": "2099-01-01T00:00:00Z",
+                        "updated": "2099-01-02T00:00:00Z",
+                        "published": "2099-01-03T00:00:00Z",
+                        "date": "2099-01-04",
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news(
+            "ACME",
+            asof=datetime(2026, 5, 28, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        article = resp.data[0]
+        assert article.created is None
+        assert article.updated is None
+        assert article.published is None
+        assert article.event_date == "2099-01-04"
+        flags = resp.lineage.data_quality_flags
+        assert flags["knowledge_timestamp_warning_rows"] == 1
+        assert flags["knowledge_timestamp_warning_types"] == {
+            "news_created_future": 1,
+            "news_published_future": 1,
+            "news_updated_future": 1,
+        }
+
+    def test_get_news_event_date_does_not_populate_publication_timestamp(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {"news": [{"id": "event-only", "date": "2099-01-04"}]},
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news(
+            "ACME",
+            asof=datetime(2026, 5, 28, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        article = resp.data[0]
+        assert article.published is None
+        assert article.created is None
+        assert article.updated is None
+        assert article.event_date == "2099-01-04"
+        assert "knowledge_timestamp_warning_rows" not in resp.lineage.data_quality_flags
 
     def test_get_news_lineage_does_not_expose_secret(self):
         session = MagicMock(spec=requests.Session)
@@ -4884,7 +4943,8 @@ class TestBenzingaAdapter:
 
         assert resp.ok
         assert "test-benzinga-key" not in repr(resp.lineage)
-        assert resp.lineage.data_quality_flags is None
+        assert "test-benzinga-key" not in repr(resp.lineage.data_quality_flags)
+        assert resp.lineage.data_quality_flags["raw_rows"] == 0
 
     def test_get_earnings_ok_and_calendar_params(self):
         session = MagicMock(spec=requests.Session)
@@ -5378,7 +5438,7 @@ class TestBenzingaAdapter:
             assert resp.ok
             assert resp.data == []
 
-    def test_calendar_adapters_malformed_payload_is_empty_success(self):
+    def test_calendar_adapters_malformed_payload_is_parse_error(self):
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
 
@@ -5391,8 +5451,10 @@ class TestBenzingaAdapter:
             session.get.return_value = _mock_response(200, {"unexpected": []})
             resp = getattr(adapter, method_name)("ACME")
 
-            assert resp.ok
-            assert resp.data == []
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.lineage.data_quality_flags["payload_shape_error"] is True
 
     def test_calendar_adapters_skip_rows_without_ticker(self):
         session = MagicMock(spec=requests.Session)
@@ -5416,7 +5478,11 @@ class TestBenzingaAdapter:
         assert params["parameters[tickers]"] == "ACME"
 
         session.get.return_value = _mock_response(200, {"guidance": []})
-        resp = adapter.get_guidance(tickers=[" ", ""])
+        resp = adapter.get_guidance(
+            tickers=[" ", ""],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+        )
 
         assert resp.ok
         params = session.get.call_args.kwargs["params"]
@@ -5443,7 +5509,7 @@ class TestBenzingaAdapter:
             assert not resp.ok
             assert resp.error.error_type == "validation"
             assert resp.error.retryable is False
-            assert resp.error.message == "Benzinga calendar ticker parameters must be strings"
+            assert resp.error.message == "Benzinga ticker parameters must be strings"
             assert resp.lineage.endpoint == endpoint
         session.get.assert_not_called()
 
@@ -5522,7 +5588,7 @@ class TestBenzingaAdapter:
             assert resp.ok
             assert resp.data == []
 
-    def test_dividends_and_insider_adapters_malformed_payload_is_empty_success(self):
+    def test_dividends_and_insider_adapters_malformed_payload_is_parse_error(self):
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
 
@@ -5534,8 +5600,10 @@ class TestBenzingaAdapter:
             session.get.return_value = _mock_response(200, {"unexpected": []})
             resp = getattr(adapter, method_name)("ACME")
 
-            assert resp.ok
-            assert resp.data == []
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.lineage.data_quality_flags["payload_shape_error"] is True
 
     def test_dividends_and_insider_adapters_skip_identity_less_rows(self):
         session = MagicMock(spec=requests.Session)
@@ -5789,7 +5857,10 @@ class TestBenzingaAdapter:
         ]
         session.get.return_value = _mock_response(200, json_data)
         adapter = self._adapter(session)
-        resp = adapter.get_mergers_acquisitions()
+        resp = adapter.get_mergers_acquisitions(
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+        )
 
         assert resp.ok
         assert len(resp.data) == 1
@@ -5797,14 +5868,16 @@ class TestBenzingaAdapter:
         assert resp.data[0].importance == 3
         assert resp.data[0].updated == 1779307200
 
-    def test_get_mergers_acquisitions_empty_unexpected_payload_is_empty(self):
+    def test_get_mergers_acquisitions_unexpected_payload_is_parse_error(self):
         session = MagicMock(spec=requests.Session)
         session.get.return_value = _mock_response(200, {"unexpected": []})
         adapter = self._adapter(session)
         resp = adapter.get_mergers_acquisitions("ACME")
 
-        assert resp.ok
-        assert resp.data == []
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+        assert resp.lineage.data_quality_flags["payload_shape_error"] is True
 
     def test_auth_error(self):
         session = MagicMock(spec=requests.Session)
@@ -5856,6 +5929,510 @@ class TestBenzingaAdapter:
         resp1 = adapter.get_mergers_acquisitions("ACME")
         resp2 = adapter.get_mergers_acquisitions("ACME")
         assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
+    def test_json_parse_error_message_is_sanitized(self):
+        session = MagicMock(spec=requests.Session)
+        resp_mock = _mock_response(200, text="not json token=SECRET")
+        resp_mock.json.side_effect = ValueError(
+            "GET https://api.benzinga.com/api/v2/news?token=SECRET failed"
+        )
+        session.get.return_value = resp_mock
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+        assert resp.error.message == "Benzinga JSON parse error"
+        assert "SECRET" not in repr(resp)
+        assert "token" not in resp.error.message
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_news", {"unexpected": True}),
+            ("get_wiims", {"unexpected": True}),
+            ("get_earnings", {"unexpected": True}),
+            ("get_guidance", {"unexpected": True}),
+            ("get_ratings", {"unexpected": True}),
+            ("get_offerings", {"unexpected": True}),
+            ("get_dividends", {"unexpected": True}),
+            ("get_insider_filings", {"unexpected": True}),
+            ("get_insider_transactions", {"unexpected": True}),
+            ("get_mergers_acquisitions", {"unexpected": True}),
+        ],
+    )
+    def test_benzinga_unexpected_payload_shapes_are_parse_errors(
+        self, method_name, payload
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+        assert resp.lineage.data_quality_flags["payload_shape_error"] is True
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_news", {"news": {"not": "list"}}),
+            ("get_earnings", {"earnings": {"not": "list"}}),
+            ("get_guidance", {"guidance": {"not": "list"}}),
+            ("get_ratings", {"ratings": {"not": "list"}}),
+            ("get_offerings", {"offerings": {"not": "list"}}),
+            ("get_dividends", {"dividends": {"not": "list"}}),
+            ("get_insider_filings", {"data": {"not": "list"}}),
+            ("get_insider_transactions", {"data": {"not": "list"}}),
+            ("get_mergers_acquisitions", {"ma": {"not": "list"}}),
+        ],
+    )
+    def test_benzinga_expected_key_non_list_is_parse_error(self, method_name, payload):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+        assert resp.lineage.data_quality_flags["payload_shape_error"] is True
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_news", {"news": [{}]}),
+            ("get_wiims", {"news": [{}]}),
+            ("get_mergers_acquisitions", {"ma": [{}]}),
+        ],
+    )
+    def test_benzinga_news_wiims_and_ma_skip_identity_less_rows(
+        self, method_name, payload
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 1
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_benzinga_non_dict_rows_are_skipped_with_telemetry(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {"ratings": [None, 7, {"ticker": "ACME", "date": "2026-05-27"}]},
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ratings("ACME")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.lineage.data_quality_flags["raw_rows"] == 3
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 2
+
+    def test_benzinga_bare_list_payload_is_flagged_and_still_row_guarded(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            [{}, {"ticker": "ACME", "date": "2026-05-27"}],
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_guidance("ACME")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        flags = resp.lineage.data_quality_flags
+        assert flags["bare_list_payload"] is True
+        assert flags["raw_rows"] == 2
+        assert flags["parsed_rows"] == 1
+        assert flags["skipped_rows"] == 1
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda adapter: adapter.get_news(tickers=["AAPL", 123]),  # type: ignore[list-item]
+            lambda adapter: adapter.get_news(tickers="AAPL,MSFT"),
+            lambda adapter: adapter.get_news(tickers="AAPL\x00MSFT"),
+            lambda adapter: adapter.get_news(tickers="AAPL\nMSFT"),
+            lambda adapter: adapter.get_news(tickers="AAPL\tMSFT"),
+            lambda adapter: adapter.get_news(tickers={"AAPL", "MSFT"}),  # type: ignore[arg-type]
+            lambda adapter: adapter.get_earnings(tickers=["AAPL", 123]),  # type: ignore[list-item]
+            lambda adapter: adapter.get_earnings(tickers="AAPL,MSFT"),
+            lambda adapter: adapter.get_earnings(tickers="AAPL\x00MSFT"),
+            lambda adapter: adapter.get_earnings(tickers={"AAPL", "MSFT"}),  # type: ignore[arg-type]
+            lambda adapter: adapter.get_insider_filings(tickers=[object()]),  # type: ignore[list-item]
+            lambda adapter: adapter.get_insider_filings(tickers="AAPL\nMSFT"),
+            lambda adapter: adapter.get_insider_filings(tickers=frozenset(["AAPL"])),  # type: ignore[arg-type]
+            lambda adapter: adapter.get_mergers_acquisitions(tickers=[123]),  # type: ignore[list-item]
+            lambda adapter: adapter.get_mergers_acquisitions(tickers="AAPL\tMSFT"),
+            lambda adapter: adapter.get_mergers_acquisitions(tickers={"AAPL"}),  # type: ignore[arg-type]
+        ],
+    )
+    def test_benzinga_ticker_validation_rejects_bad_inputs_before_http(self, call):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = call(adapter)
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        session.get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda adapter: adapter.get_news(),
+            lambda adapter: adapter.get_news(tickers=["", " "]),
+            lambda adapter: adapter.get_earnings(tickers=["", " "]),
+            lambda adapter: adapter.get_insider_filings(tickers=" "),
+            lambda adapter: adapter.get_mergers_acquisitions(tickers=None),
+        ],
+    )
+    def test_benzinga_broad_queries_require_ticker_or_date_bounds(self, call):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = call(adapter)
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        session.get.assert_not_called()
+
+    def test_benzinga_blank_ticker_with_full_date_bounds_is_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"earnings": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings(
+            tickers=["", " "],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+        )
+
+        assert resp.ok
+        params = session.get.call_args.kwargs["params"]
+        assert "parameters[tickers]" not in params
+        assert params["parameters[date_from]"] == "2026-05-01"
+        assert params["parameters[date_to]"] == "2026-05-31"
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda adapter: adapter.get_news("ACME", date_from="bad", date_to="2026-05-31"),
+            lambda adapter: adapter.get_earnings("ACME", date_from="2026-05-31", date_to="2026-05-01"),
+            lambda adapter: adapter.get_dividends("ACME", page=0),
+            lambda adapter: adapter.get_insider_transactions("ACME", pagesize=1001),
+            lambda adapter: adapter.get_mergers_acquisitions("ACME", page="bad"),  # type: ignore[arg-type]
+        ],
+    )
+    def test_benzinga_date_page_and_pagesize_validation_is_local(self, call):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = call(adapter)
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        session.get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            (
+                "get_earnings",
+                {"earnings": [{"ticker": "ACME", "date": "bad"}, {"ticker": "ACME", "date": "2026-05-27"}]},
+            ),
+            (
+                "get_guidance",
+                {"guidance": [{"ticker": "ACME", "date": "2026-13-45"}, {"ticker": "ACME", "date": "2026-05-27"}]},
+            ),
+            (
+                "get_ratings",
+                {"ratings": [{"ticker": "ACME", "date": ""}, {"ticker": "ACME", "date": "2026-05-27"}]},
+            ),
+            (
+                "get_offerings",
+                {"offerings": [{"ticker": "ACME", "date": 20260527}, {"ticker": "ACME", "date": "2026-05-27"}]},
+            ),
+            (
+                "get_dividends",
+                {"dividends": [{"ticker": "ACME", "date": "bad"}, {"ticker": "ACME", "ex_dividend_date": "2026-05-27"}]},
+            ),
+        ],
+    )
+    def test_benzinga_calendar_provider_row_dates_are_validated(
+        self, method_name, payload
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.lineage.data_quality_flags["raw_rows"] == 2
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 1
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            (
+                "get_insider_filings",
+                {
+                    "data": [
+                        {"id": "bad", "company_symbol": "ACME", "filing_date": "bad"},
+                        {
+                            "id": "good",
+                            "company_symbol": "ACME",
+                            "filing_date": "2026-05-27T12:00:00Z",
+                        },
+                    ]
+                },
+            ),
+            (
+                "get_insider_transactions",
+                {
+                    "data": [
+                        {
+                            "transaction_id": "bad",
+                            "company_symbol": "ACME",
+                            "filing_date": "bad",
+                        },
+                        {
+                            "transaction_id": "good",
+                            "company_symbol": "ACME",
+                            "filing_date": "2026-05-27T12:00:00Z",
+                        },
+                    ]
+                },
+            ),
+        ],
+    )
+    def test_benzinga_insider_provider_row_dates_are_validated(
+        self, method_name, payload
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.lineage.data_quality_flags["raw_rows"] == 2
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 1
+
+    def test_benzinga_calendar_future_updated_is_nulled_without_rejecting_event_date(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "earnings": [
+                    {
+                        "ticker": "ACME",
+                        "date": "2099-01-01",
+                        "updated": 9999999999,
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings(
+            "ACME",
+            asof=datetime(2026, 5, 28, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data[0].date == "2099-01-01"
+        assert resp.data[0].updated is None
+        flags = resp.lineage.data_quality_flags
+        assert flags["knowledge_timestamp_warning_rows"] == 1
+        assert flags["knowledge_timestamp_warning_types"] == {
+            "calendar_updated_future": 1
+        }
+
+    def test_benzinga_insider_future_filing_knowledge_timestamp_is_nulled_and_flagged(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "data": [
+                    {
+                        "id": "filing-1",
+                        "company_symbol": "ACME",
+                        "filing_date": "2099-01-01T00:00:00Z",
+                        "accepted": "2099-01-01T00:01:00Z",
+                        "updated": "2099-01-02T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_insider_filings(
+            "ACME",
+            asof=datetime(2026, 5, 28, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data[0].filing_date is None
+        assert resp.data[0].updated is None
+        flags = resp.lineage.data_quality_flags
+        assert flags["knowledge_timestamp_warning_rows"] == 1
+        assert flags["knowledge_timestamp_warning_types"] == {
+            "insider_accepted_future": 1,
+            "insider_filing_date_future": 1,
+            "insider_updated_future": 1,
+        }
+
+    def test_benzinga_ma_future_updated_is_nulled_and_flagged(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "ma": [
+                    {
+                        "id": "deal-1",
+                        "target_ticker": "ACME",
+                        "date_announced": "2099-01-01T00:00:00Z",
+                        "updated": 9999999999,
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_mergers_acquisitions(
+            "ACME",
+            asof=datetime(2026, 5, 28, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data[0].updated is None
+        flags = resp.lineage.data_quality_flags
+        assert flags["knowledge_timestamp_warning_rows"] == 1
+        assert flags["knowledge_timestamp_warning_types"] == {
+            "ma_publication_future": 1,
+            "ma_updated_future": 1,
+        }
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_earnings", {"earnings": [{"ticker": "ACME", "date": "2026-05-27", "revenue": "-1"}]}),
+            ("get_guidance", {"guidance": [{"ticker": "ACME", "date": "2026-05-27", "revenue_guidance_min": "-1"}]}),
+            ("get_ratings", {"ratings": [{"ticker": "ACME", "date": "2026-05-27", "pt_current": "-1"}]}),
+            ("get_offerings", {"offerings": [{"ticker": "ACME", "date": "2026-05-27", "number_shares": "-1"}]}),
+            ("get_dividends", {"dividends": [{"ticker": "ACME", "date": "2026-05-27", "dividend": "-0.10"}]}),
+            ("get_insider_transactions", {"data": [{"transaction_id": "tx-1", "company_symbol": "ACME", "shares": "-1"}]}),
+            ("get_mergers_acquisitions", {"ma": [{"id": "deal-1", "target_ticker": "ACME", "deal_size": "-1"}]}),
+        ],
+    )
+    def test_benzinga_negative_impossible_economics_are_skipped(
+        self, method_name, payload
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 1
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_benzinga_raw_nested_payload_is_isolated_for_news_and_insider(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "news": [
+                    {
+                        "id": "news-1",
+                        "stocks": [{"name": "ACME"}],
+                        "channels": [{"name": "News"}],
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        news = adapter.get_news("ACME").data[0]
+        news.stocks[0]["name"] = "MUTATED_PARSED"
+        assert news.raw["stocks"][0]["name"] == "ACME"
+
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "data": [
+                    {
+                        "id": "filing-1",
+                        "accession_number": "0001",
+                        "company_symbol": "ACME",
+                        "filing_date": "2026-05-27T12:00:00Z",
+                        "owner": {"insider_name": "Original"},
+                        "transactions": [{"transaction_code": "P"}],
+                    }
+                ]
+            },
+        )
+        filing = adapter.get_insider_filings("ACME").data[0]
+        filing.owner["insider_name"] = "MUTATED_OWNER"
+        filing.transactions[0]["transaction_code"] = "S"
+        assert filing.raw["owner"]["insider_name"] == "Original"
+        assert filing.raw["transactions"][0]["transaction_code"] == "P"
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload1", "payload2"),
+        [
+            ("get_news", {"news": [{"id": "news-1"}]}, {"news": [{"id": "news-2"}]}),
+            ("get_wiims", {"news": [{"id": "wiim-1"}]}, {"news": [{"id": "wiim-2"}]}),
+            ("get_earnings", {"earnings": [{"ticker": "ACME", "date": "2026-05-27"}]}, {"earnings": [{"ticker": "ACME", "date": "2026-05-28"}]}),
+            ("get_guidance", {"guidance": [{"ticker": "ACME", "date": "2026-05-27"}]}, {"guidance": [{"ticker": "ACME", "date": "2026-05-28"}]}),
+            ("get_ratings", {"ratings": [{"ticker": "ACME", "date": "2026-05-27"}]}, {"ratings": [{"ticker": "ACME", "date": "2026-05-28"}]}),
+            ("get_offerings", {"offerings": [{"ticker": "ACME", "date": "2026-05-27"}]}, {"offerings": [{"ticker": "ACME", "date": "2026-05-28"}]}),
+            ("get_dividends", {"dividends": [{"ticker": "ACME", "date": "2026-05-27"}]}, {"dividends": [{"ticker": "ACME", "date": "2026-05-28"}]}),
+            ("get_insider_filings", {"data": [{"id": "filing-1", "company_symbol": "ACME", "filing_date": "2026-05-27T12:00:00Z"}]}, {"data": [{"id": "filing-2", "company_symbol": "ACME", "filing_date": "2026-05-27T12:00:00Z"}]}),
+            ("get_insider_transactions", {"data": [{"transaction_id": "tx-1", "company_symbol": "ACME", "filing_date": "2026-05-27T12:00:00Z"}]}, {"data": [{"transaction_id": "tx-2", "company_symbol": "ACME", "filing_date": "2026-05-27T12:00:00Z"}]}),
+            ("get_mergers_acquisitions", {"ma": [{"id": "deal-1", "target_ticker": "ACME"}]}, {"ma": [{"id": "deal-2", "target_ticker": "ACME"}]}),
+        ],
+    )
+    def test_benzinga_lineage_hash_stability_and_change_all_methods(
+        self, method_name, payload1, payload2
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload1)
+        adapter = self._adapter(session)
+
+        resp1 = getattr(adapter, method_name)("ACME")
+        resp2 = getattr(adapter, method_name)("ACME")
+        session.get.return_value = _mock_response(200, payload2)
+        resp3 = getattr(adapter, method_name)("ACME")
+
+        assert resp1.ok
+        assert resp2.ok
+        assert resp3.ok
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+        assert resp1.lineage.raw_payload_hash != resp3.lineage.raw_payload_hash
 
     def test_request_converts_aware_asof_to_utc(self):
         session = MagicMock(spec=requests.Session)

@@ -10,11 +10,13 @@ Does not write to DB. Returns AdapterResponse with LineageMeta.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Union
+from urllib.parse import urlparse
 
 import requests
 
@@ -39,6 +41,8 @@ INSIDER_FILINGS_ENDPOINT = "/api/v1/sec/insider_transactions/filings"
 INSIDER_TRANSACTIONS_ENDPOINT = "/api/v1/sec/insider_transactions/transactions"
 NEWS_ENDPOINT = "/api/v2/news"
 WIIM_CHANNEL = "wiim"
+MAX_PAGESIZE = 1000
+KNOWLEDGE_TIMESTAMP_FUTURE_TOLERANCE = timedelta(minutes=5)
 
 
 @dataclass
@@ -79,6 +83,7 @@ class BenzingaNewsArticle:
     created: Optional[datetime] = None
     updated: Optional[datetime] = None
     published: Optional[datetime] = None
+    event_date: Optional[str] = None
     title: Optional[str] = None
     body: Optional[str] = None
     teaser: Optional[str] = None
@@ -470,7 +475,7 @@ class BenzingaAdapter:
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except ValueError:
             return AdapterResponse(
                 data=None,
                 lineage=lineage,
@@ -479,7 +484,7 @@ class BenzingaAdapter:
                     endpoint=endpoint,
                     status_code=200,
                     error_type="parse",
-                    message=f"JSON parse error: {exc}",
+                    message="Benzinga JSON parse error",
                     retryable=False,
                 ),
             )
@@ -503,37 +508,80 @@ class BenzingaAdapter:
     ) -> AdapterResponse[List[BenzingaNewsArticle]]:
         """Fetch Benzinga news article rows as catalyst/context evidence."""
 
+        try:
+            page_value = _positive_int_param(page, "page", required=False)
+            page_size = pagesize if pagesize is not None else limit
+            pagesize_value = _positive_int_param(
+                page_size, "pagesize", required=False
+            )
+            date_from_value, date_to_value = _validate_date_range(
+                date_from,
+                date_to,
+                from_name="date_from",
+                to_name="date_to",
+            )
+            ticker_param = _validated_ticker_filter(tickers, symbols)
+            _require_ticker_or_bounded_dates(
+                ticker_param,
+                date_from_value,
+                date_to_value,
+            )
+            published_since_value = _updated_param(
+                published_since,
+                "published_since",
+            )
+            updated_since_value = _updated_param(
+                updated_since,
+                "updated_since",
+            )
+        except ValueError as exc:
+            return _validation_error_response(NEWS_ENDPOINT, str(exc), asof=asof)
+
         params: Dict[str, Any] = {}
-        ticker_values = tickers if tickers else symbols
-        if ticker_values:
-            params["tickers"] = _csv_param(ticker_values)
+        if ticker_param:
+            params["tickers"] = ticker_param
         if channels:
             params["channels"] = _csv_param(channels)
-        if date_from:
-            params["dateFrom"] = date_from
-        if date_to:
-            params["dateTo"] = date_to
-        if published_since is not None:
-            params["publishedSince"] = published_since
-        if updated_since is not None:
-            params["updatedSince"] = updated_since
-        if page is not None:
-            params["page"] = page
-        page_size = pagesize if pagesize is not None else limit
-        if page_size is not None:
-            params["pageSize"] = page_size
+        if date_from_value:
+            params["dateFrom"] = date_from_value
+        if date_to_value:
+            params["dateTo"] = date_to_value
+        if published_since_value is not None:
+            params["publishedSince"] = published_since_value
+        if updated_since_value is not None:
+            params["updatedSince"] = updated_since_value
+        if page_value is not None:
+            params["page"] = page_value
+        if pagesize_value is not None:
+            params["pageSize"] = pagesize_value
 
         resp = self._request(NEWS_ENDPOINT, params=params or None, asof=asof)
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        rows = _news_rows_from_payload(resp.data)
-        articles = [
-            _parse_news_article_row(row)
-            for row in rows
-            if isinstance(row, dict)
-        ]
-        return AdapterResponse(data=articles, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=NEWS_ENDPOINT,
+            keys=("news", "articles", "data", "results"),
+            page=page_value,
+            pagesize=pagesize_value,
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        articles, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_news_row_has_identity,
+            parser=_parse_news_article_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            articles,
+            raw_rows=len(rows or []),
+            page=page_value,
+            pagesize=pagesize_value,
+            extra_flags=extra_flags,
+        )
 
     def get_wiims(
         self,
@@ -595,12 +643,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        events = [
-            _parse_earnings_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "earnings")
-            if _calendar_row_has_usable_ticker(row)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=EARNINGS_ENDPOINT,
+            keys=("earnings",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_earnings_row_is_valid,
+            parser=_parse_earnings_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_guidance(
         self,
@@ -632,12 +697,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        events = [
-            _parse_guidance_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "guidance")
-            if _calendar_row_has_usable_ticker(row)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=GUIDANCE_ENDPOINT,
+            keys=("guidance",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_guidance_row_is_valid,
+            parser=_parse_guidance_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_ratings(
         self,
@@ -669,12 +751,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        events = [
-            _parse_rating_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "ratings")
-            if _calendar_row_has_usable_ticker(row)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=RATINGS_ENDPOINT,
+            keys=("ratings",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_rating_row_is_valid,
+            parser=_parse_rating_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_offerings(
         self,
@@ -706,12 +805,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        events = [
-            _parse_offering_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "offerings")
-            if _calendar_row_has_usable_ticker(row)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=OFFERINGS_ENDPOINT,
+            keys=("offerings",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_offering_row_is_valid,
+            parser=_parse_offering_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_dividends(
         self,
@@ -743,12 +859,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        events = [
-            _parse_dividend_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "dividends")
-            if _calendar_row_has_usable_ticker(row)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=DIVIDENDS_ENDPOINT,
+            keys=("dividends",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_dividend_row_is_valid,
+            parser=_parse_dividend_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_insider_filings(
         self,
@@ -780,12 +913,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        filings = [
-            _parse_insider_filing_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "data")
-            if _insider_filing_row_has_identity(row)
-        ]
-        return AdapterResponse(data=filings, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=INSIDER_FILINGS_ENDPOINT,
+            keys=("data",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        filings, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_insider_filing_row_has_identity,
+            parser=_parse_insider_filing_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            filings,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_insider_transactions(
         self,
@@ -821,12 +971,29 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        transactions = [
-            _parse_insider_transaction_row(row)
-            for row in _calendar_rows_from_payload(resp.data, "data")
-            if _insider_transaction_row_has_identity(row)
-        ]
-        return AdapterResponse(data=transactions, lineage=resp.lineage)
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=INSIDER_TRANSACTIONS_ENDPOINT,
+            keys=("data",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
+        transactions, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_insider_transaction_row_has_identity,
+            parser=_parse_insider_transaction_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            transactions,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
     def get_mergers_acquisitions(
         self,
@@ -844,19 +1011,33 @@ class BenzingaAdapter:
     ) -> AdapterResponse[List[BenzingaMergerAcquisition]]:
         """Fetch Benzinga calendar M&A rows."""
 
-        params: Dict[str, Any] = {"pagesize": pagesize}
-        if page is not None:
-            params["page"] = page
-        if tickers:
-            params["parameters[tickers]"] = _csv_param(tickers)
-        if date_from:
-            params["parameters[date_from]"] = date_from
-        if date_to:
-            params["parameters[date_to]"] = date_to
+        try:
+            page_value = _positive_int_param(page, "page", required=False)
+            pagesize_value = _positive_int_param(pagesize, "pagesize", required=True)
+            date_from_value, date_to_value = _validate_date_range(date_from, date_to)
+            ticker_param = _validated_ticker_filter(tickers, None)
+            _require_ticker_or_bounded_dates(
+                ticker_param,
+                date_from_value,
+                date_to_value,
+            )
+            updated_value = _updated_param(updated)
+        except ValueError as exc:
+            return _validation_error_response(M_AND_A_ENDPOINT, str(exc), asof=asof)
+
+        params: Dict[str, Any] = {"pagesize": pagesize_value}
+        if page_value is not None:
+            params["page"] = page_value
+        if ticker_param:
+            params["parameters[tickers]"] = ticker_param
+        if date_from_value:
+            params["parameters[date_from]"] = date_from_value
+        if date_to_value:
+            params["parameters[date_to]"] = date_to_value
         if importance is not None:
             params["parameters[importance]"] = importance
-        if updated is not None:
-            params["parameters[updated]"] = updated
+        if updated_value is not None:
+            params["parameters[updated]"] = updated_value
         if date_sort is not None:
             params["parameters[date_sort]"] = date_sort
         if cusip:
@@ -882,19 +1063,30 @@ class BenzingaAdapter:
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        if isinstance(resp.data, dict):
-            rows = resp.data.get("ma") or []
-        elif isinstance(resp.data, list):
-            rows = resp.data
-        else:
-            rows = []
+        rows, error = _rows_from_payload(
+            resp,
+            endpoint=M_AND_A_ENDPOINT,
+            keys=("ma",),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+        )
+        if error is not None:
+            return error  # type: ignore[return-value]
 
-        events = [
-            _parse_merger_acquisition_row(row)
-            for row in rows
-            if isinstance(row, dict)
-        ]
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        events, extra_flags = _parse_valid_rows(
+            rows,
+            is_valid=_merger_acquisition_row_is_valid,
+            parser=_parse_merger_acquisition_row,
+            cutoff=resp.lineage.asof_timestamp,
+        )
+        return _response_with_data(
+            resp,
+            events,
+            raw_rows=len(rows or []),
+            page=params.get("page"),
+            pagesize=params.get("pagesize"),
+            extra_flags=extra_flags,
+        )
 
 
 def _calendar_params(
@@ -907,22 +1099,339 @@ def _calendar_params(
     pagesize: int,
     updated: Optional[Union[int, str]],
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"pagesize": pagesize}
-    if page is not None:
-        params["page"] = page
+    page_value = _positive_int_param(page, "page", required=False)
+    pagesize_value = _positive_int_param(pagesize, "pagesize", required=True)
+    date_from_value, date_to_value = _validate_date_range(date_from, date_to)
+    ticker_param = _validated_ticker_filter(tickers, symbols)
+    _require_ticker_or_bounded_dates(ticker_param, date_from_value, date_to_value)
 
-    ticker_values = tickers if tickers else symbols
-    if ticker_values:
-        normalized_tickers = _calendar_ticker_csv_param(ticker_values)
-        if normalized_tickers:
-            params["parameters[tickers]"] = normalized_tickers
-    if date_from:
-        params["parameters[date_from]"] = date_from
-    if date_to:
-        params["parameters[date_to]"] = date_to
+    params: Dict[str, Any] = {"pagesize": pagesize_value}
+    if page_value is not None:
+        params["page"] = page_value
+
+    if ticker_param:
+        params["parameters[tickers]"] = ticker_param
+    if date_from_value:
+        params["parameters[date_from]"] = date_from_value
+    if date_to_value:
+        params["parameters[date_to]"] = date_to_value
     if updated is not None:
-        params["parameters[updated]"] = updated
+        params["parameters[updated]"] = _updated_param(updated)
     return params
+
+
+def _validate_ticker_values(value: Union[str, Sequence[str]]) -> Optional[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (set, frozenset)):
+        raise ValueError("Benzinga ticker parameters must be ordered string sequences")
+    else:
+        try:
+            items = list(value)
+        except TypeError as exc:
+            raise ValueError("Benzinga ticker parameters must be strings") from exc
+    normalized: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError("Benzinga ticker parameters must be strings")
+        if any(ord(ch) < 32 for ch in item):
+            raise ValueError("Benzinga ticker parameters must not contain control characters")
+        ticker = item.strip().upper()
+        if not ticker:
+            continue
+        if "," in ticker:
+            raise ValueError("Benzinga ticker parameters must not contain commas")
+        normalized.append(ticker)
+    if not normalized:
+        return None
+    return ",".join(dict.fromkeys(normalized))
+
+
+def _validate_iso_date(value: Optional[str], name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Benzinga {name} must be YYYY-MM-DD")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"Benzinga {name} must be YYYY-MM-DD")
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"Benzinga {name} must be YYYY-MM-DD") from exc
+    if parsed.strftime("%Y-%m-%d") != text:
+        raise ValueError(f"Benzinga {name} must be YYYY-MM-DD")
+    return text
+
+
+def _validate_date_range(
+    date_from: Optional[str],
+    date_to: Optional[str],
+    *,
+    from_name: str = "date_from",
+    to_name: str = "date_to",
+) -> tuple[Optional[str], Optional[str]]:
+    parsed_from = _validate_iso_date(date_from, from_name)
+    parsed_to = _validate_iso_date(date_to, to_name)
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise ValueError(f"Benzinga {from_name} must be <= {to_name}")
+    return parsed_from, parsed_to
+
+
+def _positive_int_param(
+    value: Any,
+    name: str,
+    *,
+    required: bool,
+    maximum: int = MAX_PAGESIZE,
+) -> Optional[int]:
+    if value is None:
+        if required:
+            raise ValueError(f"Benzinga {name} must be a positive integer")
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Benzinga {name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Benzinga {name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"Benzinga {name} must be a positive integer")
+    if parsed > maximum:
+        raise ValueError(f"Benzinga {name} must be <= {maximum}")
+    return parsed
+
+
+def _nonnegative_int_param(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Benzinga {name} must be a nonnegative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Benzinga {name} must be a nonnegative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"Benzinga {name} must be a nonnegative integer")
+    return parsed
+
+
+def _updated_param(value: Any, name: str = "updated") -> Optional[Union[int, str]]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Benzinga {name} must be a nonnegative integer or timestamp")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        if text and _timestamp_or_none(text) is not None:
+            return text
+        raise ValueError(
+            f"Benzinga {name} must be a nonnegative integer or timestamp"
+        )
+    if parsed < 0:
+        raise ValueError(f"Benzinga {name} must be a nonnegative integer or timestamp")
+    return parsed
+
+
+def _validated_ticker_filter(
+    tickers: Optional[Union[str, Sequence[str]]],
+    symbols: Optional[Union[str, Sequence[str]]],
+) -> Optional[str]:
+    ticker_values = tickers if tickers is not None else symbols
+    if ticker_values is None:
+        return None
+    return _validate_ticker_values(ticker_values)
+
+
+def _require_ticker_or_bounded_dates(
+    ticker_param: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+) -> None:
+    if ticker_param:
+        return
+    if date_from and date_to:
+        return
+    raise ValueError(
+        "Benzinga broad queries require a ticker filter or complete date_from/date_to bounds"
+    )
+
+
+def _page_flags(page: Optional[int], pagesize: Optional[int]) -> Dict[str, Any]:
+    flags: Dict[str, Any] = {
+        "page": page,
+        "pagesize": pagesize,
+        "pagination_unpaged": True,
+        "truncation_risk": False,
+    }
+    return flags
+
+
+def _row_flags(
+    raw_rows: int,
+    parsed_rows: int,
+    *,
+    page: Optional[int],
+    pagesize: Optional[int],
+) -> Dict[str, Any]:
+    skipped_rows = max(raw_rows - parsed_rows, 0)
+    flags = _page_flags(page, pagesize)
+    flags.update(
+        {
+            "raw_rows": raw_rows,
+            "parsed_rows": parsed_rows,
+            "skipped_rows": skipped_rows,
+            "truncation_risk": bool(pagesize and raw_rows >= pagesize),
+        }
+    )
+    if raw_rows > 0 and parsed_rows == 0:
+        flags["all_rows_skipped"] = True
+    return flags
+
+
+def _with_lineage_flags(lineage: LineageMeta, flags: Dict[str, Any]) -> LineageMeta:
+    existing = dict(lineage.data_quality_flags or {})
+    existing.update(flags)
+    return replace(lineage, data_quality_flags=existing)
+
+
+def _response_with_data(
+    resp: AdapterResponse[Any],
+    data: Any,
+    *,
+    raw_rows: int,
+    page: Optional[int],
+    pagesize: Optional[int],
+    extra_flags: Optional[Dict[str, Any]] = None,
+) -> AdapterResponse[Any]:
+    flags = _row_flags(
+        raw_rows,
+        len(data) if isinstance(data, list) else 0,
+        page=page,
+        pagesize=pagesize,
+    )
+    if isinstance(resp.data, list):
+        flags["bare_list_payload"] = True
+    if extra_flags:
+        flags.update(extra_flags)
+    return AdapterResponse(
+        data=data,
+        lineage=_with_lineage_flags(resp.lineage, flags),
+        rate_limit=resp.rate_limit,
+    )
+
+
+def _parse_valid_rows(
+    rows: Optional[List[Any]],
+    *,
+    is_valid: Any,
+    parser: Any,
+    cutoff: datetime,
+) -> tuple[List[Any], Dict[str, Any]]:
+    parsed_rows: List[Any] = []
+    warning_rows = 0
+    warning_types: Dict[str, int] = {}
+
+    for row in rows or []:
+        if not isinstance(row, dict) or not is_valid(row):
+            continue
+        row_warning_types: Dict[str, int] = {}
+        parsed_rows.append(
+            parser(row, cutoff=cutoff, warning_types=row_warning_types)
+        )
+        if row_warning_types:
+            warning_rows += 1
+            for warning_type, count in row_warning_types.items():
+                warning_types[warning_type] = warning_types.get(warning_type, 0) + count
+
+    return parsed_rows, _knowledge_warning_flags(warning_rows, warning_types)
+
+
+def _knowledge_warning_flags(
+    warning_rows: int,
+    warning_types: Dict[str, int],
+) -> Dict[str, Any]:
+    if warning_rows == 0:
+        return {}
+    return {
+        "knowledge_timestamp_warning_rows": warning_rows,
+        "knowledge_timestamp_warning_types": dict(sorted(warning_types.items())),
+    }
+
+
+def _increment_warning(warning_types: Optional[Dict[str, int]], warning_type: str) -> None:
+    if warning_types is None:
+        return
+    warning_types[warning_type] = warning_types.get(warning_type, 0) + 1
+
+
+def _parse_error_response(
+    endpoint: str,
+    lineage: LineageMeta,
+    *,
+    message: str = "Benzinga payload shape parse error",
+    flags: Optional[Dict[str, Any]] = None,
+) -> AdapterResponse[Any]:
+    parse_flags = {"payload_shape_error": True}
+    if flags:
+        parse_flags.update(flags)
+    return AdapterResponse(
+        data=None,
+        lineage=_with_lineage_flags(lineage, parse_flags),
+        error=ProviderError(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            status_code=200,
+            error_type="parse",
+            message=message,
+            retryable=False,
+        ),
+    )
+
+
+def _rows_from_payload(
+    resp: AdapterResponse[Any],
+    *,
+    endpoint: str,
+    keys: Sequence[str],
+    page: Optional[int],
+    pagesize: Optional[int],
+    allow_list_payload: bool = True,
+) -> tuple[Optional[List[Any]], Optional[AdapterResponse[Any]]]:
+    payload = resp.data
+    if isinstance(payload, list):
+        if allow_list_payload:
+            return payload, None
+        return None, _parse_error_response(
+            endpoint,
+            resp.lineage,
+            flags=_page_flags(page, pagesize),
+        )
+    if not isinstance(payload, dict):
+        return None, _parse_error_response(
+            endpoint,
+            resp.lineage,
+            flags=_page_flags(page, pagesize),
+        )
+    if not payload:
+        return [], None
+    for key in keys:
+        if key in payload:
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return rows, None
+            return None, _parse_error_response(
+                endpoint,
+                resp.lineage,
+                flags=_page_flags(page, pagesize),
+            )
+    return None, _parse_error_response(
+        endpoint,
+        resp.lineage,
+        flags=_page_flags(page, pagesize),
+    )
 
 
 def _insider_params(
@@ -935,22 +1444,25 @@ def _insider_params(
     pagesize: int,
     updated: Optional[Union[int, str]],
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"pagesize": pagesize}
-    if page is not None:
-        params["page"] = page
+    page_value = _positive_int_param(page, "page", required=False)
+    pagesize_value = _positive_int_param(pagesize, "pagesize", required=True)
+    date_from_value, date_to_value = _validate_date_range(date_from, date_to)
+    ticker_param = _validated_ticker_filter(tickers, symbols)
+    _require_ticker_or_bounded_dates(ticker_param, date_from_value, date_to_value)
 
-    ticker_values = tickers if tickers else symbols
-    if ticker_values:
-        normalized_tickers = _calendar_ticker_csv_param(ticker_values)
-        if normalized_tickers:
-            params["search_keys_type"] = "symbol"
-            params["search_keys"] = normalized_tickers
-    if date_from:
-        params["date_from"] = date_from
-    if date_to:
-        params["date_to"] = date_to
+    params: Dict[str, Any] = {"pagesize": pagesize_value}
+    if page_value is not None:
+        params["page"] = page_value
+
+    if ticker_param:
+        params["search_keys_type"] = "symbol"
+        params["search_keys"] = ticker_param
+    if date_from_value:
+        params["date_from"] = date_from_value
+    if date_to_value:
+        params["date_to"] = date_to_value
     if updated is not None:
-        params["updated_since"] = updated
+        params["updated_since"] = _updated_param(updated)
     return params
 
 
@@ -970,11 +1482,125 @@ def _calendar_row_has_usable_ticker(row: Dict[str, Any]) -> bool:
 
 
 def _insider_filing_row_has_identity(row: Dict[str, Any]) -> bool:
-    return _has_nonblank_field(row, "id", "accession_number")
+    return (
+        _has_nonblank_field(row, "id", "accession_number")
+        and _has_nonblank_field(row, "company_symbol")
+        and _has_valid_timestamp(row.get("filing_date"))
+        and not _has_negative_decimal(row, "remaining_shares")
+    )
 
 
 def _insider_transaction_row_has_identity(row: Dict[str, Any]) -> bool:
-    return _has_nonblank_field(row, "transaction_id")
+    filing = _dict_or_empty(row.get("filing"))
+    return _has_nonblank_field(row, "transaction_id") and (
+        _has_nonblank_field(row, "company_symbol")
+        or _has_nonblank_field(filing, "company_symbol")
+    ) and (
+        _has_valid_timestamp(row.get("filing_date"))
+        or _has_valid_timestamp(filing.get("filing_date"))
+    ) and _insider_transaction_numbers_are_valid(row)
+
+
+def _news_row_has_identity(row: Dict[str, Any]) -> bool:
+    if _has_nonblank_field(row, "id"):
+        return True
+    return _valid_http_url(_first_string(row, "url", "link"))
+
+
+def _earnings_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _calendar_row_has_usable_ticker(row)
+        and _required_row_date(row, "date")
+        and not _has_negative_decimal(
+            row,
+            "revenue",
+            "revenue_est",
+            "revenue_prior",
+            "revenue_surprise",
+        )
+    )
+
+
+def _guidance_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _calendar_row_has_usable_ticker(row)
+        and _required_row_date(row, "date")
+        and not _has_negative_decimal(
+            row,
+            "revenue_guidance_est",
+            "revenue_guidance_min",
+            "revenue_guidance_max",
+            "revenue_guidance_prior_min",
+            "revenue_guidance_prior_max",
+        )
+    )
+
+
+def _rating_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _calendar_row_has_usable_ticker(row)
+        and _required_row_date(row, "date")
+        and not _has_negative_decimal(
+            row,
+            "pt_current",
+            "pt_prior",
+            "adjusted_pt_current",
+            "adjusted_pt_prior",
+        )
+    )
+
+
+def _offering_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _calendar_row_has_usable_ticker(row)
+        and _required_row_date(row, "date")
+        and not _has_negative_decimal(
+            row,
+            "price",
+            "number_shares",
+            "dollar_shares",
+            "proceeds",
+        )
+    )
+
+
+def _dividend_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _calendar_row_has_usable_ticker(row)
+        and _required_row_date(row, "date", "ex_dividend_date")
+        and not _has_negative_decimal(
+            row,
+            "dividend",
+            "dividend_prior",
+            "dividend_yield",
+        )
+    )
+
+
+def _insider_transaction_numbers_are_valid(row: Dict[str, Any]) -> bool:
+    return not _has_negative_decimal(
+        row,
+        "conversion_exercise_price_derivative",
+        "post_transaction_quantity",
+        "price_per_share",
+        "remaining_underlying_shares",
+        "shares",
+        "underlying_shares",
+    )
+
+
+def _merger_acquisition_row_is_valid(row: Dict[str, Any]) -> bool:
+    return (
+        _has_nonblank_field(
+            row,
+            "id",
+            "target_ticker",
+            "target_cusip",
+            "target_isin",
+            "target_name",
+        )
+        and not _has_negative_deal_size(row.get("deal_size"))
+    )
 
 
 def _has_nonblank_field(row: Dict[str, Any], *keys: str) -> bool:
@@ -983,6 +1609,72 @@ def _has_nonblank_field(row: Dict[str, Any], *keys: str) -> bool:
         if text is not None and text.strip() != "":
             return True
     return False
+
+
+def _valid_http_url(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    text = value.strip()
+    if not text or any(ord(ch) < 32 for ch in text):
+        return False
+    parsed = urlparse(text)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _row_iso_date_value(row: Dict[str, Any], key: str) -> Optional[str]:
+    value = row.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return text if parsed.strftime("%Y-%m-%d") == text else None
+
+
+def _required_row_date(row: Dict[str, Any], *keys: str) -> bool:
+    has_present = False
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        has_present = True
+        if _row_iso_date_value(row, key) is None:
+            return False
+    return has_present
+
+
+def _has_valid_timestamp(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return _timestamp_or_none(value) is not None
+
+
+def _has_negative_decimal(row: Dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        parsed = _decimal_or_none(value)
+        if parsed is not None and parsed < 0:
+            return True
+    return False
+
+
+def _has_negative_deal_size(value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    parsed = _decimal_or_none(value)
+    return bool(parsed is not None and parsed < 0)
 
 
 def _calendar_ticker_csv_param(value: Union[str, Sequence[str]]) -> Optional[str]:
@@ -1028,27 +1720,41 @@ def _news_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _parse_news_article_row(row: Dict[str, Any]) -> BenzingaNewsArticle:
+def _parse_news_article_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaNewsArticle:
     stock_rows = _stock_rows(row.get("stocks"))
     return BenzingaNewsArticle(
         id=_string_or_none(row.get("id")),
-        created=_timestamp_or_none(
+        created=_knowledge_timestamp_or_none(
             row.get("created")
             or row.get("created_at")
-            or row.get("createdAt")
+            or row.get("createdAt"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="news_created_future",
         ),
-        updated=_timestamp_or_none(
+        updated=_knowledge_timestamp_or_none(
             row.get("updated")
             or row.get("updated_at")
-            or row.get("updatedAt")
+            or row.get("updatedAt"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="news_updated_future",
         ),
-        published=_timestamp_or_none(
+        published=_knowledge_timestamp_or_none(
             row.get("published")
             or row.get("published_at")
             or row.get("publishedAt")
-            or row.get("published_date")
-            or row.get("date")
+            or row.get("published_date"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="news_published_future",
         ),
+        event_date=_string_or_none(row.get("date")),
         title=_string_or_none(row.get("title")),
         body=_first_string(row, "body", "content"),
         teaser=_first_string(row, "teaser", "summary", "description"),
@@ -1067,11 +1773,16 @@ def _parse_news_article_row(row: Dict[str, Any]) -> BenzingaNewsArticle:
             _named_strings(row.get("categories"))
             + _named_strings(row.get("category"))
         ),
-        raw=dict(row),
+        raw=deepcopy(row),
     )
 
 
-def _parse_earnings_row(row: Dict[str, Any]) -> BenzingaEarnings:
+def _parse_earnings_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaEarnings:
     return BenzingaEarnings(
         id=_string_or_none(row.get("id")),
         ticker=_string_or_none(row.get("ticker")),
@@ -1101,12 +1812,22 @@ def _parse_earnings_row(row: Dict[str, Any]) -> BenzingaEarnings:
         date_confirmed=_bool_or_none(row.get("date_confirmed")),
         importance=_int_or_none(row.get("importance")),
         notes=_string_or_none(row.get("notes")),
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="calendar_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_guidance_row(row: Dict[str, Any]) -> BenzingaGuidance:
+def _parse_guidance_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaGuidance:
     return BenzingaGuidance(
         id=_string_or_none(row.get("id")),
         ticker=_string_or_none(row.get("ticker")),
@@ -1142,12 +1863,22 @@ def _parse_guidance_row(row: Dict[str, Any]) -> BenzingaGuidance:
         prelim=_bool_or_none(row.get("prelim")),
         importance=_int_or_none(row.get("importance")),
         notes=_string_or_none(row.get("notes")),
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="calendar_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_rating_row(row: Dict[str, Any]) -> BenzingaRating:
+def _parse_rating_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaRating:
     return BenzingaRating(
         id=_string_or_none(row.get("id")),
         ticker=_string_or_none(row.get("ticker")),
@@ -1178,12 +1909,22 @@ def _parse_rating_row(row: Dict[str, Any]) -> BenzingaRating:
         url=_string_or_none(row.get("url")),
         url_calendar=_string_or_none(row.get("url_calendar")),
         url_news=_string_or_none(row.get("url_news")),
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="calendar_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_offering_row(row: Dict[str, Any]) -> BenzingaOffering:
+def _parse_offering_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaOffering:
     return BenzingaOffering(
         id=_string_or_none(row.get("id")),
         ticker=_string_or_none(row.get("ticker")),
@@ -1202,12 +1943,22 @@ def _parse_offering_row(row: Dict[str, Any]) -> BenzingaOffering:
         importance=_int_or_none(row.get("importance")),
         notes=_string_or_none(row.get("notes")),
         url=_string_or_none(row.get("url")),
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="calendar_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_dividend_row(row: Dict[str, Any]) -> BenzingaDividend:
+def _parse_dividend_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaDividend:
     return BenzingaDividend(
         id=_string_or_none(row.get("id")),
         ticker=_string_or_none(row.get("ticker")),
@@ -1231,20 +1982,42 @@ def _parse_dividend_row(row: Dict[str, Any]) -> BenzingaDividend:
         year=_int_or_none(row.get("year")),
         importance=_int_or_none(row.get("importance")),
         notes=_string_or_none(row.get("notes")),
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="calendar_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_insider_filing_row(row: Dict[str, Any]) -> BenzingaInsiderFiling:
+def _parse_insider_filing_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaInsiderFiling:
     owner = _dict_or_empty(row.get("owner"))
+    _warn_future_knowledge_fields(
+        row,
+        ("accepted", "accepted_at", "accepted_date", "acceptance_date"),
+        cutoff=cutoff,
+        warning_types=warning_types,
+        warning_type="insider_accepted_future",
+    )
     return BenzingaInsiderFiling(
         id=_string_or_none(row.get("id")),
         accession_number=_string_or_none(row.get("accession_number")),
         company_cik=_string_or_none(row.get("company_cik")),
         company_name=_string_or_none(row.get("company_name")),
         company_symbol=_string_or_none(row.get("company_symbol")),
-        filing_date=_timestamp_or_none(row.get("filing_date")),
+        filing_date=_knowledge_timestamp_or_none(
+            row.get("filing_date"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="insider_filing_date_future",
+        ),
         form_type=_string_or_none(row.get("form_type")),
         html_url=_string_or_none(row.get("html_url")),
         is_10b5=_bool_or_none(row.get("is_10b5")),
@@ -1260,16 +2033,40 @@ def _parse_insider_filing_row(row: Dict[str, Any]) -> BenzingaInsiderFiling:
         footnotes=_dict_rows(row.get("footnotes")),
         transactions=_dict_rows(row.get("transactions")),
         owner=owner,
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="insider_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_insider_transaction_row(row: Dict[str, Any]) -> BenzingaInsiderTransaction:
+def _parse_insider_transaction_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaInsiderTransaction:
     filing = _dict_or_empty(row.get("filing"))
     owner = _dict_or_empty(row.get("owner"))
     if not owner:
         owner = _dict_or_empty(filing.get("owner"))
+    _warn_future_knowledge_fields(
+        row,
+        ("accepted", "accepted_at", "accepted_date", "acceptance_date"),
+        cutoff=cutoff,
+        warning_types=warning_types,
+        warning_type="insider_accepted_future",
+    )
+    _warn_future_knowledge_fields(
+        filing,
+        ("accepted", "accepted_at", "accepted_date", "acceptance_date"),
+        cutoff=cutoff,
+        warning_types=warning_types,
+        warning_type="insider_accepted_future",
+    )
 
     return BenzingaInsiderTransaction(
         transaction_id=_string_or_none(row.get("transaction_id")),
@@ -1283,7 +2080,12 @@ def _parse_insider_transaction_row(row: Dict[str, Any]) -> BenzingaInsiderTransa
         company_symbol=_string_or_none(
             row.get("company_symbol") or filing.get("company_symbol")
         ),
-        filing_date=_timestamp_or_none(row.get("filing_date") or filing.get("filing_date")),
+        filing_date=_knowledge_timestamp_or_none(
+            row.get("filing_date") or filing.get("filing_date"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="insider_filing_date_future",
+        ),
         form_type=_string_or_none(row.get("form_type") or filing.get("form_type")),
         filing_id=_string_or_none(row.get("filing_id") or filing.get("id")),
         html_url=_string_or_none(row.get("html_url") or filing.get("html_url")),
@@ -1321,12 +2123,37 @@ def _parse_insider_transaction_row(row: Dict[str, Any]) -> BenzingaInsiderTransa
         voluntarily_reported=_bool_or_none(row.get("voluntarily_reported")),
         owner=owner,
         filing=filing,
-        updated=_timestamp_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_timestamp_or_none(
+            _first_present(row, "updated", "updated_at", "last_updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="insider_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
-def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisition:
+def _parse_merger_acquisition_row(
+    row: Dict[str, Any],
+    *,
+    cutoff: Optional[datetime] = None,
+    warning_types: Optional[Dict[str, int]] = None,
+) -> BenzingaMergerAcquisition:
+    _warn_future_knowledge_fields(
+        row,
+        (
+            "announced",
+            "announced_at",
+            "date_announced",
+            "published",
+            "published_at",
+            "created",
+            "created_at",
+        ),
+        cutoff=cutoff,
+        warning_types=warning_types,
+        warning_type="ma_publication_future",
+    )
     return BenzingaMergerAcquisition(
         id=_string_or_none(row.get("id")),
         target_ticker=_string_or_none(row.get("target_ticker")),
@@ -1378,8 +2205,13 @@ def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisit
         deal_terms_extra=_string_or_none(row.get("deal_terms_extra")),
         notes=_string_or_none(row.get("notes")),
         importance=_int_or_none(row.get("importance")),
-        updated=_int_or_none(row.get("updated")),
-        raw=dict(row),
+        updated=_knowledge_epoch_int_or_none(
+            row.get("updated"),
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type="ma_updated_future",
+        ),
+        raw=deepcopy(row),
     )
 
 
@@ -1480,6 +2312,17 @@ def _first_string(row: Dict[str, Any], *keys: str) -> Optional[str]:
     return None
 
 
+def _first_present(row: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
 def _normalize_identifier(value: Any, *, kind: str) -> Optional[str]:
     text = _string_or_none(value)
     if text is None:
@@ -1571,6 +2414,63 @@ def _timestamp_or_none(value: Any) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     return _timestamp_or_none(parsed)
+
+
+def _knowledge_timestamp_or_none(
+    value: Any,
+    *,
+    cutoff: Optional[datetime],
+    warning_types: Optional[Dict[str, int]],
+    warning_type: str,
+) -> Optional[datetime]:
+    parsed = _timestamp_or_none(value)
+    if parsed is None:
+        return None
+    if cutoff is not None and parsed > cutoff + KNOWLEDGE_TIMESTAMP_FUTURE_TOLERANCE:
+        _increment_warning(warning_types, warning_type)
+        return None
+    return parsed
+
+
+def _knowledge_epoch_int_or_none(
+    value: Any,
+    *,
+    cutoff: Optional[datetime],
+    warning_types: Optional[Dict[str, int]],
+    warning_type: str,
+) -> Optional[int]:
+    parsed = _int_or_none(value)
+    if parsed is None:
+        return None
+    parsed_timestamp = _timestamp_or_none(parsed)
+    if (
+        parsed_timestamp is not None
+        and cutoff is not None
+        and parsed_timestamp > cutoff + KNOWLEDGE_TIMESTAMP_FUTURE_TOLERANCE
+    ):
+        _increment_warning(warning_types, warning_type)
+        return None
+    return parsed
+
+
+def _warn_future_knowledge_fields(
+    row: Dict[str, Any],
+    keys: Sequence[str],
+    *,
+    cutoff: Optional[datetime],
+    warning_types: Optional[Dict[str, int]],
+    warning_type: str,
+) -> None:
+    for key in keys:
+        value = row.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        _knowledge_timestamp_or_none(
+            value,
+            cutoff=cutoff,
+            warning_types=warning_types,
+            warning_type=warning_type,
+        )
 
 
 def _validation_error_response(
