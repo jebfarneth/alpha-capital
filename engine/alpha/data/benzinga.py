@@ -3,14 +3,16 @@ Benzinga adapter.
 
 Supplemental event source for:
   - M&A and acquisition evidence for survivorship/corporate-action review
+  - News/WIIMs catalyst context for event diagnostics
 
 Does not write to DB. Returns AdapterResponse with LineageMeta.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import requests
@@ -27,6 +29,8 @@ from alpha.data.contracts import (
 
 PROVIDER = "Benzinga"
 M_AND_A_ENDPOINT = "/api/v2.1/calendar/ma"
+NEWS_ENDPOINT = "/api/v2/news"
+WIIM_CHANNEL = "wiim"
 
 
 @dataclass
@@ -56,6 +60,28 @@ class BenzingaMergerAcquisition:
     notes: Optional[str] = None
     importance: Optional[int] = None
     updated: Optional[int] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaNewsArticle:
+    """Normalized Benzinga news row with raw payload preserved."""
+
+    id: Optional[str]
+    created: Optional[datetime] = None
+    updated: Optional[datetime] = None
+    published: Optional[datetime] = None
+    title: Optional[str] = None
+    body: Optional[str] = None
+    teaser: Optional[str] = None
+    url: Optional[str] = None
+    author: Optional[str] = None
+    source: Optional[str] = None
+    stocks: List[Dict[str, Any]] = field(default_factory=list)
+    tickers: List[str] = field(default_factory=list)
+    channels: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    categories: List[str] = field(default_factory=list)
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -220,6 +246,85 @@ class BenzingaAdapter:
 
         return AdapterResponse(data=data, lineage=lineage)
 
+    def get_news(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        channels: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        published_since: Optional[Union[str, int]] = None,
+        updated_since: Optional[Union[str, int]] = None,
+        page: Optional[int] = None,
+        pagesize: Optional[int] = None,
+        limit: Optional[int] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaNewsArticle]]:
+        """Fetch Benzinga news article rows as catalyst/context evidence."""
+
+        params: Dict[str, Any] = {}
+        ticker_values = tickers if tickers else symbols
+        if ticker_values:
+            params["tickers"] = _csv_param(ticker_values)
+        if channels:
+            params["channels"] = _csv_param(channels)
+        if date_from:
+            params["dateFrom"] = date_from
+        if date_to:
+            params["dateTo"] = date_to
+        if published_since is not None:
+            params["publishedSince"] = published_since
+        if updated_since is not None:
+            params["updatedSince"] = updated_since
+        if page is not None:
+            params["page"] = page
+        page_size = pagesize if pagesize is not None else limit
+        if page_size is not None:
+            params["pageSize"] = page_size
+
+        resp = self._request(NEWS_ENDPOINT, params=params or None, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        rows = _news_rows_from_payload(resp.data)
+        articles = [
+            _parse_news_article_row(row)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return AdapterResponse(data=articles, lineage=resp.lineage)
+
+    def get_wiims(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        published_since: Optional[Union[str, int]] = None,
+        updated_since: Optional[Union[str, int]] = None,
+        page: Optional[int] = None,
+        pagesize: Optional[int] = None,
+        limit: Optional[int] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaNewsArticle]]:
+        """Fetch Benzinga WIIM-channel news rows."""
+
+        return self.get_news(
+            tickers=tickers,
+            symbols=symbols,
+            channels=WIIM_CHANNEL,
+            date_from=date_from,
+            date_to=date_to,
+            published_since=published_since,
+            updated_since=updated_since,
+            page=page,
+            pagesize=pagesize,
+            limit=limit,
+            asof=asof,
+        )
+
     def get_mergers_acquisitions(
         self,
         tickers: Optional[Union[str, Sequence[str]]] = None,
@@ -289,6 +394,62 @@ class BenzingaAdapter:
         return AdapterResponse(data=events, lineage=resp.lineage)
 
 
+def _news_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("news", "articles", "data", "results"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+def _parse_news_article_row(row: Dict[str, Any]) -> BenzingaNewsArticle:
+    stock_rows = _stock_rows(row.get("stocks"))
+    return BenzingaNewsArticle(
+        id=_string_or_none(row.get("id")),
+        created=_timestamp_or_none(
+            row.get("created")
+            or row.get("created_at")
+            or row.get("createdAt")
+        ),
+        updated=_timestamp_or_none(
+            row.get("updated")
+            or row.get("updated_at")
+            or row.get("updatedAt")
+        ),
+        published=_timestamp_or_none(
+            row.get("published")
+            or row.get("published_at")
+            or row.get("publishedAt")
+            or row.get("published_date")
+            or row.get("date")
+        ),
+        title=_string_or_none(row.get("title")),
+        body=_first_string(row, "body", "content"),
+        teaser=_first_string(row, "teaser", "summary", "description"),
+        url=_first_string(row, "url", "link"),
+        author=_string_or_none(row.get("author")),
+        source=_first_string(row, "source", "source_name", "provider"),
+        stocks=stock_rows,
+        tickers=_dedupe_strings(
+            _ticker_strings(row.get("tickers"))
+            + _ticker_strings(row.get("symbols"))
+            + _ticker_strings(stock_rows)
+        ),
+        channels=_named_strings(row.get("channels")),
+        tags=_named_strings(row.get("tags")),
+        categories=_dedupe_strings(
+            _named_strings(row.get("categories"))
+            + _named_strings(row.get("category"))
+        ),
+        raw=dict(row),
+    )
+
+
 def _parse_merger_acquisition_row(row: Dict[str, Any]) -> BenzingaMergerAcquisition:
     return BenzingaMergerAcquisition(
         id=_string_or_none(row.get("id")),
@@ -350,6 +511,71 @@ def _csv_param(value: Union[str, Sequence[str]]) -> str:
     return value if isinstance(value, str) else ",".join(value)
 
 
+def _stock_rows(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        rows: List[Dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                rows.append(dict(item))
+            else:
+                text = _string_or_none(item)
+                if text is not None:
+                    rows.append({"ticker": text})
+        return rows
+    if isinstance(value, dict):
+        return [dict(value)]
+    text = _string_or_none(value)
+    if text is None:
+        return []
+    return [{"ticker": part.strip()} for part in text.split(",") if part.strip()]
+
+
+def _ticker_strings(value: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+
+    for item in items:
+        if isinstance(item, dict):
+            text = _first_string(item, "ticker", "symbol", "name")
+        else:
+            text = _string_or_none(item)
+        if text is None:
+            continue
+        values.extend(part.strip().upper() for part in text.split(",") if part.strip())
+    return values
+
+
+def _named_strings(value: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+
+    for item in items:
+        if isinstance(item, dict):
+            text = _first_string(item, "name", "channel", "category", "tag", "slug", "id")
+        else:
+            text = _string_or_none(item)
+        if text is None:
+            continue
+        values.extend(part.strip() for part in text.split(",") if part.strip())
+    return _dedupe_strings(values)
+
+
+def _dedupe_strings(values: Sequence[str]) -> List[str]:
+    seen = set()
+    deduped: List[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
 def _identifier_csv_param(
     value: Union[str, Sequence[str]],
     *,
@@ -404,6 +630,42 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _timestamp_or_none(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric = numeric / 1000
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return _timestamp_or_none(float(text))
+    except ValueError:
+        pass
+
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        return _timestamp_or_none(parsed)
+
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    return _timestamp_or_none(parsed)
 
 
 def _validation_error_response(

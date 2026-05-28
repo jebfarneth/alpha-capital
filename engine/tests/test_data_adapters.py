@@ -1307,6 +1307,212 @@ class TestBenzingaAdapter:
     def _adapter(self, mock_session):
         return BenzingaAdapter(_benzinga_config(), session=mock_session)
 
+    def test_get_news_ok(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "news": [
+                {
+                    "id": 123,
+                    "created": "2026-05-27T12:00:00Z",
+                    "updated": 1779883200,
+                    "published": "Wed, 27 May 2026 08:15:00 -0400",
+                    "title": "Acme wins contract",
+                    "body": "Full article body",
+                    "teaser": "Short article teaser",
+                    "url": "https://benzinga.example/news/123",
+                    "author": "Newsdesk",
+                    "source": "Benzinga",
+                    "stocks": [{"name": "ACME", "exchange": "NASDAQ"}],
+                    "channels": [{"name": "News"}, {"name": "WIIM"}],
+                    "tags": [{"name": "contract"}],
+                    "categories": ["press releases"],
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news(
+            symbols=["ACME", "BETA"],
+            channels=["news", "wiim"],
+            date_from="2026-05-01",
+            date_to="2026-05-27",
+            published_since="2026-05-01T00:00:00Z",
+            updated_since=1779796800,
+            page=1,
+            limit=25,
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        article = resp.data[0]
+        assert article.id == "123"
+        assert article.created == datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
+        assert article.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert article.published == datetime(2026, 5, 27, 12, 15, tzinfo=timezone.utc)
+        assert article.title == "Acme wins contract"
+        assert article.body == "Full article body"
+        assert article.teaser == "Short article teaser"
+        assert article.url == "https://benzinga.example/news/123"
+        assert article.author == "Newsdesk"
+        assert article.source == "Benzinga"
+        assert article.stocks == [{"name": "ACME", "exchange": "NASDAQ"}]
+        assert article.tickers == ["ACME"]
+        assert article.channels == ["News", "WIIM"]
+        assert article.tags == ["contract"]
+        assert article.categories == ["press releases"]
+        assert article.raw["id"] == 123
+        assert resp.lineage.provider == "Benzinga"
+        assert resp.lineage.endpoint == "/api/v2/news"
+        assert resp.lineage.source_authority == "Benzinga"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v2/news",
+            params={
+                "tickers": "ACME,BETA",
+                "channels": "news,wiim",
+                "dateFrom": "2026-05-01",
+                "dateTo": "2026-05-27",
+                "publishedSince": "2026-05-01T00:00:00Z",
+                "updatedSince": 1779796800,
+                "page": 1,
+                "pageSize": 25,
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
+    def test_get_wiims_uses_wiim_channel(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "news": [
+                {
+                    "id": "wiim-1",
+                    "title": "Why ACME shares are trading higher",
+                    "stocks": "ACME",
+                    "channels": [{"name": "WIIM"}],
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_wiims("ACME", pagesize=5)
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].id == "wiim-1"
+        assert resp.data[0].tickers == ["ACME"]
+        assert resp.data[0].channels == ["WIIM"]
+        params = session.get.call_args.kwargs["params"]
+        assert params["channels"] == "wiim"
+        assert params["tickers"] == "ACME"
+        assert params["pageSize"] == 5
+        assert params["token"] == "test-benzinga-key"
+
+    def test_get_news_empty_list_response_is_empty_success(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, [])
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    def test_get_news_auth_error(self, status_code):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(status_code, text="Unauthorized")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "auth"
+        assert resp.error.status_code == status_code
+        assert resp.error.retryable is False
+
+    def test_get_news_rate_limit_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(429, text="Rate limit")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "rate_limit"
+        assert resp.error.retryable is True
+
+    def test_get_news_provider_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(500, text="Internal Server Error")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.status_code == 500
+        assert resp.error.retryable is True
+
+    def test_get_news_timeout_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = requests.exceptions.Timeout("timed out")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "timeout"
+        assert resp.error.retryable is True
+
+    def test_get_news_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        resp_mock = _mock_response(200, text="not json")
+        resp_mock.json.side_effect = ValueError("parse fail")
+        session.get.return_value = resp_mock
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+
+    def test_get_news_timestamp_parsing_variants(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "news": [
+                {
+                    "id": "time-1",
+                    "created": "2026-05-27 12:00:00",
+                    "updated": "1779883200000",
+                    "published": "Wed, 27 May 2026 08:15:00 -0400",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news()
+
+        assert resp.ok
+        article = resp.data[0]
+        assert article.created == datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
+        assert article.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert article.published == datetime(2026, 5, 27, 12, 15, tzinfo=timezone.utc)
+
+    def test_get_news_lineage_does_not_expose_secret(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"news": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert resp.ok
+        assert "test-benzinga-key" not in repr(resp.lineage)
+        assert resp.lineage.data_quality_flags is None
+
     def test_get_mergers_acquisitions_ok(self):
         session = MagicMock(spec=requests.Session)
         json_data = {
