@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
+from alpha.assembly.signal_context import enrich_m4_signal_context
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage
@@ -43,11 +44,17 @@ class M4DailyAssemblyJob(BaseJob):
         session: Session,
         *,
         adapter: Any,
+        polygon_adapter: Any = None,
+        benzinga_adapter: Any = None,
+        enable_signal_context: bool = True,
         run_timestamp: Optional[datetime] = None,
         lookback_calendar_days: int = 430,
     ):
         self._session = session
         self._adapter = adapter
+        self._polygon_adapter = polygon_adapter
+        self._benzinga_adapter = benzinga_adapter
+        self._enable_signal_context = enable_signal_context
         self._run_timestamp = run_timestamp
         self._lookback_calendar_days = lookback_calendar_days
 
@@ -185,6 +192,19 @@ class M4DailyAssemblyJob(BaseJob):
                 if lineage_id not in inp.lineage_ids:
                     inp.lineage_ids.append(lineage_id)
 
+        signal_context_metrics: Dict[str, Any] = {}
+        if self._enable_signal_context:
+            signal_context_metrics = enrich_m4_signal_context(
+                assembly.inputs,
+                session=self._session,
+                polygon_adapter=self._polygon_adapter,
+                benzinga_adapter=self._benzinga_adapter,
+                cutoff_timestamp=cutoff_timestamp,
+                decision_date=decision_date,
+                evidence_session_date=evidence_session_date,
+                job_run_id=ctx.job_run_id,
+            )
+
         if not assembly.inputs:
             return JobResult(
                 status="failed",
@@ -234,6 +254,7 @@ class M4DailyAssemblyJob(BaseJob):
             "assembly": _assembly_metrics(assembly),
             "security_identity_present_count": identity_injected,
             "security_identity_snapshot_count": len(identity_by_ticker),
+            "signal_context": signal_context_metrics,
             "orchestration": orchestration_result.metrics,
         }
 

@@ -261,6 +261,42 @@ class TestM4Firing:
         assert f["breakout_extension"] == 0.0
         assert f["X_M4"] == 1.0
 
+    def test_signal_context_passes_through_without_changing_m4_firing(self):
+        det = M4Detector()
+        base_market = _m4_base_data(
+            price=11.00,
+            high_52w=10.00,
+            cohort_extensions=_cohort_extensions(30, 0.15),
+        )
+        context = {
+            "schema_version": "m4-signal-context-v1",
+            "polygon_short_interest": {
+                "status": "matched",
+                "short_interest": 1200,
+            },
+        }
+        without_context = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=base_market,
+            lineage_hashes=["hash1"],
+        ))
+        with_context = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data={**base_market, "signal_context": context},
+            lineage_hashes=["hash1"],
+        ))
+
+        assert with_context.has_signal == without_context.has_signal
+        assert with_context.signals[0].raw_signal_strength == (
+            without_context.signals[0].raw_signal_strength
+        )
+        assert with_context.signals[0].raw_expected_edge == (
+            without_context.signals[0].raw_expected_edge
+        )
+        assert with_context.features.features["signal_context"] == context
+
     def test_missing_cohort_still_fires(self):
         det = M4Detector()
         inp = PatternInput(

@@ -14,8 +14,10 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from alpha.data.config import FmpConfig
+from alpha.data.benzinga import BenzingaAdapter
+from alpha.data.config import BenzingaConfig, ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter
+from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
 from alpha.jobs.m4_daily import M4DailyAssemblyJob
 from alpha.jobs.runner import run_job
@@ -58,9 +60,13 @@ def _run_live(args: argparse.Namespace) -> int:
 
     try:
         adapter = FmpAdapter(FmpConfig.from_env())
+        polygon_adapter = _optional_polygon_adapter()
+        benzinga_adapter = _optional_benzinga_adapter()
         job = M4DailyAssemblyJob(
             session=session,
             adapter=adapter,
+            polygon_adapter=polygon_adapter,
+            benzinga_adapter=benzinga_adapter,
             run_timestamp=_parse_timestamp(args.run_timestamp),
             lookback_calendar_days=args.lookback_calendar_days,
         )
@@ -86,6 +92,9 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Fetched symbols:        {metrics.get('fetched_symbol_count')}")
         print(f"Fetched bars:           {metrics.get('fetched_bar_count')}")
         print(f"Fetch errors:           {metrics.get('fetch_error_count')}")
+        context_metrics = metrics.get("signal_context") or {}
+        print(f"Context attempts:       {context_metrics.get('source_attempt_count')}")
+        print(f"Context provider errs:  {context_metrics.get('provider_error_count')}")
         print(f"Assembled M4 inputs:    {assembly.get('assembled_count')}")
         print(f"M4 signals persisted:   {orchestration.get('total_signals_persisted')}")
         if result.errors:
@@ -95,6 +104,20 @@ def _run_live(args: argparse.Namespace) -> int:
         return 0 if result.ok else 1
     finally:
         session.close()
+
+
+def _optional_polygon_adapter() -> PolygonAdapter | None:
+    try:
+        return PolygonAdapter(PolygonConfig.from_env())
+    except ConfigError:
+        return None
+
+
+def _optional_benzinga_adapter() -> BenzingaAdapter | None:
+    try:
+        return BenzingaAdapter(BenzingaConfig.from_env())
+    except ConfigError:
+        return None
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
