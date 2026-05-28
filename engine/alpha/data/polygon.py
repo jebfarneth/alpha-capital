@@ -2,7 +2,7 @@
 Polygon.io adapter.
 
 Supplemental source for:
-  - Short interest / borrow / lending data for I3 (EERR 2024 loan fee signal)
+  - Short-interest / short-volume proxy data for future I3 LITE work
   - Ticker details
   - Market data where needed
 
@@ -35,6 +35,8 @@ TICKERS_ENDPOINT = "/v3/reference/tickers"
 TICKER_EVENTS_ENDPOINT_PREFIX = "/vX/reference/tickers"
 SPLITS_ENDPOINT = "/stocks/v1/splits"
 DIVIDENDS_ENDPOINT = "/stocks/v1/dividends"
+SHORT_INTEREST_ENDPOINT = "/stocks/v1/short-interest"
+SHORT_VOLUME_ENDPOINT = "/stocks/v1/short-volume"
 POLYGON_API_HOSTS = {"api.polygon.io", "api.massive.com"}
 
 
@@ -48,7 +50,30 @@ class PolygonShortInterest:
     settlement_date: str
     short_interest: Optional[int] = None
     avg_daily_volume: Optional[int] = None
-    days_to_cover: Optional[float] = None
+    days_to_cover: Optional[Decimal] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PolygonShortVolume:
+    """Normalized Polygon short-volume observation with raw payload preserved."""
+
+    ticker: str
+    date: str
+    short_volume: Optional[Decimal] = None
+    total_volume: Optional[Decimal] = None
+    short_volume_ratio: Optional[Decimal] = None
+    exempt_volume: Optional[Decimal] = None
+    non_exempt_volume: Optional[Decimal] = None
+    adf_short_volume: Optional[Decimal] = None
+    adf_short_volume_exempt: Optional[Decimal] = None
+    nasdaq_carteret_short_volume: Optional[Decimal] = None
+    nasdaq_carteret_short_volume_exempt: Optional[Decimal] = None
+    nasdaq_chicago_short_volume: Optional[Decimal] = None
+    nasdaq_chicago_short_volume_exempt: Optional[Decimal] = None
+    nyse_short_volume: Optional[Decimal] = None
+    nyse_short_volume_exempt: Optional[Decimal] = None
+    raw: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -350,6 +375,7 @@ class PolygonAdapter:
     def get_splits(
         self,
         ticker: Optional[str] = None,
+        execution_date: Optional[str] = None,
         *,
         execution_date_from: Optional[str] = None,
         execution_date_to: Optional[str] = None,
@@ -364,6 +390,8 @@ class PolygonAdapter:
         validation_error = _validate_corporate_action_query(
             endpoint=SPLITS_ENDPOINT,
             ticker=ticker,
+            date_field="execution_date",
+            date_value=execution_date,
             date_from=execution_date_from,
             date_to=execution_date_to,
             max_pages=max_pages,
@@ -375,6 +403,7 @@ class PolygonAdapter:
         params = _corporate_action_params(
             ticker=ticker,
             date_field="execution_date",
+            date_value=execution_date,
             date_from=execution_date_from,
             date_to=execution_date_to,
             limit=limit,
@@ -405,6 +434,7 @@ class PolygonAdapter:
     def get_dividends(
         self,
         ticker: Optional[str] = None,
+        ex_dividend_date: Optional[str] = None,
         *,
         ex_dividend_date_from: Optional[str] = None,
         ex_dividend_date_to: Optional[str] = None,
@@ -419,6 +449,8 @@ class PolygonAdapter:
         validation_error = _validate_corporate_action_query(
             endpoint=DIVIDENDS_ENDPOINT,
             ticker=ticker,
+            date_field="ex_dividend_date",
+            date_value=ex_dividend_date,
             date_from=ex_dividend_date_from,
             date_to=ex_dividend_date_to,
             max_pages=max_pages,
@@ -430,6 +462,7 @@ class PolygonAdapter:
         params = _corporate_action_params(
             ticker=ticker,
             date_field="ex_dividend_date",
+            date_value=ex_dividend_date,
             date_from=ex_dividend_date_from,
             date_to=ex_dividend_date_to,
             limit=limit,
@@ -464,8 +497,9 @@ class PolygonAdapter:
         params: Dict[str, Any],
         max_pages: int,
         asof: Optional[datetime],
+        feed_label: str = "corporate-action",
     ) -> AdapterResponse[List[Any]]:
-        """Fetch corporate-action rows across Polygon pages without leaking cursors."""
+        """Fetch Polygon results rows across pages without leaking cursors."""
 
         rows: List[Any] = []
         next_url: Optional[str] = None
@@ -516,7 +550,7 @@ class PolygonAdapter:
                         endpoint=endpoint,
                         status_code=200,
                         error_type="parse",
-                        message="Polygon corporate-action response missing list results",
+                        message=f"Polygon {feed_label} response missing list results",
                         retryable=False,
                     ),
                 )
@@ -549,7 +583,7 @@ class PolygonAdapter:
                             endpoint=endpoint,
                             status_code=200,
                             error_type="pagination",
-                            message="Polygon corporate-action pagination next_url rejected",
+                            message=f"Polygon {feed_label} pagination next_url rejected",
                             retryable=False,
                         ),
                     )
@@ -573,7 +607,7 @@ class PolygonAdapter:
                         endpoint=endpoint,
                         status_code=200,
                         error_type="pagination",
-                        message="Polygon corporate-action pagination exceeded max_pages",
+                        message=f"Polygon {feed_label} pagination exceeded max_pages",
                         retryable=False,
                     ),
                 )
@@ -587,35 +621,128 @@ class PolygonAdapter:
         )
         return AdapterResponse(data=rows, lineage=lineage)
 
-    # --- Short interest / borrow ---
+    # --- Short-interest / short-volume proxy ---
 
     def get_short_interest(
         self,
-        ticker: str,
-        date_str: Optional[str] = None,
+        ticker: Optional[str] = None,
+        settlement_date: Optional[str] = None,
+        *,
+        settlement_date_from: Optional[str] = None,
+        settlement_date_to: Optional[str] = None,
+        limit: int = 1000,
+        sort: Optional[str] = "settlement_date",
+        order: Optional[str] = "desc",
+        max_pages: int = 10,
+        asof: Optional[datetime] = None,
     ) -> AdapterResponse[List[PolygonShortInterest]]:
-        """Fetch reported short interest for a ticker, optionally by settlement date."""
+        """Fetch Polygon short-interest rows as I3 LITE/proxy evidence."""
 
-        endpoint = "/stocks/v1/short-interest"
-        params: Dict[str, Any] = {"ticker": ticker}
-        if date_str:
-            params["settlement_date"] = date_str
-        resp = self._request(endpoint, params=params)
+        validation_error = _validate_polygon_feed_query(
+            endpoint=SHORT_INTEREST_ENDPOINT,
+            ticker=ticker,
+            date_value=settlement_date,
+            date_from=settlement_date_from,
+            date_to=settlement_date_to,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if validation_error is not None:
+            return validation_error  # type: ignore[return-value]
+
+        params = _dated_feed_params(
+            ticker=ticker,
+            date_field="settlement_date",
+            date_value=settlement_date,
+            date_from=settlement_date_from,
+            date_to=settlement_date_to,
+            limit=limit,
+            sort=sort,
+            order=order,
+            max_limit=50000,
+        )
+        resp = self._fetch_corporate_action_rows(
+            SHORT_INTEREST_ENDPOINT,
+            params=params,
+            max_pages=max_pages,
+            asof=asof,
+            feed_label="short-interest",
+        )
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        results_list = resp.data.get("results", []) if isinstance(resp.data, dict) else []
-        results = [
-            PolygonShortInterest(
-                ticker=r.get("ticker", ticker),
-                settlement_date=r.get("settlement_date", ""),
-                short_interest=r.get("short_interest"),
-                avg_daily_volume=r.get("avg_daily_volume"),
-                days_to_cover=r.get("days_to_cover"),
-            )
-            for r in results_list
-        ]
-        return AdapterResponse(data=results, lineage=resp.lineage)
+        results = []
+        raw_rows = 0
+        for row in resp.data or []:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            parsed = _parse_short_interest_row(row)
+            if parsed is not None:
+                results.append(parsed)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(results))
+        return AdapterResponse(data=results, lineage=lineage)
+
+    def get_short_volume(
+        self,
+        ticker: Optional[str] = None,
+        date: Optional[str] = None,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 1000,
+        sort: Optional[str] = "date",
+        order: Optional[str] = "desc",
+        max_pages: int = 10,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[PolygonShortVolume]]:
+        """Fetch Polygon short-volume rows as I3 LITE/proxy evidence."""
+
+        validation_error = _validate_polygon_feed_query(
+            endpoint=SHORT_VOLUME_ENDPOINT,
+            ticker=ticker,
+            date_value=date,
+            date_from=date_from,
+            date_to=date_to,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if validation_error is not None:
+            return validation_error  # type: ignore[return-value]
+
+        params = _dated_feed_params(
+            ticker=ticker,
+            date_field="date",
+            date_value=date,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            sort=sort,
+            order=order,
+            max_limit=50000,
+        )
+        resp = self._fetch_corporate_action_rows(
+            SHORT_VOLUME_ENDPOINT,
+            params=params,
+            max_pages=max_pages,
+            asof=asof,
+            feed_label="short-volume",
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        results = []
+        raw_rows = 0
+        for row in resp.data or []:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            parsed = _parse_short_volume_row(row)
+            if parsed is not None:
+                results.append(parsed)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(results))
+        lineage = _short_volume_semantic_lineage(lineage, results)
+        return AdapterResponse(data=results, lineage=lineage)
 
     # --- Bulk ticker reference / identity ---
 
@@ -944,6 +1071,8 @@ def _validate_corporate_action_query(
     *,
     endpoint: str,
     ticker: Optional[str],
+    date_field: str,
+    date_value: Optional[str],
     date_from: Optional[str],
     date_to: Optional[str],
     max_pages: Any,
@@ -967,11 +1096,72 @@ def _validate_corporate_action_query(
             retryable=False,
             asof=asof,
         )
-    if _ticker_param(ticker) is None and not (date_from and date_to):
+    date_error = _validate_iso_date_params(
+        endpoint=endpoint,
+        date_fields={
+            date_field: date_value,
+            f"{date_field}_from": date_from,
+            f"{date_field}_to": date_to,
+        },
+        asof=asof,
+    )
+    if date_error is not None:
+        return date_error
+    if _ticker_param(ticker) is None and not (date_value or (date_from and date_to)):
         return _provider_error_response(
             endpoint=endpoint,
             error_type="validation",
-            message="Polygon corporate-action broad query requires a bounded date window",
+            message="Polygon corporate-action broad query requires an exact date or bounded date window",
+            retryable=False,
+            asof=asof,
+        )
+    return None
+
+
+def _validate_polygon_feed_query(
+    *,
+    endpoint: str,
+    ticker: Optional[str],
+    date_value: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    max_pages: Any,
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    try:
+        page_cap = int(max_pages)
+    except (TypeError, ValueError):
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon feed max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    if page_cap < 1:
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon feed max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    date_error = _validate_iso_date_params(
+        endpoint=endpoint,
+        date_fields={
+            "date": date_value,
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+        asof=asof,
+    )
+    if date_error is not None:
+        return date_error
+    if _ticker_param(ticker) is None and not (date_value or (date_from and date_to)):
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon feed broad query requires an exact date or bounded date window",
             retryable=False,
             asof=asof,
         )
@@ -982,6 +1172,7 @@ def _corporate_action_params(
     *,
     ticker: Optional[str],
     date_field: str,
+    date_value: Optional[str],
     date_from: Optional[str],
     date_to: Optional[str],
     limit: int,
@@ -992,10 +1183,42 @@ def _corporate_action_params(
     ticker_param = _ticker_param(ticker)
     if ticker_param:
         params["ticker"] = ticker_param
-    if date_from:
-        params[f"{date_field}.gte"] = date_from
-    if date_to:
-        params[f"{date_field}.lte"] = date_to
+    if date_value:
+        params[date_field] = date_value
+    else:
+        if date_from:
+            params[f"{date_field}.gte"] = date_from
+        if date_to:
+            params[f"{date_field}.lte"] = date_to
+    sort_param = _corporate_action_sort(sort, order)
+    if sort_param is not None:
+        params["sort"] = sort_param
+    return params
+
+
+def _dated_feed_params(
+    *,
+    ticker: Optional[str],
+    date_field: str,
+    date_value: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    limit: int,
+    sort: Optional[str],
+    order: Optional[str],
+    max_limit: int,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"limit": _limited_int(limit, maximum=max_limit)}
+    ticker_param = _ticker_param(ticker)
+    if ticker_param:
+        params["ticker"] = ticker_param
+    if date_value:
+        params[date_field] = date_value
+    else:
+        if date_from:
+            params[f"{date_field}.gte"] = date_from
+        if date_to:
+            params[f"{date_field}.lte"] = date_to
     sort_param = _corporate_action_sort(sort, order)
     if sort_param is not None:
         params["sort"] = sort_param
@@ -1043,13 +1266,15 @@ def _corporate_action_next_request(
 ) -> Optional[_NextPageRequest]:
     parsed = urlparse(next_url)
     base_parsed = urlparse(base_url)
+    base_host = _next_url_host_or_none(base_parsed)
     allowed_hosts = {
         host.lower()
-        for host in (base_parsed.netloc, *POLYGON_API_HOSTS)
+        for host in (base_host, *POLYGON_API_HOSTS)
         if host
     }
     if parsed.scheme or parsed.netloc:
-        if parsed.scheme != "https" or parsed.netloc.lower() not in allowed_hosts:
+        host = _next_url_host_or_none(parsed)
+        if parsed.scheme != "https" or host not in allowed_hosts:
             return None
     path = parsed.path or endpoint
     if not path.startswith("/"):
@@ -1068,6 +1293,21 @@ def _corporate_action_next_request(
         params={"cursor": cursor},
         path=path,
     )
+
+
+def _next_url_host_or_none(parsed_url) -> Optional[str]:
+    if parsed_url.username or parsed_url.password:
+        return None
+    host = parsed_url.hostname
+    if not host:
+        return None
+    try:
+        port = parsed_url.port
+    except ValueError:
+        return None
+    if port not in (None, 443):
+        return None
+    return host.lower()
 
 
 def _normalized_cik(value: Any) -> Optional[str]:
@@ -1170,6 +1410,94 @@ def _corporate_action_row_lineage(
     return replace(lineage, data_quality_flags=flags)
 
 
+def _short_volume_semantic_lineage(
+    lineage: LineageMeta,
+    rows: List[PolygonShortVolume],
+) -> LineageMeta:
+    warning_types: Dict[str, int] = {}
+    warning_rows = 0
+    for row in rows:
+        row_warnings = _short_volume_semantic_warnings(row)
+        if row_warnings:
+            warning_rows += 1
+            for warning in row_warnings:
+                warning_types[warning] = warning_types.get(warning, 0) + 1
+
+    flags = dict(lineage.data_quality_flags or {})
+    flags["semantic_warning_rows"] = warning_rows
+    flags["semantic_warning_types"] = warning_types
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _short_volume_semantic_warnings(row: PolygonShortVolume) -> List[str]:
+    warnings: List[str] = []
+    if (
+        row.short_volume is not None
+        and row.total_volume is not None
+        and row.total_volume > 0
+        and row.short_volume > row.total_volume
+    ):
+        warnings.append("short_volume_gt_total")
+    if row.short_volume_ratio is not None and row.short_volume_ratio > 100:
+        warnings.append("short_volume_ratio_gt_100")
+    if (
+        row.short_volume_ratio is not None
+        and row.short_volume_ratio == 0
+        and row.short_volume is not None
+        and row.short_volume > 0
+    ):
+        warnings.append("zero_ratio_with_positive_short_volume")
+    if (
+        row.total_volume is not None
+        and row.total_volume == 0
+        and row.short_volume is not None
+        and row.short_volume > 0
+    ):
+        warnings.append("zero_total_with_positive_short_volume")
+    if (
+        row.exempt_volume is not None
+        and row.non_exempt_volume is not None
+        and row.short_volume is not None
+        and row.exempt_volume + row.non_exempt_volume != row.short_volume
+    ):
+        warnings.append("exempt_non_exempt_sum_mismatch")
+    return warnings
+
+
+def _validate_iso_date_params(
+    *,
+    endpoint: str,
+    date_fields: Dict[str, Optional[str]],
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    for label, value in date_fields.items():
+        if value is None:
+            continue
+        text = _str_or_none(value)
+        if text is None or len(text) != 10:
+            return _invalid_date_response(endpoint=endpoint, label=label, asof=asof)
+        try:
+            date.fromisoformat(text)
+        except ValueError:
+            return _invalid_date_response(endpoint=endpoint, label=label, asof=asof)
+    return None
+
+
+def _invalid_date_response(
+    *,
+    endpoint: str,
+    label: str,
+    asof: Optional[datetime],
+) -> AdapterResponse[Any]:
+    return _provider_error_response(
+        endpoint=endpoint,
+        error_type="validation",
+        message=f"Polygon feed {label} must be YYYY-MM-DD",
+        retryable=False,
+        asof=asof,
+    )
+
+
 def _positive_decimal_or_none(value: Any) -> Optional[Decimal]:
     parsed = _decimal_or_none(value)
     if parsed is None or parsed <= 0:
@@ -1182,6 +1510,104 @@ def _nonnegative_decimal_or_none(value: Any) -> Optional[Decimal]:
     if parsed is None or parsed < 0:
         return None
     return parsed
+
+
+def _optional_nonnegative_decimal(value: Any) -> tuple[Optional[Decimal], bool]:
+    if value is None:
+        return None, True
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed < 0:
+        return None, False
+    return parsed, True
+
+
+def _optional_nonnegative_int(value: Any) -> tuple[Optional[int], bool]:
+    if value is None:
+        return None, True
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed < 0 or parsed != parsed.to_integral_value():
+        return None, False
+    return int(parsed), True
+
+
+def _parse_short_interest_row(row: Dict[str, Any]) -> Optional[PolygonShortInterest]:
+    ticker = _ticker_param(row.get("ticker"))  # type: ignore[arg-type]
+    settlement_date = _str_or_none(row.get("settlement_date"))
+    if not ticker or not settlement_date:
+        return None
+    short_interest, short_interest_ok = _optional_nonnegative_int(
+        row.get("short_interest")
+    )
+    if short_interest is None or not short_interest_ok:
+        return None
+    avg_daily_volume, avg_volume_ok = _optional_nonnegative_int(
+        row.get("avg_daily_volume")
+    )
+    days_to_cover, days_ok = _optional_nonnegative_decimal(row.get("days_to_cover"))
+    if not (avg_volume_ok and days_ok):
+        return None
+    return PolygonShortInterest(
+        ticker=ticker,
+        settlement_date=settlement_date,
+        short_interest=short_interest,
+        avg_daily_volume=avg_daily_volume,
+        days_to_cover=days_to_cover,
+        raw=dict(row),
+    )
+
+
+def _parse_short_volume_row(row: Dict[str, Any]) -> Optional[PolygonShortVolume]:
+    ticker = _ticker_param(row.get("ticker"))  # type: ignore[arg-type]
+    date_value = _str_or_none(row.get("date"))
+    if not ticker or not date_value:
+        return None
+
+    decimal_fields = [
+        "short_volume",
+        "total_volume",
+        "short_volume_ratio",
+        "exempt_volume",
+        "non_exempt_volume",
+        "adf_short_volume",
+        "adf_short_volume_exempt",
+        "nasdaq_carteret_short_volume",
+        "nasdaq_carteret_short_volume_exempt",
+        "nasdaq_chicago_short_volume",
+        "nasdaq_chicago_short_volume_exempt",
+        "nyse_short_volume",
+        "nyse_short_volume_exempt",
+    ]
+    values: Dict[str, Optional[Decimal]] = {}
+    for field in decimal_fields:
+        parsed, ok = _optional_nonnegative_decimal(row.get(field))
+        if not ok:
+            return None
+        values[field] = parsed
+    if values["short_volume"] is None and values["short_volume_ratio"] is None:
+        return None
+
+    return PolygonShortVolume(
+        ticker=ticker,
+        date=date_value,
+        short_volume=values["short_volume"],
+        total_volume=values["total_volume"],
+        short_volume_ratio=values["short_volume_ratio"],
+        exempt_volume=values["exempt_volume"],
+        non_exempt_volume=values["non_exempt_volume"],
+        adf_short_volume=values["adf_short_volume"],
+        adf_short_volume_exempt=values["adf_short_volume_exempt"],
+        nasdaq_carteret_short_volume=values["nasdaq_carteret_short_volume"],
+        nasdaq_carteret_short_volume_exempt=values[
+            "nasdaq_carteret_short_volume_exempt"
+        ],
+        nasdaq_chicago_short_volume=values["nasdaq_chicago_short_volume"],
+        nasdaq_chicago_short_volume_exempt=values[
+            "nasdaq_chicago_short_volume_exempt"
+        ],
+        nyse_short_volume=values["nyse_short_volume"],
+        nyse_short_volume_exempt=values["nyse_short_volume_exempt"],
+        raw=dict(row),
+    )
 
 
 def _parse_split_row(row: Dict[str, Any]) -> Optional[PolygonSplit]:

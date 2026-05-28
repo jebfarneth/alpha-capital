@@ -948,21 +948,688 @@ class TestPolygonAdapter:
         }
         session.get.return_value = _mock_response(200, json_data)
         adapter = self._adapter(session)
-        resp = adapter.get_short_interest("ACME")
+        resp = adapter.get_short_interest(
+            " acme ",
+            settlement_date_from="2026-05-01",
+            settlement_date_to="2026-05-31",
+            limit=60000,
+            sort="settlement_date",
+            order="desc",
+        )
 
         assert resp.ok
         assert len(resp.data) == 1
+        assert resp.data[0].ticker == "ACME"
+        assert resp.data[0].settlement_date == "2026-05-15"
         assert resp.data[0].short_interest == 50000
         assert resp.data[0].avg_daily_volume == 200000
-        assert resp.data[0].days_to_cover == 0.25
+        assert resp.data[0].days_to_cover == Decimal("0.25")
+        assert resp.data[0].raw == json_data["results"][0]
         assert resp.lineage.provider == "Polygon"
         assert resp.lineage.endpoint == "/stocks/v1/short-interest"
         assert resp.lineage.source_authority == "Polygon"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
         session.get.assert_called_with(
             "https://api.polygon.io/stocks/v1/short-interest",
-            params={"ticker": "ACME"},
+            params={
+                "ticker": "ACME",
+                "settlement_date.gte": "2026-05-01",
+                "settlement_date.lte": "2026-05-31",
+                "limit": 50000,
+                "sort": "settlement_date.desc",
+            },
             timeout=30,
         )
+
+    def test_get_short_volume_ok(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-27",
+                    "short_volume": "11705767.246896",
+                    "total_volume": "20717490.359599",
+                    "short_volume_ratio": "56.5",
+                    "exempt_volume": "33578.0",
+                    "non_exempt_volume": "11672189.246896",
+                    "adf_short_volume": "0",
+                    "nyse_short_volume": "345339",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume(
+            " aapl ",
+            date_from="2026-05-01",
+            date_to="2026-05-28",
+            limit=25,
+            sort="date",
+            order="asc",
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        row = resp.data[0]
+        assert row.ticker == "AAPL"
+        assert row.date == "2026-05-27"
+        assert row.short_volume == Decimal("11705767.246896")
+        assert row.total_volume == Decimal("20717490.359599")
+        assert row.short_volume_ratio == Decimal("56.5")
+        assert row.exempt_volume == Decimal("33578.0")
+        assert row.nyse_short_volume == Decimal("345339")
+        assert row.raw == json_data["results"][0]
+        assert resp.lineage.endpoint == "/stocks/v1/short-volume"
+        assert resp.lineage.source_authority == "Polygon"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        session.get.assert_called_with(
+            "https://api.polygon.io/stocks/v1/short-volume",
+            params={
+                "ticker": "AAPL",
+                "date.gte": "2026-05-01",
+                "date.lte": "2026-05-28",
+                "limit": 25,
+                "sort": "date.asc",
+            },
+            timeout=30,
+        )
+
+    def test_polygon_short_feeds_empty_payload_success(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        short_interest = adapter.get_short_interest("AAPL")
+        short_volume = adapter.get_short_volume("AAPL")
+
+        for resp in (short_interest, short_volume):
+            assert resp.ok
+            assert resp.data == []
+            assert resp.lineage.data_quality_flags["raw_rows"] == 0
+            assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+            assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+            assert "all_rows_skipped" not in resp.lineage.data_quality_flags
+
+    def test_polygon_short_feed_invalid_shape_is_parse_error(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "a list"}},
+            [{"ticker": "AAPL"}],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_short_interest("AAPL")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.error.retryable is False
+            assert resp.lineage.endpoint == "/stocks/v1/short-interest"
+            assert resp.lineage.data_quality_flags["page_count"] == 1
+            assert resp.lineage.data_quality_flags["truncated"] is False
+
+    def test_polygon_short_interest_skips_invalid_rows_with_telemetry(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "ticker": "VALID",
+                    "settlement_date": "2026-05-15",
+                    "short_interest": "50000",
+                    "avg_daily_volume": "200000",
+                    "days_to_cover": "0.25",
+                },
+                {},
+                {"settlement_date": "2026-05-15", "short_interest": 1},
+                {"ticker": "MISSDATE", "short_interest": 1},
+                {"ticker": "IDENTITY", "settlement_date": "2026-05-15"},
+                {"ticker": "ONLYAVG", "settlement_date": "2026-05-15", "avg_daily_volume": 200000},
+                {"ticker": "ONLYDTC", "settlement_date": "2026-05-15", "days_to_cover": "0.25"},
+                {"ticker": "NEGSI", "settlement_date": "2026-05-15", "short_interest": -1},
+                {"ticker": "NEGAVG", "settlement_date": "2026-05-15", "avg_daily_volume": -1},
+                {"ticker": "NEGDTC", "settlement_date": "2026-05-15", "days_to_cover": "-0.1"},
+                {"ticker": "FRACTION", "settlement_date": "2026-05-15", "short_interest": "1.5"},
+                None,
+                "bad",
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_interest("VALID")
+
+        assert resp.ok
+        assert [row.ticker for row in resp.data] == ["VALID"]
+        assert resp.data[0].short_interest == 50000
+        assert resp.data[0].days_to_cover == Decimal("0.25")
+        assert resp.lineage.data_quality_flags["raw_rows"] == 13
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 12
+
+    def test_polygon_short_interest_requires_short_interest_metric(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {},
+                {"ticker": "IDENTITY", "settlement_date": "2026-05-15"},
+                {"ticker": "ONLYAVG", "settlement_date": "2026-05-15", "avg_daily_volume": 200000},
+                {"ticker": "ONLYDTC", "settlement_date": "2026-05-15", "days_to_cover": "0.25"},
+                None,
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_interest("AAPL")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 5
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 5
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_polygon_short_volume_skips_invalid_rows_and_flags_all_invalid(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {},
+                {"date": "2026-05-27", "short_volume": "1"},
+                {"ticker": "MISSDATE", "short_volume": "1"},
+                {"ticker": "IDENTITY", "date": "2026-05-27"},
+                {"ticker": "ONLYTOTAL", "date": "2026-05-27", "total_volume": "100"},
+                {"ticker": "ONLYVENUE", "date": "2026-05-27", "nyse_short_volume": "10"},
+                {"ticker": "NEGSHORT", "date": "2026-05-27", "short_volume": "-1"},
+                {"ticker": "NEGTOTAL", "date": "2026-05-27", "short_volume": "1", "total_volume": "-1"},
+                {"ticker": "NEGRATIO", "date": "2026-05-27", "short_volume_ratio": "-0.1"},
+                {"ticker": "BADNUM", "date": "2026-05-27", "short_volume": "N/A"},
+                None,
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 11
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 11
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_polygon_short_volume_requires_short_metric(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {"ticker": "IDENTITY", "date": "2026-05-27"},
+                {"ticker": "ONLYTOTAL", "date": "2026-05-27", "total_volume": "100"},
+                {"ticker": "ONLYVENUE", "date": "2026-05-27", "nyse_short_volume": "10"},
+                {"ticker": "WITHSHORT", "date": "2026-05-27", "short_volume": "1"},
+                {"ticker": "WITHRATIO", "date": "2026-05-26", "short_volume_ratio": "12.5"},
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL")
+
+        assert resp.ok
+        assert [row.ticker for row in resp.data] == ["WITHSHORT", "WITHRATIO"]
+        assert resp.data[0].short_volume == Decimal("1")
+        assert resp.data[0].short_volume_ratio is None
+        assert resp.data[1].short_volume is None
+        assert resp.data[1].short_volume_ratio == Decimal("12.5")
+        assert resp.lineage.data_quality_flags["raw_rows"] == 5
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 3
+
+    def test_polygon_short_volume_preserves_decimal_precision(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-27",
+                    "short_volume": "0.333333333333333333",
+                    "total_volume": "1.000000000000000001",
+                    "short_volume_ratio": "33.333333333333333333",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL")
+
+        assert resp.ok
+        assert resp.data[0].short_volume == Decimal("0.333333333333333333")
+        assert resp.data[0].total_volume == Decimal("1.000000000000000001")
+        assert resp.data[0].short_volume_ratio == Decimal("33.333333333333333333")
+        assert resp.lineage.data_quality_flags["semantic_warning_rows"] == 0
+        assert resp.lineage.data_quality_flags["semantic_warning_types"] == {}
+
+    def test_polygon_short_feed_rejects_invalid_dates(self):
+        cases = [
+            lambda adapter: adapter.get_short_interest("AAPL", settlement_date="bad"),
+            lambda adapter: adapter.get_short_interest(
+                "AAPL",
+                settlement_date_from="2026-99-99",
+                settlement_date_to="2026-05-31",
+            ),
+            lambda adapter: adapter.get_short_interest(
+                "AAPL",
+                settlement_date_from="2026-05-01",
+                settlement_date_to="2026/05/31",
+            ),
+            lambda adapter: adapter.get_short_volume("AAPL", date=" "),
+            lambda adapter: adapter.get_short_volume(
+                "AAPL",
+                date_from="2026-99-99",
+                date_to="2026-05-31",
+            ),
+            lambda adapter: adapter.get_short_volume(
+                "AAPL",
+                date_from="2026-05-01",
+                date_to="",
+            ),
+        ]
+
+        for call in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            session.get.assert_not_called()
+
+    def test_polygon_short_feed_valid_dates_request_normally(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL", date="2026-05-27")
+
+        assert resp.ok
+        session.get.assert_called_once_with(
+            "https://api.polygon.io/stocks/v1/short-volume",
+            params={
+                "ticker": "AAPL",
+                "date": "2026-05-27",
+                "limit": 1000,
+                "sort": "date.desc",
+            },
+            timeout=30,
+        )
+
+    def test_polygon_short_volume_flags_semantic_warnings(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-27",
+                    "short_volume": "200",
+                    "total_volume": "100",
+                },
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-26",
+                    "short_volume_ratio": "101",
+                },
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-25",
+                    "short_volume": "10",
+                    "short_volume_ratio": "0",
+                },
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-24",
+                    "short_volume": "10",
+                    "total_volume": "0",
+                },
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-23",
+                    "short_volume": "100",
+                    "exempt_volume": "10",
+                    "non_exempt_volume": "20",
+                },
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-22",
+                    "short_volume": "10",
+                    "total_volume": "20",
+                    "short_volume_ratio": "50",
+                    "exempt_volume": "4",
+                    "non_exempt_volume": "6",
+                },
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL")
+
+        assert resp.ok
+        assert len(resp.data) == 6
+        flags = resp.lineage.data_quality_flags
+        assert flags["semantic_warning_rows"] == 5
+        assert flags["semantic_warning_types"] == {
+            "short_volume_gt_total": 1,
+            "short_volume_ratio_gt_100": 1,
+            "zero_ratio_with_positive_short_volume": 1,
+            "zero_total_with_positive_short_volume": 1,
+            "exempt_non_exempt_sum_mismatch": 1,
+        }
+
+    def test_polygon_short_feed_broad_query_requires_date_bound(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        no_interest_ticker = adapter.get_short_interest(None)
+        blank_volume_ticker = adapter.get_short_volume(" ")
+
+        assert not no_interest_ticker.ok
+        assert no_interest_ticker.error.error_type == "validation"
+        assert not blank_volume_ticker.ok
+        assert blank_volume_ticker.error.error_type == "validation"
+        session.get.assert_not_called()
+
+    def test_polygon_short_feed_bounded_broad_query_is_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        exact_interest = adapter.get_short_interest(None, settlement_date="2026-05-15")
+        ranged_interest = adapter.get_short_interest(
+            None,
+            settlement_date_from="2026-05-01",
+            settlement_date_to="2026-05-31",
+        )
+        ranged_volume = adapter.get_short_volume(
+            " ",
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+        )
+
+        assert exact_interest.ok
+        assert ranged_interest.ok
+        assert ranged_volume.ok
+        exact_params = session.get.call_args_list[0].kwargs["params"]
+        interest_params = session.get.call_args_list[1].kwargs["params"]
+        volume_params = session.get.call_args_list[2].kwargs["params"]
+        assert "ticker" not in exact_params
+        assert exact_params["settlement_date"] == "2026-05-15"
+        assert "ticker" not in interest_params
+        assert interest_params["settlement_date.gte"] == "2026-05-01"
+        assert interest_params["settlement_date.lte"] == "2026-05-31"
+        assert "ticker" not in volume_params
+        assert volume_params["date.gte"] == "2026-05-01"
+        assert volume_params["date.lte"] == "2026-05-31"
+
+    def test_polygon_short_feed_provider_errors(self):
+        expected = {
+            403: "auth",
+            429: "rate_limit",
+            500: "http",
+        }
+        for status_code, error_type in expected.items():
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(status_code, text="provider error")
+            adapter = self._adapter(session)
+
+            resp = adapter.get_short_volume("AAPL")
+
+            assert not resp.ok
+            assert resp.error.error_type == error_type
+            assert resp.error.status_code == status_code
+
+    def test_polygon_short_feed_timeout_and_request_exception_are_safe(self):
+        timeout_session = MagicMock(spec=requests.Session)
+        timeout_session.params = {}
+        timeout_session.get.side_effect = requests.exceptions.Timeout("timed out")
+        timeout_adapter = self._adapter(timeout_session)
+
+        timeout_resp = timeout_adapter.get_short_interest("AAPL")
+
+        assert not timeout_resp.ok
+        assert timeout_resp.error.error_type == "timeout"
+        assert timeout_resp.error.retryable is True
+
+        error_session = MagicMock(spec=requests.Session)
+        error_session.params = {}
+        error_session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/stocks/v1/short-volume?apiKey=test-polygon-key&ticker=AAPL"
+        )
+        error_adapter = self._adapter(error_session)
+
+        error_resp = error_adapter.get_short_volume("AAPL")
+
+        assert not error_resp.ok
+        assert error_resp.error.error_type == "http"
+        assert error_resp.error.message == "Polygon request failed: ConnectionError"
+        assert "test-polygon-key" not in error_resp.error.message
+        assert "apiKey" not in error_resp.error.message
+        assert "https://api.polygon.io" not in error_resp.error.message
+
+    def test_polygon_short_feed_malformed_json_is_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, text="not json")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+
+    def test_polygon_short_feed_paginates_and_sanitizes_next_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-27",
+                    "short_volume": "10",
+                    "total_volume": "20",
+                    "short_volume_ratio": "50",
+                }
+            ],
+            "next_url": "https://api.massive.com/stocks/v1/short-volume?cursor=abc&apiKey=SECRET",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "date": "2026-05-26",
+                    "short_volume": "11",
+                    "total_volume": "22",
+                    "short_volume_ratio": "50",
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_volume("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.date for row in resp.data] == ["2026-05-27", "2026-05-26"]
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/stocks/v1/short-volume"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert "SECRET" not in repr(session.get.call_args_list[1])
+        assert resp.lineage.data_quality_flags["page_count"] == 2
+        assert resp.lineage.data_quality_flags["paginated"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is False
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/short-volume"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 2
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_short_feed_accepts_default_port_next_urls(self):
+        cases = [
+            (
+                "https://api.polygon.io:443/stocks/v1/short-volume?cursor=abc&apiKey=SECRET&token=SECRET",
+                "get_short_volume",
+                "/stocks/v1/short-volume",
+            ),
+            (
+                "https://api.massive.com:443/stocks/v1/short-interest?cursor=def&apiKey=SECRET",
+                "get_short_interest",
+                "/stocks/v1/short-interest",
+            ),
+        ]
+        for next_url, method_name, endpoint in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            if method_name == "get_short_volume":
+                page_1 = {
+                    "results": [
+                        {
+                            "ticker": "AAPL",
+                            "date": "2026-05-27",
+                            "short_volume": "10",
+                        }
+                    ],
+                    "next_url": next_url,
+                }
+                page_2 = {
+                    "results": [
+                        {
+                            "ticker": "AAPL",
+                            "date": "2026-05-26",
+                            "short_volume": "11",
+                        }
+                    ]
+                }
+            else:
+                page_1 = {
+                    "results": [
+                        {
+                            "ticker": "AAPL",
+                            "settlement_date": "2026-05-15",
+                            "short_interest": "10",
+                        }
+                    ],
+                    "next_url": next_url,
+                }
+                page_2 = {
+                    "results": [
+                        {
+                            "ticker": "AAPL",
+                            "settlement_date": "2026-04-30",
+                            "short_interest": "11",
+                        }
+                    ]
+                }
+            session.get.side_effect = [
+                _mock_response(200, page_1),
+                _mock_response(200, page_2),
+            ]
+            adapter = self._adapter(session)
+
+            resp = getattr(adapter, method_name)("AAPL", limit=1)
+
+            assert resp.ok
+            assert len(resp.data) == 2
+            assert session.get.call_count == 2
+            assert session.get.call_args_list[1].args[0] == f"https://api.polygon.io{endpoint}"
+            expected_cursor = "abc" if method_name == "get_short_volume" else "def"
+            assert session.get.call_args_list[1].kwargs["params"] == {
+                "cursor": expected_cursor
+            }
+            assert "SECRET" not in repr(session.get.call_args_list[1])
+            assert "apiKey" not in repr(session.get.call_args_list[1])
+            assert "token" not in repr(session.get.call_args_list[1])
+            assert resp.lineage.data_quality_flags["next_url_paths"] == [endpoint]
+            assert "SECRET" not in repr(resp.lineage)
+            assert "apiKey" not in repr(resp.lineage)
+            assert "token" not in repr(resp.lineage)
+
+    def test_polygon_short_feed_evil_next_url_is_rejected(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "ticker": "AAPL",
+                    "settlement_date": "2026-05-15",
+                    "short_interest": "50000",
+                }
+            ],
+            "next_url": "https://evil.example/stocks/v1/short-interest?cursor=abc&apiKey=SECRET",
+        }
+        session.get.return_value = _mock_response(200, page_1)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_short_interest("AAPL", limit=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        assert session.get.call_count == 1
+        assert "evil.example" not in repr(resp.lineage)
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_short_feed_invalid_max_pages_is_validation_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        bad = adapter.get_short_interest("AAPL", max_pages="bad")  # type: ignore[arg-type]
+        zero = adapter.get_short_volume("AAPL", max_pages=0)
+        negative = adapter.get_short_interest("AAPL", max_pages=-1)
+
+        for resp in (bad, zero, negative):
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+        session.get.assert_not_called()
 
     def test_get_ticker_details_ok(self):
         session = MagicMock(spec=requests.Session)
@@ -1109,6 +1776,80 @@ class TestPolygonAdapter:
                 "ex_dividend_date.lte": "2026-05-28",
                 "limit": 10,
                 "sort": "ex_dividend_date.desc",
+            },
+            timeout=30,
+        )
+
+    def test_polygon_corporate_action_rejects_invalid_dates(self):
+        cases = [
+            lambda adapter: adapter.get_splits("AAPL", execution_date="bad"),
+            lambda adapter: adapter.get_splits(
+                "AAPL",
+                execution_date_from="2026-99-99",
+                execution_date_to="2026-05-31",
+            ),
+            lambda adapter: adapter.get_splits(
+                "AAPL",
+                execution_date_from="2026-05-01",
+                execution_date_to="2026/05/31",
+            ),
+            lambda adapter: adapter.get_dividends("MSFT", ex_dividend_date=" "),
+            lambda adapter: adapter.get_dividends(
+                "MSFT",
+                ex_dividend_date_from="2026-99-99",
+                ex_dividend_date_to="2026-05-31",
+            ),
+            lambda adapter: adapter.get_dividends(
+                "MSFT",
+                ex_dividend_date_from="2026-05-01",
+                ex_dividend_date_to="",
+            ),
+        ]
+
+        for call in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            session.get.assert_not_called()
+
+    def test_polygon_corporate_action_valid_exact_dates_request_normally(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        splits = adapter.get_splits("AAPL", execution_date="2026-05-27")
+        dividends = adapter.get_dividends("MSFT", ex_dividend_date="2026-05-27")
+
+        assert splits.ok
+        assert dividends.ok
+        session.get.assert_any_call(
+            "https://api.polygon.io/stocks/v1/splits",
+            params={
+                "ticker": "AAPL",
+                "execution_date": "2026-05-27",
+                "limit": 1000,
+                "sort": "execution_date.asc",
+            },
+            timeout=30,
+        )
+        session.get.assert_any_call(
+            "https://api.polygon.io/stocks/v1/dividends",
+            params={
+                "ticker": "MSFT",
+                "ex_dividend_date": "2026-05-27",
+                "limit": 1000,
+                "sort": "ex_dividend_date.asc",
             },
             timeout=30,
         )
@@ -1891,7 +2632,7 @@ class TestPolygonAdapter:
     def test_lineage_hash_stability(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
-        json_data = {
+        short_interest_json = {
             "results": [
                 {
                     "ticker": "ACME",
@@ -1900,12 +2641,27 @@ class TestPolygonAdapter:
                 }
             ]
         }
-        session.get.return_value = _mock_response(200, json_data)
+        short_volume_json = {
+            "results": [
+                {
+                    "ticker": "ACME",
+                    "date": "2026-05-15",
+                    "short_volume": "100",
+                    "total_volume": "250",
+                    "short_volume_ratio": "40",
+                }
+            ]
+        }
         adapter = self._adapter(session)
 
+        session.get.return_value = _mock_response(200, short_interest_json)
         resp1 = adapter.get_short_interest("ACME")
         resp2 = adapter.get_short_interest("ACME")
+        session.get.return_value = _mock_response(200, short_volume_json)
+        resp3 = adapter.get_short_volume("ACME")
+        resp4 = adapter.get_short_volume("ACME")
         assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+        assert resp3.lineage.raw_payload_hash == resp4.lineage.raw_payload_hash
 
     def test_request_converts_aware_asof_to_utc(self):
         session = MagicMock(spec=requests.Session)
