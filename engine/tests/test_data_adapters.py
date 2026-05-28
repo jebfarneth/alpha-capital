@@ -1756,6 +1756,240 @@ class TestBenzingaAdapter:
         assert event.raw["notes"] == "Registered direct offering"
         assert resp.lineage.endpoint == "/api/v2.1/calendar/offerings"
 
+    def test_get_dividends_ok_and_calendar_params(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "dividends": [
+                {
+                    "id": "dividend-1",
+                    "ticker": "ACME",
+                    "name": "Acme Corp",
+                    "exchange": "NYSE",
+                    "currency": "USD",
+                    "cusip": "004397105",
+                    "isin": "US0043971052",
+                    "date": "2026-05-26",
+                    "ex_dividend_date": "2026-06-15",
+                    "payable_date": "2026-06-30",
+                    "record_date": "2026-06-16",
+                    "dividend": "0.8500",
+                    "dividend_prior": "0.8100",
+                    "dividend_type": "Cash",
+                    "dividend_yield": "0.0277755085368842",
+                    "frequency": "4",
+                    "confirmed": "true",
+                    "end_regular_dividend": False,
+                    "period": "Q2",
+                    "year": "2026",
+                    "importance": 5,
+                    "notes": "Quarterly dividend",
+                    "updated": 1779883200,
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends(
+            symbols=[" acme ", "BETA"],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+            page=2,
+            pagesize=25,
+            updated=1779796800,
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        event = resp.data[0]
+        assert event.id == "dividend-1"
+        assert event.ticker == "ACME"
+        assert event.dividend == Decimal("0.8500")
+        assert event.dividend_prior == Decimal("0.8100")
+        assert event.dividend_type == "Cash"
+        assert event.dividend_yield == Decimal("0.0277755085368842")
+        assert event.frequency == 4
+        assert event.confirmed is True
+        assert event.end_regular_dividend is False
+        assert event.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert event.raw["ticker"] == "ACME"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/dividends"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v2.1/calendar/dividends",
+            params={
+                "pagesize": 25,
+                "page": 2,
+                "parameters[tickers]": "ACME,BETA",
+                "parameters[date_from]": "2026-05-01",
+                "parameters[date_to]": "2026-05-31",
+                "parameters[updated]": 1779796800,
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
+    def test_get_insider_filings_ok_and_params(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "data": [
+                {
+                    "id": "filing-1",
+                    "accession_number": "0001234567-26-000001",
+                    "company_cik": "0001234567",
+                    "company_name": "Acme Corp",
+                    "company_symbol": "ACME",
+                    "filing_date": "2026-05-28T01:49:13Z",
+                    "form_type": "4",
+                    "html_url": "https://www.sec.gov/Archives/example-index.htm",
+                    "is_10b5": False,
+                    "owner": {
+                        "insider_cik": "0007654321",
+                        "insider_name": "Jane Insider",
+                        "insider_title": "CEO",
+                        "is_director": True,
+                        "is_officer": True,
+                        "is_ten_percent_owner": False,
+                        "raw_signature": "/s/ Jane Insider",
+                    },
+                    "remaining_shares": "34400",
+                    "traded_percentage": "0.68%",
+                    "footnotes": [{"id": "F1", "text": "Example footnote"}],
+                    "transactions": [{"transaction_id": "tx-1"}],
+                    "updated": "1779883200000",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_insider_filings(
+            tickers=["acme"],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+            page=3,
+            pagesize=20,
+            updated=1779796800,
+        )
+
+        assert resp.ok
+        filing = resp.data[0]
+        assert filing.id == "filing-1"
+        assert filing.accession_number == "0001234567-26-000001"
+        assert filing.company_symbol == "ACME"
+        assert filing.form_type == "4"
+        assert filing.filing_date == datetime(2026, 5, 28, 1, 49, 13, tzinfo=timezone.utc)
+        assert filing.insider_name == "Jane Insider"
+        assert filing.is_director is True
+        assert filing.remaining_shares == Decimal("34400")
+        assert filing.traded_percentage == "0.68%"
+        assert filing.footnotes == [{"id": "F1", "text": "Example footnote"}]
+        assert filing.transactions == [{"transaction_id": "tx-1"}]
+        assert filing.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert filing.raw["id"] == "filing-1"
+        assert resp.lineage.endpoint == "/api/v1/sec/insider_transactions/filings"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v1/sec/insider_transactions/filings",
+            params={
+                "pagesize": 20,
+                "page": 3,
+                "search_keys_type": "symbol",
+                "search_keys": "ACME",
+                "date_from": "2026-05-01",
+                "date_to": "2026-05-31",
+                "updated_since": 1779796800,
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
+    def test_get_insider_transactions_ok_and_params(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "data": [
+                {
+                    "transaction_id": "tx-1",
+                    "acquired_or_disposed": "A",
+                    "conversion_exercise_price_derivative": "0",
+                    "date_transaction": "2026-05-22T00:00:00Z",
+                    "is_derivative": False,
+                    "owner": {
+                        "insider_cik": "0007654321",
+                        "insider_name": "Jane Insider",
+                        "insider_title": "CEO",
+                        "is_director": True,
+                        "is_officer": True,
+                        "is_ten_percent_owner": False,
+                    },
+                    "ownership": "D",
+                    "post_transaction_quantity": "34400",
+                    "price_per_share": "2.50",
+                    "security_title": "Common Stock",
+                    "shares": "10000",
+                    "transaction_code": "P",
+                    "underlying_security_title": "Option",
+                    "underlying_shares": "10000",
+                    "voluntarily_reported": "false",
+                    "filing": {
+                        "id": "filing-1",
+                        "accession_number": "0001234567-26-000001",
+                        "company_cik": "0001234567",
+                        "company_name": "Acme Corp",
+                        "company_symbol": "ACME",
+                        "filing_date": "2026-05-28T01:49:13Z",
+                        "form_type": "4",
+                        "html_url": "https://www.sec.gov/Archives/example-index.htm",
+                    },
+                    "updated": "Wed, 27 May 2026 08:15:00 -0400",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_insider_transactions(
+            symbols=[" ACME "],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+            page=4,
+            pagesize=10,
+            updated="2026-05-01T00:00:00Z",
+        )
+
+        assert resp.ok
+        transaction = resp.data[0]
+        assert transaction.transaction_id == "tx-1"
+        assert transaction.company_symbol == "ACME"
+        assert transaction.accession_number == "0001234567-26-000001"
+        assert transaction.filing_id == "filing-1"
+        assert transaction.insider_name == "Jane Insider"
+        assert transaction.acquired_or_disposed == "A"
+        assert transaction.date_transaction == datetime(2026, 5, 22, tzinfo=timezone.utc)
+        assert transaction.post_transaction_quantity == Decimal("34400")
+        assert transaction.price_per_share == Decimal("2.50")
+        assert transaction.shares == Decimal("10000")
+        assert transaction.transaction_code == "P"
+        assert transaction.voluntarily_reported is False
+        assert transaction.updated == datetime(2026, 5, 27, 12, 15, tzinfo=timezone.utc)
+        assert transaction.raw["transaction_id"] == "tx-1"
+        assert resp.lineage.endpoint == "/api/v1/sec/insider_transactions/transactions"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v1/sec/insider_transactions/transactions",
+            params={
+                "pagesize": 10,
+                "page": 4,
+                "search_keys_type": "symbol",
+                "search_keys": "ACME",
+                "date_from": "2026-05-01",
+                "date_to": "2026-05-31",
+                "updated_since": "2026-05-01T00:00:00Z",
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
     def test_calendar_adapters_empty_payload_success(self):
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
@@ -1820,13 +2054,25 @@ class TestBenzingaAdapter:
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
 
-        resp = adapter.get_earnings(tickers=["AAPL", 123])  # type: ignore[list-item]
+        for method_name, endpoint in [
+            ("get_earnings", "/api/v2.1/calendar/earnings"),
+            ("get_dividends", "/api/v2.1/calendar/dividends"),
+            (
+                "get_insider_filings",
+                "/api/v1/sec/insider_transactions/filings",
+            ),
+            (
+                "get_insider_transactions",
+                "/api/v1/sec/insider_transactions/transactions",
+            ),
+        ]:
+            resp = getattr(adapter, method_name)(tickers=["AAPL", 123])  # type: ignore[list-item]
 
-        assert not resp.ok
-        assert resp.error.error_type == "validation"
-        assert resp.error.retryable is False
-        assert resp.error.message == "Benzinga calendar ticker parameters must be strings"
-        assert resp.lineage.endpoint == "/api/v2.1/calendar/earnings"
+            assert not resp.ok
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            assert resp.error.message == "Benzinga calendar ticker parameters must be strings"
+            assert resp.lineage.endpoint == endpoint
         session.get.assert_not_called()
 
     def test_request_exception_message_does_not_expose_secret_or_url(self):
@@ -1888,6 +2134,133 @@ class TestBenzingaAdapter:
         assert resp1.ok
         assert resp2.ok
         assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
+    def test_dividends_and_insider_adapters_empty_payload_success(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name, payload in [
+            ("get_dividends", {"dividends": []}),
+            ("get_insider_filings", {"data": []}),
+            ("get_insider_transactions", {"data": []}),
+        ]:
+            session.get.return_value = _mock_response(200, payload)
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert resp.data == []
+
+    def test_dividends_and_insider_adapters_malformed_payload_is_empty_success(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name in [
+            "get_dividends",
+            "get_insider_filings",
+            "get_insider_transactions",
+        ]:
+            session.get.return_value = _mock_response(200, {"unexpected": []})
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert resp.data == []
+
+    def test_dividends_and_insider_adapters_skip_identity_less_rows(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name, payload in [
+            ("get_dividends", {"dividends": [{}]}),
+            ("get_insider_filings", {"data": [{}]}),
+            ("get_insider_transactions", {"data": [{}]}),
+        ]:
+            session.get.return_value = _mock_response(200, payload)
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert resp.data == []
+
+    def test_dividends_and_insider_adapters_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name in [
+            "get_dividends",
+            "get_insider_filings",
+            "get_insider_transactions",
+        ]:
+            resp_mock = _mock_response(200, text="not json")
+            resp_mock.json.side_effect = ValueError("parse fail")
+            session.get.return_value = resp_mock
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+
+    @pytest.mark.parametrize("status_code", [403, 429, 500])
+    def test_dividends_and_insider_adapters_provider_errors(self, status_code):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        expected_error = {
+            403: "auth",
+            429: "rate_limit",
+            500: "http",
+        }[status_code]
+        for method_name in [
+            "get_dividends",
+            "get_insider_filings",
+            "get_insider_transactions",
+        ]:
+            session.get.return_value = _mock_response(status_code, text="provider error")
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert not resp.ok
+            assert resp.error.error_type == expected_error
+            assert resp.error.status_code == status_code
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_dividends", {"dividends": [{"id": "div-1", "ticker": "ACME"}]}),
+            (
+                "get_insider_filings",
+                {"data": [{"id": "filing-1", "accession_number": "0001"}]},
+            ),
+            (
+                "get_insider_transactions",
+                {"data": [{"transaction_id": "tx-1"}]},
+            ),
+        ],
+    )
+    def test_dividends_and_insider_lineage_hash_stability(self, method_name, payload):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp1 = getattr(adapter, method_name)("ACME")
+        resp2 = getattr(adapter, method_name)("ACME")
+
+        assert resp1.ok
+        assert resp2.ok
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
+    def test_dividends_and_insider_lineage_does_not_expose_secret(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name, payload in [
+            ("get_dividends", {"dividends": []}),
+            ("get_insider_filings", {"data": []}),
+            ("get_insider_transactions", {"data": []}),
+        ]:
+            session.get.return_value = _mock_response(200, payload)
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert "test-benzinga-key" not in repr(resp.lineage)
+            assert resp.lineage.source_authority == "Benzinga"
 
     def test_calendar_lineage_does_not_expose_secret(self):
         session = MagicMock(spec=requests.Session)

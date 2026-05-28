@@ -34,6 +34,9 @@ EARNINGS_ENDPOINT = "/api/v2.1/calendar/earnings"
 GUIDANCE_ENDPOINT = "/api/v2.1/calendar/guidance"
 RATINGS_ENDPOINT = "/api/v2.1/calendar/ratings"
 OFFERINGS_ENDPOINT = "/api/v2.1/calendar/offerings"
+DIVIDENDS_ENDPOINT = "/api/v2.1/calendar/dividends"
+INSIDER_FILINGS_ENDPOINT = "/api/v1/sec/insider_transactions/filings"
+INSIDER_TRANSACTIONS_ENDPOINT = "/api/v1/sec/insider_transactions/transactions"
 NEWS_ENDPOINT = "/api/v2/news"
 WIIM_CHANNEL = "wiim"
 
@@ -216,6 +219,108 @@ class BenzingaOffering:
     importance: Optional[int] = None
     notes: Optional[str] = None
     url: Optional[str] = None
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaDividend:
+    """Normalized Benzinga dividend calendar row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    cusip: Optional[str] = None
+    isin: Optional[str] = None
+    date: Optional[str] = None
+    ex_dividend_date: Optional[str] = None
+    payable_date: Optional[str] = None
+    record_date: Optional[str] = None
+    dividend: Optional[Decimal] = None
+    dividend_prior: Optional[Decimal] = None
+    dividend_type: Optional[str] = None
+    dividend_yield: Optional[Decimal] = None
+    frequency: Optional[int] = None
+    confirmed: Optional[bool] = None
+    end_regular_dividend: Optional[bool] = None
+    period: Optional[str] = None
+    year: Optional[int] = None
+    importance: Optional[int] = None
+    notes: Optional[str] = None
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaInsiderFiling:
+    """Normalized Benzinga insider filing row with raw payload preserved."""
+
+    id: Optional[str]
+    accession_number: Optional[str] = None
+    company_cik: Optional[str] = None
+    company_name: Optional[str] = None
+    company_symbol: Optional[str] = None
+    filing_date: Optional[datetime] = None
+    form_type: Optional[str] = None
+    html_url: Optional[str] = None
+    is_10b5: Optional[bool] = None
+    insider_cik: Optional[str] = None
+    insider_name: Optional[str] = None
+    insider_title: Optional[str] = None
+    is_director: Optional[bool] = None
+    is_officer: Optional[bool] = None
+    is_ten_percent_owner: Optional[bool] = None
+    raw_signature: Optional[str] = None
+    remaining_shares: Optional[Decimal] = None
+    traded_percentage: Optional[str] = None
+    footnotes: List[Dict[str, Any]] = field(default_factory=list)
+    transactions: List[Dict[str, Any]] = field(default_factory=list)
+    owner: Dict[str, Any] = field(default_factory=dict)
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaInsiderTransaction:
+    """Normalized Benzinga insider transaction row with raw payload preserved."""
+
+    transaction_id: Optional[str]
+    accession_number: Optional[str] = None
+    company_cik: Optional[str] = None
+    company_name: Optional[str] = None
+    company_symbol: Optional[str] = None
+    filing_date: Optional[datetime] = None
+    form_type: Optional[str] = None
+    filing_id: Optional[str] = None
+    html_url: Optional[str] = None
+    insider_cik: Optional[str] = None
+    insider_name: Optional[str] = None
+    insider_title: Optional[str] = None
+    is_director: Optional[bool] = None
+    is_officer: Optional[bool] = None
+    is_ten_percent_owner: Optional[bool] = None
+    raw_signature: Optional[str] = None
+    acquired_or_disposed: Optional[str] = None
+    conversion_exercise_price_derivative: Optional[Decimal] = None
+    date_deemed_execution: Optional[datetime] = None
+    date_exercisable: Optional[datetime] = None
+    date_expiration: Optional[datetime] = None
+    date_transaction: Optional[datetime] = None
+    is_derivative: Optional[bool] = None
+    ownership: Optional[str] = None
+    post_transaction_quantity: Optional[Decimal] = None
+    price_per_share: Optional[Decimal] = None
+    remaining_underlying_shares: Optional[Decimal] = None
+    security_title: Optional[str] = None
+    shares: Optional[Decimal] = None
+    transaction_code: Optional[str] = None
+    underlying_security_title: Optional[str] = None
+    underlying_shares: Optional[Decimal] = None
+    voluntarily_reported: Optional[bool] = None
+    owner: Dict[str, Any] = field(default_factory=dict)
+    filing: Dict[str, Any] = field(default_factory=dict)
     updated: Optional[datetime] = None
     raw: Optional[Dict[str, Any]] = None
 
@@ -608,6 +713,121 @@ class BenzingaAdapter:
         ]
         return AdapterResponse(data=events, lineage=resp.lineage)
 
+    def get_dividends(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaDividend]]:
+        """Fetch Benzinga dividend calendar rows as corporate-action evidence."""
+
+        try:
+            params = _calendar_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(DIVIDENDS_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(DIVIDENDS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        events = [
+            _parse_dividend_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "dividends")
+            if _calendar_row_has_usable_ticker(row)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
+    def get_insider_filings(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaInsiderFiling]]:
+        """Fetch Benzinga insider Forms 3/4/5 filing rows as review evidence."""
+
+        try:
+            params = _insider_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(INSIDER_FILINGS_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(INSIDER_FILINGS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        filings = [
+            _parse_insider_filing_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "data")
+            if _insider_filing_row_has_identity(row)
+        ]
+        return AdapterResponse(data=filings, lineage=resp.lineage)
+
+    def get_insider_transactions(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaInsiderTransaction]]:
+        """Fetch Benzinga flattened insider transaction rows as review evidence."""
+
+        try:
+            params = _insider_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(
+                INSIDER_TRANSACTIONS_ENDPOINT,
+                str(exc),
+                asof=asof,
+            )
+        resp = self._request(INSIDER_TRANSACTIONS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        transactions = [
+            _parse_insider_transaction_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "data")
+            if _insider_transaction_row_has_identity(row)
+        ]
+        return AdapterResponse(data=transactions, lineage=resp.lineage)
+
     def get_mergers_acquisitions(
         self,
         tickers: Optional[Union[str, Sequence[str]]] = None,
@@ -705,6 +925,35 @@ def _calendar_params(
     return params
 
 
+def _insider_params(
+    *,
+    tickers: Optional[Union[str, Sequence[str]]],
+    symbols: Optional[Union[str, Sequence[str]]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    page: Optional[int],
+    pagesize: int,
+    updated: Optional[Union[int, str]],
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"pagesize": pagesize}
+    if page is not None:
+        params["page"] = page
+
+    ticker_values = tickers if tickers else symbols
+    if ticker_values:
+        normalized_tickers = _calendar_ticker_csv_param(ticker_values)
+        if normalized_tickers:
+            params["search_keys_type"] = "symbol"
+            params["search_keys"] = normalized_tickers
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    if updated is not None:
+        params["updated_since"] = updated
+    return params
+
+
 def _calendar_rows_from_payload(payload: Any, key: str) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
@@ -717,8 +966,23 @@ def _calendar_rows_from_payload(payload: Any, key: str) -> List[Dict[str, Any]]:
 
 
 def _calendar_row_has_usable_ticker(row: Dict[str, Any]) -> bool:
-    ticker = _string_or_none(row.get("ticker"))
-    return ticker is not None and ticker.strip() != ""
+    return _has_nonblank_field(row, "ticker")
+
+
+def _insider_filing_row_has_identity(row: Dict[str, Any]) -> bool:
+    return _has_nonblank_field(row, "id", "accession_number")
+
+
+def _insider_transaction_row_has_identity(row: Dict[str, Any]) -> bool:
+    return _has_nonblank_field(row, "transaction_id")
+
+
+def _has_nonblank_field(row: Dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        text = _string_or_none(row.get(key))
+        if text is not None and text.strip() != "":
+            return True
+    return False
 
 
 def _calendar_ticker_csv_param(value: Union[str, Sequence[str]]) -> Optional[str]:
@@ -739,6 +1003,16 @@ def _calendar_ticker_csv_param(value: Union[str, Sequence[str]]) -> Optional[str
     if not normalized:
         return None
     return ",".join(normalized)
+
+
+def _dict_or_empty(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _dict_rows(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(row) for row in value if isinstance(row, dict)]
 
 
 def _news_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -928,6 +1202,125 @@ def _parse_offering_row(row: Dict[str, Any]) -> BenzingaOffering:
         importance=_int_or_none(row.get("importance")),
         notes=_string_or_none(row.get("notes")),
         url=_string_or_none(row.get("url")),
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_dividend_row(row: Dict[str, Any]) -> BenzingaDividend:
+    return BenzingaDividend(
+        id=_string_or_none(row.get("id")),
+        ticker=_string_or_none(row.get("ticker")),
+        name=_string_or_none(row.get("name")),
+        exchange=_string_or_none(row.get("exchange")),
+        currency=_string_or_none(row.get("currency")),
+        cusip=_first_identifier(row, "cusip", kind="cusip"),
+        isin=_first_identifier(row, "isin", kind="isin"),
+        date=_string_or_none(row.get("date")),
+        ex_dividend_date=_string_or_none(row.get("ex_dividend_date")),
+        payable_date=_string_or_none(row.get("payable_date")),
+        record_date=_string_or_none(row.get("record_date")),
+        dividend=_decimal_or_none(row.get("dividend")),
+        dividend_prior=_decimal_or_none(row.get("dividend_prior")),
+        dividend_type=_string_or_none(row.get("dividend_type")),
+        dividend_yield=_decimal_or_none(row.get("dividend_yield")),
+        frequency=_int_or_none(row.get("frequency")),
+        confirmed=_bool_or_none(row.get("confirmed")),
+        end_regular_dividend=_bool_or_none(row.get("end_regular_dividend")),
+        period=_string_or_none(row.get("period")),
+        year=_int_or_none(row.get("year")),
+        importance=_int_or_none(row.get("importance")),
+        notes=_string_or_none(row.get("notes")),
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_insider_filing_row(row: Dict[str, Any]) -> BenzingaInsiderFiling:
+    owner = _dict_or_empty(row.get("owner"))
+    return BenzingaInsiderFiling(
+        id=_string_or_none(row.get("id")),
+        accession_number=_string_or_none(row.get("accession_number")),
+        company_cik=_string_or_none(row.get("company_cik")),
+        company_name=_string_or_none(row.get("company_name")),
+        company_symbol=_string_or_none(row.get("company_symbol")),
+        filing_date=_timestamp_or_none(row.get("filing_date")),
+        form_type=_string_or_none(row.get("form_type")),
+        html_url=_string_or_none(row.get("html_url")),
+        is_10b5=_bool_or_none(row.get("is_10b5")),
+        insider_cik=_string_or_none(owner.get("insider_cik")),
+        insider_name=_string_or_none(owner.get("insider_name")),
+        insider_title=_string_or_none(owner.get("insider_title")),
+        is_director=_bool_or_none(owner.get("is_director")),
+        is_officer=_bool_or_none(owner.get("is_officer")),
+        is_ten_percent_owner=_bool_or_none(owner.get("is_ten_percent_owner")),
+        raw_signature=_string_or_none(owner.get("raw_signature")),
+        remaining_shares=_decimal_or_none(row.get("remaining_shares")),
+        traded_percentage=_string_or_none(row.get("traded_percentage")),
+        footnotes=_dict_rows(row.get("footnotes")),
+        transactions=_dict_rows(row.get("transactions")),
+        owner=owner,
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_insider_transaction_row(row: Dict[str, Any]) -> BenzingaInsiderTransaction:
+    filing = _dict_or_empty(row.get("filing"))
+    owner = _dict_or_empty(row.get("owner"))
+    if not owner:
+        owner = _dict_or_empty(filing.get("owner"))
+
+    return BenzingaInsiderTransaction(
+        transaction_id=_string_or_none(row.get("transaction_id")),
+        accession_number=_string_or_none(
+            row.get("accession_number") or filing.get("accession_number")
+        ),
+        company_cik=_string_or_none(row.get("company_cik") or filing.get("company_cik")),
+        company_name=_string_or_none(
+            row.get("company_name") or filing.get("company_name")
+        ),
+        company_symbol=_string_or_none(
+            row.get("company_symbol") or filing.get("company_symbol")
+        ),
+        filing_date=_timestamp_or_none(row.get("filing_date") or filing.get("filing_date")),
+        form_type=_string_or_none(row.get("form_type") or filing.get("form_type")),
+        filing_id=_string_or_none(row.get("filing_id") or filing.get("id")),
+        html_url=_string_or_none(row.get("html_url") or filing.get("html_url")),
+        insider_cik=_string_or_none(owner.get("insider_cik")),
+        insider_name=_string_or_none(owner.get("insider_name")),
+        insider_title=_string_or_none(owner.get("insider_title")),
+        is_director=_bool_or_none(owner.get("is_director")),
+        is_officer=_bool_or_none(owner.get("is_officer")),
+        is_ten_percent_owner=_bool_or_none(owner.get("is_ten_percent_owner")),
+        raw_signature=_string_or_none(owner.get("raw_signature")),
+        acquired_or_disposed=_string_or_none(row.get("acquired_or_disposed")),
+        conversion_exercise_price_derivative=_decimal_or_none(
+            row.get("conversion_exercise_price_derivative")
+        ),
+        date_deemed_execution=_timestamp_or_none(row.get("date_deemed_execution")),
+        date_exercisable=_timestamp_or_none(row.get("date_exercisable")),
+        date_expiration=_timestamp_or_none(row.get("date_expiration")),
+        date_transaction=_timestamp_or_none(row.get("date_transaction")),
+        is_derivative=_bool_or_none(row.get("is_derivative")),
+        ownership=_string_or_none(row.get("ownership")),
+        post_transaction_quantity=_decimal_or_none(
+            row.get("post_transaction_quantity")
+        ),
+        price_per_share=_decimal_or_none(row.get("price_per_share")),
+        remaining_underlying_shares=_decimal_or_none(
+            row.get("remaining_underlying_shares")
+        ),
+        security_title=_string_or_none(row.get("security_title")),
+        shares=_decimal_or_none(row.get("shares")),
+        transaction_code=_string_or_none(row.get("transaction_code")),
+        underlying_security_title=_string_or_none(
+            row.get("underlying_security_title")
+        ),
+        underlying_shares=_decimal_or_none(row.get("underlying_shares")),
+        voluntarily_reported=_bool_or_none(row.get("voluntarily_reported")),
+        owner=owner,
+        filing=filing,
         updated=_timestamp_or_none(row.get("updated")),
         raw=dict(row),
     )
