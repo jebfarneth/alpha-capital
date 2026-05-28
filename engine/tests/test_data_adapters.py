@@ -1242,6 +1242,11 @@ class TestPolygonAdapter:
                 settlement_date_from="2026-05-01",
                 settlement_date_to="2026/05/31",
             ),
+            lambda adapter: adapter.get_short_interest(
+                "AAPL",
+                settlement_date_from="2026-05-31",
+                settlement_date_to="2026-05-01",
+            ),
             lambda adapter: adapter.get_short_volume("AAPL", date=" "),
             lambda adapter: adapter.get_short_volume(
                 "AAPL",
@@ -1252,6 +1257,11 @@ class TestPolygonAdapter:
                 "AAPL",
                 date_from="2026-05-01",
                 date_to="",
+            ),
+            lambda adapter: adapter.get_short_volume(
+                "AAPL",
+                date_from="2026-05-31",
+                date_to="2026-05-01",
             ),
         ]
 
@@ -1906,6 +1916,11 @@ class TestPolygonAdapter:
                 published_utc_from="2026-05-01",
                 published_utc_to="2026-99-99",
             ),
+            lambda adapter: adapter.get_news(
+                "AAPL",
+                published_utc_from="2026-05-31",
+                published_utc_to="2026-05-01",
+            ),
         ]
 
         for call in cases:
@@ -1947,6 +1962,42 @@ class TestPolygonAdapter:
             session.get.call_args_list[2].kwargs["params"]["published_utc"]
             == "2026-05-27T12:00:00+00:00"
         )
+
+    def test_polygon_same_day_date_ranges_request_normally(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [_mock_response(200, {"results": []}) for _ in range(5)]
+        adapter = self._adapter(session)
+
+        responses = [
+            adapter.get_splits(
+                None,
+                execution_date_from="2026-05-27",
+                execution_date_to="2026-05-27",
+            ),
+            adapter.get_dividends(
+                None,
+                ex_dividend_date_from="2026-05-27",
+                ex_dividend_date_to="2026-05-27",
+            ),
+            adapter.get_short_interest(
+                None,
+                settlement_date_from="2026-05-27",
+                settlement_date_to="2026-05-27",
+            ),
+            adapter.get_short_volume(
+                None,
+                date_from="2026-05-27",
+                date_to="2026-05-27",
+            ),
+            adapter.get_news(
+                published_utc_from="2026-05-27",
+                published_utc_to="2026-05-27",
+            ),
+        ]
+
+        assert all(resp.ok for resp in responses)
+        assert session.get.call_count == 5
 
     def test_polygon_news_normalizes_tickers_and_omits_blank_filter(self):
         session = MagicMock(spec=requests.Session)
@@ -2279,6 +2330,111 @@ class TestPolygonAdapter:
         assert len(resp.data) == 1
         assert resp.data[0].close == 5.25
         assert resp.data[0].vwap == 5.15
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        session.get.assert_called_once_with(
+            "https://api.polygon.io/v2/aggs/ticker/ACME/range/1/day/2026-05-01/2026-05-19",
+            params={"limit": 5000, "sort": "asc"},
+            timeout=30,
+        )
+
+    def test_get_daily_bars_rejects_invalid_ticker_and_dates_without_request(self):
+        invalid_calls = [
+            lambda adapter: adapter.get_daily_bars("", "2026-05-01", "2026-05-02"),
+            lambda adapter: adapter.get_daily_bars("AAPL/../../x", "2026-05-01", "2026-05-02"),
+            lambda adapter: adapter.get_daily_bars("AAPL?x=1", "2026-05-01", "2026-05-02"),
+            lambda adapter: adapter.get_daily_bars("AAPL", "bad", "2026-05-02"),
+            lambda adapter: adapter.get_daily_bars("AAPL", "2026-05-01", "2026-13-45"),
+            lambda adapter: adapter.get_daily_bars("AAPL", "2026-05-03", "2026-05-02"),
+        ]
+        for call in invalid_calls:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            session.get.assert_not_called()
+
+    def test_get_daily_bars_malformed_results_are_parse_errors(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "list"}},
+            [],
+            {"results": [None]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "v": 100000}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": "N/A"}]},
+            {"results": [{"t": 1716163200000, "o": -1.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": -1.0, "l": 4.9, "c": 5.25, "v": 100000}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": -1.0, "c": 5.25, "v": 100000}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": -1.0, "v": 100000}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": -1}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000, "vw": -1}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000, "n": -1}]},
+            {"results": [{"t": -1, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000}]},
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+
+    def test_get_daily_bars_zero_values_are_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": [
+                    {
+                        "t": 0,
+                        "o": 0,
+                        "h": 0,
+                        "l": 0,
+                        "c": 0,
+                        "v": 0,
+                        "vw": 0,
+                        "n": 0,
+                    }
+                ]
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+
+        assert resp.ok
+        assert resp.data[0].open == 0
+        assert resp.data[0].volume == 0
+        assert resp.data[0].vwap == 0
+        assert resp.data[0].transactions == 0
+
+    def test_get_daily_bars_request_exception_does_not_leak_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/v2/aggs/ticker/AAPL/range/1/day/2026-05-01/2026-05-02?apiKey=SECRET&token=LEAK"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "Polygon request failed: ConnectionError"
+        assert "SECRET" not in repr(resp)
+        assert "apiKey" not in repr(resp)
+        assert "token" not in repr(resp)
 
     def test_get_splits_ok(self):
         session = MagicMock(spec=requests.Session)
@@ -2404,6 +2560,11 @@ class TestPolygonAdapter:
                 execution_date_from="2026-05-01",
                 execution_date_to="2026/05/31",
             ),
+            lambda adapter: adapter.get_splits(
+                "AAPL",
+                execution_date_from="2026-05-31",
+                execution_date_to="2026-05-01",
+            ),
             lambda adapter: adapter.get_dividends("MSFT", ex_dividend_date=" "),
             lambda adapter: adapter.get_dividends(
                 "MSFT",
@@ -2414,6 +2575,11 @@ class TestPolygonAdapter:
                 "MSFT",
                 ex_dividend_date_from="2026-05-01",
                 ex_dividend_date_to="",
+            ),
+            lambda adapter: adapter.get_dividends(
+                "MSFT",
+                ex_dividend_date_from="2026-05-31",
+                ex_dividend_date_to="2026-05-01",
             ),
         ]
 
@@ -2531,6 +2697,64 @@ class TestPolygonAdapter:
         assert resp.lineage.data_quality_flags["raw_rows"] == 9
         assert resp.lineage.data_quality_flags["parsed_rows"] == 1
         assert resp.lineage.data_quality_flags["skipped_rows"] == 8
+
+    def test_polygon_dated_feeds_skip_malformed_provider_row_dates(self):
+        cases = [
+            (
+                lambda adapter: adapter.get_splits("AAPL"),
+                [
+                    {"ticker": "VALID", "execution_date": "2026-05-27", "split_from": 1, "split_to": 2},
+                    {"ticker": "BAD", "execution_date": "bad", "split_from": 1, "split_to": 2},
+                    {"ticker": "IMPOSSIBLE", "execution_date": "2026-13-45", "split_from": 1, "split_to": 2},
+                    {"ticker": "BLANK", "execution_date": "", "split_from": 1, "split_to": 2},
+                    {"ticker": "NUMERIC", "execution_date": 20260527, "split_from": 1, "split_to": 2},
+                ],
+            ),
+            (
+                lambda adapter: adapter.get_dividends("AAPL"),
+                [
+                    {"ticker": "VALID", "ex_dividend_date": "2026-05-27", "cash_amount": "0.25"},
+                    {"ticker": "BAD", "ex_dividend_date": "bad", "cash_amount": "0.25"},
+                    {"ticker": "IMPOSSIBLE", "ex_dividend_date": "2026-13-45", "cash_amount": "0.25"},
+                    {"ticker": "BLANK", "ex_dividend_date": "", "cash_amount": "0.25"},
+                    {"ticker": "NUMERIC", "ex_dividend_date": 20260527, "cash_amount": "0.25"},
+                ],
+            ),
+            (
+                lambda adapter: adapter.get_short_interest("AAPL"),
+                [
+                    {"ticker": "VALID", "settlement_date": "2026-05-27", "short_interest": "10"},
+                    {"ticker": "BAD", "settlement_date": "bad", "short_interest": "10"},
+                    {"ticker": "IMPOSSIBLE", "settlement_date": "2026-13-45", "short_interest": "10"},
+                    {"ticker": "BLANK", "settlement_date": "", "short_interest": "10"},
+                    {"ticker": "NUMERIC", "settlement_date": 20260527, "short_interest": "10"},
+                ],
+            ),
+            (
+                lambda adapter: adapter.get_short_volume("AAPL"),
+                [
+                    {"ticker": "VALID", "date": "2026-05-27", "short_volume": "10"},
+                    {"ticker": "BAD", "date": "bad", "short_volume": "10"},
+                    {"ticker": "IMPOSSIBLE", "date": "2026-13-45", "short_volume": "10"},
+                    {"ticker": "BLANK", "date": "", "short_volume": "10"},
+                    {"ticker": "NUMERIC", "date": 20260527, "short_volume": "10"},
+                ],
+            ),
+        ]
+
+        for call, rows in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, {"results": rows})
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert resp.ok
+            assert [row.ticker for row in resp.data] == ["VALID"]
+            assert resp.lineage.data_quality_flags["raw_rows"] == 5
+            assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+            assert resp.lineage.data_quality_flags["skipped_rows"] == 4
 
     def test_polygon_corporate_action_skipped_row_telemetry_counts_rows(self):
         session = MagicMock(spec=requests.Session)
@@ -3274,6 +3498,89 @@ class TestPolygonAdapter:
         assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
         assert resp3.lineage.raw_payload_hash == resp4.lineage.raw_payload_hash
 
+    def test_legacy_polygon_lineage_hash_stability_and_changes(self):
+        tickers_page_1 = {
+            "results": [{"ticker": "AAPL", "name": "Apple Inc.", "cik": "320193"}],
+            "next_url": "/v3/reference/tickers?cursor=abc",
+        }
+        tickers_page_2 = {
+            "results": [{"ticker": "MSFT", "name": "Microsoft Corp.", "cik": "789019"}]
+        }
+        tickers_page_2_changed = {
+            "results": [{"ticker": "MSFT", "name": "Microsoft Corporation", "cik": "789019"}]
+        }
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, tickers_page_1),
+            _mock_response(200, tickers_page_2),
+            _mock_response(200, tickers_page_1),
+            _mock_response(200, tickers_page_2),
+            _mock_response(200, tickers_page_1),
+            _mock_response(200, tickers_page_2_changed),
+        ]
+        adapter = self._adapter(session)
+
+        tickers_1 = adapter.get_tickers(limit=1)
+        tickers_2 = adapter.get_tickers(limit=1)
+        tickers_3 = adapter.get_tickers(limit=1)
+
+        assert tickers_1.ok
+        assert tickers_2.ok
+        assert tickers_3.ok
+        assert tickers_1.lineage.raw_payload_hash == tickers_2.lineage.raw_payload_hash
+        assert tickers_1.lineage.raw_payload_hash != tickers_3.lineage.raw_payload_hash
+
+        details_payload = {"results": {"ticker": "AAPL", "name": "Apple Inc."}}
+        details_changed = {"results": {"ticker": "AAPL", "name": "Apple Incorporated"}}
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, details_payload),
+            _mock_response(200, details_payload),
+            _mock_response(200, details_changed),
+        ]
+        adapter = self._adapter(session)
+
+        details_1 = adapter.get_ticker_details("AAPL")
+        details_2 = adapter.get_ticker_details("AAPL")
+        details_3 = adapter.get_ticker_details("AAPL")
+
+        assert details_1.ok
+        assert details_2.ok
+        assert details_3.ok
+        assert details_1.lineage.raw_payload_hash == details_2.lineage.raw_payload_hash
+        assert details_1.lineage.raw_payload_hash != details_3.lineage.raw_payload_hash
+
+        bars_payload = {
+            "results": [
+                {"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000}
+            ]
+        }
+        bars_changed = {
+            "results": [
+                {"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.30, "v": 100000}
+            ]
+        }
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, bars_payload),
+            _mock_response(200, bars_payload),
+            _mock_response(200, bars_changed),
+        ]
+        adapter = self._adapter(session)
+
+        bars_1 = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+        bars_2 = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+        bars_3 = adapter.get_daily_bars("AAPL", "2026-05-01", "2026-05-02")
+
+        assert bars_1.ok
+        assert bars_2.ok
+        assert bars_3.ok
+        assert bars_1.lineage.raw_payload_hash == bars_2.lineage.raw_payload_hash
+        assert bars_1.lineage.raw_payload_hash != bars_3.lineage.raw_payload_hash
+
     def test_request_converts_aware_asof_to_utc(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -3342,7 +3649,7 @@ class TestPolygonAdapter:
                     "list_date": "1980-12-12",
                 }
             ],
-            "next_url": "https://api.polygon.io/v3/reference/tickers?cursor=abc",
+            "next_url": "https://api.polygon.io/v3/reference/tickers?cursor=abc&apiKey=SECRET&token=LEAK",
         }
         page_2 = {
             "results": [
@@ -3375,8 +3682,25 @@ class TestPolygonAdapter:
         assert resp.data[1].results[0].ticker == "META"
         assert resp.data[1].results[0].cik == "0001326801"
         assert resp.data[0].next_url == "/v3/reference/tickers"
+        assert resp.data[0].raw_payload["next_url"] == "/v3/reference/tickers"
+        assert "SECRET" not in repr(resp)
+        assert "apiKey" not in repr(resp)
+        assert "token" not in repr(resp)
         assert session.get.call_count == 2
         assert session.get.call_args_list[0].kwargs["params"]["limit"] == 1000
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/v3/reference/tickers"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert "SECRET" not in repr(session.get.call_args_list[1])
+        assert "apiKey" not in repr(session.get.call_args_list[1])
+        flags = resp.lineage.data_quality_flags
+        assert flags["page_count"] == 2
+        assert flags["paginated"] is True
+        assert flags["truncated"] is False
+        assert flags["next_url_paths"] == ["/v3/reference/tickers"]
+        assert flags["raw_rows"] == 2
+        assert flags["parsed_rows"] == 2
+        assert flags["duplicate_same_identity_rows"] == 0
+        assert flags["duplicate_conflict_rows"] == 0
 
     def test_get_tickers_no_data_is_successful_empty_page(self):
         session = MagicMock(spec=requests.Session)
@@ -3413,6 +3737,151 @@ class TestPolygonAdapter:
         assert not resp.ok
         assert resp.error.error_type == "parse"
 
+    def test_get_tickers_rejects_unsafe_next_urls(self):
+        bad_next_urls = [
+            "https://evil.example/v3/reference/tickers?cursor=abc&apiKey=SECRET",
+            "http://api.polygon.io/v3/reference/tickers?cursor=abc",
+            "https://api.polygon.io.evil.example/v3/reference/tickers?cursor=abc",
+            "https://api.polygon.io/v3/reference/tickers/other?cursor=abc",
+            "https://api.polygon.io/v3/reference/tickers?apiKey=SECRET",
+        ]
+        for next_url in bad_next_urls:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(
+                200,
+                {
+                    "results": [{"ticker": "AAPL", "name": "Apple Inc."}],
+                    "next_url": next_url,
+                },
+            )
+            adapter = self._adapter(session)
+
+            resp = adapter.get_tickers(limit=1)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "pagination"
+            assert resp.error.retryable is False
+            assert session.get.call_count == 1
+            assert "SECRET" not in repr(resp)
+            assert "apiKey" not in repr(resp)
+            assert "evil.example" not in repr(resp)
+
+    def test_get_tickers_pagination_cap_fails_loud(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": [{"ticker": "AAPL", "name": "Apple Inc."}],
+                "next_url": "/v3/reference/tickers?cursor=abc&apiKey=SECRET",
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers(limit=1, max_pages=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        flags = resp.lineage.data_quality_flags
+        assert flags["page_count"] == 1
+        assert flags["paginated"] is True
+        assert flags["truncated"] is True
+        assert flags["next_url_paths"] == ["/v3/reference/tickers"]
+        assert "SECRET" not in repr(resp)
+        assert "apiKey" not in repr(resp)
+
+    def test_get_tickers_unexpected_payload_shapes_are_parse_errors(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "list"}},
+            [],
+            {"results": [None]},
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_tickers()
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+
+    def test_get_tickers_duplicate_identity_telemetry_and_conflict(self):
+        same_identity = {
+            "ticker": "AAPL",
+            "name": "Apple Inc.",
+            "active": True,
+            "cik": "320193",
+            "primary_exchange": "XNAS",
+            "type": "CS",
+            "list_date": "1980-12-12",
+        }
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "results": [same_identity],
+                    "next_url": "/v3/reference/tickers?cursor=abc",
+                },
+            ),
+            _mock_response(200, {"results": [same_identity]}),
+        ]
+        adapter = self._adapter(session)
+
+        same_resp = adapter.get_tickers(limit=1)
+
+        assert same_resp.ok
+        assert same_resp.lineage.data_quality_flags["duplicate_same_identity_rows"] == 1
+        assert same_resp.lineage.data_quality_flags["duplicate_conflict_rows"] == 0
+
+        conflict = dict(same_identity)
+        conflict["cik"] = "1326801"
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "results": [same_identity],
+                    "next_url": "/v3/reference/tickers?cursor=abc",
+                },
+            ),
+            _mock_response(200, {"results": [conflict]}),
+        ]
+        adapter = self._adapter(session)
+
+        conflict_resp = adapter.get_tickers(limit=1)
+
+        assert not conflict_resp.ok
+        assert conflict_resp.data is None
+        assert conflict_resp.error.error_type == "identity_conflict"
+        assert conflict_resp.lineage.data_quality_flags["duplicate_conflict_rows"] == 1
+
+    def test_get_tickers_request_exception_does_not_leak_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/v3/reference/tickers?apiKey=SECRET&token=LEAK"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_tickers()
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "Polygon request failed: ConnectionError"
+        assert "SECRET" not in repr(resp)
+        assert "apiKey" not in repr(resp)
+        assert "token" not in repr(resp)
+
 
     def test_get_ticker_details_with_cik_figi(self):
         session = MagicMock(spec=requests.Session)
@@ -3448,6 +3917,11 @@ class TestPolygonAdapter:
         assert resp.data.list_date == "1980-12-12"
         assert resp.data.market == "stocks"
         assert resp.data.sic_code == "3571"
+        session.get.assert_called_once_with(
+            "https://api.polygon.io/v3/reference/tickers/AAPL",
+            params={},
+            timeout=30,
+        )
 
     def test_get_ticker_details_no_data(self):
         session = MagicMock(spec=requests.Session)
@@ -3481,6 +3955,89 @@ class TestPolygonAdapter:
         assert resp.data.delisted_utc == "2025-11-15T00:00:00Z"
         assert resp.data.cik == "0001831097"
 
+    def test_get_ticker_details_rejects_invalid_ticker_and_date_without_request(self):
+        invalid_calls = [
+            lambda adapter: adapter.get_ticker_details(""),
+            lambda adapter: adapter.get_ticker_details(" "),
+            lambda adapter: adapter.get_ticker_details("AAPL/../../x"),
+            lambda adapter: adapter.get_ticker_details("AAPL?x=1"),
+            lambda adapter: adapter.get_ticker_details(".AAPL"),
+            lambda adapter: adapter.get_ticker_details("AAPL."),
+            lambda adapter: adapter.get_ticker_details("A..PL"),
+            lambda adapter: adapter.get_ticker_details("AAPL", date_str="bad"),
+            lambda adapter: adapter.get_ticker_details("AAPL", date_str="2026-13-45"),
+        ]
+        for call in invalid_calls:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            session.get.assert_not_called()
+
+    def test_get_ticker_details_bad_shapes_are_parse_errors(self):
+        cases = [
+            {"unexpected": True},
+            {"results": []},
+            {"results": "bad"},
+            {"results": {"not": "list"}},
+            {"results": {"name": " "}},
+            [],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_ticker_details("AAPL")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+
+    def test_get_ticker_details_rejects_provider_ticker_mismatch(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": {
+                    "ticker": "MSFT",
+                    "name": "Microsoft",
+                    "active": True,
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_details("AAPL")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+
+    def test_get_ticker_details_request_exception_does_not_leak_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/v3/reference/tickers/AAPL?apiKey=SECRET&token=LEAK"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_details("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "Polygon request failed: ConnectionError"
+        assert "SECRET" not in repr(resp)
+        assert "apiKey" not in repr(resp)
+        assert "token" not in repr(resp)
+
     def test_get_ticker_events_ticker_change(self):
         from alpha.data.polygon import PolygonTickerEvent
         session = MagicMock(spec=requests.Session)
@@ -3508,6 +4065,121 @@ class TestPolygonAdapter:
         assert ev.date == "2022-06-09"
         assert ev.old_ticker == "FB"
         assert ev.identifier_queried == "META"
+        assert ev.identity_continuity_status == "unproven"
+        assert ev.raw_event == json_data["results"]["events"][0]
+        assert resp.lineage.data_quality_flags["identifier_queried"] == "META"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        assert resp.lineage.data_quality_flags["identity_continuity_unproven_rows"] == 1
+        session.get.assert_called_with(
+            "https://api.polygon.io/vX/reference/tickers/META/events",
+            params={"types": "ticker_change"},
+            timeout=30,
+        )
+
+    def test_get_ticker_events_rejects_invalid_identifiers_without_request(self):
+        cases = [
+            "",
+            " ",
+            "META,FB",
+            "META/FB",
+            "META?x=1",
+            "META#frag",
+            "META&x=1",
+            "META%2FFB",
+            "META%3FFB",
+            "META%26FB",
+            "META\\FB",
+            "META:FB",
+            "META FB",
+            ".",
+            "..",
+            "-",
+            "_",
+            ".META",
+            "META.",
+            "-META",
+            "META-",
+            "_META",
+            "META_",
+            "A..B",
+            "X" * 300,
+            123,
+        ]
+        for identifier in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = adapter.get_ticker_events(identifier)  # type: ignore[arg-type]
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            session.get.assert_not_called()
+
+    def test_get_ticker_events_accepts_path_safe_identifiers(self):
+        cases = {
+            " meta ": "META",
+            "BRK.B": "BRK.B",
+            "BRK-B": "BRK-B",
+            "BBG000B9XRY4": "BBG000B9XRY4",
+            "123456789": "123456789",
+        }
+        for identifier, normalized in cases.items():
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, {"results": {"events": []}})
+            adapter = self._adapter(session)
+
+            resp = adapter.get_ticker_events(identifier)
+
+            assert resp.ok
+            session.get.assert_called_once_with(
+                f"https://api.polygon.io/vX/reference/tickers/{normalized}/events",
+                params={"types": "ticker_change"},
+                timeout=30,
+            )
+            assert resp.lineage.data_quality_flags["identifier_queried"] == normalized
+
+    def test_get_ticker_events_validates_event_types_without_injection(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": {"events": []}})
+        adapter = self._adapter(session)
+
+        default_resp = adapter.get_ticker_events(" meta ")
+        list_resp = adapter.get_ticker_events("meta", types=[" ticker_change ", "ticker_change"])
+
+        assert default_resp.ok
+        assert list_resp.ok
+        assert session.get.call_args_list[0].args[0] == (
+            "https://api.polygon.io/vX/reference/tickers/META/events"
+        )
+        assert session.get.call_args_list[0].kwargs["params"] == {"types": "ticker_change"}
+        assert session.get.call_args_list[1].kwargs["params"] == {"types": "ticker_change"}
+
+        bad_cases = [
+            ["ticker_change", 123],
+            [" "],
+            "ticker_change,delisting",
+            "ticker_change&x=1",
+            "name_change",
+        ]
+        for types in bad_cases:
+            bad_session = MagicMock(spec=requests.Session)
+            bad_session.params = {}
+            bad_adapter = self._adapter(bad_session)
+
+            resp = bad_adapter.get_ticker_events("META", types=types)  # type: ignore[arg-type]
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            bad_session.get.assert_not_called()
 
     def test_get_ticker_events_no_events(self):
         session = MagicMock(spec=requests.Session)
@@ -3519,6 +4191,474 @@ class TestPolygonAdapter:
 
         assert resp.ok
         assert resp.data == []
+        assert resp.lineage.data_quality_flags["identifier_queried"] == "ACME"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 0
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        assert resp.lineage.data_quality_flags["event_types_present"] == []
+
+    def test_get_ticker_events_invalid_shape_is_parse_error(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"events": {"not": "list"}}},
+            {"results": {}},
+            [{"events": []}],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_ticker_events("META")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.error.retryable is False
+            assert resp.lineage.endpoint == "/vX/reference/tickers/META/events"
+            assert resp.lineage.data_quality_flags["identifier_queried"] == "META"
+
+    def test_get_ticker_events_malformed_json_is_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, text="not json")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+
+    def test_get_ticker_events_skips_invalid_rows_and_tracks_continuity(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "events": [
+                    None,
+                    "bad",
+                    {},
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-09",
+                        "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+                    },
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-10",
+                        "ticker_change": {
+                            "ticker": "OLD",
+                            "new_ticker": "NEW",
+                            "old_cik": "0001234567",
+                            "new_cik": "1234567",
+                        },
+                    },
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-11",
+                        "ticker_change": {
+                            "ticker": "OLD2",
+                            "new_ticker": "NEW2",
+                            "old_cik": "0001234567",
+                            "new_cik": "0007654321",
+                        },
+                    },
+                    {
+                        "type": "name_change",
+                        "date": "2022-06-12",
+                        "name": "New Name",
+                    },
+                ]
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert [row.event_type for row in resp.data] == [
+            "ticker_change",
+            "ticker_change",
+            "ticker_change",
+        ]
+        assert [row.identity_continuity_status for row in resp.data] == [
+            "unproven",
+            "proved",
+            "mismatch",
+        ]
+        assert resp.data[0].old_ticker == "FB"
+        assert resp.data[0].new_ticker == "META"
+        assert resp.data[1].old_cik == "0001234567"
+        assert resp.data[1].new_cik == "0001234567"
+        assert resp.data[2].new_cik == "0007654321"
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 7
+        assert flags["parsed_rows"] == 3
+        assert flags["skipped_rows"] == 4
+        assert flags["identity_continuity_unproven_rows"] == 1
+        assert flags["identity_continuity_proved_rows"] == 1
+        assert flags["identity_continuity_mismatch_rows"] == 1
+        assert flags["identity_continuity_not_applicable_rows"] == 0
+        assert flags["event_types_present"] == ["ticker_change"]
+
+    def test_get_ticker_events_skips_undated_ticker_change_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": {
+                    "events": [
+                        {
+                            "type": "ticker_change",
+                            "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+                        }
+                    ]
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert resp.data == []
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 1
+        assert flags["parsed_rows"] == 0
+        assert flags["skipped_rows"] == 1
+        assert flags["all_rows_skipped"] is True
+
+    def test_get_ticker_events_accepts_valid_iso_date_fields(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        rows = [
+            {
+                "type": "ticker_change",
+                "date": "2022-06-09",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "event_date": "2022-06-10",
+                "ticker_change": {"ticker": "OLD1", "new_ticker": "NEW1"},
+            },
+            {
+                "type": "ticker_change",
+                "effective_date": "2022-06-11",
+                "ticker_change": {"ticker": "OLD2", "new_ticker": "NEW2"},
+            },
+            {
+                "type": "ticker_change",
+                "effective_utc": "2022-06-12",
+                "ticker_change": {"ticker": "OLD3", "new_ticker": "NEW3"},
+            },
+            {
+                "type": "ticker_change",
+                "effective_utc": "2022-06-14T00:00:00Z",
+                "ticker_change": {"ticker": "OLD5", "new_ticker": "NEW5"},
+            },
+            {
+                "type": "ticker_change",
+                "effective_utc": "2022-06-14T23:30:00-04:00",
+                "ticker_change": {"ticker": "OLD6", "new_ticker": "NEW6"},
+            },
+            {
+                "type": "ticker_change",
+                "execution_date": "2022-06-13",
+                "ticker_change": {"ticker": "OLD4", "new_ticker": "NEW4"},
+            },
+        ]
+        session.get.return_value = _mock_response(200, {"results": {"events": rows}})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert len(resp.data) == 7
+        assert [event.date for event in resp.data] == [
+            "2022-06-09",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+        assert [event.event_date for event in resp.data] == [
+            "2022-06-09",
+            "2022-06-10",
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+        assert [event.effective_date for event in resp.data] == [
+            "2022-06-09",
+            "2022-06-10",
+            "2022-06-11",
+            "2022-06-12",
+            "2022-06-14",
+            "2022-06-15",
+            "2022-06-13",
+        ]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 7
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 7
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+
+    def test_get_ticker_events_skips_malformed_date_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        rows = [
+            {
+                "type": "ticker_change",
+                "date": "not-a-date",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "date": "2022-99-99",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "date": "",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "date": "   ",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "date": 20220609,
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "effective_utc": "2022-06-09T00:00:00",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+        ]
+        session.get.return_value = _mock_response(200, {"results": {"events": rows}})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert resp.data == []
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 6
+        assert flags["parsed_rows"] == 0
+        assert flags["skipped_rows"] == 6
+        assert flags["all_rows_skipped"] is True
+
+    def test_get_ticker_events_mixed_valid_and_malformed_date_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        rows = [
+            {
+                "type": "ticker_change",
+                "date": "2022-06-09",
+                "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+            },
+            {
+                "type": "ticker_change",
+                "date": "not-a-date",
+                "ticker_change": {"ticker": "BAD", "new_ticker": "WORSE"},
+            },
+        ]
+        session.get.return_value = _mock_response(200, {"results": {"events": rows}})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert [event.old_ticker for event in resp.data] == ["FB"]
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 2
+        assert flags["parsed_rows"] == 1
+        assert flags["skipped_rows"] == 1
+        assert "all_rows_skipped" not in flags
+
+    def test_get_ticker_events_skips_unsupported_returned_event_types(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": {
+                    "events": [
+                        {"type": "name_change", "date": "2022-06-09", "name": "New"},
+                        {"type": "delisting", "date": "2022-06-10", "ticker": "OLD"},
+                        {"type": "merger", "date": "2022-06-11", "ticker": "OLD"},
+                        {"type": "unknown_type", "date": "2022-06-12", "ticker": "OLD"},
+                    ]
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert resp.data == []
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 4
+        assert flags["parsed_rows"] == 0
+        assert flags["skipped_rows"] == 4
+        assert flags["all_rows_skipped"] is True
+        assert flags["event_types_present"] == []
+
+    def test_get_ticker_events_mixed_rows_only_reports_supported_events(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": {
+                    "events": [
+                        {
+                            "type": "ticker_change",
+                            "date": "2022-06-09",
+                            "ticker_change": {"ticker": "FB", "new_ticker": "META"},
+                        },
+                        {
+                            "type": "ticker_change",
+                            "ticker_change": {"ticker": "UNDATED", "new_ticker": "NEW"},
+                        },
+                        {"type": "name_change", "date": "2022-06-10", "name": "New"},
+                    ]
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert [row.event_type for row in resp.data] == ["ticker_change"]
+        assert resp.data[0].identity_continuity_status == "unproven"
+        flags = resp.lineage.data_quality_flags
+        assert flags["raw_rows"] == 3
+        assert flags["parsed_rows"] == 1
+        assert flags["skipped_rows"] == 2
+        assert flags["event_types_present"] == ["ticker_change"]
+        assert flags["identity_continuity_unproven_rows"] == 1
+
+    def test_get_ticker_events_all_invalid_rows_are_flagged(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {"results": {"events": [None, {}, {"type": "ticker_change"}]}},
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 3
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 3
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_get_ticker_events_raw_event_is_deep_copied(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        row = {
+            "type": "ticker_change",
+            "date": "2022-06-09",
+            "ticker_change": {"ticker": "FB", "new_ticker": "META", "nested": {"rank": 1}},
+        }
+        json_data = {"results": {"events": [row]}}
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert resp.ok
+        event = resp.data[0]
+        row["ticker_change"]["nested"]["rank"] = 2
+        assert event.raw_event["ticker_change"]["nested"]["rank"] == 1
+        event.raw_event["ticker_change"]["nested"]["rank"] = 3
+        assert event.raw_event["ticker_change"]["nested"]["rank"] == 3
+
+    def test_get_ticker_events_pagination_marker_fails_loud(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "results": {
+                    "events": [
+                        {
+                            "type": "ticker_change",
+                            "ticker_change": {"ticker": "FB"},
+                        }
+                    ]
+                },
+                "next_url": "https://api.polygon.io/vX/reference/tickers/META/events?cursor=abc&apiKey=SECRET",
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        assert resp.error.retryable is False
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+        assert session.get.call_count == 1
+
+    def test_get_ticker_events_request_exception_does_not_leak_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/vX/reference/tickers/META/events?apiKey=test-polygon-key&types=ticker_change"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("META")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "Polygon request failed: ConnectionError"
+        assert "test-polygon-key" not in resp.error.message
+        assert "apiKey" not in resp.error.message
+        assert "https://api.polygon.io" not in resp.error.message
+
+    def test_get_ticker_events_lineage_hash_stability(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "events": [
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-09",
+                        "ticker_change": {"ticker": "FB"},
+                    }
+                ]
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp1 = adapter.get_ticker_events("META")
+        resp2 = adapter.get_ticker_events("META")
+
+        assert resp1.ok
+        assert resp2.ok
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
 
     def test_get_ticker_events_403_not_accessible(self):
         session = MagicMock(spec=requests.Session)

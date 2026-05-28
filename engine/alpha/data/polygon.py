@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
@@ -40,6 +40,13 @@ SHORT_INTEREST_ENDPOINT = "/stocks/v1/short-interest"
 SHORT_VOLUME_ENDPOINT = "/stocks/v1/short-volume"
 NEWS_ENDPOINT = "/v2/reference/news"
 POLYGON_API_HOSTS = {"api.polygon.io", "api.massive.com"}
+TICKER_EVENT_ALLOWED_TYPES = {"ticker_change"}
+TICKER_EVENT_IDENTIFIER_MAX_LENGTH = 64
+TICKER_EVENT_IDENTIFIER_ALLOWED_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+PATH_TICKER_MAX_LENGTH = 64
+PATH_TICKER_ALLOWED_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
 
 
 # --- Response types ---
@@ -213,9 +220,16 @@ class PolygonTickerEvent:
     old_ticker: Optional[str] = None
     new_ticker: Optional[str] = None
     cik: Optional[str] = None
+    old_cik: Optional[str] = None
+    new_cik: Optional[str] = None
     composite_figi: Optional[str] = None
+    old_composite_figi: Optional[str] = None
+    new_composite_figi: Optional[str] = None
     share_class_figi: Optional[str] = None
+    old_share_class_figi: Optional[str] = None
+    new_share_class_figi: Optional[str] = None
     name: Optional[str] = None
+    identity_continuity_status: str = "not_applicable"
     raw_event: Optional[Dict[str, Any]] = None
 
 
@@ -852,7 +866,29 @@ class PolygonAdapter:
         """Fetch Polygon's paginated all-tickers reference identity feed."""
 
         endpoint = TICKERS_ENDPOINT
-        params: Dict[str, Any] = {"limit": min(int(limit), 1000)}
+        if max_pages is not None:
+            try:
+                page_cap = int(max_pages)
+            except (TypeError, ValueError):
+                return _provider_error_response(
+                    endpoint=endpoint,
+                    error_type="validation",
+                    message="Polygon tickers max_pages must be a positive integer",
+                    retryable=False,
+                    asof=asof,
+                )
+            if page_cap < 1:
+                return _provider_error_response(
+                    endpoint=endpoint,
+                    error_type="validation",
+                    message="Polygon tickers max_pages must be a positive integer",
+                    retryable=False,
+                    asof=asof,
+                )
+        else:
+            page_cap = None
+
+        params: Dict[str, Any] = {"limit": _limited_int(limit, maximum=1000)}
         if market is not None:
             params["market"] = market
         if locale is not None:
@@ -874,64 +910,218 @@ class PolygonAdapter:
 
         pages: List[PolygonTickerReferencePage] = []
         next_url: Optional[str] = None
+        next_request: Optional[_NextPageRequest] = None
         first_lineage: Optional[LineageMeta] = None
+        page_hashes: List[str] = []
+        next_url_paths: List[str] = []
         page_number = 0
+        raw_rows = 0
+        parsed_rows = 0
+        duplicate_same_identity_rows = 0
+        seen_identity_hashes: Dict[str, str] = {}
 
         while True:
-            request_params = (
-                dict(params)
-                if page_number == 0
-                else {"cursor_url_path": _safe_url_path(next_url)}
-            )
+            request_params = dict(params) if page_number == 0 else dict(next_request.params)
             resp = self._request(
                 endpoint,
-                params=params if page_number == 0 else None,
+                params=params if page_number == 0 else next_request.params,
                 asof=asof,
-                url_override=next_url,
+                url_override=None if page_number == 0 else next_request.url,
                 lineage_endpoint=endpoint,
             )
             first_lineage = first_lineage or resp.lineage
             if not resp.ok:
+                lineage = resp.lineage
+                if page_number > 0 or next_url_paths:
+                    lineage = _corporate_action_error_lineage(
+                        resp.lineage,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=True,
+                    )
                 return AdapterResponse(
                     data=None,
-                    lineage=resp.lineage,
+                    lineage=lineage,
                     error=resp.error,
                 )
 
-            payload = resp.data if isinstance(resp.data, dict) else {}
-            raw_results = payload.get("results") or []
-            if not isinstance(raw_results, list):
-                raw_results = []
+            page_hashes.append(resp.lineage.raw_payload_hash)
+            payload = resp.data
+            if (
+                not isinstance(payload, dict)
+                or "results" not in payload
+                or not isinstance(payload.get("results"), list)
+            ):
+                lineage = _ticker_reference_lineage(
+                    first_lineage=first_lineage,
+                    page_hashes=page_hashes,
+                    page_count=page_number + 1,
+                    next_url_paths=next_url_paths,
+                    truncated=page_number > 0 or bool(next_url_paths),
+                    raw_rows=raw_rows,
+                    parsed_rows=parsed_rows,
+                    duplicate_same_identity_rows=duplicate_same_identity_rows,
+                )
+                return _parse_error_response(
+                    lineage=lineage,
+                    endpoint=endpoint,
+                    message="Polygon tickers response missing list results",
+                )
+
+            raw_results = payload["results"]
             next_url = _str_or_none(payload.get("next_url"))
+            parsed_results: List[PolygonTickerReference] = []
+            for row in raw_results:
+                raw_rows += 1
+                if not isinstance(row, dict):
+                    lineage = _ticker_reference_lineage(
+                        first_lineage=first_lineage,
+                        page_hashes=page_hashes,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=page_number > 0 or bool(next_url_paths),
+                        raw_rows=raw_rows,
+                        parsed_rows=parsed_rows,
+                        duplicate_same_identity_rows=duplicate_same_identity_rows,
+                    )
+                    return _parse_error_response(
+                        lineage=lineage,
+                        endpoint=endpoint,
+                        message="Polygon tickers response contains non-object result row",
+                    )
+                parsed = _parse_ticker_reference_row(row)
+                if not parsed.ticker:
+                    lineage = _ticker_reference_lineage(
+                        first_lineage=first_lineage,
+                        page_hashes=page_hashes,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=page_number > 0 or bool(next_url_paths),
+                        raw_rows=raw_rows,
+                        parsed_rows=parsed_rows,
+                        duplicate_same_identity_rows=duplicate_same_identity_rows,
+                    )
+                    return _parse_error_response(
+                        lineage=lineage,
+                        endpoint=endpoint,
+                        message="Polygon tickers response contains identity-less ticker row",
+                    )
+                identity_hash = _ticker_reference_identity_hash(parsed)
+                previous_hash = seen_identity_hashes.get(parsed.ticker)
+                if previous_hash is None:
+                    seen_identity_hashes[parsed.ticker] = identity_hash
+                elif previous_hash == identity_hash:
+                    duplicate_same_identity_rows += 1
+                else:
+                    lineage = _ticker_reference_lineage(
+                        first_lineage=first_lineage,
+                        page_hashes=page_hashes,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=True,
+                        raw_rows=raw_rows,
+                        parsed_rows=parsed_rows,
+                        duplicate_same_identity_rows=duplicate_same_identity_rows,
+                        duplicate_conflict_rows=1,
+                    )
+                    return AdapterResponse(
+                        data=None,
+                        lineage=lineage,
+                        error=ProviderError(
+                            provider=PROVIDER,
+                            endpoint=endpoint,
+                            status_code=200,
+                            error_type="identity_conflict",
+                            message="Polygon tickers response contains conflicting duplicate ticker identity",
+                            retryable=False,
+                        ),
+                    )
+                parsed_results.append(parsed)
+                parsed_rows += 1
+
             pages.append(PolygonTickerReferencePage(
-                results=[
-                    _parse_ticker_reference_row(row)
-                    for row in raw_results
-                    if isinstance(row, dict)
-                ],
+                results=parsed_results,
                 lineage=resp.lineage,
                 request_params=request_params,
                 page_number=page_number,
                 next_url=_safe_url_path(next_url),
-                raw_payload=payload,
+                raw_payload=_sanitized_page_payload(payload),
             ))
+
+            next_request = None
+            if next_url:
+                safe_path = _safe_url_path(next_url)
+                if safe_path:
+                    next_url_paths.append(safe_path)
+                next_request = _corporate_action_next_request(
+                    next_url,
+                    endpoint=endpoint,
+                    base_url=self._config.base_url,
+                )
+                if next_request is None:
+                    lineage = _ticker_reference_lineage(
+                        first_lineage=first_lineage,
+                        page_hashes=page_hashes,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=True,
+                        raw_rows=raw_rows,
+                        parsed_rows=parsed_rows,
+                        duplicate_same_identity_rows=duplicate_same_identity_rows,
+                    )
+                    return AdapterResponse(
+                        data=None,
+                        lineage=lineage,
+                        error=ProviderError(
+                            provider=PROVIDER,
+                            endpoint=endpoint,
+                            status_code=200,
+                            error_type="pagination",
+                            message="Polygon tickers pagination next_url rejected",
+                            retryable=False,
+                        ),
+                    )
 
             page_number += 1
             if not next_url:
                 break
-            if max_pages is not None and page_number >= max_pages:
-                break
+            if page_cap is not None and page_number >= page_cap:
+                lineage = _ticker_reference_lineage(
+                    first_lineage=first_lineage,
+                    page_hashes=page_hashes,
+                    page_count=page_number,
+                    next_url_paths=next_url_paths,
+                    truncated=True,
+                    raw_rows=raw_rows,
+                    parsed_rows=parsed_rows,
+                    duplicate_same_identity_rows=duplicate_same_identity_rows,
+                )
+                return AdapterResponse(
+                    data=None,
+                    lineage=lineage,
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        status_code=200,
+                        error_type="pagination",
+                        message="Polygon tickers pagination exceeded max_pages",
+                        retryable=False,
+                    ),
+                )
 
+        lineage = _ticker_reference_lineage(
+            first_lineage=first_lineage,
+            page_hashes=page_hashes,
+            page_count=page_number,
+            next_url_paths=next_url_paths,
+            truncated=False,
+            raw_rows=raw_rows,
+            parsed_rows=parsed_rows,
+            duplicate_same_identity_rows=duplicate_same_identity_rows,
+        )
         return AdapterResponse(
             data=pages,
-            lineage=first_lineage or LineageMeta(
-                provider=PROVIDER,
-                endpoint=endpoint,
-                request_timestamp=utcnow(),
-                asof_timestamp=utcnow(),
-                raw_payload_hash="",
-                source_authority="Polygon",
-            ),
+            lineage=lineage,
         )
 
     # --- Ticker details ---
@@ -945,20 +1135,62 @@ class PolygonAdapter:
     ) -> AdapterResponse[Optional[PolygonTickerDetail]]:
         """Fetch reference details for one ticker including CIK/FIGI identity."""
 
-        endpoint = f"{TICKERS_ENDPOINT}/{ticker}"
+        normalized_ticker, ticker_error = _normalize_polygon_path_ticker(
+            ticker,
+            endpoint=TICKERS_ENDPOINT,
+            asof=asof,
+        )
+        if ticker_error is not None:
+            return ticker_error  # type: ignore[return-value]
+
+        endpoint = f"{TICKERS_ENDPOINT}/{normalized_ticker}"
+        date_error = _validate_iso_date_params(
+            endpoint=endpoint,
+            date_fields={"date": date_str},
+            asof=asof,
+        )
+        if date_error is not None:
+            return date_error  # type: ignore[return-value]
+
         params: Dict[str, Any] = {}
-        if date_str:
-            params["date"] = date_str
+        date_text = _str_or_none(date_str)
+        if date_text:
+            params["date"] = date_text
         resp = self._request(endpoint, params=params or None, asof=asof)
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        r = resp.data.get("results", {}) if isinstance(resp.data, dict) else {}
-        if not r:
+        if not isinstance(resp.data, dict) or "results" not in resp.data:
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon ticker details response missing results object",
+            )
+        r = resp.data.get("results")
+        if r is None or r == {}:
             return AdapterResponse(data=None, lineage=resp.lineage)
+        if not isinstance(r, dict):
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon ticker details response missing results object",
+            )
+        if not _ticker_detail_has_known_field(r):
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon ticker details response missing usable identity fields",
+            )
+        provider_ticker = _str_or_none(r.get("ticker"))
+        if provider_ticker and provider_ticker.upper() != normalized_ticker:
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon ticker details response ticker mismatch",
+            )
 
         detail = PolygonTickerDetail(
-            ticker=_str_or_none(r.get("ticker")) or ticker,
+            ticker=provider_ticker.upper() if provider_ticker else normalized_ticker,
             name=_str_or_none(r.get("name")) or "",
             market=_str_or_none(r.get("market")),
             locale=_str_or_none(r.get("locale")),
@@ -975,7 +1207,7 @@ class PolygonAdapter:
             sic_description=r.get("sic_description"),
             share_class_shares_outstanding=r.get("share_class_shares_outstanding"),
             weighted_shares_outstanding=r.get("weighted_shares_outstanding"),
-            raw=dict(r),
+            raw=deepcopy(r),
         )
         return AdapterResponse(data=detail, lineage=resp.lineage)
 
@@ -983,62 +1215,80 @@ class PolygonAdapter:
 
     def get_ticker_events(
         self,
-        identifier: str,
+        identifier: Any,
         *,
-        types: str = "ticker_change",
+        types: Any = "ticker_change",
         asof: Optional[datetime] = None,
     ) -> AdapterResponse[List[PolygonTickerEvent]]:
-        """Fetch ticker events (e.g. ticker_change) from experimental vX endpoint.
+        """Fetch ticker events as targeted identity cross-check evidence only.
 
         ``identifier`` can be a ticker, CUSIP, or Composite FIGI.
         """
-        endpoint = f"{TICKER_EVENTS_ENDPOINT_PREFIX}/{identifier}/events"
-        params: Dict[str, Any] = {"types": types}
+
+        normalized_identifier, identifier_error = _normalize_ticker_event_identifier(
+            identifier,
+            asof=asof,
+        )
+        if identifier_error is not None:
+            return identifier_error  # type: ignore[return-value]
+
+        normalized_types, types_error = _normalize_ticker_event_types(types, asof=asof)
+        if types_error is not None:
+            return types_error  # type: ignore[return-value]
+
+        endpoint = f"{TICKER_EVENTS_ENDPOINT_PREFIX}/{normalized_identifier}/events"
+        params: Dict[str, Any] = {"types": normalized_types}
         resp = self._request(endpoint, params=params, asof=asof)
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        raw_events = []
-        if isinstance(resp.data, dict):
-            raw_events = resp.data.get("results", {}).get("events", [])
-            if not isinstance(raw_events, list):
-                raw_events = []
+        payload = resp.data
+        if not isinstance(payload, dict):
+            return _ticker_event_parse_error(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                identifier=normalized_identifier,
+            )
+        results = payload.get("results")
+        if not isinstance(results, dict) or not isinstance(results.get("events"), list):
+            return _ticker_event_parse_error(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                identifier=normalized_identifier,
+            )
+        if _str_or_none(payload.get("next_url")):
+            lineage = _ticker_event_base_lineage(resp.lineage, normalized_identifier)
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=200,
+                    error_type="pagination",
+                    message="Polygon ticker-events pagination is not supported",
+                    retryable=False,
+                ),
+            )
 
         events = []
+        raw_events = results["events"]
+        raw_rows = 0
         for ev in raw_events:
+            raw_rows += 1
             if not isinstance(ev, dict):
                 continue
-            event_type = _str_or_none(ev.get("type") or ev.get("event_type")) or "unknown"
-            ev_date = _str_or_none(ev.get("date"))
-            effective_date = _str_or_none(ev.get("effective_date") or ev_date)
-            ticker_change = ev.get("ticker_change", {})
-            if not isinstance(ticker_change, dict):
-                ticker_change = {}
-            events.append(PolygonTickerEvent(
-                identifier_queried=identifier,
-                event_type=event_type,
-                date=ev_date,
-                event_date=ev_date,
-                effective_date=effective_date,
-                ticker=_str_or_none(ticker_change.get("ticker") or ev.get("ticker")),
-                old_ticker=_str_or_none(
-                    ticker_change.get("ticker")
-                    or ev.get("old_ticker")
-                    or ev.get("previous_ticker")
-                ),
-                new_ticker=_str_or_none(
-                    ticker_change.get("new_ticker")
-                    or ev.get("new_ticker")
-                    or ev.get("successor_ticker")
-                ),
-                cik=_normalized_cik(ev.get("cik")),
-                composite_figi=_str_or_none(ev.get("composite_figi")),
-                share_class_figi=_str_or_none(ev.get("share_class_figi")),
-                name=ev.get("name"),
-                raw_event=ev,
-            ))
+            parsed = _parse_ticker_event_row(normalized_identifier, ev)
+            if parsed is not None:
+                events.append(parsed)
 
-        return AdapterResponse(data=events, lineage=resp.lineage)
+        lineage = _ticker_event_row_lineage(
+            resp.lineage,
+            identifier=normalized_identifier,
+            raw_rows=raw_rows,
+            events=events,
+        )
+        return AdapterResponse(data=events, lineage=lineage)
 
     # --- Market data ---
 
@@ -1051,27 +1301,83 @@ class PolygonAdapter:
     ) -> AdapterResponse[List[PolygonBar]]:
         """Fetch daily aggregate bars for a ticker and date range."""
 
-        endpoint = f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}"
+        endpoint_prefix = "/v2/aggs/ticker"
+        normalized_ticker, ticker_error = _normalize_polygon_path_ticker(
+            ticker,
+            endpoint=endpoint_prefix,
+        )
+        if ticker_error is not None:
+            return ticker_error  # type: ignore[return-value]
+        date_error = _validate_iso_date_params(
+            endpoint=endpoint_prefix,
+            date_fields={"from_date": from_date, "to_date": to_date},
+            asof=None,
+        )
+        if date_error is not None:
+            return date_error  # type: ignore[return-value]
+        from_text = _str_or_none(from_date) or ""
+        to_text = _str_or_none(to_date) or ""
+        from_parsed = date.fromisoformat(from_text)
+        to_parsed = date.fromisoformat(to_text)
+        if from_parsed > to_parsed:
+            return _provider_error_response(
+                endpoint=endpoint_prefix,
+                error_type="validation",
+                message="Polygon daily bars from_date must be on or before to_date",
+                retryable=False,
+            )
+
+        endpoint = f"/v2/aggs/ticker/{normalized_ticker}/range/1/day/{from_text}/{to_text}"
         params: Dict[str, Any] = {"limit": limit, "sort": "asc"}
         resp = self._request(endpoint, params=params)
         if not resp.ok:
             return resp  # type: ignore[return-value]
 
-        results_list = resp.data.get("results", []) if isinstance(resp.data, dict) else []
-        bars = [
-            PolygonBar(
-                timestamp=b.get("t", 0),
-                open=b.get("o", 0.0),
-                high=b.get("h", 0.0),
-                low=b.get("l", 0.0),
-                close=b.get("c", 0.0),
-                volume=b.get("v", 0),
-                vwap=b.get("vw"),
-                transactions=b.get("n"),
+        if not isinstance(resp.data, dict):
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon daily bars response missing results list",
             )
-            for b in results_list
-        ]
-        return AdapterResponse(data=bars, lineage=resp.lineage)
+        if "results" not in resp.data:
+            if resp.data.get("resultsCount") == 0 or resp.data.get("queryCount") == 0:
+                lineage = _corporate_action_row_lineage(resp.lineage, 0, 0)
+                return AdapterResponse(data=[], lineage=lineage)
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon daily bars response missing results list",
+            )
+        results_list = resp.data.get("results")
+        if not isinstance(results_list, list):
+            return _parse_error_response(
+                lineage=resp.lineage,
+                endpoint=endpoint,
+                message="Polygon daily bars response missing results list",
+            )
+
+        bars = []
+        raw_rows = 0
+        for row in results_list:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+                return _parse_error_response(
+                    lineage=lineage,
+                    endpoint=endpoint,
+                    message="Polygon daily bars response contains malformed result row",
+                )
+            parsed = _parse_daily_bar_row(row)
+            if parsed is None:
+                lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+                return _parse_error_response(
+                    lineage=lineage,
+                    endpoint=endpoint,
+                    message="Polygon daily bars response contains malformed result row",
+                )
+            bars.append(parsed)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+        return AdapterResponse(data=bars, lineage=lineage)
 
 
 def _str_or_none(value: Any) -> Optional[str]:
@@ -1079,6 +1385,19 @@ def _str_or_none(value: Any) -> Optional[str]:
         return None
     s = str(value).strip()
     return s if s else None
+
+
+def _iso_date_str_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) != 10:
+        return None
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return None
+    return text
 
 
 def _decimal_or_none(value: Any) -> Optional[Decimal]:
@@ -1154,6 +1473,177 @@ def _provider_error_response(
     )
 
 
+def _parse_error_response(
+    *,
+    lineage: LineageMeta,
+    endpoint: str,
+    message: str,
+) -> AdapterResponse[Any]:
+    return AdapterResponse(
+        data=None,
+        lineage=lineage,
+        error=ProviderError(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            status_code=200,
+            error_type="parse",
+            message=message,
+            retryable=False,
+        ),
+    )
+
+
+def _normalize_polygon_path_ticker(
+    value: Any,
+    *,
+    endpoint: str,
+    asof: Optional[datetime] = None,
+) -> tuple[Optional[str], Optional[AdapterResponse[Any]]]:
+    if not isinstance(value, str):
+        return None, _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon ticker must be a nonblank path-safe string",
+            retryable=False,
+            asof=asof,
+        )
+    text = value.strip()
+    if not text:
+        return None, _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon ticker must be a nonblank path-safe string",
+            retryable=False,
+            asof=asof,
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return None, _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon ticker contains unsafe characters",
+            retryable=False,
+            asof=asof,
+        )
+    normalized = text.upper()
+    if (
+        len(normalized) > PATH_TICKER_MAX_LENGTH
+        or any(char not in PATH_TICKER_ALLOWED_CHARS for char in normalized)
+        or not any(char.isalnum() for char in normalized)
+        or ".." in normalized
+        or normalized[0] in ".-"
+        or normalized[-1] in ".-"
+    ):
+        return None, _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon ticker contains unsafe characters",
+            retryable=False,
+            asof=asof,
+        )
+    return normalized, None
+
+
+def _normalize_ticker_event_identifier(
+    identifier: Any,
+    *,
+    asof: Optional[datetime],
+) -> tuple[Optional[str], Optional[AdapterResponse[Any]]]:
+    if not isinstance(identifier, str):
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events identifier must be a nonblank string",
+            asof=asof,
+        )
+    text = identifier.strip()
+    if not text:
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events identifier must be a nonblank string",
+            asof=asof,
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events identifier contains unsafe characters",
+            asof=asof,
+        )
+    normalized = text.upper()
+    if (
+        len(normalized) > TICKER_EVENT_IDENTIFIER_MAX_LENGTH
+        or any(char not in TICKER_EVENT_IDENTIFIER_ALLOWED_CHARS for char in normalized)
+        or not any(char.isalnum() for char in normalized)
+        or ".." in normalized
+        or normalized[0] in "._-"
+        or normalized[-1] in "._-"
+    ):
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events identifier contains unsafe characters",
+            asof=asof,
+        )
+    return normalized, None
+
+
+def _normalize_ticker_event_types(
+    types: Any,
+    *,
+    asof: Optional[datetime],
+) -> tuple[Optional[str], Optional[AdapterResponse[Any]]]:
+    if isinstance(types, str):
+        items = [types]
+    elif isinstance(types, (list, tuple, set)):
+        items = list(types)
+    else:
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events types must be strings",
+            asof=asof,
+        )
+
+    values: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            return None, _ticker_event_validation_error(
+                message="Polygon ticker-events types must be strings",
+                asof=asof,
+            )
+        text = item.strip()
+        if not text:
+            return None, _ticker_event_validation_error(
+                message="Polygon ticker-events types must be nonblank",
+                asof=asof,
+            )
+        if any(char in text for char in [",", "/", "?", "#", "&"]):
+            return None, _ticker_event_validation_error(
+                message="Polygon ticker-events type contains unsafe characters",
+                asof=asof,
+            )
+        value = text.lower()
+        if value not in TICKER_EVENT_ALLOWED_TYPES:
+            return None, _ticker_event_validation_error(
+                message="Polygon ticker-events type is not supported",
+                asof=asof,
+            )
+        if value not in values:
+            values.append(value)
+
+    if not values:
+        return None, _ticker_event_validation_error(
+            message="Polygon ticker-events types must be nonblank",
+            asof=asof,
+        )
+    return ",".join(values), None
+
+
+def _ticker_event_validation_error(
+    *,
+    message: str,
+    asof: Optional[datetime],
+) -> AdapterResponse[Any]:
+    return _provider_error_response(
+        endpoint=f"{TICKER_EVENTS_ENDPOINT_PREFIX}/events",
+        error_type="validation",
+        message=message,
+        retryable=False,
+        asof=asof,
+    )
+
+
 def _validate_corporate_action_query(
     *,
     endpoint: str,
@@ -1194,6 +1684,16 @@ def _validate_corporate_action_query(
     )
     if date_error is not None:
         return date_error
+    range_error = _validate_iso_date_range_order(
+        endpoint=endpoint,
+        start_label=f"{date_field}_from",
+        start_value=date_from,
+        end_label=f"{date_field}_to",
+        end_value=date_to,
+        asof=asof,
+    )
+    if range_error is not None:
+        return range_error
     if _ticker_param(ticker) is None and not (date_value or (date_from and date_to)):
         return _provider_error_response(
             endpoint=endpoint,
@@ -1244,6 +1744,16 @@ def _validate_polygon_feed_query(
     )
     if date_error is not None:
         return date_error
+    range_error = _validate_iso_date_range_order(
+        endpoint=endpoint,
+        start_label="date_from",
+        start_value=date_from,
+        end_label="date_to",
+        end_value=date_to,
+        asof=asof,
+    )
+    if range_error is not None:
+        return range_error
     if _ticker_param(ticker) is None and not (date_value or (date_from and date_to)):
         return _provider_error_response(
             endpoint=endpoint,
@@ -1294,6 +1804,16 @@ def _validate_polygon_news_query(
     )
     if date_error is not None:
         return date_error
+    range_error = _validate_news_datetime_range_order(
+        endpoint=NEWS_ENDPOINT,
+        start_label="published_utc_from",
+        start_value=published_utc_from,
+        end_label="published_utc_to",
+        end_value=published_utc_to,
+        asof=asof,
+    )
+    if range_error is not None:
+        return range_error
 
     ticker_error = _validate_news_ticker_inputs(
         ticker=ticker,
@@ -1597,6 +2117,36 @@ def _safe_url_path(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _sanitized_page_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = deepcopy(payload)
+    next_url = _str_or_none(sanitized.get("next_url"))
+    if next_url:
+        safe_path = _safe_url_path(next_url)
+        if safe_path:
+            sanitized["next_url"] = safe_path
+        else:
+            sanitized.pop("next_url", None)
+    return sanitized
+
+
+def _ticker_detail_has_known_field(row: Dict[str, Any]) -> bool:
+    string_fields = {
+        "ticker",
+        "name",
+        "composite_figi",
+        "share_class_figi",
+        "list_date",
+        "delisted_utc",
+        "primary_exchange",
+        "type",
+    }
+    if any(_str_or_none(row.get(key)) is not None for key in string_fields):
+        return True
+    if _normalized_cik(row.get("cik")) is not None:
+        return True
+    return row.get("active") is not None
+
+
 def _corporate_action_lineage(
     *,
     first_lineage: Optional[LineageMeta],
@@ -1676,6 +2226,95 @@ def _corporate_action_row_lineage(
     return replace(lineage, data_quality_flags=flags)
 
 
+def _ticker_event_base_lineage(
+    lineage: LineageMeta,
+    identifier: str,
+) -> LineageMeta:
+    flags = dict(lineage.data_quality_flags or {})
+    flags["identifier_queried"] = identifier
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _ticker_event_row_lineage(
+    lineage: LineageMeta,
+    *,
+    identifier: str,
+    raw_rows: int,
+    events: List[PolygonTickerEvent],
+) -> LineageMeta:
+    lineage = _corporate_action_row_lineage(lineage, raw_rows, len(events))
+    flags = dict(lineage.data_quality_flags or {})
+    flags["identifier_queried"] = identifier
+    flags["event_types_present"] = sorted(
+        {event.event_type for event in events if event.event_type}
+    )
+    flags["identity_continuity_proved_rows"] = sum(
+        1 for event in events if event.identity_continuity_status == "proved"
+    )
+    flags["identity_continuity_unproven_rows"] = sum(
+        1 for event in events if event.identity_continuity_status == "unproven"
+    )
+    flags["identity_continuity_mismatch_rows"] = sum(
+        1 for event in events if event.identity_continuity_status == "mismatch"
+    )
+    flags["identity_continuity_not_applicable_rows"] = sum(
+        1 for event in events if event.identity_continuity_status == "not_applicable"
+    )
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _ticker_reference_lineage(
+    *,
+    first_lineage: Optional[LineageMeta],
+    page_hashes: List[str],
+    page_count: int,
+    next_url_paths: List[str],
+    truncated: bool,
+    raw_rows: int,
+    parsed_rows: int,
+    duplicate_same_identity_rows: int,
+    duplicate_conflict_rows: int = 0,
+) -> LineageMeta:
+    lineage = _corporate_action_lineage(
+        first_lineage=first_lineage,
+        page_hashes=page_hashes,
+        page_count=page_count,
+        next_url_paths=next_url_paths,
+        truncated=truncated,
+    )
+    flags = dict(lineage.data_quality_flags or {})
+    flags.update({
+        "raw_rows": raw_rows,
+        "parsed_rows": parsed_rows,
+        "skipped_rows": 0,
+        "duplicate_same_identity_rows": duplicate_same_identity_rows,
+        "duplicate_conflict_rows": duplicate_conflict_rows,
+    })
+    if next_url_paths:
+        flags["paginated"] = True
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _ticker_event_parse_error(
+    *,
+    lineage: LineageMeta,
+    endpoint: str,
+    identifier: str,
+) -> AdapterResponse[Any]:
+    return AdapterResponse(
+        data=None,
+        lineage=_ticker_event_base_lineage(lineage, identifier),
+        error=ProviderError(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            status_code=200,
+            error_type="parse",
+            message="Polygon ticker-events response missing results.events list",
+            retryable=False,
+        ),
+    )
+
+
 def _short_volume_semantic_lineage(
     lineage: LineageMeta,
     rows: List[PolygonShortVolume],
@@ -1747,6 +2386,72 @@ def _validate_iso_date_params(
         except ValueError:
             return _invalid_date_response(endpoint=endpoint, label=label, asof=asof)
     return None
+
+
+def _validate_iso_date_range_order(
+    *,
+    endpoint: str,
+    start_label: str,
+    start_value: Optional[str],
+    end_label: str,
+    end_value: Optional[str],
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    start_text = _iso_date_str_or_none(start_value)
+    end_text = _iso_date_str_or_none(end_value)
+    if start_text is None or end_text is None:
+        return None
+    if date.fromisoformat(start_text) > date.fromisoformat(end_text):
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message=f"Polygon feed {start_label} must be on or before {end_label}",
+            retryable=False,
+            asof=asof,
+        )
+    return None
+
+
+def _validate_news_datetime_range_order(
+    *,
+    endpoint: str,
+    start_label: str,
+    start_value: Optional[str],
+    end_label: str,
+    end_value: Optional[str],
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    start_dt = _parse_iso_date_or_datetime_for_order(start_value)
+    end_dt = _parse_iso_date_or_datetime_for_order(end_value)
+    if start_dt is None or end_dt is None:
+        return None
+    if start_dt > end_dt:
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message=f"Polygon news {start_label} must be on or before {end_label}",
+            retryable=False,
+            asof=asof,
+        )
+    return None
+
+
+def _parse_iso_date_or_datetime_for_order(value: Optional[str]) -> Optional[datetime]:
+    text = _str_or_none(value)
+    if text is None:
+        return None
+    if len(text) == 10:
+        try:
+            return datetime.combine(date.fromisoformat(text), datetime.min.time(), tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _validate_iso_date_or_datetime_params(
@@ -1844,9 +2549,72 @@ def _optional_nonnegative_int(value: Any) -> tuple[Optional[int], bool]:
     return int(parsed), True
 
 
+def _required_int_or_none(value: Any) -> Optional[int]:
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
+
+
+def _required_nonnegative_int_or_none(value: Any) -> Optional[int]:
+    parsed = _required_int_or_none(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def _required_float_or_none(value: Any) -> Optional[float]:
+    parsed = _decimal_or_none(value)
+    if parsed is None:
+        return None
+    return float(parsed)
+
+
+def _required_nonnegative_float_or_none(value: Any) -> Optional[float]:
+    parsed = _required_float_or_none(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def _parse_daily_bar_row(row: Dict[str, Any]) -> Optional[PolygonBar]:
+    timestamp = _required_nonnegative_int_or_none(row.get("t"))
+    open_price = _required_nonnegative_float_or_none(row.get("o"))
+    high = _required_nonnegative_float_or_none(row.get("h"))
+    low = _required_nonnegative_float_or_none(row.get("l"))
+    close = _required_nonnegative_float_or_none(row.get("c"))
+    volume = _required_nonnegative_int_or_none(row.get("v"))
+    if None in (timestamp, open_price, high, low, close, volume):
+        return None
+    vwap = (
+        _required_nonnegative_float_or_none(row.get("vw"))
+        if row.get("vw") is not None
+        else None
+    )
+    transactions = (
+        _required_nonnegative_int_or_none(row.get("n"))
+        if row.get("n") is not None
+        else None
+    )
+    if (row.get("vw") is not None and vwap is None) or (
+        row.get("n") is not None and transactions is None
+    ):
+        return None
+    return PolygonBar(
+        timestamp=timestamp,
+        open=open_price,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        vwap=vwap,
+        transactions=transactions,
+    )
+
+
 def _parse_short_interest_row(row: Dict[str, Any]) -> Optional[PolygonShortInterest]:
     ticker = _ticker_param(row.get("ticker"))  # type: ignore[arg-type]
-    settlement_date = _str_or_none(row.get("settlement_date"))
+    settlement_date = _iso_date_str_or_none(row.get("settlement_date"))
     if not ticker or not settlement_date:
         return None
     short_interest, short_interest_ok = _optional_nonnegative_int(
@@ -1872,7 +2640,7 @@ def _parse_short_interest_row(row: Dict[str, Any]) -> Optional[PolygonShortInter
 
 def _parse_short_volume_row(row: Dict[str, Any]) -> Optional[PolygonShortVolume]:
     ticker = _ticker_param(row.get("ticker"))  # type: ignore[arg-type]
-    date_value = _str_or_none(row.get("date"))
+    date_value = _iso_date_str_or_none(row.get("date"))
     if not ticker or not date_value:
         return None
 
@@ -1926,7 +2694,7 @@ def _parse_short_volume_row(row: Dict[str, Any]) -> Optional[PolygonShortVolume]
 
 def _parse_split_row(row: Dict[str, Any]) -> Optional[PolygonSplit]:
     ticker = _str_or_none(row.get("ticker"))
-    execution_date = _str_or_none(row.get("execution_date"))
+    execution_date = _iso_date_str_or_none(row.get("execution_date"))
     split_from = _positive_decimal_or_none(row.get("split_from"))
     split_to = _positive_decimal_or_none(row.get("split_to"))
     if not ticker or not execution_date or split_from is None or split_to is None:
@@ -1948,7 +2716,7 @@ def _parse_split_row(row: Dict[str, Any]) -> Optional[PolygonSplit]:
 
 def _parse_dividend_row(row: Dict[str, Any]) -> Optional[PolygonDividend]:
     ticker = _str_or_none(row.get("ticker"))
-    ex_dividend_date = _str_or_none(row.get("ex_dividend_date"))
+    ex_dividend_date = _iso_date_str_or_none(row.get("ex_dividend_date"))
     cash_amount = _nonnegative_decimal_or_none(row.get("cash_amount"))
     if not ticker or not ex_dividend_date or cash_amount is None:
         return None
@@ -2048,6 +2816,259 @@ def _dict_list(value: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _parse_ticker_event_row(
+    identifier_queried: str,
+    row: Dict[str, Any],
+) -> Optional[PolygonTickerEvent]:
+    event_type = _str_or_none(row.get("type") or row.get("event_type"))
+    if event_type is None:
+        return None
+    event_type = event_type.lower()
+    if event_type not in TICKER_EVENT_ALLOWED_TYPES:
+        return None
+    ev_date, date_ok = _ticker_event_iso_date_or_none(row.get("date"))
+    event_date_value, event_date_ok = _ticker_event_iso_date_or_none(row.get("event_date"))
+    effective_date_value, effective_date_ok = _ticker_event_iso_date_or_none(
+        row.get("effective_date")
+    )
+    effective_utc_value, effective_utc_ok = _ticker_event_effective_utc_date_or_none(
+        row.get("effective_utc")
+    )
+    execution_date_value, execution_date_ok = _ticker_event_iso_date_or_none(
+        row.get("execution_date")
+    )
+    if not (
+        date_ok
+        and event_date_ok
+        and effective_date_ok
+        and effective_utc_ok
+        and execution_date_ok
+    ):
+        return None
+    event_date = event_date_value or ev_date
+    effective_date = (
+        effective_date_value
+        or effective_utc_value
+        or execution_date_value
+        or event_date
+    )
+    ticker_change = row.get("ticker_change")
+    if not isinstance(ticker_change, dict):
+        ticker_change = {}
+
+    old_ticker = _ticker_param(
+        _first_present(
+            ticker_change,
+            row,
+            ["old_ticker", "previous_ticker", "from_ticker", "ticker"],
+        )
+    )
+    new_ticker = _ticker_param(
+        _first_present(
+            ticker_change,
+            row,
+            ["new_ticker", "successor_ticker", "to_ticker"],
+        )
+    )
+    ticker = _ticker_param(
+        row.get("ticker")
+        or ticker_change.get("current_ticker")
+        or ticker_change.get("new_ticker")
+        or ticker_change.get("ticker")
+    )
+    if event_type == "ticker_change":
+        if not (ev_date or event_date or effective_date):
+            return None
+        if not (ticker or old_ticker or new_ticker):
+            return None
+
+    old_cik = _normalized_cik(
+        _first_present(
+            ticker_change,
+            row,
+            ["old_cik", "previous_cik", "from_cik"],
+        )
+    )
+    new_cik = _normalized_cik(
+        _first_present(
+            ticker_change,
+            row,
+            ["new_cik", "successor_cik", "current_cik", "to_cik"],
+        )
+    )
+    cik = _normalized_cik(row.get("cik") or ticker_change.get("cik") or new_cik or old_cik)
+
+    old_composite_figi = _upper_str_or_none(
+        _first_present(
+            ticker_change,
+            row,
+            [
+                "old_composite_figi",
+                "previous_composite_figi",
+                "from_composite_figi",
+            ],
+        )
+    )
+    new_composite_figi = _upper_str_or_none(
+        _first_present(
+            ticker_change,
+            row,
+            [
+                "new_composite_figi",
+                "successor_composite_figi",
+                "current_composite_figi",
+                "to_composite_figi",
+            ],
+        )
+    )
+    composite_figi = _upper_str_or_none(
+        row.get("composite_figi")
+        or ticker_change.get("composite_figi")
+        or new_composite_figi
+        or old_composite_figi
+    )
+
+    old_share_class_figi = _upper_str_or_none(
+        _first_present(
+            ticker_change,
+            row,
+            [
+                "old_share_class_figi",
+                "previous_share_class_figi",
+                "from_share_class_figi",
+            ],
+        )
+    )
+    new_share_class_figi = _upper_str_or_none(
+        _first_present(
+            ticker_change,
+            row,
+            [
+                "new_share_class_figi",
+                "successor_share_class_figi",
+                "current_share_class_figi",
+                "to_share_class_figi",
+            ],
+        )
+    )
+    share_class_figi = _upper_str_or_none(
+        row.get("share_class_figi")
+        or ticker_change.get("share_class_figi")
+        or new_share_class_figi
+        or old_share_class_figi
+    )
+    continuity_status = _ticker_event_continuity_status(
+        event_type=event_type,
+        old_cik=old_cik,
+        new_cik=new_cik,
+        old_composite_figi=old_composite_figi,
+        new_composite_figi=new_composite_figi,
+        old_share_class_figi=old_share_class_figi,
+        new_share_class_figi=new_share_class_figi,
+    )
+
+    return PolygonTickerEvent(
+        identifier_queried=identifier_queried,
+        event_type=event_type,
+        date=ev_date,
+        event_date=event_date,
+        effective_date=effective_date,
+        ticker=ticker,
+        old_ticker=old_ticker,
+        new_ticker=new_ticker,
+        cik=cik,
+        old_cik=old_cik,
+        new_cik=new_cik,
+        composite_figi=composite_figi,
+        old_composite_figi=old_composite_figi,
+        new_composite_figi=new_composite_figi,
+        share_class_figi=share_class_figi,
+        old_share_class_figi=old_share_class_figi,
+        new_share_class_figi=new_share_class_figi,
+        name=_str_or_none(row.get("name") or row.get("company_name")),
+        identity_continuity_status=continuity_status,
+        raw_event=deepcopy(row),
+    )
+
+
+def _ticker_event_iso_date_or_none(value: Any) -> tuple[Optional[str], bool]:
+    if value is None:
+        return None, True
+    if not isinstance(value, str):
+        return None, False
+    text = value.strip()
+    if not text or len(text) != 10:
+        return None, False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return None, False
+    return text, True
+
+
+def _ticker_event_effective_utc_date_or_none(value: Any) -> tuple[Optional[str], bool]:
+    parsed_date, ok = _ticker_event_iso_date_or_none(value)
+    if ok or value is None:
+        return parsed_date, ok
+    if not isinstance(value, str):
+        return None, False
+    text = value.strip()
+    if not text or "T" not in text:
+        return None, False
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None, False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, False
+    return parsed.astimezone(timezone.utc).date().isoformat(), True
+
+
+def _first_present(
+    primary: Dict[str, Any],
+    fallback: Dict[str, Any],
+    keys: List[str],
+) -> Any:
+    for key in keys:
+        value = primary.get(key)
+        if _str_or_none(value) is not None:
+            return value
+        value = fallback.get(key)
+        if _str_or_none(value) is not None:
+            return value
+    return None
+
+
+def _upper_str_or_none(value: Any) -> Optional[str]:
+    text = _str_or_none(value)
+    return text.upper() if text else None
+
+
+def _ticker_event_continuity_status(
+    *,
+    event_type: str,
+    old_cik: Optional[str],
+    new_cik: Optional[str],
+    old_composite_figi: Optional[str],
+    new_composite_figi: Optional[str],
+    old_share_class_figi: Optional[str],
+    new_share_class_figi: Optional[str],
+) -> str:
+    if event_type != "ticker_change":
+        return "not_applicable"
+    pairs = [
+        (old_cik, new_cik),
+        (old_composite_figi, new_composite_figi),
+        (old_share_class_figi, new_share_class_figi),
+    ]
+    present_pairs = [(old, new) for old, new in pairs if old and new]
+    if any(old != new for old, new in present_pairs):
+        return "mismatch"
+    if present_pairs:
+        return "proved"
+    return "unproven"
+
+
 def _parse_ticker_reference_row(row: Dict[str, Any]) -> PolygonTickerReference:
     return PolygonTickerReference(
         ticker=_str_or_none(row.get("ticker")) or "",
@@ -2064,3 +3085,17 @@ def _parse_ticker_reference_row(row: Dict[str, Any]) -> PolygonTickerReference:
         delisted_utc=_str_or_none(row.get("delisted_utc")),
         raw=dict(row),
     )
+
+
+def _ticker_reference_identity_hash(row: PolygonTickerReference) -> str:
+    return stable_hash({
+        "ticker": row.ticker,
+        "cik": row.cik,
+        "composite_figi": row.composite_figi,
+        "share_class_figi": row.share_class_figi,
+        "active": row.active,
+        "primary_exchange": row.primary_exchange,
+        "type": row.type,
+        "list_date": row.list_date,
+        "delisted_utc": row.delisted_utc,
+    })
