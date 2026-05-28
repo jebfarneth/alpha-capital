@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -1512,6 +1513,392 @@ class TestBenzingaAdapter:
         assert resp.ok
         assert "test-benzinga-key" not in repr(resp.lineage)
         assert resp.lineage.data_quality_flags is None
+
+    def test_get_earnings_ok_and_calendar_params(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "earnings": [
+                {
+                    "id": "earn-1",
+                    "ticker": "ACME",
+                    "name": "Acme Corp",
+                    "exchange": "NASDAQ",
+                    "currency": "USD",
+                    "cusip": "004397105",
+                    "isin": "US0043971052",
+                    "period": "Q1",
+                    "period_year": "2026",
+                    "date": "2026-05-27",
+                    "time": "bmo",
+                    "eps": "1.25",
+                    "eps_est": "1.10",
+                    "eps_prior": "0.92",
+                    "eps_surprise": "0.15",
+                    "eps_surprise_percent": "13.64",
+                    "eps_type": "GAAP",
+                    "revenue": "1000000.00",
+                    "revenue_est": "950000",
+                    "revenue_prior": "875000",
+                    "revenue_surprise": "50000",
+                    "revenue_surprise_percent": "5.26",
+                    "revenue_type": "reported",
+                    "date_confirmed": "1",
+                    "importance": "5",
+                    "notes": "Beat estimates",
+                    "updated": 1779883200,
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings(
+            symbols=["ACME", "BETA"],
+            date_from="2026-05-01",
+            date_to="2026-05-31",
+            page=2,
+            pagesize=50,
+            updated=1779796800,
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        event = resp.data[0]
+        assert event.id == "earn-1"
+        assert event.ticker == "ACME"
+        assert event.currency == "USD"
+        assert event.period == "Q1"
+        assert event.period_year == 2026
+        assert event.date == "2026-05-27"
+        assert event.time == "bmo"
+        assert event.eps == Decimal("1.25")
+        assert event.eps_est == Decimal("1.10")
+        assert event.revenue == Decimal("1000000.00")
+        assert event.revenue_est == Decimal("950000")
+        assert event.date_confirmed is True
+        assert event.importance == 5
+        assert event.notes == "Beat estimates"
+        assert event.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert event.raw["ticker"] == "ACME"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/earnings"
+        session.get.assert_called_with(
+            "https://api.benzinga.com/api/v2.1/calendar/earnings",
+            params={
+                "pagesize": 50,
+                "page": 2,
+                "parameters[tickers]": "ACME,BETA",
+                "parameters[date_from]": "2026-05-01",
+                "parameters[date_to]": "2026-05-31",
+                "parameters[updated]": 1779796800,
+                "token": "test-benzinga-key",
+            },
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+
+    def test_get_guidance_ok(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = [
+            {
+                "id": "guidance-1",
+                "ticker": "ACME",
+                "name": "Acme Corp",
+                "exchange": "NASDAQ",
+                "currency": "USD",
+                "cusip": "004397105",
+                "period": "FY",
+                "period_year": 2026,
+                "date": "2026-05-27",
+                "time": "amc",
+                "eps_guidance_est": "1.80",
+                "eps_guidance_min": "1.70",
+                "eps_guidance_max": "1.95",
+                "eps_guidance_prior_min": "1.50",
+                "eps_guidance_prior_max": "1.60",
+                "eps_type": "adjusted",
+                "revenue_guidance_est": "2000000",
+                "revenue_guidance_min": "1900000",
+                "revenue_guidance_max": "2100000",
+                "revenue_guidance_prior_min": "1800000",
+                "revenue_guidance_prior_max": "1850000",
+                "revenue_type": "sales",
+                "is_primary": 1,
+                "prelim": "false",
+                "importance": 4,
+                "notes": "Raised full-year guidance",
+                "updated": "1779883200000",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_guidance("ACME")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        event = resp.data[0]
+        assert event.id == "guidance-1"
+        assert event.ticker == "ACME"
+        assert event.currency == "USD"
+        assert event.cusip == "004397105"
+        assert event.eps_guidance_min == Decimal("1.70")
+        assert event.eps_guidance_max == Decimal("1.95")
+        assert event.revenue_guidance_est == Decimal("2000000")
+        assert event.is_primary is True
+        assert event.prelim is False
+        assert event.notes == "Raised full-year guidance"
+        assert event.updated == datetime.fromtimestamp(1779883200, tz=timezone.utc)
+        assert event.raw["id"] == "guidance-1"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/guidance"
+
+    def test_get_ratings_ok(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "ratings": [
+                {
+                    "id": "rating-1",
+                    "ticker": "ACME",
+                    "name": "Acme Corp",
+                    "exchange": "NASDAQ",
+                    "currency": "USD",
+                    "cusip": "004397105",
+                    "isin": "US0043971052",
+                    "date": "2026-05-27",
+                    "time": "13:30:00",
+                    "analyst": "A. Analyst",
+                    "analyst_id": "42",
+                    "analyst_name": "A. Analyst",
+                    "firm": "Example Securities",
+                    "firm_id": "123",
+                    "action_company": "Initiates Coverage On",
+                    "action_pt": "Announces",
+                    "rating_current": "Buy",
+                    "rating_prior": "Neutral",
+                    "pt_current": "12.50",
+                    "pt_prior": "10",
+                    "adjusted_pt_current": "12.00",
+                    "adjusted_pt_prior": "9.75",
+                    "pt_pct_change": "25.0",
+                    "ratings_accuracy": "0.72",
+                    "importance": "3",
+                    "notes": "New coverage",
+                    "url": "https://benzinga.example/ratings/1",
+                    "url_calendar": "https://benzinga.example/calendar/1",
+                    "url_news": "https://benzinga.example/news/1",
+                    "updated": "Wed, 27 May 2026 08:15:00 -0400",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ratings("ACME")
+
+        assert resp.ok
+        event = resp.data[0]
+        assert event.id == "rating-1"
+        assert event.ticker == "ACME"
+        assert event.analyst == "A. Analyst"
+        assert event.firm == "Example Securities"
+        assert event.action_company == "Initiates Coverage On"
+        assert event.rating_current == "Buy"
+        assert event.rating_prior == "Neutral"
+        assert event.pt_current == Decimal("12.50")
+        assert event.pt_prior == Decimal("10")
+        assert event.adjusted_pt_current == Decimal("12.00")
+        assert event.ratings_accuracy == Decimal("0.72")
+        assert event.updated == datetime(2026, 5, 27, 12, 15, tzinfo=timezone.utc)
+        assert event.raw["url_news"] == "https://benzinga.example/news/1"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/ratings"
+
+    def test_get_offerings_ok(self):
+        session = MagicMock(spec=requests.Session)
+        json_data = {
+            "offerings": [
+                {
+                    "id": "offering-1",
+                    "ticker": "ACME",
+                    "name": "Acme Corp",
+                    "exchange": "NASDAQ",
+                    "currency": "USD",
+                    "cusip": "004397105",
+                    "date": "2026-05-27",
+                    "time": "09:00:00",
+                    "offering_type": "Secondary",
+                    "price": "2.50",
+                    "number_shares": "4000000",
+                    "dollar_shares": "10000000",
+                    "proceeds": "9500000",
+                    "shelf": "true",
+                    "importance": 5,
+                    "notes": "Registered direct offering",
+                    "url": "https://benzinga.example/offerings/1",
+                    "updated": "2026-05-27T12:00:00Z",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_offerings("ACME")
+
+        assert resp.ok
+        event = resp.data[0]
+        assert event.id == "offering-1"
+        assert event.ticker == "ACME"
+        assert event.cusip == "004397105"
+        assert event.offering_type == "Secondary"
+        assert event.price == Decimal("2.50")
+        assert event.number_shares == Decimal("4000000")
+        assert event.proceeds == Decimal("9500000")
+        assert event.shelf is True
+        assert event.updated == datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
+        assert event.raw["notes"] == "Registered direct offering"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/offerings"
+
+    def test_calendar_adapters_empty_payload_success(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name, payload in [
+            ("get_earnings", {"earnings": []}),
+            ("get_guidance", {"guidance": []}),
+            ("get_ratings", {"ratings": []}),
+            ("get_offerings", {"offerings": []}),
+        ]:
+            session.get.return_value = _mock_response(200, payload)
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert resp.data == []
+
+    def test_calendar_adapters_malformed_payload_is_empty_success(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        for method_name in [
+            "get_earnings",
+            "get_guidance",
+            "get_ratings",
+            "get_offerings",
+        ]:
+            session.get.return_value = _mock_response(200, {"unexpected": []})
+            resp = getattr(adapter, method_name)("ACME")
+
+            assert resp.ok
+            assert resp.data == []
+
+    def test_calendar_adapters_skip_rows_without_ticker(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"ratings": [{}]})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ratings("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+
+    def test_calendar_ticker_params_are_normalized_and_blank_only_filter_omitted(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"earnings": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings(tickers=[" ACME ", ""])
+
+        assert resp.ok
+        params = session.get.call_args.kwargs["params"]
+        assert params["parameters[tickers]"] == "ACME"
+
+        session.get.return_value = _mock_response(200, {"guidance": []})
+        resp = adapter.get_guidance(tickers=[" ", ""])
+
+        assert resp.ok
+        params = session.get.call_args.kwargs["params"]
+        assert "parameters[tickers]" not in params
+
+    def test_calendar_ticker_params_reject_non_string_members(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings(tickers=["AAPL", 123])  # type: ignore[list-item]
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.error.retryable is False
+        assert resp.error.message == "Benzinga calendar ticker parameters must be strings"
+        assert resp.lineage.endpoint == "/api/v2.1/calendar/earnings"
+        session.get.assert_not_called()
+
+    def test_request_exception_message_does_not_expose_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "GET https://api.benzinga.com/api/v2/news?tickers=ACME&token=test-benzinga-key failed"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert "ConnectionError" in resp.error.message
+        assert "test-benzinga-key" not in resp.error.message
+        assert "token" not in resp.error.message
+        assert "https://api.benzinga.com" not in resp.error.message
+
+    @pytest.mark.parametrize(
+        ("method_name", "endpoint"),
+        [
+            ("get_earnings", "/api/v2.1/calendar/earnings"),
+            ("get_guidance", "/api/v2.1/calendar/guidance"),
+            ("get_ratings", "/api/v2.1/calendar/ratings"),
+            ("get_offerings", "/api/v2.1/calendar/offerings"),
+        ],
+    )
+    def test_calendar_adapters_parse_error(self, method_name, endpoint):
+        session = MagicMock(spec=requests.Session)
+        resp_mock = _mock_response(200, text="not json")
+        resp_mock.json.side_effect = ValueError("parse fail")
+        session.get.return_value = resp_mock
+        adapter = self._adapter(session)
+
+        resp = getattr(adapter, method_name)("ACME")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+        assert resp.error.retryable is False
+        assert resp.lineage.endpoint == endpoint
+
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("get_earnings", {"earnings": [{"id": "earn-1", "ticker": "ACME"}]}),
+            ("get_guidance", [{"id": "guidance-1", "ticker": "ACME"}]),
+            ("get_ratings", {"ratings": [{"id": "rating-1", "ticker": "ACME"}]}),
+            ("get_offerings", {"offerings": [{"id": "offering-1", "ticker": "ACME"}]}),
+        ],
+    )
+    def test_calendar_lineage_hash_stability(self, method_name, payload):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, payload)
+        adapter = self._adapter(session)
+
+        resp1 = getattr(adapter, method_name)("ACME")
+        resp2 = getattr(adapter, method_name)("ACME")
+
+        assert resp1.ok
+        assert resp2.ok
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
+    def test_calendar_lineage_does_not_expose_secret(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(200, {"offerings": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_offerings("ACME")
+
+        assert resp.ok
+        assert "test-benzinga-key" not in repr(resp.lineage)
+        assert resp.lineage.source_authority == "Benzinga"
 
     def test_get_mergers_acquisitions_ok(self):
         session = MagicMock(spec=requests.Session)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -29,6 +30,10 @@ from alpha.data.contracts import (
 
 PROVIDER = "Benzinga"
 M_AND_A_ENDPOINT = "/api/v2.1/calendar/ma"
+EARNINGS_ENDPOINT = "/api/v2.1/calendar/earnings"
+GUIDANCE_ENDPOINT = "/api/v2.1/calendar/guidance"
+RATINGS_ENDPOINT = "/api/v2.1/calendar/ratings"
+OFFERINGS_ENDPOINT = "/api/v2.1/calendar/offerings"
 NEWS_ENDPOINT = "/api/v2/news"
 WIIM_CHANNEL = "wiim"
 
@@ -82,6 +87,136 @@ class BenzingaNewsArticle:
     channels: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
     categories: List[str] = field(default_factory=list)
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaEarnings:
+    """Normalized Benzinga earnings calendar row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    cusip: Optional[str] = None
+    isin: Optional[str] = None
+    period: Optional[str] = None
+    period_year: Optional[int] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    eps: Optional[Decimal] = None
+    eps_est: Optional[Decimal] = None
+    eps_prior: Optional[Decimal] = None
+    eps_surprise: Optional[Decimal] = None
+    eps_surprise_percent: Optional[Decimal] = None
+    eps_type: Optional[str] = None
+    revenue: Optional[Decimal] = None
+    revenue_est: Optional[Decimal] = None
+    revenue_prior: Optional[Decimal] = None
+    revenue_surprise: Optional[Decimal] = None
+    revenue_surprise_percent: Optional[Decimal] = None
+    revenue_type: Optional[str] = None
+    date_confirmed: Optional[bool] = None
+    importance: Optional[int] = None
+    notes: Optional[str] = None
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaGuidance:
+    """Normalized Benzinga guidance calendar row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    cusip: Optional[str] = None
+    period: Optional[str] = None
+    period_year: Optional[int] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    eps_guidance_est: Optional[Decimal] = None
+    eps_guidance_min: Optional[Decimal] = None
+    eps_guidance_max: Optional[Decimal] = None
+    eps_guidance_prior_min: Optional[Decimal] = None
+    eps_guidance_prior_max: Optional[Decimal] = None
+    eps_type: Optional[str] = None
+    revenue_guidance_est: Optional[Decimal] = None
+    revenue_guidance_min: Optional[Decimal] = None
+    revenue_guidance_max: Optional[Decimal] = None
+    revenue_guidance_prior_min: Optional[Decimal] = None
+    revenue_guidance_prior_max: Optional[Decimal] = None
+    revenue_type: Optional[str] = None
+    is_primary: Optional[bool] = None
+    prelim: Optional[bool] = None
+    importance: Optional[int] = None
+    notes: Optional[str] = None
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaRating:
+    """Normalized Benzinga analyst rating calendar row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    cusip: Optional[str] = None
+    isin: Optional[str] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    analyst: Optional[str] = None
+    analyst_id: Optional[str] = None
+    analyst_name: Optional[str] = None
+    firm: Optional[str] = None
+    firm_id: Optional[str] = None
+    action_company: Optional[str] = None
+    action_pt: Optional[str] = None
+    rating_current: Optional[str] = None
+    rating_prior: Optional[str] = None
+    pt_current: Optional[Decimal] = None
+    pt_prior: Optional[Decimal] = None
+    adjusted_pt_current: Optional[Decimal] = None
+    adjusted_pt_prior: Optional[Decimal] = None
+    pt_pct_change: Optional[Decimal] = None
+    ratings_accuracy: Optional[Decimal] = None
+    importance: Optional[int] = None
+    notes: Optional[str] = None
+    url: Optional[str] = None
+    url_calendar: Optional[str] = None
+    url_news: Optional[str] = None
+    updated: Optional[datetime] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BenzingaOffering:
+    """Normalized Benzinga offering calendar row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    exchange: Optional[str] = None
+    currency: Optional[str] = None
+    cusip: Optional[str] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    offering_type: Optional[str] = None
+    price: Optional[Decimal] = None
+    number_shares: Optional[Decimal] = None
+    dollar_shares: Optional[Decimal] = None
+    proceeds: Optional[Decimal] = None
+    shelf: Optional[bool] = None
+    importance: Optional[int] = None
+    notes: Optional[str] = None
+    url: Optional[str] = None
+    updated: Optional[datetime] = None
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -168,7 +303,7 @@ class BenzingaAdapter:
                     endpoint=endpoint,
                     status_code=None,
                     error_type="http",
-                    message=str(exc),
+                    message=f"Benzinga request failed: {exc.__class__.__name__}",
                     retryable=True,
                 ),
             )
@@ -325,6 +460,154 @@ class BenzingaAdapter:
             asof=asof,
         )
 
+    def get_earnings(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaEarnings]]:
+        """Fetch Benzinga earnings calendar rows as catalyst/context evidence."""
+
+        try:
+            params = _calendar_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(EARNINGS_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(EARNINGS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        events = [
+            _parse_earnings_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "earnings")
+            if _calendar_row_has_usable_ticker(row)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
+    def get_guidance(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaGuidance]]:
+        """Fetch Benzinga guidance calendar rows as catalyst/context evidence."""
+
+        try:
+            params = _calendar_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(GUIDANCE_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(GUIDANCE_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        events = [
+            _parse_guidance_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "guidance")
+            if _calendar_row_has_usable_ticker(row)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
+    def get_ratings(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaRating]]:
+        """Fetch Benzinga analyst rating calendar rows as catalyst context."""
+
+        try:
+            params = _calendar_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(RATINGS_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(RATINGS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        events = [
+            _parse_rating_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "ratings")
+            if _calendar_row_has_usable_ticker(row)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
+    def get_offerings(
+        self,
+        tickers: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        symbols: Optional[Union[str, Sequence[str]]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        page: Optional[int] = None,
+        pagesize: int = 100,
+        updated: Optional[Union[int, str]] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[BenzingaOffering]]:
+        """Fetch Benzinga secondary offering rows as catalyst/review evidence."""
+
+        try:
+            params = _calendar_params(
+                tickers=tickers,
+                symbols=symbols,
+                date_from=date_from,
+                date_to=date_to,
+                page=page,
+                pagesize=pagesize,
+                updated=updated,
+            )
+        except ValueError as exc:
+            return _validation_error_response(OFFERINGS_ENDPOINT, str(exc), asof=asof)
+        resp = self._request(OFFERINGS_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        events = [
+            _parse_offering_row(row)
+            for row in _calendar_rows_from_payload(resp.data, "offerings")
+            if _calendar_row_has_usable_ticker(row)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
     def get_mergers_acquisitions(
         self,
         tickers: Optional[Union[str, Sequence[str]]] = None,
@@ -394,6 +677,70 @@ class BenzingaAdapter:
         return AdapterResponse(data=events, lineage=resp.lineage)
 
 
+def _calendar_params(
+    *,
+    tickers: Optional[Union[str, Sequence[str]]],
+    symbols: Optional[Union[str, Sequence[str]]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    page: Optional[int],
+    pagesize: int,
+    updated: Optional[Union[int, str]],
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"pagesize": pagesize}
+    if page is not None:
+        params["page"] = page
+
+    ticker_values = tickers if tickers else symbols
+    if ticker_values:
+        normalized_tickers = _calendar_ticker_csv_param(ticker_values)
+        if normalized_tickers:
+            params["parameters[tickers]"] = normalized_tickers
+    if date_from:
+        params["parameters[date_from]"] = date_from
+    if date_to:
+        params["parameters[date_to]"] = date_to
+    if updated is not None:
+        params["parameters[updated]"] = updated
+    return params
+
+
+def _calendar_rows_from_payload(payload: Any, key: str) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get(key) or []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _calendar_row_has_usable_ticker(row: Dict[str, Any]) -> bool:
+    ticker = _string_or_none(row.get("ticker"))
+    return ticker is not None and ticker.strip() != ""
+
+
+def _calendar_ticker_csv_param(value: Union[str, Sequence[str]]) -> Optional[str]:
+    if isinstance(value, str):
+        items = [value]
+    else:
+        try:
+            items = list(value)
+        except TypeError as exc:
+            raise ValueError("Benzinga calendar ticker parameters must be strings") from exc
+    normalized = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError("Benzinga calendar ticker parameters must be strings")
+        ticker = item.strip().upper()
+        if ticker:
+            normalized.append(ticker)
+    if not normalized:
+        return None
+    return ",".join(normalized)
+
+
 def _news_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
@@ -446,6 +793,142 @@ def _parse_news_article_row(row: Dict[str, Any]) -> BenzingaNewsArticle:
             _named_strings(row.get("categories"))
             + _named_strings(row.get("category"))
         ),
+        raw=dict(row),
+    )
+
+
+def _parse_earnings_row(row: Dict[str, Any]) -> BenzingaEarnings:
+    return BenzingaEarnings(
+        id=_string_or_none(row.get("id")),
+        ticker=_string_or_none(row.get("ticker")),
+        name=_string_or_none(row.get("name")),
+        exchange=_string_or_none(row.get("exchange")),
+        currency=_string_or_none(row.get("currency")),
+        cusip=_first_identifier(row, "cusip", kind="cusip"),
+        isin=_first_identifier(row, "isin", kind="isin"),
+        period=_string_or_none(row.get("period")),
+        period_year=_int_or_none(row.get("period_year")),
+        date=_string_or_none(row.get("date")),
+        time=_string_or_none(row.get("time")),
+        eps=_decimal_or_none(row.get("eps")),
+        eps_est=_decimal_or_none(row.get("eps_est")),
+        eps_prior=_decimal_or_none(row.get("eps_prior")),
+        eps_surprise=_decimal_or_none(row.get("eps_surprise")),
+        eps_surprise_percent=_decimal_or_none(row.get("eps_surprise_percent")),
+        eps_type=_string_or_none(row.get("eps_type")),
+        revenue=_decimal_or_none(row.get("revenue")),
+        revenue_est=_decimal_or_none(row.get("revenue_est")),
+        revenue_prior=_decimal_or_none(row.get("revenue_prior")),
+        revenue_surprise=_decimal_or_none(row.get("revenue_surprise")),
+        revenue_surprise_percent=_decimal_or_none(
+            row.get("revenue_surprise_percent")
+        ),
+        revenue_type=_string_or_none(row.get("revenue_type")),
+        date_confirmed=_bool_or_none(row.get("date_confirmed")),
+        importance=_int_or_none(row.get("importance")),
+        notes=_string_or_none(row.get("notes")),
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_guidance_row(row: Dict[str, Any]) -> BenzingaGuidance:
+    return BenzingaGuidance(
+        id=_string_or_none(row.get("id")),
+        ticker=_string_or_none(row.get("ticker")),
+        name=_string_or_none(row.get("name")),
+        exchange=_string_or_none(row.get("exchange")),
+        currency=_string_or_none(row.get("currency")),
+        cusip=_first_identifier(row, "cusip", kind="cusip"),
+        period=_string_or_none(row.get("period")),
+        period_year=_int_or_none(row.get("period_year")),
+        date=_string_or_none(row.get("date")),
+        time=_string_or_none(row.get("time")),
+        eps_guidance_est=_decimal_or_none(row.get("eps_guidance_est")),
+        eps_guidance_min=_decimal_or_none(row.get("eps_guidance_min")),
+        eps_guidance_max=_decimal_or_none(row.get("eps_guidance_max")),
+        eps_guidance_prior_min=_decimal_or_none(
+            row.get("eps_guidance_prior_min")
+        ),
+        eps_guidance_prior_max=_decimal_or_none(
+            row.get("eps_guidance_prior_max")
+        ),
+        eps_type=_string_or_none(row.get("eps_type")),
+        revenue_guidance_est=_decimal_or_none(row.get("revenue_guidance_est")),
+        revenue_guidance_min=_decimal_or_none(row.get("revenue_guidance_min")),
+        revenue_guidance_max=_decimal_or_none(row.get("revenue_guidance_max")),
+        revenue_guidance_prior_min=_decimal_or_none(
+            row.get("revenue_guidance_prior_min")
+        ),
+        revenue_guidance_prior_max=_decimal_or_none(
+            row.get("revenue_guidance_prior_max")
+        ),
+        revenue_type=_string_or_none(row.get("revenue_type")),
+        is_primary=_bool_or_none(row.get("is_primary")),
+        prelim=_bool_or_none(row.get("prelim")),
+        importance=_int_or_none(row.get("importance")),
+        notes=_string_or_none(row.get("notes")),
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_rating_row(row: Dict[str, Any]) -> BenzingaRating:
+    return BenzingaRating(
+        id=_string_or_none(row.get("id")),
+        ticker=_string_or_none(row.get("ticker")),
+        name=_string_or_none(row.get("name")),
+        exchange=_string_or_none(row.get("exchange")),
+        currency=_string_or_none(row.get("currency")),
+        cusip=_first_identifier(row, "cusip", kind="cusip"),
+        isin=_first_identifier(row, "isin", kind="isin"),
+        date=_string_or_none(row.get("date")),
+        time=_string_or_none(row.get("time")),
+        analyst=_string_or_none(row.get("analyst")),
+        analyst_id=_string_or_none(row.get("analyst_id")),
+        analyst_name=_string_or_none(row.get("analyst_name")),
+        firm=_first_string(row, "firm", "firm_name", "brokerage"),
+        firm_id=_string_or_none(row.get("firm_id")),
+        action_company=_string_or_none(row.get("action_company")),
+        action_pt=_string_or_none(row.get("action_pt")),
+        rating_current=_string_or_none(row.get("rating_current")),
+        rating_prior=_string_or_none(row.get("rating_prior")),
+        pt_current=_decimal_or_none(row.get("pt_current")),
+        pt_prior=_decimal_or_none(row.get("pt_prior")),
+        adjusted_pt_current=_decimal_or_none(row.get("adjusted_pt_current")),
+        adjusted_pt_prior=_decimal_or_none(row.get("adjusted_pt_prior")),
+        pt_pct_change=_decimal_or_none(row.get("pt_pct_change")),
+        ratings_accuracy=_decimal_or_none(row.get("ratings_accuracy")),
+        importance=_int_or_none(row.get("importance")),
+        notes=_string_or_none(row.get("notes")),
+        url=_string_or_none(row.get("url")),
+        url_calendar=_string_or_none(row.get("url_calendar")),
+        url_news=_string_or_none(row.get("url_news")),
+        updated=_timestamp_or_none(row.get("updated")),
+        raw=dict(row),
+    )
+
+
+def _parse_offering_row(row: Dict[str, Any]) -> BenzingaOffering:
+    return BenzingaOffering(
+        id=_string_or_none(row.get("id")),
+        ticker=_string_or_none(row.get("ticker")),
+        name=_string_or_none(row.get("name")),
+        exchange=_string_or_none(row.get("exchange")),
+        currency=_string_or_none(row.get("currency")),
+        cusip=_first_identifier(row, "cusip", kind="cusip"),
+        date=_string_or_none(row.get("date")),
+        time=_string_or_none(row.get("time")),
+        offering_type=_string_or_none(row.get("offering_type")),
+        price=_decimal_or_none(row.get("price")),
+        number_shares=_decimal_or_none(row.get("number_shares")),
+        dollar_shares=_decimal_or_none(row.get("dollar_shares")),
+        proceeds=_decimal_or_none(row.get("proceeds")),
+        shelf=_bool_or_none(row.get("shelf")),
+        importance=_int_or_none(row.get("importance")),
+        notes=_string_or_none(row.get("notes")),
+        url=_string_or_none(row.get("url")),
+        updated=_timestamp_or_none(row.get("updated")),
         raw=dict(row),
     )
 
@@ -632,6 +1115,35 @@ def _int_or_none(value: Any) -> Optional[int]:
         return None
 
 
+def _decimal_or_none(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _bool_or_none(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return None
+    text = str(value).strip().lower()
+    if text in ("y", "yes", "true", "1"):
+        return True
+    if text in ("n", "no", "false", "0"):
+        return False
+    return None
+
+
 def _timestamp_or_none(value: Any) -> Optional[datetime]:
     if value is None or value == "":
         return None
@@ -673,7 +1185,7 @@ def _validation_error_response(
     message: str,
     *,
     asof: Optional[datetime],
-) -> AdapterResponse[List[BenzingaMergerAcquisition]]:
+) -> AdapterResponse[Any]:
     request_ts = utcnow()
     asof_ts = aware_utc_or_none(asof) if asof is not None else request_ts
     if asof_ts is None:
