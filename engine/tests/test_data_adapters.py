@@ -1631,6 +1631,617 @@ class TestPolygonAdapter:
             assert resp.error.retryable is False
         session.get.assert_not_called()
 
+    def test_get_news_ok_preserves_sentiment_and_params(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "publisher": {
+                        "name": "Example Wire",
+                        "homepage_url": "https://example.com",
+                        "logo_url": "https://example.com/logo.png",
+                        "favicon_url": "https://example.com/favicon.ico",
+                    },
+                    "title": "Apple shares move on new product",
+                    "author": "Market Desk",
+                    "article_url": "https://example.com/aapl-news",
+                    "amp_url": "https://amp.example.com/aapl-news",
+                    "image_url": "https://example.com/aapl.jpg",
+                    "description": "AAPL article summary",
+                    "published_utc": "2026-05-27T12:00:00Z",
+                    "tickers": ["AAPL", "MSFT"],
+                    "keywords": ["products", "sentiment"],
+                    "insights": [
+                        {
+                            "ticker": "AAPL",
+                            "sentiment": "positive",
+                            "sentiment_reasoning": "Demand commentary was constructive.",
+                        }
+                    ],
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news(
+            ticker=" aapl ",
+            published_utc_from="2026-05-01",
+            published_utc_to="2026-05-28T00:00:00Z",
+            limit=2000,
+            sort="published_utc",
+            order="DESC",
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        article = resp.data[0]
+        assert article.id == "news-1"
+        assert article.publisher_name == "Example Wire"
+        assert article.publisher_homepage_url == "https://example.com"
+        assert article.publisher_logo_url == "https://example.com/logo.png"
+        assert article.publisher_favicon_url == "https://example.com/favicon.ico"
+        assert article.title == "Apple shares move on new product"
+        assert article.author == "Market Desk"
+        assert article.article_url == "https://example.com/aapl-news"
+        assert article.amp_url == "https://amp.example.com/aapl-news"
+        assert article.image_url == "https://example.com/aapl.jpg"
+        assert article.description == "AAPL article summary"
+        assert article.published_utc == "2026-05-27T12:00:00Z"
+        assert article.tickers == ["AAPL", "MSFT"]
+        assert article.keywords == ["products", "sentiment"]
+        assert article.insights[0]["sentiment"] == "positive"
+        assert article.insights[0]["sentiment_reasoning"] == (
+            "Demand commentary was constructive."
+        )
+        assert article.publisher == json_data["results"][0]["publisher"]
+        assert article.raw == json_data["results"][0]
+        assert resp.lineage.provider == "Polygon"
+        assert resp.lineage.endpoint == "/v2/reference/news"
+        assert resp.lineage.source_authority == "Polygon"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        session.get.assert_called_with(
+            "https://api.polygon.io/v2/reference/news",
+            params={
+                "ticker": "AAPL",
+                "published_utc.gte": "2026-05-01",
+                "published_utc.lte": "2026-05-28T00:00:00Z",
+                "limit": 1000,
+                "sort": "published_utc",
+                "order": "desc",
+            },
+            timeout=30,
+        )
+
+    def test_polygon_news_skips_invalid_rows_with_telemetry(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "valid",
+                    "title": "Valid article",
+                    "article_url": "https://example.com/valid",
+                },
+                {
+                    "id": "valid-http",
+                    "title": "Valid article over http",
+                    "article_url": "http://example.com/valid",
+                },
+                {},
+                {"id": "missing-title", "article_url": "https://example.com/no-title"},
+                {"id": "missing-url", "title": "No URL"},
+                {"title": "No ID", "article_url": "https://example.com/no-id"},
+                {"id": 123, "title": "Numeric ID", "article_url": "https://example.com/id"},
+                {"id": "numeric-title", "title": 456, "article_url": "https://example.com/title"},
+                {"id": "numeric-url", "title": "Numeric URL", "article_url": 789},
+                {"id": "blank-title", "title": " ", "article_url": "https://example.com/blank"},
+                {"id": "blank-url", "title": "Blank URL", "article_url": " "},
+                {"id": "no-scheme", "title": "No scheme", "article_url": "example.com/no-scheme"},
+                {"id": "ftp", "title": "FTP URL", "article_url": "ftp://example.com/no"},
+                None,
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL")
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["valid", "valid-http"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 14
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 12
+
+    def test_polygon_news_rejects_malformed_article_urls_with_telemetry(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "valid-http",
+                    "title": "Valid HTTP article",
+                    "article_url": "http://example.com/valid",
+                },
+                {
+                    "id": "valid-https",
+                    "title": "Valid HTTPS article",
+                    "article_url": "https://sub.example.com/path?x=1",
+                },
+                {"id": "empty-https", "title": "Empty HTTPS", "article_url": "https://"},
+                {"id": "path-only", "title": "Path only", "article_url": "https:///path"},
+                {"id": "empty-http", "title": "Empty HTTP", "article_url": "http://"},
+                {"id": "ftp", "title": "FTP", "article_url": "ftp://example.com/a"},
+                {"id": "no-scheme", "title": "No scheme", "article_url": "example.com/a"},
+                {
+                    "id": "control",
+                    "title": "Control char",
+                    "article_url": "https://example.com/a\nsecret",
+                },
+                {"id": "numeric-url", "title": "Numeric URL", "article_url": 123},
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL")
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["valid-http", "valid-https"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 9
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 7
+
+    def test_polygon_news_empty_payload_success(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.endpoint == "/v2/reference/news"
+        assert resp.lineage.data_quality_flags["raw_rows"] == 0
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        assert "all_rows_skipped" not in resp.lineage.data_quality_flags
+
+    def test_polygon_news_invalid_shape_is_parse_error(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "a list"}},
+            [{"id": "news-1"}],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_news("AAPL")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.error.retryable is False
+            assert resp.lineage.endpoint == "/v2/reference/news"
+            assert resp.lineage.data_quality_flags["page_count"] == 1
+
+    def test_polygon_news_malformed_json_is_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, text="not json")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL")
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+        assert resp.lineage.endpoint == "/v2/reference/news"
+
+    def test_polygon_news_provider_errors(self):
+        expected = {
+            403: "auth",
+            429: "rate_limit",
+            500: "http",
+        }
+        for status_code, error_type in expected.items():
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(status_code, text="provider error")
+            adapter = self._adapter(session)
+
+            resp = adapter.get_news("AAPL")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == error_type
+            assert resp.error.status_code == status_code
+
+    def test_polygon_news_timeout_and_request_exception_are_safe(self):
+        timeout_session = MagicMock(spec=requests.Session)
+        timeout_session.params = {}
+        timeout_session.get.side_effect = requests.exceptions.Timeout("timed out")
+        timeout_adapter = self._adapter(timeout_session)
+
+        timeout_resp = timeout_adapter.get_news("AAPL")
+
+        assert not timeout_resp.ok
+        assert timeout_resp.error.error_type == "timeout"
+        assert timeout_resp.error.retryable is True
+
+        error_session = MagicMock(spec=requests.Session)
+        error_session.params = {}
+        error_session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/v2/reference/news?apiKey=test-polygon-key&ticker=AAPL"
+        )
+        error_adapter = self._adapter(error_session)
+
+        error_resp = error_adapter.get_news("AAPL")
+
+        assert not error_resp.ok
+        assert error_resp.error.error_type == "http"
+        assert error_resp.error.message == "Polygon request failed: ConnectionError"
+        assert "test-polygon-key" not in error_resp.error.message
+        assert "apiKey" not in error_resp.error.message
+        assert "https://api.polygon.io" not in error_resp.error.message
+
+    def test_polygon_news_rejects_invalid_published_dates(self):
+        cases = [
+            lambda adapter: adapter.get_news("AAPL", published_utc="bad"),
+            lambda adapter: adapter.get_news("AAPL", published_utc="2026-99-99"),
+            lambda adapter: adapter.get_news("AAPL", published_utc="2026/05/27"),
+            lambda adapter: adapter.get_news("AAPL", published_utc=" "),
+            lambda adapter: adapter.get_news("AAPL", published_utc="2026-05-27T12:00:00"),
+            lambda adapter: adapter.get_news("AAPL", published_utc="2026-05-27 12:00:00"),
+            lambda adapter: adapter.get_news(
+                "AAPL",
+                published_utc_from="2026-05-01",
+                published_utc_to="2026-99-99",
+            ),
+        ]
+
+        for call in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            session.get.assert_not_called()
+
+    def test_polygon_news_accepts_date_and_timezone_aware_datetime_filters(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        date_resp = adapter.get_news("AAPL", published_utc="2026-05-27")
+        z_resp = adapter.get_news("AAPL", published_utc="2026-05-27T12:00:00Z")
+        offset_resp = adapter.get_news("AAPL", published_utc="2026-05-27T12:00:00+00:00")
+
+        assert date_resp.ok
+        assert z_resp.ok
+        assert offset_resp.ok
+        assert session.get.call_args_list[0].kwargs["params"]["published_utc"] == "2026-05-27"
+        assert (
+            session.get.call_args_list[1].kwargs["params"]["published_utc"]
+            == "2026-05-27T12:00:00Z"
+        )
+        assert (
+            session.get.call_args_list[2].kwargs["params"]["published_utc"]
+            == "2026-05-27T12:00:00+00:00"
+        )
+
+    def test_polygon_news_normalizes_tickers_and_omits_blank_filter(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        ticker_resp = adapter.get_news(tickers=[" msft ", "", "MSFT"])
+        blank_resp = adapter.get_news(
+            ticker=" ",
+            tickers=["", " "],
+            published_utc_from="2026-05-01",
+            published_utc_to="2026-05-28",
+        )
+        exact_resp = adapter.get_news(
+            "qqq",
+            published_utc="2026-05-27T12:00:00Z",
+        )
+
+        assert ticker_resp.ok
+        assert blank_resp.ok
+        assert exact_resp.ok
+        assert session.get.call_args_list[0].kwargs["params"]["ticker"] == "MSFT"
+        assert "ticker" not in session.get.call_args_list[1].kwargs["params"]
+        assert session.get.call_args_list[1].kwargs["params"]["published_utc.gte"] == "2026-05-01"
+        assert session.get.call_args_list[1].kwargs["params"]["published_utc.lte"] == "2026-05-28"
+        assert session.get.call_args_list[2].kwargs["params"]["ticker"] == "QQQ"
+        assert (
+            session.get.call_args_list[2].kwargs["params"]["published_utc"]
+            == "2026-05-27T12:00:00Z"
+        )
+
+    def test_polygon_news_rejects_multi_ticker_input_without_request(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        list_resp = adapter.get_news(tickers=["AAPL", "MSFT"])
+        tuple_resp = adapter.get_news(tickers=("AAPL", "MSFT"))  # type: ignore[arg-type]
+        set_resp = adapter.get_news(tickers={"AAPL", "MSFT"})  # type: ignore[arg-type]
+        mixed_resp = adapter.get_news(ticker="QQQ", tickers=["AAPL"])
+
+        for resp in (list_resp, tuple_resp, set_resp, mixed_resp):
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+        session.get.assert_not_called()
+
+    def test_polygon_news_rejects_comma_and_non_string_tickers_without_request(self):
+        cases = [
+            lambda adapter: adapter.get_news(ticker="AAPL,MSFT"),
+            lambda adapter: adapter.get_news(ticker=" AAPL , MSFT "),
+            lambda adapter: adapter.get_news(tickers="AAPL,MSFT"),  # type: ignore[arg-type]
+            lambda adapter: adapter.get_news(tickers=["AAPL,MSFT"]),
+            lambda adapter: adapter.get_news(tickers=[" AAPL , MSFT "]),
+            lambda adapter: adapter.get_news(tickers=[123]),  # type: ignore[list-item]
+            lambda adapter: adapter.get_news(tickers=[object()]),  # type: ignore[list-item]
+        ]
+        for call in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            adapter = self._adapter(session)
+
+            resp = call(adapter)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+            session.get.assert_not_called()
+
+    def test_polygon_news_broad_query_requires_date_bounds(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        empty_resp = adapter.get_news()
+        blank_resp = adapter.get_news(ticker=" ", tickers=["", " "])
+        one_sided_resp = adapter.get_news(published_utc_from="2026-05-01")
+
+        for resp in (empty_resp, blank_resp, one_sided_resp):
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+        session.get.assert_not_called()
+
+    def test_polygon_news_bounded_broad_query_is_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        exact_resp = adapter.get_news(published_utc="2026-05-27")
+        ranged_resp = adapter.get_news(
+            published_utc_from="2026-05-01",
+            published_utc_to="2026-05-28",
+        )
+
+        assert exact_resp.ok
+        assert ranged_resp.ok
+        exact_params = session.get.call_args_list[0].kwargs["params"]
+        ranged_params = session.get.call_args_list[1].kwargs["params"]
+        assert "ticker" not in exact_params
+        assert exact_params["published_utc"] == "2026-05-27"
+        assert "ticker" not in ranged_params
+        assert ranged_params["published_utc.gte"] == "2026-05-01"
+        assert ranged_params["published_utc.lte"] == "2026-05-28"
+
+    def test_polygon_news_parsed_mutation_does_not_mutate_raw_payload(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "publisher": {"name": "Publisher", "nested": {"rank": 1}},
+                    "title": "Article",
+                    "article_url": "https://example.com/article",
+                    "tickers": ["AAPL"],
+                    "keywords": ["sentiment"],
+                    "insights": [
+                        {
+                            "ticker": "AAPL",
+                            "sentiment": "positive",
+                            "nested": {"score": 1},
+                        }
+                    ],
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL")
+
+        assert resp.ok
+        article = resp.data[0]
+        article.publisher["name"] = "Changed"
+        article.publisher["nested"]["rank"] = 2
+        article.insights[0]["sentiment"] = "negative"
+        article.insights[0]["nested"]["score"] = 2
+        article.tickers.append("MSFT")
+        article.keywords.append("changed")
+        assert article.raw["publisher"]["name"] == "Publisher"
+        assert article.raw["publisher"]["nested"]["rank"] == 1
+        assert article.raw["insights"][0]["sentiment"] == "positive"
+        assert article.raw["insights"][0]["nested"]["score"] == 1
+        assert article.raw["tickers"] == ["AAPL"]
+        assert article.raw["keywords"] == ["sentiment"]
+
+    def test_polygon_news_paginates_and_sanitizes_next_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "title": "First",
+                    "article_url": "https://example.com/first",
+                }
+            ],
+            "next_url": "https://api.massive.com/v2/reference/news?cursor=abc&apiKey=SECRET&token=SECRET",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "id": "news-2",
+                    "title": "Second",
+                    "article_url": "https://example.com/second",
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["news-1", "news-2"]
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[0].args[0] == "https://api.polygon.io/v2/reference/news"
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/v2/reference/news"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert "SECRET" not in repr(session.get.call_args_list[1])
+        assert "apiKey" not in repr(session.get.call_args_list[1])
+        assert "token" not in repr(session.get.call_args_list[1])
+        assert resp.lineage.data_quality_flags["page_count"] == 2
+        assert resp.lineage.data_quality_flags["paginated"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is False
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/v2/reference/news"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 2
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+        assert "token" not in repr(resp.lineage)
+
+    def test_polygon_news_second_page_failures_are_loud(self):
+        page_1 = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "title": "First",
+                    "article_url": "https://example.com/first",
+                }
+            ],
+            "next_url": "/v2/reference/news?cursor=abc&apiKey=SECRET",
+        }
+        cases = [
+            (_mock_response(429, text="Too many requests"), "rate_limit"),
+            (_mock_response(200, text="not json"), "parse"),
+            (_mock_response(200, {"unexpected": True}), "parse"),
+        ]
+        for response, error_type in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.side_effect = [
+                _mock_response(200, page_1),
+                response,
+            ]
+            adapter = self._adapter(session)
+
+            resp = adapter.get_news("AAPL", limit=1)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == error_type
+            assert session.get.call_count == 2
+            assert resp.lineage.endpoint == "/v2/reference/news"
+            assert resp.lineage.data_quality_flags["page_count"] == 2
+            assert resp.lineage.data_quality_flags["paginated"] is True
+            assert resp.lineage.data_quality_flags["truncated"] is True
+            assert resp.lineage.data_quality_flags["next_url_paths"] == ["/v2/reference/news"]
+            assert "SECRET" not in repr(resp.lineage)
+            assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_news_evil_next_url_is_rejected_before_request(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "title": "First",
+                    "article_url": "https://example.com/first",
+                }
+            ],
+            "next_url": "https://evil.example/v2/reference/news?cursor=abc&apiKey=SECRET",
+        }
+        session.get.return_value = _mock_response(200, page_1)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_news("AAPL", limit=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        assert resp.error.retryable is False
+        assert session.get.call_count == 1
+        assert "evil.example" not in repr(resp.lineage)
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_news_lineage_hash_stability(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "news-1",
+                    "title": "First",
+                    "article_url": "https://example.com/first",
+                }
+            ]
+        }
+        adapter = self._adapter(session)
+
+        session.get.return_value = _mock_response(200, json_data)
+        resp1 = adapter.get_news("AAPL")
+        resp2 = adapter.get_news("AAPL")
+
+        assert resp1.lineage.raw_payload_hash == resp2.lineage.raw_payload_hash
+
     def test_get_ticker_details_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}

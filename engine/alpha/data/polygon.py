@@ -11,7 +11,8 @@ Does not write to DB. Returns AdapterResponse with LineageMeta.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,7 @@ SPLITS_ENDPOINT = "/stocks/v1/splits"
 DIVIDENDS_ENDPOINT = "/stocks/v1/dividends"
 SHORT_INTEREST_ENDPOINT = "/stocks/v1/short-interest"
 SHORT_VOLUME_ENDPOINT = "/stocks/v1/short-volume"
+NEWS_ENDPOINT = "/v2/reference/news"
 POLYGON_API_HOSTS = {"api.polygon.io", "api.massive.com"}
 
 
@@ -108,6 +110,29 @@ class PolygonDividend:
     pay_date: Optional[str] = None
     record_date: Optional[str] = None
     split_adjusted_cash_amount: Optional[Decimal] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PolygonNewsArticle:
+    """Normalized Polygon news article with publisher and insights preserved."""
+
+    id: str
+    title: str
+    article_url: str
+    publisher_name: Optional[str] = None
+    publisher_homepage_url: Optional[str] = None
+    publisher_logo_url: Optional[str] = None
+    publisher_favicon_url: Optional[str] = None
+    author: Optional[str] = None
+    amp_url: Optional[str] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    published_utc: Optional[str] = None
+    tickers: List[str] = field(default_factory=list)
+    keywords: List[str] = field(default_factory=list)
+    insights: List[Dict[str, Any]] = field(default_factory=list)
+    publisher: Optional[Dict[str, Any]] = None
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -744,6 +769,68 @@ class PolygonAdapter:
         lineage = _short_volume_semantic_lineage(lineage, results)
         return AdapterResponse(data=results, lineage=lineage)
 
+    # --- News / sentiment cross-check ---
+
+    def get_news(
+        self,
+        ticker: Optional[str] = None,
+        *,
+        tickers: Optional[List[str]] = None,
+        published_utc: Optional[str] = None,
+        published_utc_from: Optional[str] = None,
+        published_utc_to: Optional[str] = None,
+        limit: int = 100,
+        sort: Optional[str] = "published_utc",
+        order: Optional[str] = "desc",
+        max_pages: int = 10,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[PolygonNewsArticle]]:
+        """Fetch Polygon news articles as news/sentiment cross-check evidence."""
+
+        validation_error = _validate_polygon_news_query(
+            ticker=ticker,
+            tickers=tickers,
+            published_utc=published_utc,
+            published_utc_from=published_utc_from,
+            published_utc_to=published_utc_to,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if validation_error is not None:
+            return validation_error  # type: ignore[return-value]
+
+        params = _news_params(
+            ticker=ticker,
+            tickers=tickers,
+            published_utc=published_utc,
+            published_utc_from=published_utc_from,
+            published_utc_to=published_utc_to,
+            limit=limit,
+            sort=sort,
+            order=order,
+        )
+        resp = self._fetch_corporate_action_rows(
+            NEWS_ENDPOINT,
+            params=params,
+            max_pages=max_pages,
+            asof=asof,
+            feed_label="news",
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        articles = []
+        raw_rows = 0
+        for row in resp.data or []:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            article = _parse_news_article_row(row)
+            if article is not None:
+                articles.append(article)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(articles))
+        return AdapterResponse(data=articles, lineage=lineage)
+
     # --- Bulk ticker reference / identity ---
 
     def get_tickers(
@@ -1168,6 +1255,79 @@ def _validate_polygon_feed_query(
     return None
 
 
+def _validate_polygon_news_query(
+    *,
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+    published_utc: Optional[str],
+    published_utc_from: Optional[str],
+    published_utc_to: Optional[str],
+    max_pages: Any,
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    try:
+        page_cap = int(max_pages)
+    except (TypeError, ValueError):
+        return _provider_error_response(
+            endpoint=NEWS_ENDPOINT,
+            error_type="validation",
+            message="Polygon news max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    if page_cap < 1:
+        return _provider_error_response(
+            endpoint=NEWS_ENDPOINT,
+            error_type="validation",
+            message="Polygon news max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    date_error = _validate_iso_date_or_datetime_params(
+        endpoint=NEWS_ENDPOINT,
+        date_fields={
+            "published_utc": published_utc,
+            "published_utc_from": published_utc_from,
+            "published_utc_to": published_utc_to,
+        },
+        asof=asof,
+    )
+    if date_error is not None:
+        return date_error
+
+    ticker_error = _validate_news_ticker_inputs(
+        ticker=ticker,
+        tickers=tickers,
+        asof=asof,
+    )
+    if ticker_error is not None:
+        return ticker_error
+
+    ticker_values = _news_ticker_values(ticker, tickers)
+    if len(ticker_values) > 1:
+        return _provider_error_response(
+            endpoint=NEWS_ENDPOINT,
+            error_type="validation",
+            message="Polygon news supports one ticker per request",
+            retryable=False,
+            asof=asof,
+        )
+    has_exact_date = _str_or_none(published_utc) is not None
+    has_bounded_date_range = (
+        _str_or_none(published_utc_from) is not None
+        and _str_or_none(published_utc_to) is not None
+    )
+    if not ticker_values and not (has_exact_date or has_bounded_date_range):
+        return _provider_error_response(
+            endpoint=NEWS_ENDPOINT,
+            error_type="validation",
+            message="Polygon news broad query requires an exact published_utc or bounded published_utc window",
+            retryable=False,
+            asof=asof,
+        )
+    return None
+
+
 def _corporate_action_params(
     *,
     ticker: Optional[str],
@@ -1194,6 +1354,112 @@ def _corporate_action_params(
     if sort_param is not None:
         params["sort"] = sort_param
     return params
+
+
+def _news_params(
+    *,
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+    published_utc: Optional[str],
+    published_utc_from: Optional[str],
+    published_utc_to: Optional[str],
+    limit: int,
+    sort: Optional[str],
+    order: Optional[str],
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"limit": _limited_int(limit, maximum=1000)}
+    ticker_param = _news_ticker_param(ticker, tickers)
+    if ticker_param:
+        params["ticker"] = ticker_param
+    if published_utc:
+        params["published_utc"] = published_utc
+    else:
+        if published_utc_from:
+            params["published_utc.gte"] = published_utc_from
+        if published_utc_to:
+            params["published_utc.lte"] = published_utc_to
+    sort_text = _str_or_none(sort)
+    if sort_text:
+        params["sort"] = sort_text
+    order_text = _str_or_none(order)
+    if order_text:
+        params["order"] = order_text.lower()
+    return params
+
+
+def _news_ticker_param(
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+) -> Optional[str]:
+    values = _news_ticker_values(ticker, tickers)
+    return values[0] if values else None
+
+
+def _validate_news_ticker_inputs(
+    *,
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    values = []
+    for item in _news_ticker_items(ticker, tickers):
+        if not isinstance(item, str):
+            return _invalid_news_ticker_response(asof=asof)
+        text = item.strip()
+        if not text:
+            continue
+        if "," in text:
+            return _invalid_news_ticker_response(asof=asof)
+        value = text.upper()
+        if value not in values:
+            values.append(value)
+    if len(values) > 1:
+        return _invalid_news_ticker_response(asof=asof)
+    return None
+
+
+def _invalid_news_ticker_response(*, asof: Optional[datetime]) -> AdapterResponse[Any]:
+    return _provider_error_response(
+        endpoint=NEWS_ENDPOINT,
+        error_type="validation",
+        message="Polygon news supports one string ticker per request",
+        retryable=False,
+        asof=asof,
+    )
+
+
+def _news_ticker_items(
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+) -> List[Any]:
+    items: List[Any] = []
+    if ticker is not None:
+        items.append(ticker)
+    if tickers is not None:
+        if isinstance(tickers, str):
+            items.append(tickers)
+        elif isinstance(tickers, (list, tuple, set)):
+            items.extend(tickers)
+        else:
+            items.append(tickers)
+    return items
+
+
+def _news_ticker_values(
+    ticker: Optional[str],
+    tickers: Optional[List[str]],
+) -> List[str]:
+    normalized: List[str] = []
+    for item in _news_ticker_items(ticker, tickers):
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or "," in text:
+            continue
+        value = text.upper()
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
 
 
 def _dated_feed_params(
@@ -1483,6 +1749,39 @@ def _validate_iso_date_params(
     return None
 
 
+def _validate_iso_date_or_datetime_params(
+    *,
+    endpoint: str,
+    date_fields: Dict[str, Optional[str]],
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    for label, value in date_fields.items():
+        if value is None:
+            continue
+        text = _str_or_none(value)
+        if text is None:
+            return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+        if len(text) == 10:
+            try:
+                date.fromisoformat(text)
+            except ValueError:
+                return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+            continue
+        if "T" not in text:
+            return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+        date_part = text.split("T", 1)[0]
+        if len(date_part) != 10:
+            return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+        try:
+            date.fromisoformat(date_part)
+            parsed_dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+        if parsed_dt.tzinfo is None or parsed_dt.utcoffset() is None:
+            return _invalid_news_datetime_response(endpoint=endpoint, label=label, asof=asof)
+    return None
+
+
 def _invalid_date_response(
     *,
     endpoint: str,
@@ -1493,6 +1792,21 @@ def _invalid_date_response(
         endpoint=endpoint,
         error_type="validation",
         message=f"Polygon feed {label} must be YYYY-MM-DD",
+        retryable=False,
+        asof=asof,
+    )
+
+
+def _invalid_news_datetime_response(
+    *,
+    endpoint: str,
+    label: str,
+    asof: Optional[datetime],
+) -> AdapterResponse[Any]:
+    return _provider_error_response(
+        endpoint=endpoint,
+        error_type="validation",
+        message=f"Polygon news {label} must be YYYY-MM-DD or ISO datetime",
         retryable=False,
         asof=asof,
     )
@@ -1658,6 +1972,80 @@ def _parse_dividend_row(row: Dict[str, Any]) -> Optional[PolygonDividend]:
         ),
         raw=dict(row),
     )
+
+
+def _parse_news_article_row(row: Dict[str, Any]) -> Optional[PolygonNewsArticle]:
+    article_id = _strict_str_or_none(row.get("id"))
+    title = _strict_str_or_none(row.get("title"))
+    article_url = _url_str_or_none(row.get("article_url"))
+    if not article_id or not title or not article_url:
+        return None
+
+    publisher_payload = row.get("publisher")
+    publisher = deepcopy(publisher_payload) if isinstance(publisher_payload, dict) else None
+    publisher_lookup = publisher or {}
+
+    return PolygonNewsArticle(
+        id=article_id,
+        title=title,
+        article_url=article_url,
+        publisher_name=_str_or_none(publisher_lookup.get("name")),
+        publisher_homepage_url=_str_or_none(publisher_lookup.get("homepage_url")),
+        publisher_logo_url=_str_or_none(publisher_lookup.get("logo_url")),
+        publisher_favicon_url=_str_or_none(publisher_lookup.get("favicon_url")),
+        author=_str_or_none(row.get("author")),
+        amp_url=_str_or_none(row.get("amp_url")),
+        image_url=_str_or_none(row.get("image_url")),
+        description=_str_or_none(row.get("description")),
+        published_utc=_str_or_none(row.get("published_utc")),
+        tickers=_string_list(row.get("tickers")),
+        keywords=_string_list(row.get("keywords")),
+        insights=_dict_list(row.get("insights")),
+        publisher=publisher,
+        raw=deepcopy(row),
+    )
+
+
+def _strict_str_or_none(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return _str_or_none(value)
+
+
+def _url_str_or_none(value: Any) -> Optional[str]:
+    text = _strict_str_or_none(value)
+    if text is None:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not parsed.netloc.strip():
+        return None
+    return text
+
+
+def _string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            text = _str_or_none(item)
+            if text:
+                result.append(text)
+        return result
+    text = _str_or_none(value)
+    return [text] if text else []
+
+
+def _dict_list(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [deepcopy(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [deepcopy(value)]
+    return []
 
 
 def _parse_ticker_reference_row(row: Dict[str, Any]) -> PolygonTickerReference:
