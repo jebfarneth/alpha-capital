@@ -1002,6 +1002,871 @@ class TestPolygonAdapter:
         assert resp.data[0].close == 5.25
         assert resp.data[0].vwap == 5.15
 
+    def test_get_splits_ok(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "split-1",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-08-31",
+                    "split_from": 1,
+                    "split_to": 4,
+                    "adjustment_type": "forward_split",
+                    "historical_adjustment_factor": "0.25",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits(
+            " aapl ",
+            execution_date_from="2020-08-01",
+            execution_date_to="2020-09-30",
+            limit=6000,
+            sort="execution_date",
+            order="asc",
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        split = resp.data[0]
+        assert split.id == "split-1"
+        assert split.ticker == "AAPL"
+        assert split.execution_date == "2020-08-31"
+        assert split.split_from == Decimal("1")
+        assert split.split_to == Decimal("4")
+        assert split.adjustment_type == "forward_split"
+        assert split.historical_adjustment_factor == Decimal("0.25")
+        assert split.raw == json_data["results"][0]
+        assert resp.lineage.endpoint == "/stocks/v1/splits"
+        session.get.assert_called_with(
+            "https://api.polygon.io/stocks/v1/splits",
+            params={
+                "ticker": "AAPL",
+                "execution_date.gte": "2020-08-01",
+                "execution_date.lte": "2020-09-30",
+                "limit": 5000,
+                "sort": "execution_date.asc",
+            },
+            timeout=30,
+        )
+
+    def test_get_dividends_ok(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "MSFT",
+                    "cash_amount": "0.333333333333333333",
+                    "currency": "USD",
+                    "declaration_date": "2026-03-10",
+                    "distribution_type": "recurring",
+                    "ex_dividend_date": "2026-05-21",
+                    "frequency": "4",
+                    "historical_adjustment_factor": "0.99908",
+                    "pay_date": "2026-06-11",
+                    "record_date": "2026-05-21",
+                    "split_adjusted_cash_amount": "0.333333333333333333",
+                }
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends(
+            " msft ",
+            ex_dividend_date_from="2026-01-01",
+            ex_dividend_date_to="2026-05-28",
+            limit=10,
+            sort="ex_dividend_date",
+            order="desc",
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        dividend = resp.data[0]
+        assert dividend.id == "div-1"
+        assert dividend.ticker == "MSFT"
+        assert dividend.ex_dividend_date == "2026-05-21"
+        assert dividend.cash_amount == Decimal("0.333333333333333333")
+        assert dividend.currency == "USD"
+        assert dividend.distribution_type == "recurring"
+        assert dividend.frequency == 4
+        assert dividend.historical_adjustment_factor == Decimal("0.99908")
+        assert dividend.split_adjusted_cash_amount == Decimal("0.333333333333333333")
+        assert dividend.raw == json_data["results"][0]
+        assert resp.lineage.endpoint == "/stocks/v1/dividends"
+        session.get.assert_called_with(
+            "https://api.polygon.io/stocks/v1/dividends",
+            params={
+                "ticker": "MSFT",
+                "ex_dividend_date.gte": "2026-01-01",
+                "ex_dividend_date.lte": "2026-05-28",
+                "limit": 10,
+                "sort": "ex_dividend_date.desc",
+            },
+            timeout=30,
+        )
+
+    def test_polygon_splits_skip_invalid_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {},
+                {"execution_date": "2026-01-01", "split_from": 1, "split_to": 4},
+                {"ticker": "MISSDATE", "split_from": 1, "split_to": 4},
+                {"ticker": "MISSFROM", "execution_date": "2026-01-02", "split_to": 4},
+                {"ticker": "MISSTO", "execution_date": "2026-01-03", "split_from": 1},
+                {"ticker": "ZEROFROM", "execution_date": "2026-01-04", "split_from": 0, "split_to": 4},
+                {"ticker": "ZEROTO", "execution_date": "2026-01-05", "split_from": 1, "split_to": 0},
+                {"ticker": "NEGFROM", "execution_date": "2026-01-06", "split_from": -1, "split_to": 4},
+                {"ticker": "VALID", "execution_date": "2026-01-07", "split_from": "1", "split_to": "1000"},
+                None,
+                "bad",
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("VALID")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].ticker == "VALID"
+        assert resp.data[0].split_from == Decimal("1")
+        assert resp.data[0].split_to == Decimal("1000")
+        assert resp.lineage.data_quality_flags["raw_rows"] == 11
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 10
+
+    def test_polygon_dividends_skip_invalid_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {},
+                {"ex_dividend_date": "2026-05-21", "cash_amount": "0.91"},
+                {"ticker": "MISSDATE", "cash_amount": "0.91"},
+                {"ticker": "MISSCASH", "ex_dividend_date": "2026-05-21"},
+                {"ticker": "NEG", "ex_dividend_date": "2026-05-21", "cash_amount": "-0.10"},
+                {"ticker": "NA", "ex_dividend_date": "2026-05-21", "cash_amount": "N/A"},
+                {
+                    "ticker": "VALID",
+                    "ex_dividend_date": "2026-05-21",
+                    "cash_amount": "0.333333333333333333",
+                    "frequency": "N/A",
+                },
+                None,
+                7,
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("VALID")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].ticker == "VALID"
+        assert resp.data[0].cash_amount == Decimal("0.333333333333333333")
+        assert resp.data[0].frequency is None
+        assert resp.lineage.data_quality_flags["raw_rows"] == 9
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 8
+
+    def test_polygon_corporate_action_skipped_row_telemetry_counts_rows(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {"ticker": "V1", "execution_date": "2026-01-01", "split_from": 1, "split_to": 2},
+                {"ticker": "V2", "execution_date": "2026-01-02", "split_from": 2, "split_to": 1},
+                {"ticker": "V3", "execution_date": "2026-01-03", "split_from": "1", "split_to": "1000"},
+                {},
+                {"ticker": "BAD1", "execution_date": "2026-01-04", "split_from": 0, "split_to": 1},
+                {"ticker": "BAD2", "execution_date": "2026-01-05", "split_from": 1, "split_to": 0},
+                {"ticker": "BAD3", "split_from": 1, "split_to": 2},
+                {"execution_date": "2026-01-06", "split_from": 1, "split_to": 2},
+                "bad",
+                None,
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("ACME")
+
+        assert resp.ok
+        assert [row.ticker for row in resp.data] == ["V1", "V2", "V3"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 10
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 3
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 7
+        assert "all_rows_skipped" not in resp.lineage.data_quality_flags
+
+    def test_polygon_corporate_action_all_invalid_rows_are_flagged(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {},
+                {"ticker": "BAD1", "execution_date": "2026-01-04", "split_from": 0, "split_to": 1},
+                {"ticker": "BAD2", "execution_date": "2026-01-05", "split_from": 1, "split_to": 0},
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("ACME")
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["raw_rows"] == 3
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 0
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 3
+        assert resp.lineage.data_quality_flags["all_rows_skipped"] is True
+
+    def test_polygon_corporate_action_optional_economic_fields_are_validated(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        split_json = {
+            "results": [
+                {
+                    "ticker": "NEG",
+                    "execution_date": "2026-01-01",
+                    "split_from": 1,
+                    "split_to": 4,
+                    "historical_adjustment_factor": "-0.25",
+                },
+                {
+                    "ticker": "ZERO",
+                    "execution_date": "2026-01-02",
+                    "split_from": 1,
+                    "split_to": 4,
+                    "historical_adjustment_factor": "0",
+                },
+                {
+                    "ticker": "VALID",
+                    "execution_date": "2026-01-03",
+                    "split_from": 1,
+                    "split_to": 4,
+                    "historical_adjustment_factor": "0.25",
+                },
+            ]
+        }
+        dividend_json = {
+            "results": [
+                {
+                    "ticker": "NEGFACTOR",
+                    "ex_dividend_date": "2026-05-01",
+                    "cash_amount": "0.27",
+                    "historical_adjustment_factor": "-1",
+                    "split_adjusted_cash_amount": "0.27",
+                },
+                {
+                    "ticker": "ZEROFACTOR",
+                    "ex_dividend_date": "2026-05-02",
+                    "cash_amount": "0.27",
+                    "historical_adjustment_factor": "0",
+                    "split_adjusted_cash_amount": "0.27",
+                },
+                {
+                    "ticker": "NEGCASH",
+                    "ex_dividend_date": "2026-05-03",
+                    "cash_amount": "0.27",
+                    "historical_adjustment_factor": "0.999",
+                    "split_adjusted_cash_amount": "-0.10",
+                },
+                {
+                    "ticker": "VALID",
+                    "ex_dividend_date": "2026-05-04",
+                    "cash_amount": "0.27",
+                    "historical_adjustment_factor": "0.999",
+                    "split_adjusted_cash_amount": "0.27",
+                },
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, split_json),
+            _mock_response(200, dividend_json),
+        ]
+        adapter = self._adapter(session)
+
+        splits = adapter.get_splits("ACME")
+        dividends = adapter.get_dividends("ACME")
+
+        assert splits.ok
+        assert [row.historical_adjustment_factor for row in splits.data] == [
+            None,
+            None,
+            Decimal("0.25"),
+        ]
+        assert dividends.ok
+        assert dividends.data[0].historical_adjustment_factor is None
+        assert dividends.data[0].split_adjusted_cash_amount == Decimal("0.27")
+        assert dividends.data[1].historical_adjustment_factor is None
+        assert dividends.data[1].split_adjusted_cash_amount == Decimal("0.27")
+        assert dividends.data[2].historical_adjustment_factor == Decimal("0.999")
+        assert dividends.data[2].split_adjusted_cash_amount is None
+        assert dividends.data[3].historical_adjustment_factor == Decimal("0.999")
+        assert dividends.data[3].split_adjusted_cash_amount == Decimal("0.27")
+
+    def test_polygon_corporate_actions_empty_payload_success(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        splits = adapter.get_splits("AAPL")
+        dividends = adapter.get_dividends("AAPL")
+
+        assert splits.ok
+        assert splits.data == []
+        assert splits.lineage.data_quality_flags["raw_rows"] == 0
+        assert splits.lineage.data_quality_flags["parsed_rows"] == 0
+        assert splits.lineage.data_quality_flags["skipped_rows"] == 0
+        assert "all_rows_skipped" not in splits.lineage.data_quality_flags
+        assert dividends.ok
+        assert dividends.data == []
+        assert dividends.lineage.data_quality_flags["raw_rows"] == 0
+        assert dividends.lineage.data_quality_flags["parsed_rows"] == 0
+        assert dividends.lineage.data_quality_flags["skipped_rows"] == 0
+        assert "all_rows_skipped" not in dividends.lineage.data_quality_flags
+
+    def test_polygon_corporate_action_first_page_invalid_shape_is_parse_error(self):
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "a list"}},
+            [{"ticker": "AAPL"}],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.return_value = _mock_response(200, payload)
+            adapter = self._adapter(session)
+
+            resp = adapter.get_splits("AAPL")
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.error.retryable is False
+            assert resp.lineage.endpoint == "/stocks/v1/splits"
+            assert resp.lineage.data_quality_flags["page_count"] == 1
+            assert resp.lineage.data_quality_flags["paginated"] is False
+            assert resp.lineage.data_quality_flags["truncated"] is False
+
+    def test_polygon_corporate_action_blank_ticker_is_omitted(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, {"results": []})
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits(
+            " ",
+            execution_date_from="2020-08-01",
+            execution_date_to="2020-09-30",
+        )
+
+        assert resp.ok
+        params = session.get.call_args.kwargs["params"]
+        assert "ticker" not in params
+        assert params["execution_date.gte"] == "2020-08-01"
+        assert params["execution_date.lte"] == "2020-09-30"
+
+    def test_polygon_corporate_action_blank_ticker_without_dates_is_validation_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        splits = adapter.get_splits(" ")
+        dividends = adapter.get_dividends(" ")
+
+        assert not splits.ok
+        assert splits.error.error_type == "validation"
+        assert splits.error.retryable is False
+        assert splits.lineage.endpoint == "/stocks/v1/splits"
+        assert not dividends.ok
+        assert dividends.error.error_type == "validation"
+        assert dividends.error.retryable is False
+        assert dividends.lineage.endpoint == "/stocks/v1/dividends"
+        session.get.assert_not_called()
+
+    def test_polygon_corporate_action_bounded_broad_query_is_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = [
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+            _mock_response(200, {"results": []}),
+        ]
+        adapter = self._adapter(session)
+
+        splits_none = adapter.get_splits(
+            None,
+            execution_date_from="2020-08-01",
+            execution_date_to="2020-09-30",
+        )
+        dividends_none = adapter.get_dividends(
+            None,
+            ex_dividend_date_from="2026-01-01",
+            ex_dividend_date_to="2026-05-28",
+        )
+        dividends_blank = adapter.get_dividends(
+            " ",
+            ex_dividend_date_from="2026-01-01",
+            ex_dividend_date_to="2026-05-28",
+        )
+
+        assert splits_none.ok
+        assert dividends_none.ok
+        assert dividends_blank.ok
+        split_params = session.get.call_args_list[0].kwargs["params"]
+        dividend_params = session.get.call_args_list[1].kwargs["params"]
+        blank_dividend_params = session.get.call_args_list[2].kwargs["params"]
+        assert "ticker" not in split_params
+        assert split_params["execution_date.gte"] == "2020-08-01"
+        assert split_params["execution_date.lte"] == "2020-09-30"
+        assert "ticker" not in dividend_params
+        assert dividend_params["ex_dividend_date.gte"] == "2026-01-01"
+        assert dividend_params["ex_dividend_date.lte"] == "2026-05-28"
+        assert "ticker" not in blank_dividend_params
+
+    def test_polygon_corporate_action_parse_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(200, text="not json")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "parse"
+        assert resp.lineage.endpoint == "/stocks/v1/splits"
+
+    def test_polygon_corporate_action_auth_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(403, text="Forbidden")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "auth"
+        assert resp.error.status_code == 403
+
+    def test_polygon_corporate_action_rate_limit_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(429, text="Too many requests")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "rate_limit"
+        assert resp.error.retryable is True
+
+    def test_polygon_corporate_action_provider_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(500, text="Internal Server Error")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.status_code == 500
+        assert resp.error.retryable is True
+
+    def test_polygon_corporate_action_timeout_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.Timeout("timed out")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "timeout"
+        assert resp.error.retryable is True
+
+    def test_polygon_request_exception_does_not_leak_secret_or_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            "failed https://api.polygon.io/stocks/v1/dividends?apiKey=test-polygon-key&ticker=AAPL"
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "Polygon request failed: ConnectionError"
+        assert "test-polygon-key" not in resp.error.message
+        assert "apiKey" not in resp.error.message
+        assert "https://api.polygon.io" not in resp.error.message
+
+    def test_polygon_corporate_action_paginates_and_sanitizes_next_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-05-11",
+                    "cash_amount": 0.27,
+                }
+            ],
+            "next_url": "https://api.polygon.io/stocks/v1/dividends?cursor=abc&apiKey=SECRET",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "id": "div-2",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-02-09",
+                    "cash_amount": 0.26,
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["div-1", "div-2"]
+        assert session.get.call_count == 2
+        assert session.params == {"apiKey": "test-polygon-key"}
+        assert session.get.call_args_list[0].args[0] == "https://api.polygon.io/stocks/v1/dividends"
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/stocks/v1/dividends"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert "SECRET" not in session.get.call_args_list[1].args[0]
+        assert "SECRET" not in repr(session.get.call_args_list[1].kwargs["params"])
+        assert "apiKey" not in session.get.call_args_list[1].args[0]
+        assert "apiKey" not in session.get.call_args_list[1].kwargs["params"]
+        assert resp.lineage.data_quality_flags["page_count"] == 2
+        assert resp.lineage.data_quality_flags["paginated"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is False
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/dividends"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 2
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 2
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_relative_next_url_is_normalized(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "split-1",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-08-31",
+                    "split_from": 1,
+                    "split_to": 4,
+                }
+            ],
+            "next_url": "/stocks/v1/splits?cursor=abc&apiKey=SECRET",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "id": "split-2",
+                    "ticker": "MSFT",
+                    "execution_date": "2021-01-01",
+                    "split_from": 1,
+                    "split_to": 2,
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["split-1", "split-2"]
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/stocks/v1/splits"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/splits"]
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_massive_next_url_host_is_allowed(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "split-1",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-08-31",
+                    "split_from": 1,
+                    "split_to": 4,
+                }
+            ],
+            "next_url": "https://api.massive.com/stocks/v1/splits?cursor=abc",
+        }
+        page_2 = {
+            "results": [
+                {
+                    "id": "split-2",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-09-01",
+                    "split_from": 1,
+                    "split_to": 2,
+                }
+            ]
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["split-1", "split-2"]
+        assert session.get.call_args_list[1].args[0] == "https://api.polygon.io/stocks/v1/splits"
+        assert session.get.call_args_list[1].kwargs["params"] == {"cursor": "abc"}
+        assert "api.massive.com" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_second_page_invalid_shape_is_parse_error(self):
+        page_1 = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-05-11",
+                    "cash_amount": 0.27,
+                }
+            ],
+            "next_url": "/stocks/v1/dividends?cursor=abc",
+        }
+        cases = [
+            {"unexpected": True},
+            {"results": {"not": "a list"}},
+            [{"ticker": "AAPL"}],
+        ]
+        for payload in cases:
+            session = MagicMock(spec=requests.Session)
+            session.params = {}
+            session.get.side_effect = [
+                _mock_response(200, page_1),
+                _mock_response(200, payload),
+            ]
+            adapter = self._adapter(session)
+
+            resp = adapter.get_dividends("AAPL", limit=1)
+
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "parse"
+            assert resp.error.retryable is False
+            assert session.get.call_count == 2
+            assert resp.lineage.endpoint == "/stocks/v1/dividends"
+            assert resp.lineage.data_quality_flags["page_count"] == 2
+            assert resp.lineage.data_quality_flags["paginated"] is True
+            assert resp.lineage.data_quality_flags["truncated"] is True
+            assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/dividends"]
+
+    def test_polygon_corporate_action_empty_second_page_preserves_page_one_data(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-05-11",
+                    "cash_amount": 0.27,
+                }
+            ],
+            "next_url": "/stocks/v1/dividends?cursor=abc",
+        }
+        page_2 = {"results": []}
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(200, page_2),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL", limit=1)
+
+        assert resp.ok
+        assert [row.id for row in resp.data] == ["div-1"]
+        assert resp.lineage.data_quality_flags["page_count"] == 2
+        assert resp.lineage.data_quality_flags["paginated"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is False
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/dividends"]
+        assert resp.lineage.data_quality_flags["raw_rows"] == 1
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
+        assert resp.lineage.data_quality_flags["skipped_rows"] == 0
+
+    def test_polygon_corporate_action_second_page_rate_limit_has_pagination_flags(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-05-11",
+                    "cash_amount": 0.27,
+                }
+            ],
+            "next_url": "/stocks/v1/dividends?cursor=abc&apiKey=SECRET",
+        }
+        session.get.side_effect = [
+            _mock_response(200, page_1),
+            _mock_response(429, text="Too many requests"),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL", limit=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "rate_limit"
+        assert resp.lineage.data_quality_flags["page_count"] == 2
+        assert resp.lineage.data_quality_flags["paginated"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is True
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/dividends"]
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_evil_next_url_is_rejected_before_request(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "ex_dividend_date": "2026-05-11",
+                    "cash_amount": 0.27,
+                }
+            ],
+            "next_url": "https://evil.example/stocks/v1/dividends?cursor=abc&apiKey=SECRET",
+        }
+        session.get.return_value = _mock_response(200, page_1)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_dividends("AAPL", limit=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        assert resp.error.retryable is False
+        assert session.get.call_count == 1
+        assert "evil.example" not in repr(resp.lineage)
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_pagination_cap_fails_loud(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        page_1 = {
+            "results": [
+                {
+                    "id": "split-1",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-08-31",
+                    "split_from": 1,
+                    "split_to": 4,
+                }
+            ],
+            "next_url": "/stocks/v1/splits?cursor=abc&apiKey=SECRET",
+        }
+        session.get.return_value = _mock_response(200, page_1)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_splits("AAPL", max_pages=1)
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "pagination"
+        assert resp.lineage.data_quality_flags["truncated"] is True
+        assert resp.lineage.data_quality_flags["next_url_paths"] == ["/stocks/v1/splits"]
+        assert "SECRET" not in repr(resp.lineage)
+        assert "apiKey" not in repr(resp.lineage)
+
+    def test_polygon_corporate_action_invalid_max_pages_is_validation_error(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        adapter = self._adapter(session)
+
+        bad = adapter.get_splits("AAPL", max_pages="bad")  # type: ignore[arg-type]
+        zero = adapter.get_dividends("AAPL", max_pages=0)
+        negative = adapter.get_splits("AAPL", max_pages=-1)
+
+        for resp in (bad, zero, negative):
+            assert not resp.ok
+            assert resp.data is None
+            assert resp.error.error_type == "validation"
+            assert resp.error.retryable is False
+        session.get.assert_not_called()
+
+    def test_polygon_corporate_action_lineage_hash_stability(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        split_json = {
+            "results": [
+                {
+                    "id": "split-1",
+                    "ticker": "AAPL",
+                    "execution_date": "2020-08-31",
+                    "split_from": 1,
+                    "split_to": 4,
+                }
+            ]
+        }
+        dividend_json = {
+            "results": [
+                {
+                    "id": "div-1",
+                    "ticker": "AAPL",
+                    "cash_amount": 0.27,
+                    "ex_dividend_date": "2026-05-11",
+                    "frequency": 4,
+                }
+            ]
+        }
+        adapter = self._adapter(session)
+
+        session.get.return_value = _mock_response(200, split_json)
+        split_1 = adapter.get_splits("AAPL")
+        split_2 = adapter.get_splits("AAPL")
+        session.get.return_value = _mock_response(200, dividend_json)
+        dividend_1 = adapter.get_dividends("AAPL")
+        dividend_2 = adapter.get_dividends("AAPL")
+
+        assert split_1.lineage.raw_payload_hash == split_2.lineage.raw_payload_hash
+        assert dividend_1.lineage.raw_payload_hash == dividend_2.lineage.raw_payload_hash
+
     def test_rate_limit_error(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}

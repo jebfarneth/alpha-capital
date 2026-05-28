@@ -11,10 +11,11 @@ Does not write to DB. Returns AdapterResponse with LineageMeta.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 
@@ -32,6 +33,9 @@ from alpha.data.contracts import (
 PROVIDER = "Polygon"
 TICKERS_ENDPOINT = "/v3/reference/tickers"
 TICKER_EVENTS_ENDPOINT_PREFIX = "/vX/reference/tickers"
+SPLITS_ENDPOINT = "/stocks/v1/splits"
+DIVIDENDS_ENDPOINT = "/stocks/v1/dividends"
+POLYGON_API_HOSTS = {"api.polygon.io", "api.massive.com"}
 
 
 # --- Response types ---
@@ -45,6 +49,50 @@ class PolygonShortInterest:
     short_interest: Optional[int] = None
     avg_daily_volume: Optional[int] = None
     days_to_cover: Optional[float] = None
+
+
+@dataclass
+class PolygonSplit:
+    """Normalized Polygon split row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: str
+    execution_date: str
+    split_from: Decimal
+    split_to: Decimal
+    adjustment_type: Optional[str] = None
+    historical_adjustment_factor: Optional[Decimal] = None
+    status: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class PolygonDividend:
+    """Normalized Polygon dividend row with raw payload preserved."""
+
+    id: Optional[str]
+    ticker: str
+    ex_dividend_date: str
+    cash_amount: Decimal
+    currency: Optional[str] = None
+    declaration_date: Optional[str] = None
+    dividend_type: Optional[str] = None
+    distribution_type: Optional[str] = None
+    frequency: Optional[int] = None
+    historical_adjustment_factor: Optional[Decimal] = None
+    pay_date: Optional[str] = None
+    record_date: Optional[str] = None
+    split_adjusted_cash_amount: Optional[Decimal] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class _NextPageRequest:
+    """Sanitized pagination request rebuilt from a provider next_url."""
+
+    url: str
+    params: Dict[str, Any]
+    path: str
 
 
 @dataclass
@@ -219,7 +267,7 @@ class PolygonAdapter:
                     endpoint=lineage_endpoint,
                     status_code=None,
                     error_type="http",
-                    message=str(exc),
+                    message=f"Polygon request failed: {exc.__class__.__name__}",
                     retryable=True,
                 ),
             )
@@ -296,6 +344,248 @@ class PolygonAdapter:
             )
 
         return AdapterResponse(data=data, lineage=lineage)
+
+    # --- Corporate actions ---
+
+    def get_splits(
+        self,
+        ticker: Optional[str] = None,
+        *,
+        execution_date_from: Optional[str] = None,
+        execution_date_to: Optional[str] = None,
+        limit: int = 1000,
+        sort: Optional[str] = "execution_date",
+        order: Optional[str] = "asc",
+        max_pages: int = 10,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[PolygonSplit]]:
+        """Fetch Polygon split rows as corporate-action cross-check evidence."""
+
+        validation_error = _validate_corporate_action_query(
+            endpoint=SPLITS_ENDPOINT,
+            ticker=ticker,
+            date_from=execution_date_from,
+            date_to=execution_date_to,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if validation_error is not None:
+            return validation_error  # type: ignore[return-value]
+
+        params = _corporate_action_params(
+            ticker=ticker,
+            date_field="execution_date",
+            date_from=execution_date_from,
+            date_to=execution_date_to,
+            limit=limit,
+            sort=sort,
+            order=order,
+        )
+        resp = self._fetch_corporate_action_rows(
+            SPLITS_ENDPOINT,
+            params=params,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        splits = []
+        raw_rows = 0
+        for row in resp.data or []:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            split = _parse_split_row(row)
+            if split is not None:
+                splits.append(split)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(splits))
+        return AdapterResponse(data=splits, lineage=lineage)
+
+    def get_dividends(
+        self,
+        ticker: Optional[str] = None,
+        *,
+        ex_dividend_date_from: Optional[str] = None,
+        ex_dividend_date_to: Optional[str] = None,
+        limit: int = 1000,
+        sort: Optional[str] = "ex_dividend_date",
+        order: Optional[str] = "asc",
+        max_pages: int = 10,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[PolygonDividend]]:
+        """Fetch Polygon dividend rows as corporate-action cross-check evidence."""
+
+        validation_error = _validate_corporate_action_query(
+            endpoint=DIVIDENDS_ENDPOINT,
+            ticker=ticker,
+            date_from=ex_dividend_date_from,
+            date_to=ex_dividend_date_to,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if validation_error is not None:
+            return validation_error  # type: ignore[return-value]
+
+        params = _corporate_action_params(
+            ticker=ticker,
+            date_field="ex_dividend_date",
+            date_from=ex_dividend_date_from,
+            date_to=ex_dividend_date_to,
+            limit=limit,
+            sort=sort,
+            order=order,
+        )
+        resp = self._fetch_corporate_action_rows(
+            DIVIDENDS_ENDPOINT,
+            params=params,
+            max_pages=max_pages,
+            asof=asof,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        dividends = []
+        raw_rows = 0
+        for row in resp.data or []:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            dividend = _parse_dividend_row(row)
+            if dividend is not None:
+                dividends.append(dividend)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(dividends))
+        return AdapterResponse(data=dividends, lineage=lineage)
+
+    def _fetch_corporate_action_rows(
+        self,
+        endpoint: str,
+        *,
+        params: Dict[str, Any],
+        max_pages: int,
+        asof: Optional[datetime],
+    ) -> AdapterResponse[List[Any]]:
+        """Fetch corporate-action rows across Polygon pages without leaking cursors."""
+
+        rows: List[Any] = []
+        next_url: Optional[str] = None
+        next_request: Optional[_NextPageRequest] = None
+        first_lineage: Optional[LineageMeta] = None
+        page_hashes: List[str] = []
+        next_url_paths: List[str] = []
+        page_number = 0
+        page_cap = int(max_pages)
+
+        while True:
+            resp = self._request(
+                endpoint,
+                params=params if page_number == 0 else next_request.params,
+                asof=asof,
+                url_override=None if page_number == 0 else next_request.url,
+                lineage_endpoint=endpoint,
+            )
+            first_lineage = first_lineage or resp.lineage
+            if not resp.ok:
+                lineage = _corporate_action_error_lineage(
+                    resp.lineage,
+                    page_count=page_number + 1,
+                    next_url_paths=next_url_paths,
+                    truncated=page_number > 0 or bool(next_url_paths),
+                )
+                return AdapterResponse(data=None, lineage=lineage, error=resp.error)
+
+            page_hashes.append(resp.lineage.raw_payload_hash)
+            payload = resp.data
+            if (
+                not isinstance(payload, dict)
+                or "results" not in payload
+                or not isinstance(payload.get("results"), list)
+            ):
+                lineage = _corporate_action_lineage(
+                    first_lineage=first_lineage,
+                    page_hashes=page_hashes,
+                    page_count=page_number + 1,
+                    next_url_paths=next_url_paths,
+                    truncated=page_number > 0 or bool(next_url_paths),
+                )
+                return AdapterResponse(
+                    data=None,
+                    lineage=lineage,
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        status_code=200,
+                        error_type="parse",
+                        message="Polygon corporate-action response missing list results",
+                        retryable=False,
+                    ),
+                )
+            rows.extend(payload["results"])
+
+            next_url = _str_or_none(payload.get("next_url"))
+            next_request = None
+            if next_url:
+                safe_path = _safe_url_path(next_url)
+                if safe_path:
+                    next_url_paths.append(safe_path)
+                next_request = _corporate_action_next_request(
+                    next_url,
+                    endpoint=endpoint,
+                    base_url=self._config.base_url,
+                )
+                if next_request is None:
+                    lineage = _corporate_action_lineage(
+                        first_lineage=first_lineage,
+                        page_hashes=page_hashes,
+                        page_count=page_number + 1,
+                        next_url_paths=next_url_paths,
+                        truncated=True,
+                    )
+                    return AdapterResponse(
+                        data=None,
+                        lineage=lineage,
+                        error=ProviderError(
+                            provider=PROVIDER,
+                            endpoint=endpoint,
+                            status_code=200,
+                            error_type="pagination",
+                            message="Polygon corporate-action pagination next_url rejected",
+                            retryable=False,
+                        ),
+                    )
+
+            page_number += 1
+            if not next_url:
+                break
+            if page_number >= page_cap:
+                lineage = _corporate_action_lineage(
+                    first_lineage=first_lineage,
+                    page_hashes=page_hashes,
+                    page_count=page_number,
+                    next_url_paths=next_url_paths,
+                    truncated=True,
+                )
+                return AdapterResponse(
+                    data=None,
+                    lineage=lineage,
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=endpoint,
+                        status_code=200,
+                        error_type="pagination",
+                        message="Polygon corporate-action pagination exceeded max_pages",
+                        retryable=False,
+                    ),
+                )
+
+        lineage = _corporate_action_lineage(
+            first_lineage=first_lineage,
+            page_hashes=page_hashes,
+            page_count=page_number,
+            next_url_paths=next_url_paths,
+            truncated=False,
+        )
+        return AdapterResponse(data=rows, lineage=lineage)
 
     # --- Short interest / borrow ---
 
@@ -577,6 +867,209 @@ def _str_or_none(value: Any) -> Optional[str]:
     return s if s else None
 
 
+def _decimal_or_none(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool):
+        return None
+    text = _str_or_none(value)
+    if text is None or text.upper() in {"N/A", "NA", "NONE", "NULL"}:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    text = _str_or_none(value)
+    if text is None or text.upper() in {"N/A", "NA", "NONE", "NULL"}:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ticker_param(value: Optional[str]) -> Optional[str]:
+    text = _str_or_none(value)
+    return text.upper() if text else None
+
+
+def _limited_int(value: int, *, default: int = 1000, maximum: int = 5000) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(limit, maximum))
+
+
+def _provider_error_response(
+    *,
+    endpoint: str,
+    error_type: str,
+    message: str,
+    retryable: bool,
+    status_code: Optional[int] = None,
+    asof: Optional[datetime] = None,
+    flags: Optional[Dict[str, Any]] = None,
+) -> AdapterResponse[Any]:
+    request_ts = utcnow()
+    asof_ts = aware_utc_or_none(asof) if asof is not None else request_ts
+    if asof_ts is None:
+        asof_ts = request_ts
+    return AdapterResponse(
+        data=None,
+        lineage=LineageMeta(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            request_timestamp=request_ts,
+            asof_timestamp=asof_ts,
+            raw_payload_hash="",
+            source_authority="Polygon",
+            data_quality_flags=flags,
+        ),
+        error=ProviderError(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            status_code=status_code,
+            error_type=error_type,
+            message=message,
+            retryable=retryable,
+        ),
+    )
+
+
+def _validate_corporate_action_query(
+    *,
+    endpoint: str,
+    ticker: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    max_pages: Any,
+    asof: Optional[datetime],
+) -> Optional[AdapterResponse[Any]]:
+    try:
+        page_cap = int(max_pages)
+    except (TypeError, ValueError):
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon corporate-action max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    if page_cap < 1:
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon corporate-action max_pages must be a positive integer",
+            retryable=False,
+            asof=asof,
+        )
+    if _ticker_param(ticker) is None and not (date_from and date_to):
+        return _provider_error_response(
+            endpoint=endpoint,
+            error_type="validation",
+            message="Polygon corporate-action broad query requires a bounded date window",
+            retryable=False,
+            asof=asof,
+        )
+    return None
+
+
+def _corporate_action_params(
+    *,
+    ticker: Optional[str],
+    date_field: str,
+    date_from: Optional[str],
+    date_to: Optional[str],
+    limit: int,
+    sort: Optional[str],
+    order: Optional[str],
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"limit": _limited_int(limit)}
+    ticker_param = _ticker_param(ticker)
+    if ticker_param:
+        params["ticker"] = ticker_param
+    if date_from:
+        params[f"{date_field}.gte"] = date_from
+    if date_to:
+        params[f"{date_field}.lte"] = date_to
+    sort_param = _corporate_action_sort(sort, order)
+    if sort_param is not None:
+        params["sort"] = sort_param
+    return params
+
+
+def _corporate_action_sort(
+    sort: Optional[str],
+    order: Optional[str],
+) -> Optional[str]:
+    if sort is None:
+        return None
+    sort_text = sort.strip()
+    if not sort_text:
+        return None
+    if order is None:
+        return sort_text
+    order_text = order.strip().lower()
+    if order_text not in {"asc", "desc"}:
+        return sort_text
+    parts = [part.strip() for part in sort_text.split(",") if part.strip()]
+    if not parts:
+        return None
+    suffixed = []
+    for part in parts:
+        if part.endswith(".asc") or part.endswith(".desc"):
+            suffixed.append(part)
+        else:
+            suffixed.append(f"{part}.{order_text}")
+    return ",".join(suffixed)
+
+
+def _results_list(payload: Any) -> List[Any]:
+    if not isinstance(payload, dict):
+        return []
+    results = payload.get("results", [])
+    return results if isinstance(results, list) else []
+
+
+def _corporate_action_next_request(
+    next_url: str,
+    *,
+    endpoint: str,
+    base_url: str,
+) -> Optional[_NextPageRequest]:
+    parsed = urlparse(next_url)
+    base_parsed = urlparse(base_url)
+    allowed_hosts = {
+        host.lower()
+        for host in (base_parsed.netloc, *POLYGON_API_HOSTS)
+        if host
+    }
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.netloc.lower() not in allowed_hosts:
+            return None
+    path = parsed.path or endpoint
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if path != endpoint:
+        return None
+    cursor = None
+    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+        if key == "cursor" and value:
+            cursor = value
+            break
+    if cursor is None:
+        return None
+    return _NextPageRequest(
+        url=f"{base_url.rstrip('/')}{path}",
+        params={"cursor": cursor},
+        path=path,
+    )
+
+
 def _normalized_cik(value: Any) -> Optional[str]:
     text = _str_or_none(value)
     if text is None:
@@ -593,7 +1086,152 @@ def _safe_url_path(value: Optional[str]) -> Optional[str]:
     parsed = urlparse(value)
     if parsed.scheme and parsed.netloc:
         return parsed.path
+    if parsed.query:
+        return parsed.path or None
     return value
+
+
+def _corporate_action_lineage(
+    *,
+    first_lineage: Optional[LineageMeta],
+    page_hashes: List[str],
+    page_count: int,
+    next_url_paths: List[str],
+    truncated: bool,
+) -> LineageMeta:
+    if first_lineage is None:
+        now = utcnow()
+        return LineageMeta(
+            provider=PROVIDER,
+            endpoint="",
+            request_timestamp=now,
+            asof_timestamp=now,
+            raw_payload_hash="",
+            source_authority="Polygon",
+        )
+    flags = dict(first_lineage.data_quality_flags or {})
+    flags.update({
+        "page_count": page_count,
+        "paginated": page_count > 1,
+        "truncated": truncated,
+    })
+    if next_url_paths:
+        flags["next_url_paths"] = list(next_url_paths)
+    payload_hash = (
+        first_lineage.raw_payload_hash
+        if page_count == 1 and not truncated
+        else stable_hash({
+            "page_hashes": page_hashes,
+            "page_count": page_count,
+            "truncated": truncated,
+        })
+    )
+    return replace(
+        first_lineage,
+        raw_payload_hash=payload_hash,
+        data_quality_flags=flags,
+    )
+
+
+def _corporate_action_error_lineage(
+    lineage: LineageMeta,
+    *,
+    page_count: int,
+    next_url_paths: List[str],
+    truncated: bool,
+) -> LineageMeta:
+    flags = dict(lineage.data_quality_flags or {})
+    flags.update({
+        "page_count": page_count,
+        "paginated": page_count > 1,
+        "truncated": truncated,
+    })
+    if next_url_paths:
+        flags["next_url_paths"] = list(next_url_paths)
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _corporate_action_row_lineage(
+    lineage: LineageMeta,
+    raw_rows: int,
+    parsed_rows: int,
+) -> LineageMeta:
+    flags = dict(lineage.data_quality_flags or {})
+    skipped_rows = max(0, raw_rows - parsed_rows)
+    flags.update({
+        "raw_rows": raw_rows,
+        "parsed_rows": parsed_rows,
+        "skipped_rows": skipped_rows,
+    })
+    if raw_rows > 0 and parsed_rows == 0:
+        flags["all_rows_skipped"] = True
+    else:
+        flags.pop("all_rows_skipped", None)
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _positive_decimal_or_none(value: Any) -> Optional[Decimal]:
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _nonnegative_decimal_or_none(value: Any) -> Optional[Decimal]:
+    parsed = _decimal_or_none(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def _parse_split_row(row: Dict[str, Any]) -> Optional[PolygonSplit]:
+    ticker = _str_or_none(row.get("ticker"))
+    execution_date = _str_or_none(row.get("execution_date"))
+    split_from = _positive_decimal_or_none(row.get("split_from"))
+    split_to = _positive_decimal_or_none(row.get("split_to"))
+    if not ticker or not execution_date or split_from is None or split_to is None:
+        return None
+    return PolygonSplit(
+        id=_str_or_none(row.get("id")),
+        ticker=ticker,
+        execution_date=execution_date,
+        split_from=split_from,
+        split_to=split_to,
+        adjustment_type=_str_or_none(row.get("adjustment_type")),
+        historical_adjustment_factor=_positive_decimal_or_none(
+            row.get("historical_adjustment_factor")
+        ),
+        status=_str_or_none(row.get("status")),
+        raw=dict(row),
+    )
+
+
+def _parse_dividend_row(row: Dict[str, Any]) -> Optional[PolygonDividend]:
+    ticker = _str_or_none(row.get("ticker"))
+    ex_dividend_date = _str_or_none(row.get("ex_dividend_date"))
+    cash_amount = _nonnegative_decimal_or_none(row.get("cash_amount"))
+    if not ticker or not ex_dividend_date or cash_amount is None:
+        return None
+    return PolygonDividend(
+        id=_str_or_none(row.get("id")),
+        ticker=ticker,
+        ex_dividend_date=ex_dividend_date,
+        cash_amount=cash_amount,
+        currency=_str_or_none(row.get("currency")),
+        declaration_date=_str_or_none(row.get("declaration_date")),
+        dividend_type=_str_or_none(row.get("dividend_type")),
+        distribution_type=_str_or_none(row.get("distribution_type")),
+        frequency=_int_or_none(row.get("frequency")),
+        historical_adjustment_factor=_positive_decimal_or_none(
+            row.get("historical_adjustment_factor")
+        ),
+        pay_date=_str_or_none(row.get("pay_date")),
+        record_date=_str_or_none(row.get("record_date")),
+        split_adjusted_cash_amount=_nonnegative_decimal_or_none(
+            row.get("split_adjusted_cash_amount")
+        ),
+        raw=dict(row),
+    )
 
 
 def _parse_ticker_reference_row(row: Dict[str, Any]) -> PolygonTickerReference:
