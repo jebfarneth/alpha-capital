@@ -46,6 +46,7 @@ from alpha.jobs.universe_builder import (
     _requires_security_profile,
     _screener_asof_error,
 )
+from alpha.runtime_env import load_runtime_env
 
 MOCK_SCREENER_DATA = [
     FmpScreenerResult(symbol="ACME", company_name="Acme Corp", market_cap=75_000_000, price=5.25, sector="Technology", exchange="NASDAQ", country="US", is_etf=False, is_actively_trading=True),
@@ -58,18 +59,6 @@ MOCK_SCREENER_DATA = [
 ]
 
 LIVE_UNIVERSE_ADVISORY_LOCK_KEY = 2026052601
-
-
-def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key, value)
 
 
 def _default_trading_date() -> str:
@@ -161,7 +150,7 @@ def _run_live(args) -> int:
     from alpha.data.fmp import FmpAdapter
     from alpha.data.universe import SlicedUniverseFetcher
 
-    _load_dotenv()
+    load_runtime_env()
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
         reset_globals()

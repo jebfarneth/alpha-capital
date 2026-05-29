@@ -26,20 +26,9 @@ from alpha.jobs.forward_return import (
     ForwardReturnJob,
 )
 from alpha.jobs.runner import run_job
+from alpha.runtime_env import load_runtime_env
 
 LIVE_RUN_TIMESTAMP_SKEW_TOLERANCE = timedelta(minutes=5)
-
-
-def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key, value)
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -78,7 +67,7 @@ def _live_timestamp_error(
 
 
 def _run_live(args: argparse.Namespace) -> int:
-    _load_dotenv()
+    load_runtime_env()
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
         reset_globals()

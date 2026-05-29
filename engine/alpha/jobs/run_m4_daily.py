@@ -21,18 +21,7 @@ from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
 from alpha.jobs.m4_daily import M4DailyAssemblyJob
 from alpha.jobs.runner import run_job
-
-
-def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key, value)
+from alpha.runtime_env import load_runtime_env
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -42,7 +31,7 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
 
 
 def _run_live(args: argparse.Namespace) -> int:
-    _load_dotenv()
+    load_runtime_env()
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
         reset_globals()
