@@ -20,6 +20,7 @@ from alpha.db.models import (
     DataLineage,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
+    ForwardReturnPathRow,
     SignalRegistry,
 )
 from alpha.evidence.writer import record_feature_snapshot, record_signal
@@ -33,6 +34,7 @@ from alpha.jobs.forward_return import (
 )
 from alpha.jobs.run_forward_return import _live_timestamp_error
 from alpha.jobs.runner import run_job
+from alpha.market_calendar import next_us_equity_session
 
 
 ENTRY_DATE = date(2026, 5, 26)
@@ -262,6 +264,15 @@ def _bars(
         _bar(entry_date, entry_open, adj_close=1.0),
         _bar(exit_date, exit_open, adj_close=999.0),
     ]
+
+
+def _session_window(start: date, end: date) -> List[date]:
+    sessions = []
+    cursor = next_us_equity_session(start)
+    while cursor <= end:
+        sessions.append(cursor)
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return sessions
 
 
 def _make_signal(
@@ -1283,6 +1294,272 @@ def test_path_telemetry_and_same_day_barrier_ambiguity_persist(db_session):
     assert obs.same_day_barrier_ambiguity is False
     event = db_session.query(ForwardReturnObservationEvent).one()
     assert event.same_day_barrier_ambiguity is False
+
+
+def test_forward_return_daily_path_rows_persist(db_session):
+    sid = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(
+                ENTRY_DATE,
+                10.0,
+                high=10.5,
+                low=9.8,
+                close=10.2,
+                volume=111,
+                split_adjusted_close=10.2,
+                adj_close=1.0,
+            ),
+            _bar(
+                date(2026, 6, 1),
+                11.0,
+                high=12.0,
+                low=10.0,
+                close=11.5,
+                volume=222.5,
+                split_adjusted_close=11.5,
+            ),
+            _bar(
+                EXIT_DATE,
+                12.0,
+                high=12.5,
+                low=11.5,
+                close=12.25,
+                volume=333,
+                split_adjusted_close=12.25,
+            ),
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert [row.path_sequence for row in rows] == [1, 2, 3]
+    assert [row.session_date for row in rows] == [
+        ENTRY_DATE.isoformat(),
+        "2026-06-01",
+        EXIT_DATE.isoformat(),
+    ]
+    assert {row.forward_return_observation_id for row in rows} == {
+        obs.forward_return_observation_id
+    }
+    assert {row.signal_id for row in rows} == {sid}
+    assert {row.data_lineage_id for row in rows} == {obs.entry_data_lineage_id}
+    assert rows[0].is_entry_session is True
+    assert rows[0].is_exit_session is False
+    assert rows[1].volume == 222.5
+    assert rows[1].return_from_entry_open == 0.1
+    assert rows[1].return_from_entry_high == 0.2
+    assert rows[1].return_from_entry_low == 0.0
+    assert rows[1].return_from_entry_close == 0.15
+    assert rows[2].is_entry_session is False
+    assert rows[2].is_exit_session is True
+    assert rows[2].return_from_entry_close == 0.225
+    assert rows[2].input_hash == obs.input_hash
+    assert rows[2].outcome_hash == obs.outcome_hash
+    assert {row.expected_session_count for row in rows} == {15}
+    assert {row.path_status for row in rows} == {"partial"}
+    assert {row.is_synthetic_exit for row in rows} == {False}
+
+
+def test_forward_return_partial_path_rows_expose_expected_session_count(db_session):
+    _make_signal(db_session)
+    sessions = _session_window(ENTRY_DATE, EXIT_DATE)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(sessions[0], 10.0),
+            _bar(sessions[1], 11.0),
+            _bar(sessions[-1], 12.0),
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert len(sessions) > 3
+    assert [row.path_sequence for row in rows] == [1, 2, 3]
+    assert [row.session_date for row in rows] == [
+        sessions[0].isoformat(),
+        sessions[1].isoformat(),
+        sessions[-1].isoformat(),
+    ]
+    assert {row.expected_session_count for row in rows} == {len(sessions)}
+    assert {row.path_status for row in rows} == {"partial"}
+    assert {row.is_synthetic_exit for row in rows} == {False}
+
+
+def test_forward_return_complete_path_rows_expose_complete_status(db_session):
+    _make_signal(db_session)
+    sessions = _session_window(ENTRY_DATE, EXIT_DATE)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(day, 10.0 + idx, close=10.0 + idx)
+            for idx, day in enumerate(sessions)
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert len(rows) == len(sessions)
+    assert [row.path_sequence for row in rows] == list(range(1, len(sessions) + 1))
+    assert {row.expected_session_count for row in rows} == {len(sessions)}
+    assert {row.path_status for row in rows} == {"complete"}
+    assert {row.is_synthetic_exit for row in rows} == {False}
+
+
+def test_forward_return_survivorship_exit_adds_synthetic_exit_path_row(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        survivorship_by_ticker={
+            "ACME": {
+                "type": "acquisition",
+                "realized_payoff": 14.0,
+                "source_backed": True,
+            }
+        },
+    )
+
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    synthetic = [row for row in rows if row.is_synthetic_exit is True]
+    assert len(synthetic) == 1
+    assert synthetic[0].is_exit_session is True
+    assert synthetic[0].session_date == EXIT_DATE.isoformat()
+    assert synthetic[0].path_sequence == max(row.path_sequence for row in rows)
+    assert synthetic[0].open_price is None
+    assert synthetic[0].high_price is None
+    assert synthetic[0].low_price is None
+    assert synthetic[0].close_price == obs.exit_price == 14.0
+    assert synthetic[0].return_from_entry_close == 0.4
+    assert synthetic[0].provider == "TEST_SURVIVORSHIP"
+    assert synthetic[0].endpoint == "/test/survivorship-events"
+    assert {row.expected_session_count for row in rows} == {
+        len(_session_window(ENTRY_DATE, EXIT_DATE))
+    }
+    assert {row.path_status for row in rows} == {"partial"}
+
+
+def test_forward_return_daily_path_rows_absent_before_entry_price(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [_bar(EXIT_DATE, 12.0)],
+    })
+
+    _run_job(db_session, adapter)
+
+    assert db_session.query(ForwardReturnPathRow).count() == 0
+    assert _obs(db_session).status == "missing_entry_price_retry"
+
+
+def test_forward_return_daily_path_rows_replaced_but_not_wiped_by_pathless_reprice(db_session):
+    _make_signal(db_session)
+    pre_finality_ts = datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc)
+
+    initial = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, initial, run_ts=pre_finality_ts, max_attempts=10)
+    first_rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert [row.path_sequence for row in first_rows] == [1, 2, 3]
+    assert [row.session_date for row in first_rows] == [
+        ENTRY_DATE.isoformat(),
+        "2026-06-01",
+        EXIT_DATE.isoformat(),
+    ]
+    first_ids = {row.forward_return_path_row_id for row in first_rows}
+
+    replacement = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 13.0, close=13.5),
+            _bar(EXIT_DATE, 14.0, close=14.25),
+        ]
+    })
+    _run_job(db_session, replacement, run_ts=pre_finality_ts, max_attempts=10)
+    replacement_rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert [row.path_sequence for row in replacement_rows] == [1, 2, 3]
+    assert [row.session_date for row in replacement_rows] == [
+        ENTRY_DATE.isoformat(),
+        "2026-06-01",
+        EXIT_DATE.isoformat(),
+    ]
+    assert len({row.session_date for row in replacement_rows}) == 3
+    assert {row.forward_return_path_row_id for row in replacement_rows}.isdisjoint(first_ids)
+    assert replacement_rows[1].open_price == 13.0
+    assert replacement_rows[1].return_from_entry_close == 0.35
+    preserved_snapshot = [
+        (
+            row.path_sequence,
+            row.session_date,
+            row.open_price,
+            row.close_price,
+            row.return_from_entry_close,
+        )
+        for row in replacement_rows
+    ]
+
+    pathless = FakeHistoricalAdapter(
+        errors_by_ticker={
+            "ACME": ProviderError(
+                provider="FMP",
+                endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                status_code=503,
+                error_type="http",
+                message="temporary outage",
+                retryable=True,
+            )
+        }
+    )
+    _run_job(db_session, pathless, run_ts=pre_finality_ts, max_attempts=10)
+
+    after_pathless_rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    assert [
+        (
+            row.path_sequence,
+            row.session_date,
+            row.open_price,
+            row.close_price,
+            row.return_from_entry_close,
+        )
+        for row in after_pathless_rows
+    ] == preserved_snapshot
 
 
 @pytest.mark.parametrize(

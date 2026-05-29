@@ -28,6 +28,7 @@ from alpha.db.models import (
     DataLineage,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
+    ForwardReturnPathRow,
     SignalRegistry,
 )
 from alpha.evidence.writer import record_data_lineage
@@ -179,6 +180,29 @@ class PathTelemetry:
 
 
 @dataclass(frozen=True)
+class ForwardPathPoint:
+    """One persisted daily bar in a signal's bounded forward path."""
+
+    path_sequence: int
+    session_date: str
+    open_price: Optional[float]
+    high_price: Optional[float]
+    low_price: Optional[float]
+    close_price: Optional[float]
+    volume: Optional[float]
+    split_adjusted_close: Optional[float]
+    adj_close: Optional[float]
+    return_from_entry_open: Optional[float]
+    return_from_entry_high: Optional[float]
+    return_from_entry_low: Optional[float]
+    return_from_entry_close: Optional[float]
+    is_entry_session: bool
+    is_exit_session: bool
+    data_lineage_id: Optional[str]
+    is_synthetic_exit: bool = False
+
+
+@dataclass(frozen=True)
 class SurvivorshipDecision:
     """Outcome policy selected by the survivorship resolver."""
 
@@ -232,6 +256,7 @@ class ProductionPricingResult:
     endpoint: Optional[str] = None
     provider_request: Optional[Dict[str, Any]] = None
     data_lineage_ids: Optional[List[str]] = None
+    path_points: Optional[List[ForwardPathPoint]] = None
 
 
 def _finite_price(value: object) -> Optional[float]:
@@ -1041,6 +1066,7 @@ class ForwardReturnJob(BaseJob):
             endpoint: Optional[str] = None,
             provider_request_payload: Optional[Dict[str, Any]] = None,
             data_lineage_ids: Optional[List[str]] = None,
+            path_points: Optional[List[ForwardPathPoint]] = None,
         ) -> ProductionPricingResult:
             """Build a pricing result using the current provider lineage by default."""
 
@@ -1073,6 +1099,7 @@ class ForwardReturnJob(BaseJob):
                 endpoint=endpoint or resp.lineage.endpoint,
                 provider_request=provider_request_payload or provider_request,
                 data_lineage_ids=data_lineage_ids or lineage_ids,
+                path_points=path_points,
             )
 
         if not resp.ok:
@@ -1143,6 +1170,13 @@ class ForwardReturnJob(BaseJob):
             exit_session_date=plan.exit_session_date,
             geometry=M4_EXIT_GEOMETRY,
         )
+        path_points = _forward_path_points(
+            bars,
+            entry_price=entry_price,
+            entry_session_date=plan.entry_session_date,
+            exit_session_date=plan.exit_session_date,
+            data_lineage_id=lineage.data_lineage_id,
+        )
 
         if not finality_ready:
             provisional_exit_price = None
@@ -1179,6 +1213,7 @@ class ForwardReturnJob(BaseJob):
                     entry_basis_proof=entry_basis_proof,
                     exit_basis_proof=provisional_exit_basis,
                     telemetry=telemetry,
+                    path_points=path_points,
                     provider_request_payload=provider_request_payload,
                 ),
                 payload_hash,
@@ -1198,6 +1233,30 @@ class ForwardReturnJob(BaseJob):
                 if decision.exit_price is not None
                 else None
             )
+            survivorship_path_points = list(path_points)
+            if decision.exit_price is not None and exit_bar is None:
+                survivorship_path_points.append(ForwardPathPoint(
+                    path_sequence=len(survivorship_path_points) + 1,
+                    session_date=plan.exit_session_date.isoformat(),
+                    open_price=None,
+                    high_price=None,
+                    low_price=None,
+                    close_price=decision.exit_price,
+                    volume=None,
+                    split_adjusted_close=None,
+                    adj_close=None,
+                    return_from_entry_open=None,
+                    return_from_entry_high=None,
+                    return_from_entry_low=None,
+                    return_from_entry_close=_bar_return(
+                        decision.exit_price,
+                        entry_price,
+                    ),
+                    is_entry_session=False,
+                    is_exit_session=True,
+                    data_lineage_id=survivorship.primary_data_lineage_id,
+                    is_synthetic_exit=True,
+                ))
             provider_request_payload = {
                 "price_request": provider_request,
                 "survivorship_request": survivorship.provider_request,
@@ -1218,6 +1277,7 @@ class ForwardReturnJob(BaseJob):
                         or lineage.data_lineage_id
                     ),
                     telemetry=telemetry,
+                    path_points=survivorship_path_points,
                     provider=survivorship.provider or resp.lineage.provider,
                     endpoint=survivorship.endpoint or resp.lineage.endpoint,
                     provider_request_payload=provider_request_payload,
@@ -1238,6 +1298,7 @@ class ForwardReturnJob(BaseJob):
                     entry_price_source=M4_PRICE_SOURCE,
                     entry_basis_proof=entry_basis_proof,
                     telemetry=telemetry,
+                    path_points=path_points,
                 ),
                 payload_hash,
             )
@@ -1255,6 +1316,7 @@ class ForwardReturnJob(BaseJob):
                     entry_basis_proof=entry_basis_proof,
                     exit_basis_proof=exit_basis_proof,
                     telemetry=telemetry,
+                    path_points=path_points,
                 ),
                 payload_hash,
             )
@@ -1324,6 +1386,7 @@ class ForwardReturnJob(BaseJob):
                 entry_basis_proof=entry_basis_proof,
                 exit_basis_proof=exit_basis_proof,
                 telemetry=telemetry,
+                path_points=path_points,
                 provider_request_payload=finality_payload,
                 data_lineage_ids=_dedupe_list(
                     _observation_lineage_ids(previous_observation) + lineage_ids
@@ -1552,6 +1615,13 @@ class ForwardReturnJob(BaseJob):
             sig.outcome_unavailable_reason = None
 
         self._session.flush()
+        self._replace_forward_path_rows(
+            obs=obs,
+            sig=sig,
+            plan=plan,
+            pricing=pricing,
+            job_run_id=job_run_id,
+        )
         event = ForwardReturnObservationEvent(
             forward_return_observation_id=obs.forward_return_observation_id,
             signal_id=sig.signal_id,
@@ -1599,6 +1669,71 @@ class ForwardReturnJob(BaseJob):
         )
         self._session.add(event)
 
+    def _replace_forward_path_rows(
+        self,
+        *,
+        obs: ForwardReturnObservation,
+        sig: SignalRegistry,
+        plan: M4ForwardReturnPlan,
+        pricing: ProductionPricingResult,
+        job_run_id: Optional[str],
+    ) -> None:
+        if not pricing.path_points:
+            return
+
+        expected_session_count = _forward_path_expected_session_count(
+            plan.entry_session_date,
+            plan.exit_session_date,
+        )
+        available_session_count = sum(
+            1 for point in pricing.path_points if not point.is_synthetic_exit
+        )
+        path_status = (
+            "complete"
+            if available_session_count == expected_session_count
+            else "partial"
+        )
+
+        for row in list(obs.path_rows):
+            self._session.delete(row)
+        self._session.flush()
+
+        for point in pricing.path_points:
+            self._session.add(ForwardReturnPathRow(
+                forward_return_observation_id=obs.forward_return_observation_id,
+                signal_id=sig.signal_id,
+                pattern_id=sig.pattern_id,
+                ticker=sig.ticker,
+                signal_horizon=sig.signal_horizon,
+                path_sequence=point.path_sequence,
+                session_date=point.session_date,
+                entry_session_date=plan.entry_session_date.isoformat(),
+                exit_session_date=plan.exit_session_date.isoformat(),
+                entry_price=pricing.entry_price,
+                open_price=point.open_price,
+                high_price=point.high_price,
+                low_price=point.low_price,
+                close_price=point.close_price,
+                volume=point.volume,
+                split_adjusted_close=point.split_adjusted_close,
+                adj_close=point.adj_close,
+                return_from_entry_open=point.return_from_entry_open,
+                return_from_entry_high=point.return_from_entry_high,
+                return_from_entry_low=point.return_from_entry_low,
+                return_from_entry_close=point.return_from_entry_close,
+                is_entry_session=point.is_entry_session,
+                is_exit_session=point.is_exit_session,
+                expected_session_count=expected_session_count,
+                path_status=path_status,
+                is_synthetic_exit=point.is_synthetic_exit,
+                data_lineage_id=point.data_lineage_id,
+                provider=pricing.provider,
+                endpoint=pricing.endpoint,
+                job_run_id=job_run_id,
+                input_hash=obs.input_hash,
+                outcome_hash=obs.outcome_hash,
+            ))
+
     def _transition_computed_observation_to_review(
         self,
         *,
@@ -1635,6 +1770,8 @@ class ForwardReturnJob(BaseJob):
         sig.forward_return_attempts = obs.attempts
         sig.outcome_unavailable_reason = reason
         sig.intended_entry_price = obs.entry_price
+        for row in list(obs.path_rows):
+            self._session.delete(row)
 
         self._append_reconciliation_event(
             sig=sig,
@@ -3075,6 +3212,63 @@ def _path_telemetry(
         hit_stop_intraday=hit_stop,
         same_day_barrier_ambiguity=same_day_ambiguity,
     )
+
+
+def _forward_path_points(
+    bars: List[FmpBar],
+    *,
+    entry_price: float,
+    entry_session_date: date,
+    exit_session_date: date,
+    data_lineage_id: Optional[str],
+) -> List[ForwardPathPoint]:
+    window: List[Tuple[date, FmpBar]] = []
+    for bar in bars:
+        try:
+            bar_day = _parse_date(bar.date)
+        except ValueError:
+            continue
+        if entry_session_date <= bar_day <= exit_session_date:
+            window.append((bar_day, bar))
+    window.sort(key=lambda item: item[0])
+
+    points: List[ForwardPathPoint] = []
+    for idx, (bar_day, bar) in enumerate(window, start=1):
+        open_price = _finite_price(bar.open)
+        high_price = _finite_price(bar.high)
+        low_price = _finite_price(bar.low)
+        close_price = _finite_price(bar.close)
+        points.append(ForwardPathPoint(
+            path_sequence=idx,
+            session_date=bar_day.isoformat(),
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            volume=_finite_price(bar.volume),
+            split_adjusted_close=_finite_price(bar.split_adjusted_close),
+            adj_close=_finite_price(bar.adj_close),
+            return_from_entry_open=_bar_return(open_price, entry_price),
+            return_from_entry_high=_bar_return(high_price, entry_price),
+            return_from_entry_low=_bar_return(low_price, entry_price),
+            return_from_entry_close=_bar_return(close_price, entry_price),
+            is_entry_session=bar_day == entry_session_date,
+            is_exit_session=bar_day == exit_session_date,
+            data_lineage_id=data_lineage_id,
+        ))
+    return points
+
+
+def _forward_path_expected_session_count(
+    entry_session_date: date,
+    exit_session_date: date,
+) -> int:
+    count = 0
+    cursor = next_us_equity_session(entry_session_date)
+    while cursor <= exit_session_date:
+        count += 1
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return count
 
 
 def _bar_return(value: Optional[float], entry_price: float) -> Optional[float]:

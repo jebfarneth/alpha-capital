@@ -23,6 +23,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -516,6 +517,9 @@ class SignalRegistry(Base):
     forward_return_observations = relationship(
         "ForwardReturnObservation", back_populates="signal"
     )
+    forward_return_path_rows = relationship(
+        "ForwardReturnPathRow", back_populates="signal"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +605,102 @@ class ForwardReturnObservation(Base):
         "ForwardReturnObservationEvent",
         back_populates="observation",
     )
+    path_rows = relationship(
+        "ForwardReturnPathRow",
+        back_populates="observation",
+        cascade="all, delete-orphan",
+        order_by="ForwardReturnPathRow.path_sequence",
+    )
+
+
+# ---------------------------------------------------------------------------
+# forward_return_path_rows
+# ---------------------------------------------------------------------------
+class ForwardReturnPathRow(Base):
+    """Queryable per-session path captured for a forward-return observation.
+
+    Consumer contract: current paths require row.outcome_hash ==
+    observation.outcome_hash and an accepted finalized observation status;
+    mismatched rows are last-good rows preserved across pathless retries.
+    Return-from-entry values use the split-adjusted open entry basis and OHLC
+    from one FMP /full response, sharing that response's adjustment basis.
+    """
+
+    __tablename__ = "forward_return_path_rows"
+    __table_args__ = (
+        UniqueConstraint(
+            "forward_return_observation_id",
+            "session_date",
+            name="ux_forward_return_path_rows_observation_session",
+        ),
+        UniqueConstraint(
+            "forward_return_observation_id",
+            "path_sequence",
+            name="ux_forward_return_path_rows_observation_sequence",
+        ),
+        Index(
+            "ix_forward_return_path_rows_signal_session",
+            "signal_id",
+            "session_date",
+        ),
+        Index(
+            "ix_forward_return_path_rows_pattern_ticker_session",
+            "pattern_id",
+            "ticker",
+            "session_date",
+        ),
+    )
+
+    forward_return_path_row_id = Column(String, primary_key=True, default=_uuid)
+    forward_return_observation_id = Column(
+        String,
+        ForeignKey("forward_return_observations.forward_return_observation_id"),
+        nullable=False,
+    )
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), nullable=False
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    signal_horizon = Column(String, nullable=True)
+    path_sequence = Column(Integer, nullable=False)
+    session_date = Column(String, nullable=False)
+    entry_session_date = Column(String, nullable=True)
+    exit_session_date = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    open_price = Column(Float, nullable=True)
+    high_price = Column(Float, nullable=True)
+    low_price = Column(Float, nullable=True)
+    close_price = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    split_adjusted_close = Column(Float, nullable=True)
+    adj_close = Column(Float, nullable=True)
+    return_from_entry_open = Column(Float, nullable=True)
+    return_from_entry_high = Column(Float, nullable=True)
+    return_from_entry_low = Column(Float, nullable=True)
+    return_from_entry_close = Column(Float, nullable=True)
+    is_entry_session = Column(Boolean, nullable=True)
+    is_exit_session = Column(Boolean, nullable=True)
+    expected_session_count = Column(Integer, nullable=True)
+    path_status = Column(String, nullable=True)
+    is_synthetic_exit = Column(Boolean, nullable=True)
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    provider = Column(String, nullable=True)
+    endpoint = Column(String, nullable=True)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=True)
+    outcome_hash = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    observation = relationship("ForwardReturnObservation", back_populates="path_rows")
+    signal = relationship("SignalRegistry", back_populates="forward_return_path_rows")
 
 
 # ---------------------------------------------------------------------------

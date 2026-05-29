@@ -573,6 +573,7 @@ class TestSchemaCompleteness:
             "feature_snapshots",
             "signal_registry",
             "forward_return_observations",
+            "forward_return_path_rows",
             "forward_return_observation_events",
             "trade_candidates",
             "optimizer_runs",
@@ -591,6 +592,7 @@ class TestSchemaCompleteness:
     def test_alembic_upgrade_creates_all_18_tables(self, tmp_path, monkeypatch):
         db_path = tmp_path / "migration-smoke.db"
         monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
 
         cfg = Config(str(Path("alembic.ini")))
         command.upgrade(cfg, "head")
