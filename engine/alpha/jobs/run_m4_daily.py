@@ -69,6 +69,7 @@ def _run_live(args: argparse.Namespace) -> int:
             benzinga_adapter=benzinga_adapter,
             run_timestamp=_parse_timestamp(args.run_timestamp),
             lookback_calendar_days=args.lookback_calendar_days,
+            signal_context_breakout_buffer=args.signal_context_breakout_buffer,
         )
         result = run_job(
             session,
@@ -77,6 +78,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "source": "fmp_full",
                 "run_timestamp": args.run_timestamp,
                 "lookback_calendar_days": args.lookback_calendar_days,
+                "signal_context_breakout_buffer": args.signal_context_breakout_buffer,
                 "schema": args.schema,
             },
         )
@@ -93,6 +95,8 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Fetched bars:           {metrics.get('fetched_bar_count')}")
         print(f"Fetch errors:           {metrics.get('fetch_error_count')}")
         context_metrics = metrics.get("signal_context") or {}
+        print(f"Context candidates:     {context_metrics.get('context_prefilter_candidate_count')}")
+        print(f"Context skipped:        {context_metrics.get('context_prefilter_skipped_count')}")
         print(f"Context attempts:       {context_metrics.get('source_attempt_count')}")
         print(f"Context provider errs:  {context_metrics.get('provider_error_count')}")
         print(f"Assembled M4 inputs:    {assembly.get('assembled_count')}")
@@ -144,6 +148,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=430,
         help="Calendar days to request before the evidence session.",
+    )
+    parser.add_argument(
+        "--signal-context-breakout-buffer",
+        type=float,
+        default=0.02,
+        help=(
+            "M4 context prefilter buffer. Context is fetched only for inputs "
+            "with price >= high_52w * (1 - buffer)."
+        ),
     )
     parser.add_argument(
         "--create-tables",

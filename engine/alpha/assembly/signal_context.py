@@ -22,6 +22,7 @@ SIGNAL_CONTEXT limitations:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -42,6 +43,7 @@ from alpha.market_calendar import next_us_equity_session
 from alpha.patterns.contracts import PatternInput
 
 SOURCE_CONTEXT_VERSION = "m4-signal-context-v1"
+DEFAULT_M4_CONTEXT_BREAKOUT_BUFFER = 0.02
 WINDOW_7D = 7
 WINDOW_90D = 90
 CORPORATE_ACTION_LOOKBACK_DAYS = 30
@@ -88,6 +90,49 @@ CORPORATE_ACTION_AVAILABILITY_FIELDS = (
     "publication_date",
     "reported_at",
 )
+
+
+def select_m4_signal_context_inputs(
+    inputs: Sequence[PatternInput],
+    *,
+    breakout_buffer: float = DEFAULT_M4_CONTEXT_BREAKOUT_BUFFER,
+) -> Tuple[List[PatternInput], Dict[str, Any]]:
+    """Select a superset of base-lane M4 firings for expensive context calls.
+
+    The base lane (``ENTRY_LANE_BASE``) fires only when ``price >= high_52w``
+    (see ``M4Detector.detect``), so any non-negative ``breakout_buffer`` makes
+    this a no-missed-firing superset *for that lane*. It is NOT a firing superset
+    for the fresh-breakout lane (``ENTRY_LANE_FRESH``): the watchlist sub-path
+    fires at ``base_nearness >= 0.97`` and the activation sub-path keys off
+    intraday ``last_price``, neither of which this close-price filter accounts
+    for. Do not reuse this for fresh-lane inputs without revisiting both the
+    threshold and the price basis.
+    """
+
+    buffer = validate_m4_context_breakout_buffer(breakout_buffer)
+    threshold_multiplier = 1.0 - buffer
+    selected: List[PatternInput] = []
+    invalid_count = 0
+
+    for inp in inputs:
+        price = _finite_float(inp.market_data.get("price"))
+        high_52w = _finite_float(inp.market_data.get("high_52w"))
+        if price is None or high_52w is None or high_52w <= 0:
+            invalid_count += 1
+            continue
+        if price >= high_52w * threshold_multiplier:
+            selected.append(inp)
+
+    metrics = {
+        "context_prefilter_enabled": True,
+        "context_prefilter_breakout_buffer": buffer,
+        "context_prefilter_threshold_multiplier": threshold_multiplier,
+        "context_prefilter_input_count": len(inputs),
+        "context_prefilter_candidate_count": len(selected),
+        "context_prefilter_skipped_count": len(inputs) - len(selected),
+        "context_prefilter_invalid_count": invalid_count,
+    }
+    return selected, metrics
 
 
 def enrich_m4_signal_context(
@@ -1358,6 +1403,26 @@ def _reusable_signal_context(value: Any, cutoff: datetime) -> bool:
         return False
     asof = _datetime_or_none(value.get("asof_timestamp"))
     return asof == cutoff
+
+
+def validate_m4_context_breakout_buffer(value: float) -> float:
+    try:
+        buffer = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("signal_context_breakout_buffer must be a number") from exc
+    if not math.isfinite(buffer) or buffer < 0 or buffer >= 1:
+        raise ValueError("signal_context_breakout_buffer must be >= 0 and < 1")
+    return buffer
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
 
 
 def _m4_setup_identity_hash(inp: PatternInput) -> Optional[str]:

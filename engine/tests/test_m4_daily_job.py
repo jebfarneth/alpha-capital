@@ -8,6 +8,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import List
 
+import pytest
+
 from alpha.assembly.signal_context import (
     SOURCE_CONTEXT_VERSION,
     enrich_m4_signal_context,
@@ -36,14 +38,19 @@ def _request_ts() -> datetime:
     return datetime(2026, 5, 26, 8, 31, tzinfo=timezone.utc)
 
 
-def _setup_canonical_universe(db_session, *, trading_date: str = "2026-05-26"):
+def _setup_canonical_universe(
+    db_session,
+    *,
+    trading_date: str = "2026-05-26",
+    tickers=("LCUT",),
+):
     scan = UniverseScan(
         scan_id="m4-prod-scan",
         trading_date=trading_date,
         asof_timestamp=_scan_ts(),
-        raw_count=1,
-        deduped_count=1,
-        included_count=1,
+        raw_count=len(tickers),
+        deduped_count=len(tickers),
+        included_count=len(tickers),
         excluded_count=0,
         run_status="finished",
         source_lineage_hash="scan-lineage-hash",
@@ -55,18 +62,19 @@ def _setup_canonical_universe(db_session, *, trading_date: str = "2026-05-26"):
         scan_id=scan.scan_id,
         selection_reason="test",
     ))
-    db_session.add(UniverseSnapshot(
-        universe_snapshot_id="snap-LCUT",
-        scan_id=scan.scan_id,
-        ticker="LCUT",
-        asof_timestamp=_scan_ts(),
-        market_cap=75_000_000,
-        price=8.83,
-        primary_exchange="NASDAQ",
-        security_type="common_stock",
-        operating_universe_inclusion=True,
-        source_lineage_hash="snapshot-lineage-hash",
-    ))
+    for ticker in tickers:
+        db_session.add(UniverseSnapshot(
+            universe_snapshot_id=f"snap-{ticker}",
+            scan_id=scan.scan_id,
+            ticker=ticker,
+            asof_timestamp=_scan_ts(),
+            market_cap=75_000_000,
+            price=8.83,
+            primary_exchange="NASDAQ",
+            security_type="common_stock",
+            operating_universe_inclusion=True,
+            source_lineage_hash=f"snapshot-lineage-hash-{ticker}",
+        ))
     db_session.flush()
 
 
@@ -81,36 +89,47 @@ def _prior_weekdays(end_day: date, n: int) -> List[date]:
 
 
 def _m4_breakout_bars(evidence_day: date, *, prior_sessions: int = 60) -> List[FmpBar]:
+    return _m4_bars(evidence_day, evidence_close=11.0, prior_sessions=prior_sessions)
+
+
+def _m4_bars(
+    evidence_day: date,
+    *,
+    evidence_close: float,
+    prior_sessions: int = 60,
+    prior_close: float = 10.0,
+) -> List[FmpBar]:
     bars = [
         FmpBar(
             date=day.isoformat(),
             open=9.0,
             high=10.0,
             low=8.5,
-            close=10.0,
+            close=prior_close,
             volume=100_000,
-            split_adjusted_close=10.0,
+            split_adjusted_close=prior_close,
         )
         for day in _prior_weekdays(evidence_day, prior_sessions)
     ]
     bars.append(FmpBar(
         date=evidence_day.isoformat(),
-        open=10.2,
-        high=11.1,
-        low=10.0,
-        close=11.0,
+        open=evidence_close,
+        high=evidence_close,
+        low=evidence_close,
+        close=evidence_close,
         volume=200_000,
-        split_adjusted_close=11.0,
+        split_adjusted_close=evidence_close,
     ))
     return bars
 
 
 class FakeHistoricalAdapter:
-    def __init__(self, bars: List[FmpBar]):
+    def __init__(self, bars: List[FmpBar] | dict[str, List[FmpBar]]):
         self.bars = bars
         self.calls = []
 
     def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
+        bars = self.bars.get(ticker, []) if isinstance(self.bars, dict) else self.bars
         self.calls.append({
             "ticker": ticker,
             "from_date": from_date,
@@ -119,7 +138,7 @@ class FakeHistoricalAdapter:
             "kwargs": kwargs,
         })
         return AdapterResponse(
-            data=self.bars,
+            data=bars,
             lineage=LineageMeta(
                 provider="FMP",
                 endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
@@ -127,7 +146,7 @@ class FakeHistoricalAdapter:
                 asof_timestamp=asof,
                 raw_payload_hash=stable_hash([
                     {"date": bar.date, "close": bar.close}
-                    for bar in self.bars
+                    for bar in bars
                 ]),
                 source_authority="test",
             ),
@@ -542,6 +561,103 @@ def test_m4_daily_signal_context_persists_attempts_lineage_and_pit_context(db_se
         for attempt in category.get("source_attempts", [])
     ]
     assert any(lineage_id in lineage_ids for lineage_id in context_lineage_ids if lineage_id)
+
+
+def test_m4_daily_signal_context_prefilter_enriches_breakout_superset_only(db_session):
+    _setup_canonical_universe(db_session, tickers=("FIRE", "NEAR", "FAR"))
+    evidence_day = date(2026, 5, 22)
+    adapter = FakeHistoricalAdapter({
+        "FIRE": _m4_bars(evidence_day, evidence_close=10.05),
+        "NEAR": _m4_bars(evidence_day, evidence_close=9.85),
+        "FAR": _m4_bars(evidence_day, evidence_close=9.79),
+    })
+    polygon = FakePolygonContextAdapter()
+    benzinga = FakeBenzingaContextAdapter()
+    job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=polygon,
+        benzinga_adapter=benzinga,
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+        signal_context_breakout_buffer=0.02,
+    )
+
+    result = run_job(db_session, job, params={})
+
+    assert result.ok
+    metrics = result.metrics["signal_context"]
+    assert metrics["context_prefilter_input_count"] == 3
+    assert metrics["context_prefilter_candidate_count"] == 2
+    assert metrics["context_prefilter_skipped_count"] == 1
+    assert metrics["context_attached_count"] == 2
+    assert metrics["context_enriched_count"] == 2
+    assert result.metrics["orchestration"]["total_signals_persisted"] == 1
+
+    polygon_tickers = {kwargs["ticker"] for _, kwargs in polygon.calls}
+    benzinga_tickers = {
+        kwargs.get("tickers") or kwargs.get("ticker")
+        for _, kwargs in benzinga.calls
+    }
+    assert polygon_tickers == {"FIRE", "NEAR"}
+    assert benzinga_tickers == {"FIRE", "NEAR"}
+
+    features = {
+        feature.ticker: json.loads(feature.feature_json)
+        for feature in db_session.query(FeatureSnapshot).all()
+    }
+    assert "signal_context" in features["FIRE"]
+    assert "signal_context" in features["NEAR"]
+    assert "signal_context" not in features["FAR"]
+
+
+def test_m4_daily_signal_context_prefilter_buffer_is_configurable(db_session):
+    _setup_canonical_universe(db_session, tickers=("FIRE", "NEAR"))
+    evidence_day = date(2026, 5, 22)
+    adapter = FakeHistoricalAdapter({
+        "FIRE": _m4_bars(evidence_day, evidence_close=10.05),
+        "NEAR": _m4_bars(evidence_day, evidence_close=9.85),
+    })
+    polygon = FakePolygonContextAdapter()
+    job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=polygon,
+        benzinga_adapter=FakeBenzingaContextAdapter(),
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+        signal_context_breakout_buffer=0.01,
+    )
+
+    result = run_job(db_session, job, params={})
+
+    assert result.ok
+    metrics = result.metrics["signal_context"]
+    assert metrics["context_prefilter_breakout_buffer"] == 0.01
+    assert metrics["context_prefilter_threshold_multiplier"] == 0.99
+    assert metrics["context_prefilter_candidate_count"] == 1
+    assert {kwargs["ticker"] for _, kwargs in polygon.calls} == {"FIRE"}
+
+
+@pytest.mark.parametrize("invalid_buffer", [-0.01, 1.0, float("nan"), "bad"])
+def test_m4_daily_invalid_signal_context_buffer_fails_before_fetch(db_session, invalid_buffer):
+    _setup_canonical_universe(db_session)
+    adapter = FakeHistoricalAdapter(_m4_breakout_bars(date(2026, 5, 22)))
+    job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=FakePolygonContextAdapter(),
+        benzinga_adapter=FakeBenzingaContextAdapter(),
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+        signal_context_breakout_buffer=invalid_buffer,
+    )
+
+    result = run_job(db_session, job, params={})
+
+    assert not result.ok
+    assert result.errors[0]["stage"] == "params"
+    assert "signal_context_breakout_buffer" in result.errors[0]["message"]
+    assert adapter.calls == []
+    assert db_session.query(FeatureSnapshot).count() == 0
+    assert db_session.query(SignalRegistry).count() == 0
 
 
 def test_m4_daily_reuses_persisted_signal_context_without_refetch(db_session):

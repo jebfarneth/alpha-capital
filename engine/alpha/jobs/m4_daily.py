@@ -16,8 +16,11 @@ from sqlalchemy.orm import Session
 
 from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
 from alpha.assembly.signal_context import (
+    DEFAULT_M4_CONTEXT_BREAKOUT_BUFFER,
     enrich_m4_signal_context,
     reuse_persisted_m4_signal_context,
+    select_m4_signal_context_inputs,
+    validate_m4_context_breakout_buffer,
 )
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapshot
@@ -50,6 +53,7 @@ class M4DailyAssemblyJob(BaseJob):
         polygon_adapter: Any = None,
         benzinga_adapter: Any = None,
         enable_signal_context: bool = True,
+        signal_context_breakout_buffer: float = DEFAULT_M4_CONTEXT_BREAKOUT_BUFFER,
         run_timestamp: Optional[datetime] = None,
         lookback_calendar_days: int = 430,
     ):
@@ -58,6 +62,7 @@ class M4DailyAssemblyJob(BaseJob):
         self._polygon_adapter = polygon_adapter
         self._benzinga_adapter = benzinga_adapter
         self._enable_signal_context = enable_signal_context
+        self._signal_context_breakout_buffer = signal_context_breakout_buffer
         self._run_timestamp = run_timestamp
         self._lookback_calendar_days = lookback_calendar_days
 
@@ -74,6 +79,17 @@ class M4DailyAssemblyJob(BaseJob):
                 status="failed",
                 errors=[{"stage": "params", "message": timestamp_error}],
             )
+        signal_context_breakout_buffer = self._signal_context_breakout_buffer
+        if self._enable_signal_context:
+            try:
+                signal_context_breakout_buffer = validate_m4_context_breakout_buffer(
+                    signal_context_breakout_buffer
+                )
+            except ValueError as exc:
+                return JobResult(
+                    status="failed",
+                    errors=[{"stage": "params", "message": str(exc)}],
+                )
 
         session_resolution = resolve_us_equity_session(run_timestamp)
         decision_date = session_resolution.decision_date
@@ -197,14 +213,18 @@ class M4DailyAssemblyJob(BaseJob):
 
         signal_context_metrics: Dict[str, Any] = {}
         if self._enable_signal_context:
-            persisted_context_metrics = reuse_persisted_m4_signal_context(
+            context_inputs, prefilter_metrics = select_m4_signal_context_inputs(
                 assembly.inputs,
+                breakout_buffer=signal_context_breakout_buffer,
+            )
+            persisted_context_metrics = reuse_persisted_m4_signal_context(
+                context_inputs,
                 session=self._session,
                 cutoff_timestamp=cutoff_timestamp,
                 decision_date=decision_date,
             )
             signal_context_metrics = enrich_m4_signal_context(
-                assembly.inputs,
+                context_inputs,
                 session=self._session,
                 polygon_adapter=self._polygon_adapter,
                 benzinga_adapter=self._benzinga_adapter,
@@ -214,6 +234,7 @@ class M4DailyAssemblyJob(BaseJob):
                 job_run_id=ctx.job_run_id,
             )
             signal_context_metrics.update(persisted_context_metrics)
+            signal_context_metrics.update(prefilter_metrics)
 
         if not assembly.inputs:
             return JobResult(

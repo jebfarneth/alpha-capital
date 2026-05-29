@@ -27,6 +27,7 @@ from alpha.patterns.contracts import (
     SignalDirection,
     ThesisCategory,
 )
+from alpha.assembly.signal_context import select_m4_signal_context_inputs
 from alpha.patterns.evidence_bridge import persist_detection_result
 from alpha.patterns.m4 import (
     KAPPA,
@@ -260,6 +261,25 @@ class TestM4Firing:
         assert "tier_classification" not in f
         assert f["breakout_extension"] == 0.0
         assert f["X_M4"] == 1.0
+
+    def test_context_prefilter_covers_base_lane_firing_boundary(self):
+        # Coupling guard: select_m4_signal_context_inputs must never exclude an
+        # input the base-lane detector would actually fire on. Anchored to the
+        # lowest base-lane firing ratio (exact-high close, price == high_52w).
+        # If the detector firing threshold or the prefilter buffer ever drifts
+        # so the prefilter drops a real firing, this test fails.
+        det = M4Detector()
+        inp = PatternInput(
+            ticker="ACME", asof_timestamp=_ts(),
+            market_data=_m4_base_data(
+                price=10.00, high_52w=10.00,
+                cohort_extensions=_cohort_extensions(30, 0.10),
+            ),
+            lineage_hashes=["hash1"],
+        )
+        assert det.detect(inp).has_signal
+        selected, _ = select_m4_signal_context_inputs([inp])
+        assert len(selected) == 1 and selected[0] is inp
 
     def test_signal_context_passes_through_without_changing_m4_firing(self):
         det = M4Detector()
