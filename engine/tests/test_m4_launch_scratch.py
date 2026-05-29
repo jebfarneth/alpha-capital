@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from alpha.db import engine as db_engine
+from alpha.db.engine import create_all_tables
 from alpha.jobs.run_m4_launch_scratch import (
     _parse_timestamp,
     _require_safe_database,
@@ -57,3 +59,50 @@ def test_launch_scratch_requires_timezone_aware_run_timestamp():
 
     parsed = _parse_timestamp("2026-05-28T12:00:00-04:00")
     assert parsed == datetime(2026, 5, 28, 16, 0, tzinfo=timezone.utc)
+
+
+def test_create_all_tables_restricts_checkfirst_to_scratch_schema(monkeypatch):
+    class FakeDialect:
+        name = "postgresql"
+
+    class FakeConnection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(str(statement))
+
+    class FakeBegin:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeEngine:
+        dialect = FakeDialect()
+
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def begin(self):
+            return FakeBegin(self.connection)
+
+    fake_engine = FakeEngine()
+    create_calls = []
+    monkeypatch.setenv("ALPHA_DB_SCHEMA", "m4_live_scratch_20260529_020000")
+    monkeypatch.setattr(
+        db_engine.Base.metadata,
+        "create_all",
+        lambda bind: create_calls.append(bind),
+    )
+
+    create_all_tables(fake_engine)
+
+    assert fake_engine.connection.statements == [
+        'SET search_path TO "m4_live_scratch_20260529_020000"'
+    ]
+    assert create_calls == [fake_engine.connection]

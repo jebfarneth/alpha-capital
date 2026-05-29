@@ -67,6 +67,18 @@ def create_all_tables(engine=None):
     """Create ORM tables for local smoke databases and isolated scratch schemas."""
 
     engine = engine or get_engine()
+    schema = os.environ.get("ALPHA_DB_SCHEMA")
+    if schema and engine.dialect.name == "postgresql":
+        schema = _validate_schema_name(schema)
+        with engine.begin() as conn:
+            # During scratch runs the normal connection search_path is
+            # ``scratch,public`` so reads can still resolve shared objects. For
+            # metadata creation, restrict the path to the scratch schema only;
+            # otherwise SQLAlchemy's checkfirst can see stale public tables and
+            # skip creating the scratch-local table.
+            conn.execute(text(f'SET search_path TO "{schema}"'))
+            Base.metadata.create_all(conn)
+        return
     Base.metadata.create_all(engine)
 
 
