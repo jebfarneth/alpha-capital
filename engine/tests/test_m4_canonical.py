@@ -20,6 +20,7 @@ from alpha.jobs import run_m4_canonical
 from alpha.jobs.m4_daily import M4DailyAssemblyJob
 from alpha.jobs.run_m4_canonical import (
     CanonicalRunError,
+    NonTradingDayNoOp,
     build_m4_health_report,
     require_canonical_target,
     require_scratch_schema,
@@ -105,7 +106,7 @@ def test_future_decision_date_is_refused():
 # ---------------------------------------------------------------------------
 # (c) weekend / holiday decision date rejection
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("bad_day", ["2026-05-24", "2026-05-25"])  # Sunday, Memorial Day
+@pytest.mark.parametrize("bad_day", ["2026-05-23", "2026-05-24", "2026-05-25"])  # Saturday, Sunday, Memorial Day
 def test_weekend_or_holiday_decision_date_is_refused(bad_day):
     run_ts = _utc(2026, 5, 27, 8, 0)
     with pytest.raises(CanonicalRunError, match="trading session"):
@@ -116,6 +117,11 @@ def test_invalid_decision_date_string_is_refused():
     run_ts = _utc(2026, 5, 26, 8, 0)
     with pytest.raises(CanonicalRunError, match="valid ISO date"):
         resolve_canonical_clock(run_ts, "not-a-date")
+
+
+def test_default_holiday_timestamp_is_clean_noop():
+    with pytest.raises(NonTradingDayNoOp, match="2026-05-25"):
+        resolve_canonical_clock(_utc(2026, 5, 25, 12, 0), None)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +203,42 @@ def test_dry_run_makes_no_writes_or_calls(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "no database writes and no provider API calls" in out
+
+
+def test_default_saturday_main_exits_zero_before_work(monkeypatch, capsys):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+
+    def _explode(*_a, **_k):  # pragma: no cover - must never be called
+        raise AssertionError("non-trading-day no-op must exit before DB/API work")
+
+    monkeypatch.setattr(run_m4_canonical, "verify_alembic_head", _explode)
+    monkeypatch.setattr(run_m4_canonical, "_run_universe", _explode)
+    monkeypatch.setattr(run_m4_canonical, "_run_m4", _explode)
+    monkeypatch.setattr(run_m4_canonical, "_report_session", _explode)
+
+    rc = run_m4_canonical.main([
+        "--live",
+        "--confirm-canonical-write",
+        "--run-timestamp", "2026-05-30T12:00:00-04:00",
+    ])
+
+    assert rc == 0
+    assert "NO-OP" in capsys.readouterr().out
+
+
+def test_explicit_saturday_main_exits_one(monkeypatch, capsys):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+
+    rc = run_m4_canonical.main([
+        "--dry-run",
+        "--run-timestamp", "2026-05-30T12:00:00-04:00",
+        "--decision-date", "2026-05-30",
+    ])
+
+    assert rc == 1
+    assert "trading session" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -1384,7 +1426,7 @@ def test_duplicate_signal_detection(db_session):
     ],
 )
 def test_weekend_timestamp_does_not_produce_weekend_decision(run_ts):
-    with pytest.raises(CanonicalRunError, match="non-trading decision date"):
+    with pytest.raises(NonTradingDayNoOp, match="non-trading decision date"):
         resolve_canonical_clock(run_ts, None)
 
 

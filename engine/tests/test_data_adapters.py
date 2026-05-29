@@ -2329,6 +2329,7 @@ class TestPolygonAdapter:
         assert resp.ok
         assert len(resp.data) == 1
         assert resp.data[0].close == 5.25
+        assert resp.data[0].volume == 100000
         assert resp.data[0].vwap == 5.15
         assert resp.lineage.data_quality_flags["raw_rows"] == 1
         assert resp.lineage.data_quality_flags["parsed_rows"] == 1
@@ -2338,6 +2339,33 @@ class TestPolygonAdapter:
             params={"limit": 5000, "sort": "asc"},
             timeout=30,
         )
+
+    def test_get_daily_bars_accepts_float_volume(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": [
+                {
+                    "t": 1716163200000,
+                    "o": 5.0,
+                    "h": 5.5,
+                    "l": 4.9,
+                    "c": 5.25,
+                    "v": 35324922.433075,
+                    "vw": 5.15,
+                    "n": 450,
+                },
+            ]
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_daily_bars("ACME", "2026-05-01", "2026-05-19")
+
+        assert resp.ok
+        assert resp.data[0].close == 5.25
+        assert resp.data[0].volume == pytest.approx(35324922.433075)
+        assert resp.lineage.data_quality_flags["parsed_rows"] == 1
 
     def test_get_daily_bars_rejects_invalid_ticker_and_dates_without_request(self):
         invalid_calls = [
@@ -2373,6 +2401,7 @@ class TestPolygonAdapter:
             {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": -1.0, "c": 5.25, "v": 100000}]},
             {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": -1.0, "v": 100000}]},
             {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": -1}]},
+            {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25}]},
             {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000, "vw": -1}]},
             {"results": [{"t": 1716163200000, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000, "n": -1}]},
             {"results": [{"t": -1, "o": 5.0, "h": 5.5, "l": 4.9, "c": 5.25, "v": 100000}]},

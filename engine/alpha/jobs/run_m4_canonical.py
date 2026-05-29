@@ -158,6 +158,10 @@ class CanonicalRunError(ValueError):
     """Raised when a guard refuses to proceed with a canonical run."""
 
 
+class NonTradingDayNoOp(Exception):
+    """Signals a default-clock run resolved to a non-trading day; clean no-op exit."""
+
+
 def resolve_canonical_clock(
     run_timestamp: datetime,
     decision_date_override: Optional[str],
@@ -172,9 +176,9 @@ def resolve_canonical_clock(
     base = resolve_us_equity_session(run_timestamp)
     if not decision_date_override:
         if not is_us_equity_session(date.fromisoformat(base.decision_date)):
-            raise CanonicalRunError(
-                "run_timestamp resolves to a non-trading decision date; provide "
-                "--decision-date for the latest completed U.S. equity session"
+            raise NonTradingDayNoOp(
+                f"run_timestamp resolves to non-trading decision date "
+                f"{base.decision_date}; next session is {base.next_execution_session}"
             )
         return {
             "decision_date": base.decision_date,
@@ -1278,6 +1282,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         clock = resolve_canonical_clock(run_ts, args.decision_date)
+    except NonTradingDayNoOp as exc:
+        print(f"NO-OP: {exc}")
+        return 0
     except CanonicalRunError as exc:
         print(f"ERROR: {exc}")
         return 1

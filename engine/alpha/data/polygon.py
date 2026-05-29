@@ -242,7 +242,7 @@ class PolygonBar:
     high: float
     low: float
     close: float
-    volume: int
+    volume: float
     vwap: Optional[float] = None
     transactions: Optional[int] = None
 
@@ -2583,7 +2583,7 @@ def _parse_daily_bar_row(row: Dict[str, Any]) -> Optional[PolygonBar]:
     high = _required_nonnegative_float_or_none(row.get("h"))
     low = _required_nonnegative_float_or_none(row.get("l"))
     close = _required_nonnegative_float_or_none(row.get("c"))
-    volume = _required_nonnegative_int_or_none(row.get("v"))
+    volume = _required_nonnegative_float_or_none(row.get("v"))
     if None in (timestamp, open_price, high, low, close, volume):
         return None
     vwap = (
