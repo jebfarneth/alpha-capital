@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pytest
+from sqlalchemy import text
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import (
@@ -30,6 +31,7 @@ from alpha.jobs.forward_return import (
     M4_PRICE_SOURCE,
     M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF,
     ForwardReturnJob,
+    current_forward_path_rows,
     m4_entry_exit_plan,
 )
 from alpha.jobs.run_forward_return import _live_timestamp_error
@@ -1367,6 +1369,328 @@ def test_forward_return_daily_path_rows_persist(db_session):
     assert {row.is_synthetic_exit for row in rows} == {False}
 
 
+def test_current_forward_path_rows_returns_ordered_computed_path(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = current_forward_path_rows(db_session, obs)
+    assert obs.status == "computed"
+    assert [row.path_sequence for row in rows] == [1, 2, 3]
+    assert [row.session_date for row in rows] == [
+        ENTRY_DATE.isoformat(),
+        "2026-06-01",
+        EXIT_DATE.isoformat(),
+    ]
+    assert {row.outcome_hash for row in rows} == {obs.outcome_hash}
+
+
+def test_current_forward_path_rows_rereads_stale_observation_object(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+    stale_obs = _obs(db_session)
+    old_hash = stale_obs.outcome_hash
+
+    db_session.execute(
+        text(
+            "UPDATE forward_return_observations "
+            "SET status = :status, outcome_hash = :outcome_hash "
+            "WHERE forward_return_observation_id = :observation_id"
+        ),
+        {
+            "status": "pricing_unavailable_retry",
+            "outcome_hash": "manual-new-outcome-hash",
+            "observation_id": stale_obs.forward_return_observation_id,
+        },
+    )
+    db_session.flush()
+
+    assert stale_obs.status == "computed"
+    assert stale_obs.outcome_hash == old_hash
+    assert current_forward_path_rows(db_session, stale_obs) == []
+
+
+def test_current_forward_path_rows_excludes_provisional_until_final(db_session):
+    _make_signal(db_session)
+    bars = [
+        _bar(ENTRY_DATE, 10.0, close=10.0),
+        _bar(date(2026, 6, 1), 11.0, close=11.5),
+        _bar(EXIT_DATE, 12.0, close=12.25),
+    ]
+    adapter = FakeHistoricalAdapter({"ACME": bars})
+
+    _run_job(
+        db_session,
+        adapter,
+        run_ts=datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc),
+        max_attempts=10,
+    )
+
+    obs = _obs(db_session)
+    assert obs.status == "price_finality_pending"
+    assert db_session.query(ForwardReturnPathRow).count() == 3
+    assert current_forward_path_rows(db_session, obs) == []
+
+    _run_job(db_session, FakeHistoricalAdapter({"ACME": bars}), max_attempts=10)
+
+    obs = _obs(db_session)
+    rows = current_forward_path_rows(db_session, obs)
+    assert obs.status == "computed"
+    assert [row.path_sequence for row in rows] == [1, 2, 3]
+    assert {row.outcome_hash for row in rows} == {obs.outcome_hash}
+
+
+def test_current_forward_path_rows_excludes_review_status(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    obs.status = "price_drift_review"
+    db_session.flush()
+
+    assert current_forward_path_rows(db_session, obs) == []
+
+
+def test_current_forward_path_rows_excludes_empty_observation_hash(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    obs.outcome_hash = ""
+    db_session.flush()
+
+    assert current_forward_path_rows(db_session, obs) == []
+
+
+def test_current_forward_path_rows_excludes_missing_live_observation(db_session):
+    obs = ForwardReturnObservation(
+        forward_return_observation_id="missing-observation",
+        signal_id="missing-signal",
+        pattern_id="M4",
+        ticker="ACME",
+        direction="long",
+        signal_timestamp=SIGNAL_TS,
+        signal_horizon="15d",
+        next_execution_session=ENTRY_DATE.isoformat(),
+        status="computed",
+        input_hash="input",
+        outcome_hash="outcome",
+    )
+
+    assert current_forward_path_rows(db_session, obs) == []
+
+
+def test_current_forward_path_rows_isolates_observations(db_session):
+    _make_signal(db_session, ticker="ACME")
+    _make_signal(db_session, ticker="BETA")
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ],
+        "BETA": [
+            _bar(ENTRY_DATE, 20.0, close=20.0),
+            _bar(date(2026, 6, 1), 21.0, close=21.5),
+            _bar(EXIT_DATE, 22.0, close=22.25),
+        ],
+    })
+    _run_job(db_session, adapter)
+
+    observations = {
+        obs.ticker: obs
+        for obs in db_session.query(ForwardReturnObservation).all()
+    }
+    acme_rows = current_forward_path_rows(db_session, observations["ACME"])
+    beta_rows = current_forward_path_rows(db_session, observations["BETA"])
+
+    assert {row.ticker for row in acme_rows} == {"ACME"}
+    assert {row.forward_return_observation_id for row in acme_rows} == {
+        observations["ACME"].forward_return_observation_id
+    }
+    assert {row.ticker for row in beta_rows} == {"BETA"}
+    assert {row.forward_return_observation_id for row in beta_rows} == {
+        observations["BETA"].forward_return_observation_id
+    }
+
+
+def test_current_forward_path_rows_serves_partial_paths_for_consumers(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = current_forward_path_rows(db_session, obs)
+
+    assert len(rows) == 3
+    assert {row.expected_session_count for row in rows} == {15}
+    assert {row.path_status for row in rows} == {"partial"}
+
+
+def test_current_forward_path_rows_serves_distinguishable_synthetic_exit(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        survivorship_by_ticker={
+            "ACME": {
+                "type": "acquisition",
+                "realized_payoff": 14.0,
+                "source_backed": True,
+            }
+        },
+    )
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = current_forward_path_rows(db_session, obs)
+    synthetic_rows = [row for row in rows if row.is_synthetic_exit is True]
+
+    assert len(rows) == 2
+    assert len(synthetic_rows) == 1
+    assert synthetic_rows[0].is_exit_session is True
+    assert synthetic_rows[0].close_price == obs.exit_price == 14.0
+    assert synthetic_rows[0].open_price is None
+    assert synthetic_rows[0].high_price is None
+    assert synthetic_rows[0].low_price is None
+
+
+def test_current_forward_path_rows_does_not_autoflush_pending_mutation(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    assert obs.status == "computed"
+
+    # Introduce an unrelated pending dirty mutation on a persistent object
+    # without flushing it. A non-read-only reader would autoflush this when it
+    # issues its own session.query(...), persisting the mutation mid-read.
+    obs.reason = "AUTOFLUSH-PROBE-UNFLUSHED"
+    assert obs in db_session.dirty
+
+    rows = current_forward_path_rows(db_session, obs)
+    assert [row.path_sequence for row in rows] == [1, 2, 3]
+
+    # The reader must leave the pending mutation un-flushed: the ORM object is
+    # still dirty, and a raw in-transaction SELECT does not see the new value.
+    assert obs in db_session.dirty
+    persisted_reason = db_session.execute(
+        text(
+            "SELECT reason FROM forward_return_observations "
+            "WHERE forward_return_observation_id = :observation_id"
+        ),
+        {"observation_id": obs.forward_return_observation_id},
+    ).scalar_one()
+    assert persisted_reason != "AUTOFLUSH-PROBE-UNFLUSHED"
+
+
+def test_current_forward_path_rows_trusts_writer_for_corrupt_rows(db_session):
+    signal_id = _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    assert obs.status == "computed"
+
+    # Seed a row that matches the reader's only filter keys
+    # (forward_return_observation_id + outcome_hash) but is otherwise corrupt:
+    # wrong ticker, wrong input_hash, and an out-of-window session_date. The
+    # signal_id is valid because the FK requires it. This documents that the
+    # reader trusts the writer for ticker/input_hash/date-window bounds.
+    db_session.add(
+        ForwardReturnPathRow(
+            forward_return_observation_id=obs.forward_return_observation_id,
+            signal_id=signal_id,
+            pattern_id="M4",
+            ticker="WRONG-TICKER",
+            path_sequence=99,
+            session_date="1999-01-01",
+            outcome_hash=obs.outcome_hash,
+            input_hash="WRONG-INPUT-HASH",
+        )
+    )
+    db_session.flush()
+
+    rows = current_forward_path_rows(db_session, obs)
+    corrupt = [row for row in rows if row.path_sequence == 99]
+    assert len(corrupt) == 1
+    assert corrupt[0].ticker == "WRONG-TICKER"
+    assert corrupt[0].input_hash == "WRONG-INPUT-HASH"
+    assert corrupt[0].session_date == "1999-01-01"
+
+
+def test_forward_return_real_path_rows_share_entry_lineage_basis(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, close=10.0),
+            _bar(date(2026, 6, 1), 11.0, close=11.5),
+            _bar(EXIT_DATE, 12.0, close=12.25),
+        ]
+    })
+
+    _run_job(db_session, adapter)
+
+    obs = _obs(db_session)
+    rows = (
+        db_session.query(ForwardReturnPathRow)
+        .order_by(ForwardReturnPathRow.path_sequence)
+        .all()
+    )
+    real_rows = [row for row in rows if row.is_synthetic_exit is not True]
+    assert real_rows
+    assert {row.data_lineage_id for row in real_rows} == {
+        obs.entry_data_lineage_id
+    }
+
+
 def test_forward_return_partial_path_rows_expose_expected_session_count(db_session):
     _make_signal(db_session)
     sessions = _session_window(ENTRY_DATE, EXIT_DATE)
@@ -1560,6 +1884,10 @@ def test_forward_return_daily_path_rows_replaced_but_not_wiped_by_pathless_repri
         )
         for row in after_pathless_rows
     ] == preserved_snapshot
+    obs = _obs(db_session)
+    assert obs.status == "pricing_unavailable_retry"
+    assert {row.outcome_hash for row in after_pathless_rows} != {obs.outcome_hash}
+    assert current_forward_path_rows(db_session, obs) == []
 
 
 @pytest.mark.parametrize(

@@ -117,6 +117,63 @@ PRICE_DRIFT_REL_TOL = 0.0005
 LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON = (
     "legacy_next_execution_session_fallback"
 )
+CURRENT_FORWARD_PATH_STATUSES = (STATUS_COMPUTED,)
+
+
+def current_forward_path_rows(
+    session: Session,
+    observation: ForwardReturnObservation,
+) -> List[ForwardReturnPathRow]:
+    """Return the only sanctioned machine-readable current forward path.
+
+    Preserved path rows from pathless retries remain queryable as last-good
+    audit data, but a current path must belong to a finalized/computed
+    observation and match its current outcome hash. The observation is
+    re-read by primary key, so a stale caller-held ORM object cannot surface
+    stale rows. Pending un-flushed in-session changes to the observation are
+    ignored; the reader reflects committed state.
+
+    Returned rows may include partial paths; consumers must inspect
+    path_status and expected_session_count before assuming completeness.
+    Returned rows may include a synthetic survivorship terminal row; consumers
+    must inspect is_synthetic_exit before treating close as a real OHLC bar,
+    because synthetic rows have null open/high/low values.
+
+    This reader assumes READ COMMITTED isolation (the production default); under
+    a non-default long-lived REPEATABLE READ/SERIALIZABLE transaction that
+    previously observed the observation, the primary-key re-read could serve a
+    frozen snapshot rather than the latest committed state.
+    """
+    observation_id = observation.forward_return_observation_id
+    with session.no_autoflush:
+        live_observation = (
+            session.query(
+                ForwardReturnObservation.status,
+                ForwardReturnObservation.outcome_hash,
+            )
+            .filter(
+                ForwardReturnObservation.forward_return_observation_id
+                == observation_id
+            )
+            .one_or_none()
+        )
+        if live_observation is None:
+            return []
+        live_status, live_outcome_hash = live_observation
+        if live_status not in CURRENT_FORWARD_PATH_STATUSES:
+            return []
+        if not live_outcome_hash:
+            return []
+        return (
+            session.query(ForwardReturnPathRow)
+            .filter(
+                ForwardReturnPathRow.forward_return_observation_id
+                == observation_id,
+                ForwardReturnPathRow.outcome_hash == live_outcome_hash,
+            )
+            .order_by(ForwardReturnPathRow.path_sequence)
+            .all()
+        )
 
 
 @dataclass(frozen=True)
