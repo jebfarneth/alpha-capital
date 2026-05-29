@@ -5,13 +5,15 @@ This module freezes adapter-sourced context beside an assembled M4
 change M4 firing logic, price inputs, identity guards, or downstream ranking.
 
 SIGNAL_CONTEXT limitations:
-  - Polygon short-interest and short-volume typed rows do not expose a stable
-    publication/dissemination timestamp as first-class fields. When a raw row
-    lacks an explicit publication/dissemination timestamp, this module applies
+  - Polygon short-interest, short-volume, splits, and dividends expose event
+    dates that are not availability proof. When a row lacks an explicit
+    publication/announcement/dissemination timestamp, this module applies
     conservative lag constants before treating rows as PIT-eligible. The short
     interest lag is intentionally conservative because FINRA publishes short
     interest on a bi-monthly schedule after the settlement date; short volume
-    uses a smaller daily-publication lag.
+    uses a smaller daily-publication lag. Split/dividend lags are conservative
+    source-adapter assumptions for replay safety when no row-level
+    announcement timestamp is present.
   - Downstream ML feature assembly must never derive a PIT feature directly
     from context event date lists. PIT features must come from
     availability-gated counts/latest fields and source_attempt eligibility.
@@ -19,6 +21,7 @@ SIGNAL_CONTEXT limitations:
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -33,6 +36,7 @@ from alpha.data.contracts import (
     stable_hash,
     utcnow,
 )
+from alpha.db.models import DataLineage, FeatureSnapshot, SignalRegistry
 from alpha.evidence.writer import record_data_lineage
 from alpha.market_calendar import next_us_equity_session
 from alpha.patterns.contracts import PatternInput
@@ -51,6 +55,13 @@ SHORT_INTEREST_DISSEMINATION_LAG_TRADING_DAYS = 10
 # Daily short-volume data is materially fresher than bi-monthly short-interest
 # data, but trade date alone is still not availability proof under replay.
 SHORT_VOLUME_DISSEMINATION_LAG_TRADING_DAYS = 1
+# Polygon split rows expose execution_date as the event date. If the raw row has
+# no announcement/publication timestamp, require several sessions before replay
+# eligibility rather than treating execution_date as availability proof.
+SPLIT_ANNOUNCEMENT_LAG_TRADING_DAYS = 5
+# Dividend rows often expose declaration_date. If not, ex_dividend_date remains
+# event context only and a conservative lag is used for replay eligibility.
+DIVIDEND_ANNOUNCEMENT_LAG_TRADING_DAYS = 1
 SHORT_INTEREST_AVAILABILITY_FIELDS = (
     "disseminated_at",
     "dissemination_date",
@@ -63,6 +74,20 @@ SHORT_INTEREST_AVAILABILITY_FIELDS = (
     "report_timestamp",
 )
 SHORT_VOLUME_AVAILABILITY_FIELDS = SHORT_INTEREST_AVAILABILITY_FIELDS
+CORPORATE_ACTION_AVAILABILITY_FIELDS = (
+    "announcement_date",
+    "announced_at",
+    "announced_date",
+    "declaration_date",
+    "declared_at",
+    "declared_date",
+    "disseminated_at",
+    "dissemination_date",
+    "published_at",
+    "published_utc",
+    "publication_date",
+    "reported_at",
+)
 
 
 def enrich_m4_signal_context(
@@ -97,12 +122,15 @@ def enrich_m4_signal_context(
         "pit_excluded_count": 0,
         "lineage_count": 0,
         "context_reused_count": 0,
+        "context_reused_in_memory_count": 0,
+        "context_enriched_count": 0,
     }
 
     for inp in inputs:
         existing_context = inp.market_data.get("signal_context")
         if _reusable_signal_context(existing_context, cutoff):
             metrics["context_reused_count"] += 1
+            metrics["context_reused_in_memory_count"] += 1
             attempts = _all_attempts(existing_context)
             metrics["source_attempt_count"] += len(attempts)
             metrics["provider_error_count"] += sum(
@@ -141,6 +169,7 @@ def enrich_m4_signal_context(
                 inp.lineage_hashes.append(lineage_hash)
 
         metrics["context_attached_count"] += 1
+        metrics["context_enriched_count"] += 1
         attempts = _all_attempts(context)
         metrics["source_attempt_count"] += len(attempts)
         metrics["provider_error_count"] += sum(
@@ -159,6 +188,79 @@ def enrich_m4_signal_context(
             1 for item in attempts if item.get("status") == "pit_excluded"
         )
         metrics["lineage_count"] += len(lineage_refs)
+
+    return metrics
+
+
+def reuse_persisted_m4_signal_context(
+    inputs: Sequence[PatternInput],
+    *,
+    session: Session,
+    cutoff_timestamp: datetime,
+    decision_date: str,
+) -> Dict[str, Any]:
+    """Seed inputs with already-frozen persisted signal_context when available."""
+
+    cutoff = _ensure_aware(cutoff_timestamp)
+    metrics: Dict[str, Any] = {
+        "context_reused_from_persistence_count": 0,
+        "context_persistence_miss_count": 0,
+        "context_persistence_mismatch_count": 0,
+        "context_persistence_mismatch_reasons": {},
+    }
+
+    for inp in inputs:
+        if _reusable_signal_context(inp.market_data.get("signal_context"), cutoff):
+            continue
+
+        identity_hash = _m4_setup_identity_hash(inp)
+        if not identity_hash:
+            metrics["context_persistence_miss_count"] += 1
+            _increment_reason(metrics, "missing_signal_identity")
+            continue
+
+        signals = (
+            session.query(SignalRegistry)
+            .filter(
+                SignalRegistry.pattern_id == "M4",
+                SignalRegistry.ticker == inp.ticker.upper(),
+                SignalRegistry.trading_date == decision_date,
+            )
+            .all()
+        )
+        if not signals:
+            metrics["context_persistence_miss_count"] += 1
+            continue
+
+        feature: Optional[FeatureSnapshot] = None
+        context: Optional[Dict[str, Any]] = None
+        for signal in signals:
+            candidate = session.get(FeatureSnapshot, signal.feature_snapshot_id)
+            if not _feature_matches_m4_setup(candidate, identity_hash):
+                continue
+            feature = candidate
+            context = _feature_signal_context(feature)
+            break
+
+        if feature is None:
+            metrics["context_persistence_miss_count"] += 1
+            _increment_reason(metrics, "signal_identity_mismatch")
+            continue
+
+        if not _reusable_signal_context(context, cutoff):
+            metrics["context_persistence_mismatch_count"] += 1
+            _increment_reason(metrics, _context_mismatch_reason(context, cutoff))
+            continue
+
+        inp.market_data["signal_context"] = context
+        for lineage_id in _context_lineage_ids(context):
+            if lineage_id and lineage_id not in inp.lineage_ids:
+                inp.lineage_ids.append(lineage_id)
+            lineage = session.get(DataLineage, lineage_id)
+            lineage_hash = getattr(lineage, "raw_payload_hash", None)
+            if lineage_hash and lineage_hash not in inp.lineage_hashes:
+                inp.lineage_hashes.append(lineage_hash)
+        metrics["context_reused_from_persistence_count"] += 1
 
     return metrics
 
@@ -404,8 +506,10 @@ def _polygon_corporate_context(
     register: Callable[[AdapterResponse[Any], str, Dict[str, Any]], Optional[str]],
 ) -> Dict[str, Any]:
     attempts: List[Dict[str, Any]] = []
-    splits: List[Any] = []
-    dividends: List[Any] = []
+    split_rows: List[Any] = []
+    dividend_rows: List[Any] = []
+    eligible_splits: List[Any] = []
+    eligible_dividends: List[Any] = []
 
     split_request = {
         "ticker": ticker,
@@ -418,15 +522,27 @@ def _polygon_corporate_context(
         attempts.append(_unavailable_attempt("Polygon splits", split_request))
     else:
         lineage_id = register(split_resp, "Polygon splits", split_request)
-        splits = list(split_resp.data or []) if split_resp.ok else []
+        split_rows = list(split_resp.data or []) if split_resp.ok else []
+        split_flags: Dict[str, Any] = {}
+        if split_resp.ok:
+            eligible_splits, split_flags = _polygon_availability_eligible_rows(
+                split_rows,
+                split_resp,
+                cutoff,
+                event_date_attr="execution_date",
+                availability_fields=CORPORATE_ACTION_AVAILABILITY_FIELDS,
+                lag_trading_days=SPLIT_ANNOUNCEMENT_LAG_TRADING_DAYS,
+                lag_warning_flag="split_availability_lag_applied",
+            )
         attempts.append(_source_attempt(
             "Polygon splits",
             split_resp,
             split_request,
             lineage_id=lineage_id,
-            status=_matched_no_data_or_pit(list(split_resp.data or []) if split_resp.ok else [], splits)
+            status=_matched_no_data_or_pit(split_rows, eligible_splits)
             if split_resp.ok else None,
-            eligible_rows=len(splits),
+            eligible_rows=len(eligible_splits),
+            extra_warnings=split_flags,
         ))
 
     dividend_request = {
@@ -440,26 +556,45 @@ def _polygon_corporate_context(
         attempts.append(_unavailable_attempt("Polygon dividends", dividend_request))
     else:
         lineage_id = register(dividend_resp, "Polygon dividends", dividend_request)
-        dividends = list(dividend_resp.data or []) if dividend_resp.ok else []
+        dividend_rows = list(dividend_resp.data or []) if dividend_resp.ok else []
+        dividend_flags: Dict[str, Any] = {}
+        if dividend_resp.ok:
+            eligible_dividends, dividend_flags = _polygon_availability_eligible_rows(
+                dividend_rows,
+                dividend_resp,
+                cutoff,
+                event_date_attr="ex_dividend_date",
+                availability_fields=CORPORATE_ACTION_AVAILABILITY_FIELDS,
+                lag_trading_days=DIVIDEND_ANNOUNCEMENT_LAG_TRADING_DAYS,
+                lag_warning_flag="dividend_availability_lag_applied",
+            )
         attempts.append(_source_attempt(
             "Polygon dividends",
             dividend_resp,
             dividend_request,
             lineage_id=lineage_id,
-            status=_matched_no_data_or_pit(list(dividend_resp.data or []) if dividend_resp.ok else [], dividends)
+            status=_matched_no_data_or_pit(dividend_rows, eligible_dividends)
             if dividend_resp.ok else None,
-            eligible_rows=len(dividends),
+            eligible_rows=len(eligible_dividends),
+            extra_warnings=dividend_flags,
         ))
 
-    latest_dividend = _latest_by_date(dividends, "ex_dividend_date")
+    latest_dividend = _latest_by_date(eligible_dividends, "ex_dividend_date")
     context = {
-        "status": "matched" if splits or dividends else _combined_status(attempts),
-        "split_count_window": len(splits),
-        "dividend_count_window": len(dividends),
+        "status": "matched" if eligible_splits or eligible_dividends else _combined_status(attempts),
+        "split_count_window": len(eligible_splits),
+        "dividend_count_window": len(eligible_dividends),
+        "split_event_dates": [
+            _fields(row, ("ticker", "execution_date")) for row in split_rows
+        ],
+        "dividend_event_dates": [
+            _fields(row, ("ticker", "ex_dividend_date", "declaration_date"))
+            for row in dividend_rows
+        ],
         "source_attempts": attempts,
     }
-    if splits:
-        latest_split = _latest_by_date(splits, "execution_date")
+    if eligible_splits:
+        latest_split = _latest_by_date(eligible_splits, "execution_date")
         if latest_split is not None:
             context["latest_split"] = _fields(latest_split, (
                 "ticker",
@@ -941,6 +1076,9 @@ def _source_attempt(
         "status": status,
         "row_count": row_count,
         "eligible_row_count": eligible_rows,
+        "pit_excluded_row_count": (
+            max(row_count - eligible_rows, 0) if eligible_rows is not None else None
+        ),
         "lineage_id": lineage_id,
         "endpoint": resp.lineage.endpoint,
         "query": _json_safe(request),
@@ -959,6 +1097,7 @@ def _unavailable_attempt(source: str, request: Dict[str, Any]) -> Dict[str, Any]
         "status": "unavailable",
         "row_count": 0,
         "eligible_row_count": 0,
+        "pit_excluded_row_count": 0,
         "lineage_id": None,
         "endpoint": None,
         "query": _json_safe(request),
@@ -1051,15 +1190,19 @@ def _polygon_availability_eligible_rows(
     lag_applied = 0
     explicit_timestamp_rows = 0
     explicit_timestamp_excluded = 0
+    explicit_timestamp_fields: List[str] = []
     lag_excluded = 0
     unprovable = 0
     for row in rows:
-        explicit_availability = _polygon_row_availability_timestamp(
+        explicit_result = _polygon_row_availability_timestamp(
             row,
             availability_fields,
         )
-        if explicit_availability is not None:
+        if explicit_result is not None:
+            explicit_availability, explicit_field = explicit_result
             explicit_timestamp_rows += 1
+            if explicit_field not in explicit_timestamp_fields:
+                explicit_timestamp_fields.append(explicit_field)
             if explicit_availability <= cutoff:
                 eligible.append(row)
             else:
@@ -1079,10 +1222,16 @@ def _polygon_availability_eligible_rows(
 
     if lag_applied:
         flags[lag_warning_flag] = True
+        flags["availability_lag_applied"] = True
         flags["availability_lag_applied_rows"] = lag_applied
         flags["availability_lag_trading_days"] = lag_trading_days
     if explicit_timestamp_rows:
         flags["availability_timestamp_rows"] = explicit_timestamp_rows
+        flags["availability_timestamp_field"] = (
+            explicit_timestamp_fields[0]
+            if len(explicit_timestamp_fields) == 1
+            else list(explicit_timestamp_fields)
+        )
     if explicit_timestamp_excluded:
         flags["availability_timestamp_future_rows"] = explicit_timestamp_excluded
     if lag_excluded:
@@ -1095,15 +1244,15 @@ def _polygon_availability_eligible_rows(
 def _polygon_row_availability_timestamp(
     row: Any,
     fields: Sequence[str],
-) -> Optional[datetime]:
+) -> Optional[Tuple[datetime, str]]:
     for field in fields:
         value = _row_or_raw_value(row, field)
         parsed = _datetime_or_none(value)
         if parsed is not None:
-            return parsed
+            return parsed, field
         if isinstance(value, int):
             try:
-                return datetime.fromtimestamp(value, tz=timezone.utc)
+                return datetime.fromtimestamp(value, tz=timezone.utc), field
             except (OverflowError, OSError, ValueError):
                 continue
     return None
@@ -1209,6 +1358,86 @@ def _reusable_signal_context(value: Any, cutoff: datetime) -> bool:
         return False
     asof = _datetime_or_none(value.get("asof_timestamp"))
     return asof == cutoff
+
+
+def _m4_setup_identity_hash(inp: PatternInput) -> Optional[str]:
+    high_52w = inp.market_data.get("high_52w")
+    if high_52w is None:
+        return None
+    try:
+        rounded_high = round(float(high_52w), 6)
+    except (TypeError, ValueError):
+        return None
+    components = {
+        "pattern_id": "M4",
+        "ticker": inp.ticker.upper(),
+        "high_52w": rounded_high,
+        "high_52w_date": inp.market_data.get("high_52w_date"),
+    }
+    return stable_hash({
+        key: value for key, value in components.items()
+        if value is not None and value != ""
+    })
+
+
+def _feature_signal_context(feature: Optional[FeatureSnapshot]) -> Optional[Dict[str, Any]]:
+    payload = _feature_payload(feature)
+    context = payload.get("signal_context") if isinstance(payload, dict) else None
+    return context if isinstance(context, dict) else None
+
+
+def _feature_matches_m4_setup(
+    feature: Optional[FeatureSnapshot],
+    detector_identity_hash: str,
+) -> bool:
+    payload = _feature_payload(feature)
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("detector_signal_identity_hash") == detector_identity_hash:
+        return True
+    components = payload.get("signal_identity_components")
+    if isinstance(components, dict):
+        return components.get("detector_signal_identity_hash") == detector_identity_hash
+    return False
+
+
+def _feature_payload(feature: Optional[FeatureSnapshot]) -> Optional[Dict[str, Any]]:
+    if feature is None:
+        return None
+    try:
+        payload = json.loads(feature.feature_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _context_mismatch_reason(context: Optional[Dict[str, Any]], cutoff: datetime) -> str:
+    if not isinstance(context, dict) or not context:
+        return "missing_signal_context"
+    if context.get("schema_version") != SOURCE_CONTEXT_VERSION:
+        return "schema_mismatch"
+    if _datetime_or_none(context.get("asof_timestamp")) != cutoff:
+        return "asof_mismatch"
+    return "not_reusable"
+
+
+def _increment_reason(metrics: Dict[str, Any], reason: str) -> None:
+    reasons = metrics.setdefault("context_persistence_mismatch_reasons", {})
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def _context_lineage_ids(value: Any) -> List[str]:
+    ids: List[str] = []
+    if isinstance(value, dict):
+        lineage_id = value.get("lineage_id")
+        if isinstance(lineage_id, str) and lineage_id:
+            ids.append(lineage_id)
+        for nested in value.values():
+            ids.extend(_context_lineage_ids(nested))
+    elif isinstance(value, list):
+        for item in value:
+            ids.extend(_context_lineage_ids(item))
+    return list(dict.fromkeys(ids))
 
 
 def _latest_by_date(rows: Sequence[Any], attr: str) -> Optional[Any]:

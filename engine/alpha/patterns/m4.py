@@ -162,7 +162,7 @@ def build_m4_source_features(
     set_signal_identity(
         features,
         pattern_id=PatternId.M4,
-        ticker=inp.ticker,
+        ticker=inp.ticker.upper(),
         components={
             "high_52w": round(high_52w, 6),
             "high_52w_date": inp.market_data.get("high_52w_date"),

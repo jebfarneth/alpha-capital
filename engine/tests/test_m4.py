@@ -866,6 +866,34 @@ class TestM4Hashes:
         })
         assert result.output_hashes["features"] == expected
 
+    def test_signal_identity_canonicalizes_ticker_case(self):
+        det = M4Detector()
+        market_data = _m4_base_data(
+            price=11.00,
+            high_52w=10.00,
+            high_52w_date="2026-05-19",
+        )
+        upper = det.detect(PatternInput(
+            ticker="ACME",
+            asof_timestamp=_ts(),
+            market_data=market_data,
+            lineage_hashes=["h"],
+        ))
+        lower = det.detect(PatternInput(
+            ticker="acme",
+            asof_timestamp=_ts(),
+            market_data=market_data,
+            lineage_hashes=["h"],
+        ))
+
+        upper_features = upper.features.features
+        lower_features = lower.features.features
+        assert lower_features["signal_identity_components"]["ticker"] == "ACME"
+        assert (
+            lower_features["signal_identity_hash"]
+            == upper_features["signal_identity_hash"]
+        )
+
 
 # -----------------------------------------------------------------------
 # Evidence bridge

@@ -15,7 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
-from alpha.assembly.signal_context import enrich_m4_signal_context
+from alpha.assembly.signal_context import (
+    enrich_m4_signal_context,
+    reuse_persisted_m4_signal_context,
+)
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import record_data_lineage
@@ -194,6 +197,12 @@ class M4DailyAssemblyJob(BaseJob):
 
         signal_context_metrics: Dict[str, Any] = {}
         if self._enable_signal_context:
+            persisted_context_metrics = reuse_persisted_m4_signal_context(
+                assembly.inputs,
+                session=self._session,
+                cutoff_timestamp=cutoff_timestamp,
+                decision_date=decision_date,
+            )
             signal_context_metrics = enrich_m4_signal_context(
                 assembly.inputs,
                 session=self._session,
@@ -204,6 +213,7 @@ class M4DailyAssemblyJob(BaseJob):
                 evidence_session_date=evidence_session_date,
                 job_run_id=ctx.job_run_id,
             )
+            signal_context_metrics.update(persisted_context_metrics)
 
         if not assembly.inputs:
             return JobResult(

@@ -159,10 +159,19 @@ def _adapter_response(
 
 
 class FakePolygonContextAdapter:
-    def __init__(self, *, short_interest_rows=None, short_volume_rows=None):
+    def __init__(
+        self,
+        *,
+        short_interest_rows=None,
+        short_volume_rows=None,
+        split_rows=None,
+        dividend_rows=None,
+    ):
         self.calls = []
         self.short_interest_rows = short_interest_rows
         self.short_volume_rows = short_volume_rows
+        self.split_rows = split_rows
+        self.dividend_rows = dividend_rows
 
     def get_short_interest(self, **kwargs):
         self.calls.append(("get_short_interest", kwargs))
@@ -198,20 +207,19 @@ class FakePolygonContextAdapter:
 
     def get_splits(self, **kwargs):
         self.calls.append(("get_splits", kwargs))
+        rows = self.split_rows if self.split_rows is not None else []
         return _adapter_response(
             provider="Polygon",
             endpoint="/stocks/v1/splits",
             asof=kwargs["asof"],
-            data=[],
+            data=rows,
         )
 
     def get_dividends(self, **kwargs):
         self.calls.append(("get_dividends", kwargs))
-        return _adapter_response(
-            provider="Polygon",
-            endpoint="/stocks/v1/dividends",
-            asof=kwargs["asof"],
-            data=[
+        rows = self.dividend_rows
+        if rows is None:
+            rows = [
                 SimpleNamespace(
                     ticker="LCUT",
                     ex_dividend_date="2026-05-20",
@@ -219,8 +227,14 @@ class FakePolygonContextAdapter:
                     dividend_type="CD",
                     distribution_type="regular",
                     frequency=4,
+                    declaration_date="2026-05-01",
                 )
-            ],
+            ]
+        return _adapter_response(
+            provider="Polygon",
+            endpoint="/stocks/v1/dividends",
+            asof=kwargs["asof"],
+            data=rows,
         )
 
     def get_news(self, **kwargs):
@@ -262,6 +276,7 @@ class FakeBenzingaContextAdapter:
                     tickers=["LCUT"],
                     channels=["general"],
                     source="Benzinga",
+                    body="raw provider article body",
                 )
             ],
         )
@@ -493,6 +508,8 @@ def test_m4_daily_signal_context_persists_attempts_lineage_and_pit_context(db_se
     assert result.metrics["signal_context"]["provider_error_count"] == 1
     feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
     feature_json = json.loads(feature.feature_json)
+    assert "raw provider article body" not in feature.feature_json
+    assert "raw_payload" not in feature.feature_json
     context = feature_json["signal_context"]
     assert context["polygon_short_interest"]["short_interest"] == 1200
     assert context["polygon_short_volume"]["source_attempts"][0]["status"] == "no_data"
@@ -525,6 +542,97 @@ def test_m4_daily_signal_context_persists_attempts_lineage_and_pit_context(db_se
         for attempt in category.get("source_attempts", [])
     ]
     assert any(lineage_id in lineage_ids for lineage_id in context_lineage_ids if lineage_id)
+
+
+def test_m4_daily_reuses_persisted_signal_context_without_refetch(db_session):
+    _setup_canonical_universe(db_session)
+    evidence_day = date(2026, 5, 22)
+    adapter = FakeHistoricalAdapter(_m4_breakout_bars(evidence_day))
+    first_polygon = FakePolygonContextAdapter()
+    first_benzinga = FakeBenzingaContextAdapter()
+    first_job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=first_polygon,
+        benzinga_adapter=first_benzinga,
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+    )
+
+    first_result = run_job(db_session, first_job, params={})
+    feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
+    frozen_context = json.loads(feature.feature_json)["signal_context"]
+    frozen_feature_json = feature.feature_json
+
+    second_polygon = FakePolygonContextAdapter(short_interest_rows=[
+        SimpleNamespace(
+            ticker="LCUT",
+            settlement_date="2026-05-01",
+            short_interest=999999,
+            raw={"published_utc": "2026-05-02T12:00:00Z"},
+        )
+    ])
+    second_benzinga = FakeBenzingaContextAdapter()
+    second_job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=second_polygon,
+        benzinga_adapter=second_benzinga,
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+    )
+
+    second_result = run_job(db_session, second_job, params={})
+
+    assert first_result.ok
+    assert second_result.ok
+    assert second_polygon.calls == []
+    assert second_benzinga.calls == []
+    metrics = second_result.metrics["signal_context"]
+    assert metrics["context_reused_from_persistence_count"] == 1
+    assert metrics["context_reused_in_memory_count"] == 1
+    assert metrics["context_enriched_count"] == 0
+    assert db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").count() == 1
+    feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
+    assert feature.feature_json == frozen_feature_json
+    assert json.loads(feature.feature_json)["signal_context"] == frozen_context
+
+
+def test_m4_daily_reenriches_when_persisted_signal_context_asof_mismatches(db_session):
+    _setup_canonical_universe(db_session)
+    evidence_day = date(2026, 5, 22)
+    adapter = FakeHistoricalAdapter(_m4_breakout_bars(evidence_day))
+    first_job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=FakePolygonContextAdapter(),
+        benzinga_adapter=FakeBenzingaContextAdapter(),
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+    )
+    first_result = run_job(db_session, first_job, params={})
+    assert first_result.ok
+
+    feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
+    feature_payload = json.loads(feature.feature_json)
+    feature_payload["signal_context"]["asof_timestamp"] = "2026-05-21T20:00:00+00:00"
+    feature.feature_json = json.dumps(feature_payload, sort_keys=True)
+    db_session.flush()
+
+    second_polygon = FakePolygonContextAdapter()
+    second_job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        polygon_adapter=second_polygon,
+        benzinga_adapter=FakeBenzingaContextAdapter(),
+        run_timestamp=datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc),
+    )
+    second_result = run_job(db_session, second_job, params={})
+
+    assert second_result.ok
+    assert second_polygon.calls
+    metrics = second_result.metrics["signal_context"]
+    assert metrics["context_reused_from_persistence_count"] == 0
+    assert metrics["context_persistence_mismatch_count"] == 1
+    assert metrics["context_persistence_mismatch_reasons"] == {"asof_mismatch": 1}
+    assert metrics["context_enriched_count"] == 1
 
 
 def test_polygon_short_interest_availability_lag_excludes_unpublished_recent_row(db_session):
@@ -666,6 +774,199 @@ def test_polygon_short_row_event_date_alone_is_context_not_eligibility(db_sessio
     assert attempt["warnings"]["availability_lag_excluded_rows"] == 1
 
 
+def test_polygon_split_availability_excludes_future_announcement_and_selects_available(db_session):
+    cutoff = us_equity_session_close_timestamp(date(2026, 5, 22))
+    inp = PatternInput(
+        ticker="LCUT",
+        asof_timestamp=cutoff,
+        market_data={},
+        lineage_hashes=["base-hash"],
+    )
+    polygon = FakePolygonContextAdapter(
+        short_interest_rows=[],
+        split_rows=[
+            SimpleNamespace(
+                ticker="LCUT",
+                execution_date="2026-05-01",
+                split_from=Decimal("1"),
+                split_to=Decimal("2"),
+                raw={"announcement_date": "2026-04-25"},
+            ),
+            SimpleNamespace(
+                ticker="LCUT",
+                execution_date="2026-05-22",
+                split_from=Decimal("1"),
+                split_to=Decimal("4"),
+                raw={"announcement_date": "2026-05-26"},
+            ),
+        ],
+        dividend_rows=[],
+    )
+
+    enrich_m4_signal_context(
+        [inp],
+        session=db_session,
+        polygon_adapter=polygon,
+        cutoff_timestamp=cutoff,
+        decision_date="2026-05-26",
+        evidence_session_date="2026-05-22",
+    )
+
+    context = inp.market_data["signal_context"]["polygon_corporate_actions"]
+    assert context["status"] == "matched"
+    assert context["split_count_window"] == 1
+    assert context["latest_split"]["execution_date"] == "2026-05-01"
+    assert context["split_event_dates"] == [
+        {"ticker": "LCUT", "execution_date": "2026-05-01"},
+        {"ticker": "LCUT", "execution_date": "2026-05-22"},
+    ]
+    attempt = [
+        item for item in context["source_attempts"]
+        if item["source"] == "Polygon splits"
+    ][0]
+    assert attempt["status"] == "matched"
+    assert attempt["eligible_row_count"] == 1
+    assert attempt["pit_excluded_row_count"] == 1
+    assert attempt["warnings"]["availability_timestamp_field"] == "announcement_date"
+    assert attempt["warnings"]["availability_timestamp_future_rows"] == 1
+
+
+def test_polygon_dividend_availability_excludes_future_declaration_and_selects_available(db_session):
+    cutoff = us_equity_session_close_timestamp(date(2026, 5, 22))
+    inp = PatternInput(
+        ticker="LCUT",
+        asof_timestamp=cutoff,
+        market_data={},
+        lineage_hashes=["base-hash"],
+    )
+    polygon = FakePolygonContextAdapter(
+        short_interest_rows=[],
+        split_rows=[],
+        dividend_rows=[
+            SimpleNamespace(
+                ticker="LCUT",
+                ex_dividend_date="2026-05-20",
+                cash_amount=Decimal("0.05"),
+                dividend_type="CD",
+                declaration_date="2026-05-01",
+            ),
+            SimpleNamespace(
+                ticker="LCUT",
+                ex_dividend_date="2026-05-22",
+                cash_amount=Decimal("0.10"),
+                dividend_type="CD",
+                declaration_date="2026-05-26",
+            ),
+        ],
+    )
+
+    enrich_m4_signal_context(
+        [inp],
+        session=db_session,
+        polygon_adapter=polygon,
+        cutoff_timestamp=cutoff,
+        decision_date="2026-05-26",
+        evidence_session_date="2026-05-22",
+    )
+
+    context = inp.market_data["signal_context"]["polygon_corporate_actions"]
+    assert context["status"] == "matched"
+    assert context["dividend_count_window"] == 1
+    assert context["last_dividend"]["ex_dividend_date"] == "2026-05-20"
+    assert context["dividend_proximity_days"] == -2
+    assert context["dividend_event_dates"] == [
+        {
+            "ticker": "LCUT",
+            "ex_dividend_date": "2026-05-20",
+            "declaration_date": "2026-05-01",
+        },
+        {
+            "ticker": "LCUT",
+            "ex_dividend_date": "2026-05-22",
+            "declaration_date": "2026-05-26",
+        },
+    ]
+    attempt = [
+        item for item in context["source_attempts"]
+        if item["source"] == "Polygon dividends"
+    ][0]
+    assert attempt["status"] == "matched"
+    assert attempt["eligible_row_count"] == 1
+    assert attempt["pit_excluded_row_count"] == 1
+    assert attempt["warnings"]["availability_timestamp_field"] == "declaration_date"
+    assert attempt["warnings"]["availability_timestamp_future_rows"] == 1
+
+
+def test_polygon_corporate_action_event_date_alone_is_context_not_eligibility(db_session):
+    cutoff = us_equity_session_close_timestamp(date(2026, 5, 22))
+    inp = PatternInput(
+        ticker="LCUT",
+        asof_timestamp=cutoff,
+        market_data={},
+        lineage_hashes=["base-hash"],
+    )
+    polygon = FakePolygonContextAdapter(
+        short_interest_rows=[],
+        split_rows=[
+            SimpleNamespace(
+                ticker="LCUT",
+                execution_date="2026-05-22",
+                split_from=Decimal("1"),
+                split_to=Decimal("4"),
+            ),
+        ],
+        dividend_rows=[
+            SimpleNamespace(
+                ticker="LCUT",
+                ex_dividend_date="2026-05-22",
+                cash_amount=Decimal("0.10"),
+            ),
+        ],
+    )
+
+    enrich_m4_signal_context(
+        [inp],
+        session=db_session,
+        polygon_adapter=polygon,
+        cutoff_timestamp=cutoff,
+        decision_date="2026-05-26",
+        evidence_session_date="2026-05-22",
+    )
+
+    context = inp.market_data["signal_context"]["polygon_corporate_actions"]
+    assert context["status"] == "pit_excluded"
+    assert context["split_count_window"] == 0
+    assert context["dividend_count_window"] == 0
+    assert "latest_split" not in context
+    assert "last_dividend" not in context
+    assert context["split_event_dates"] == [
+        {"ticker": "LCUT", "execution_date": "2026-05-22"}
+    ]
+    assert context["dividend_event_dates"] == [
+        {"ticker": "LCUT", "ex_dividend_date": "2026-05-22"}
+    ]
+    split_attempt = [
+        item for item in context["source_attempts"]
+        if item["source"] == "Polygon splits"
+    ][0]
+    dividend_attempt = [
+        item for item in context["source_attempts"]
+        if item["source"] == "Polygon dividends"
+    ][0]
+    assert split_attempt["status"] == "pit_excluded"
+    assert split_attempt["eligible_row_count"] == 0
+    assert split_attempt["pit_excluded_row_count"] == 1
+    assert split_attempt["warnings"]["split_availability_lag_applied"] is True
+    assert split_attempt["warnings"]["availability_lag_applied"] is True
+    assert split_attempt["warnings"]["availability_lag_excluded_rows"] == 1
+    assert dividend_attempt["status"] == "pit_excluded"
+    assert dividend_attempt["eligible_row_count"] == 0
+    assert dividend_attempt["pit_excluded_row_count"] == 1
+    assert dividend_attempt["warnings"]["dividend_availability_lag_applied"] is True
+    assert dividend_attempt["warnings"]["availability_lag_applied"] is True
+    assert dividend_attempt["warnings"]["availability_lag_excluded_rows"] == 1
+
+
 def test_signal_context_reuses_matching_frozen_context_without_refetch(db_session):
     cutoff = us_equity_session_close_timestamp(date(2026, 5, 22))
     existing = {
@@ -696,6 +997,7 @@ def test_signal_context_reuses_matching_frozen_context_without_refetch(db_sessio
     assert inp.market_data["signal_context"] is existing
     assert polygon.calls == []
     assert metrics["context_reused_count"] == 1
+    assert metrics["context_reused_in_memory_count"] == 1
     assert metrics["context_attached_count"] == 0
 
 
