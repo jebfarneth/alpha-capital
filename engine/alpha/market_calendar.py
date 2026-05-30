@@ -2,8 +2,8 @@
 
 The engine needs completed-session semantics, not just calendar dates.
 This module implements the U.S. equity regular-session calendar rules the
-feature assembly path depends on: weekends, NYSE holidays, and standard
-09:30-16:00 America/New_York session hours.
+feature assembly path depends on: weekends, NYSE holidays, and audited
+09:30-16:00 or early-close America/New_York session hours.
 """
 
 from __future__ import annotations
@@ -15,6 +15,20 @@ from zoneinfo import ZoneInfo
 EASTERN_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN_ET = time(9, 30)
 MARKET_CLOSE_ET = time(16, 0)
+MARKET_EARLY_CLOSE_ET = time(13, 0)
+_NYSE_EARLY_CLOSES: dict[int, frozenset[date]] = {
+    2026: frozenset({
+        date(2026, 11, 27),
+        date(2026, 12, 24),
+    }),
+    2027: frozenset({
+        date(2027, 11, 26),
+    }),
+    2028: frozenset({
+        date(2028, 7, 3),
+        date(2028, 11, 24),
+    }),
+}
 
 
 @dataclass(frozen=True)
@@ -41,14 +55,18 @@ def resolve_us_equity_session(run_timestamp: datetime) -> SessionResolution:
     decision_day = local_ts.date()
     is_session_day = is_us_equity_session(decision_day)
     local_time = local_ts.time()
+    session_close = (
+        us_equity_session_close_time(decision_day)
+        if is_session_day else MARKET_CLOSE_ET
+    )
 
-    if is_session_day and local_time >= MARKET_CLOSE_ET:
+    if is_session_day and local_time >= session_close:
         evidence_day = decision_day
     else:
         evidence_day = previous_us_equity_session(decision_day)
 
     is_premarket = is_session_day and local_time < MARKET_OPEN_ET
-    if is_session_day and local_time < MARKET_CLOSE_ET:
+    if is_session_day and local_time < session_close:
         next_execution_day = decision_day
     else:
         next_execution_day = next_us_equity_session(decision_day + timedelta(days=1))
@@ -64,6 +82,22 @@ def resolve_us_equity_session(run_timestamp: datetime) -> SessionResolution:
 def is_us_equity_session(day: date) -> bool:
     """Return True when `day` is a regular NYSE trading session."""
     return day.weekday() < 5 and day not in nyse_holidays(day.year)
+
+
+def nyse_early_closes(year: int) -> set[date]:
+    """Curated 13:00 ET NYSE equity early closes for audited years."""
+
+    early_closes = set(_NYSE_EARLY_CLOSES.get(year, frozenset()))
+    holidays = nyse_holidays(year)
+    invalid = [
+        day
+        for day in early_closes
+        if day.year != year or day in holidays or not is_us_equity_session(day)
+    ]
+    if invalid:
+        bad = ", ".join(day.isoformat() for day in sorted(invalid))
+        raise ValueError(f"invalid NYSE early-close date(s): {bad}")
+    return early_closes
 
 
 def previous_us_equity_session(day: date) -> date:
@@ -99,12 +133,24 @@ def nth_us_equity_session(day: date, n: int) -> date:
 def us_equity_session_close_timestamp(day: date) -> datetime:
     """Return the regular-session close timestamp for `day` in UTC.
 
-    The current resolver models regular 16:00 ET closes. Half days and
-    unscheduled closures remain explicit future work.
+    Uses audited early-close times where known and degrades future unknown
+    years to the regular 16:00 ET close.
     """
     if not is_us_equity_session(day):
         raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
-    return datetime.combine(day, MARKET_CLOSE_ET, EASTERN_TZ).astimezone(ZoneInfo("UTC"))
+    return datetime.combine(
+        day, us_equity_session_close_time(day), EASTERN_TZ
+    ).astimezone(ZoneInfo("UTC"))
+
+
+def us_equity_session_close_time(day: date) -> time:
+    """Return the day-specific NYSE equity close time in America/New_York."""
+
+    if not is_us_equity_session(day):
+        raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
+    if day in nyse_early_closes(day.year):
+        return MARKET_EARLY_CLOSE_ET
+    return MARKET_CLOSE_ET
 
 
 def us_equity_session_open_timestamp(day: date) -> datetime:

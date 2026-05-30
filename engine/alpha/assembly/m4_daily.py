@@ -476,7 +476,7 @@ def assemble_m4_daily(
         inp = build_pattern_input(
             ticker=ticker,
             pattern_id=PATTERN_ID,
-            asof_timestamp=_ensure_aware(asof) or cutoff_timestamp,
+            asof_timestamp=cutoff_timestamp,
             validated_fields=validated,
             lineage_ids=lineage_ids,
             lineage_hashes=lineage_hashes,

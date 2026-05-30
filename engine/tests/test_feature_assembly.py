@@ -57,9 +57,14 @@ from alpha.patterns.contracts import (
 )
 from alpha.patterns.m4 import M4Detector
 from alpha.evidence.writer import record_data_lineage
+import alpha.market_calendar as market_calendar
 from alpha.market_calendar import (
     is_us_equity_session,
+    nyse_early_closes,
+    nyse_holidays,
     resolve_us_equity_session,
+    us_equity_session_close_time,
+    us_equity_session_close_timestamp,
 )
 
 
@@ -144,6 +149,17 @@ def _prior_weekdays(end_day: date_type, n: int) -> List[date_type]:
             days.append(cursor)
         cursor -= timedelta(days=1)
     return list(reversed(days))
+
+
+def _day_after_thanksgiving(year: int) -> date_type:
+    cursor = date_type(year, 11, 1)
+    thursdays = 0
+    while True:
+        if cursor.weekday() == 3:
+            thursdays += 1
+            if thursdays == 4:
+                return cursor + timedelta(days=1)
+        cursor += timedelta(days=1)
 
 
 def _make_snapshot(
@@ -379,6 +395,114 @@ class TestFrameworkLookahead:
 
 
 class TestMarketSessionResolver:
+    def test_early_close_timestamp_uses_1pm_et(self):
+        assert us_equity_session_close_timestamp(
+            date_type(2026, 11, 27)
+        ) == datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)
+        assert us_equity_session_close_timestamp(
+            date_type(2026, 12, 24)
+        ) == datetime(2026, 12, 24, 18, 0, tzinfo=timezone.utc)
+        assert us_equity_session_close_timestamp(
+            date_type(2026, 12, 23)
+        ) == datetime(2026, 12, 23, 21, 0, tzinfo=timezone.utc)
+
+    def test_early_close_summer_timestamp_is_dst_correct(self):
+        assert us_equity_session_close_timestamp(
+            date_type(2028, 7, 3)
+        ) == datetime(2028, 7, 3, 17, 0, tzinfo=timezone.utc)
+
+    def test_early_close_before_close_uses_prior_completed_session(self):
+        run_ts = datetime(
+            2026, 11, 27, 12, 59, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.evidence_session_date == "2026-11-25"
+        assert resolved.next_execution_session == "2026-11-27"
+
+    def test_early_close_at_close_uses_same_completed_session(self):
+        run_ts = datetime(
+            2026, 11, 27, 13, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.evidence_session_date == "2026-11-27"
+        assert resolved.next_execution_session == "2026-11-30"
+
+    def test_early_close_after_close_uses_same_completed_session(self):
+        run_ts = datetime(
+            2026, 11, 27, 15, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        resolved = resolve_us_equity_session(run_ts)
+
+        assert resolved.evidence_session_date == "2026-11-27"
+        assert resolved.next_execution_session == "2026-11-30"
+
+    def test_non_early_close_regular_day_still_uses_4pm(self):
+        before_close = resolve_us_equity_session(datetime(
+            2026, 11, 25, 15, 59, tzinfo=ZoneInfo("America/New_York")
+        ))
+        at_close = resolve_us_equity_session(datetime(
+            2026, 11, 25, 16, 0, tzinfo=ZoneInfo("America/New_York")
+        ))
+
+        assert before_close.evidence_session_date == "2026-11-24"
+        assert at_close.evidence_session_date == "2026-11-25"
+
+    def test_early_close_set_integrity_and_future_degradation(self):
+        assert nyse_early_closes(2026) == {
+            date_type(2026, 11, 27),
+            date_type(2026, 12, 24),
+        }
+        assert nyse_early_closes(2027) == {date_type(2027, 11, 26)}
+        assert nyse_early_closes(2028) == {
+            date_type(2028, 7, 3),
+            date_type(2028, 11, 24),
+        }
+        assert nyse_early_closes(2099) == set()
+        for year in (2026, 2027, 2028):
+            holidays = nyse_holidays(year)
+            for day in nyse_early_closes(year):
+                assert is_us_equity_session(day)
+                assert day not in holidays
+
+    def test_early_close_table_extension_alarm(self):
+        table_year = max(market_calendar._NYSE_EARLY_CLOSES)
+        next_black_friday = _day_after_thanksgiving(table_year + 1)
+        extension_deadline = date_type(table_year, 1, 1)
+
+        assert date_type.today() < extension_deadline, (
+            "_NYSE_EARLY_CLOSES must be extended before the audited horizon "
+            f"year begins; next recurring half-day is {next_black_friday}"
+        )
+
+    @pytest.mark.parametrize(
+        ("year", "bad_day"),
+        [
+            (2026, date_type(2026, 12, 25)),
+            (2026, date_type(2026, 11, 28)),
+            (2026, date_type(2027, 11, 26)),
+        ],
+    )
+    def test_early_close_integrity_guard_rejects_bad_entries(
+        self,
+        monkeypatch,
+        year,
+        bad_day,
+    ):
+        monkeypatch.setattr(
+            market_calendar,
+            "_NYSE_EARLY_CLOSES",
+            {year: frozenset({bad_day})},
+        )
+
+        with pytest.raises(ValueError, match="invalid NYSE early-close date"):
+            nyse_early_closes(year)
+
+    def test_session_close_time_rejects_non_session(self):
+        with pytest.raises(ValueError, match="not a regular U.S. equity session"):
+            us_equity_session_close_time(date_type(2026, 12, 25))
+
     def test_memorial_day_2026_tuesday_premarket(self):
         run_ts = datetime(
             2026, 5, 26, 4, 0, tzinfo=ZoneInfo("America/New_York")

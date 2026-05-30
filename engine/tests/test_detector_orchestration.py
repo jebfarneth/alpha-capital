@@ -582,6 +582,8 @@ class TestStrictRefusal:
         assert result.status == "partial_failed"
         assert diag["detector_status"] == "failed"
         assert diag["lookahead_failure_count"] == 1
+        assert "lookahead_guard_failed" in diag["errors"][0]["error"]
+        assert "missing_lineage_hashes" in diag["errors"][0]["error"]
 
     def test_blank_lineage_hash_fails_guard(self, db_session):
         _setup_canonical_universe(db_session)
@@ -640,6 +642,108 @@ class TestStrictRefusal:
 
         assert passed is True
         assert reason is None
+
+    def test_evidence_close_ceiling_rejects_after_close_timestamp(self):
+        passed, reason = check_lookahead_guard(
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=datetime(2026, 11, 27, 18, 1, tzinfo=timezone.utc),
+                market_data={"evidence_session_date": "2026-11-27"},
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+            trading_date="2026-11-27",
+            max_asof_timestamp=datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc),
+            max_asof_label="evidence session close",
+        )
+
+        assert passed is False
+        assert "after evidence session close" in reason
+
+    def test_future_evidence_session_date_fails_closed(self, db_session):
+        _setup_canonical_universe(db_session, tickers=["ACME"])
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
+                market_data={
+                    "price": 5.0,
+                    "evidence_session_date": "2026-05-21",
+                },
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+        ]
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"TEST_FIRES": inputs},
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert db_session.query(SignalRegistry).count() == 0
+        diag = result.metrics["detector_diagnostics"][0]
+        assert result.status == "partial_failed"
+        assert diag["lookahead_failure_count"] == 1
+        assert diag["fired_count"] == 0
+        assert "future_evidence_session_date" in diag["errors"][0]["error"]
+
+    def test_same_day_evidence_session_date_still_passes(self, db_session):
+        _setup_canonical_universe(db_session, tickers=["ACME"])
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
+                market_data={
+                    "price": 5.0,
+                    "evidence_session_date": "2026-05-20",
+                },
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+        ]
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"TEST_FIRES": inputs},
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        diag = result.metrics["detector_diagnostics"][0]
+        assert result.status == "finished"
+        assert diag["lookahead_failure_count"] == 0
+        assert diag["fired_count"] == 1
+        assert db_session.query(SignalRegistry).count() == 1
+
+    def test_missing_evidence_session_date_uses_scan_asof_ceiling(self, db_session):
+        _setup_canonical_universe(db_session, tickers=["ACME"])
+        inputs = [
+            PatternInput(
+                ticker="ACME",
+                asof_timestamp=_ts(),
+                market_data={"price": 5.0},
+                lineage_hashes=["hash1"],
+                universe_snapshot_id="snap-ACME",
+            ),
+        ]
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+            assembled_inputs={"TEST_FIRES": inputs},
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        diag = result.metrics["detector_diagnostics"][0]
+        assert result.status == "finished"
+        assert diag["lookahead_failure_count"] == 0
+        assert diag["fired_count"] == 1
+        assert db_session.query(SignalRegistry).count() == 1
 
     def test_detector_feature_guard_false_refuses_signal(self, db_session):
         _setup_canonical_universe(db_session)

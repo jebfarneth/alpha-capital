@@ -66,6 +66,23 @@ def test_clock_anchors_evidence_on_explicit_decision_date():
     assert clock["effective_run_timestamp"].startswith("2026-05-22T20:00:00")
 
 
+def test_explicit_decision_date_early_close_anchors_to_early_close_asof():
+    run_ts = _utc(2026, 12, 1, 20, 0)
+    clock = resolve_canonical_clock(run_ts, "2026-11-27")
+
+    assert clock["decision_date"] == "2026-11-27"
+    assert clock["evidence_session_date"] == "2026-11-27"
+    assert clock["effective_run_timestamp"].startswith("2026-11-27T18:00:00+00:00")
+
+
+def test_default_early_close_timestamp_is_not_noop_and_uses_same_day_after_1pm():
+    clock = resolve_canonical_clock(_utc(2026, 11, 27, 20, 0), None)
+
+    assert clock["decision_date"] == "2026-11-27"
+    assert clock["evidence_session_date"] == "2026-11-27"
+    assert clock["next_execution_session"] == "2026-11-30"
+
+
 def test_health_report_exposes_pinned_evidence_asof_timestamp(db_session):
     _add_feature(db_session, "feature-asof", "ASOF")
     _add_signal(db_session, "signal-asof", "feature-asof", "ASOF")

@@ -43,11 +43,13 @@ def _setup_canonical_universe(
     *,
     trading_date: str = "2026-05-26",
     tickers=("LCUT",),
+    scan_asof_timestamp: datetime | None = None,
 ):
+    scan_asof = scan_asof_timestamp or _scan_ts()
     scan = UniverseScan(
         scan_id="m4-prod-scan",
         trading_date=trading_date,
-        asof_timestamp=_scan_ts(),
+        asof_timestamp=scan_asof,
         raw_count=len(tickers),
         deduped_count=len(tickers),
         included_count=len(tickers),
@@ -67,7 +69,7 @@ def _setup_canonical_universe(
             universe_snapshot_id=f"snap-{ticker}",
             scan_id=scan.scan_id,
             ticker=ticker,
-            asof_timestamp=_scan_ts(),
+            asof_timestamp=scan_asof,
             market_cap=75_000_000,
             price=8.83,
             primary_exchange="NASDAQ",
@@ -504,6 +506,53 @@ def test_m4_production_job_caps_fetch_at_evidence_session_and_persists(db_sessio
     assert signal.next_execution_session == "2026-05-26"
     assert json.loads(feature.feature_json)["next_execution_session"] == "2026-05-26"
     assert json.loads(feature.feature_json)["signal_context"]["schema_version"] == SOURCE_CONTEXT_VERSION
+
+
+def test_m4_production_job_uses_early_close_asof_for_evidence_day(db_session, monkeypatch):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            frozen = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+            if tz is None:
+                return frozen.replace(tzinfo=None)
+            return frozen.astimezone(tz)
+
+    monkeypatch.setattr("alpha.patterns.guards.datetime", FrozenDatetime)
+    evidence_day = date(2026, 11, 27)
+    scan_asof = datetime(2026, 11, 27, 13, 0, tzinfo=timezone.utc)
+    early_close_asof = us_equity_session_close_timestamp(evidence_day)
+    assert scan_asof < early_close_asof
+    _setup_canonical_universe(
+        db_session,
+        trading_date="2026-11-27",
+        scan_asof_timestamp=scan_asof,
+    )
+    adapter = FakeHistoricalAdapter(_m4_breakout_bars(evidence_day))
+    job = M4DailyAssemblyJob(
+        db_session,
+        adapter=adapter,
+        run_timestamp=datetime(2026, 11, 27, 20, 0, tzinfo=timezone.utc),
+    )
+
+    result = run_job(db_session, job, params={})
+
+    assert result.ok
+    assert result.metrics["decision_date"] == "2026-11-27"
+    assert result.metrics["evidence_session_date"] == "2026-11-27"
+    assert adapter.calls[0]["asof"] == early_close_asof
+    assert result.metrics["fetch_asof_timestamp"] == early_close_asof.isoformat()
+    assert result.metrics["orchestration"]["total_signals_persisted"] == 1
+    diag = result.metrics["orchestration"]["detector_diagnostics"][0]
+    assert diag["lookahead_failure_count"] == 0
+
+    feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
+    signal = db_session.query(SignalRegistry).filter_by(ticker="LCUT").one()
+    assert _as_utc(feature.asof_timestamp) == early_close_asof
+    assert _as_utc(signal.signal_timestamp) == early_close_asof
+    assert _as_utc(feature.asof_timestamp) != scan_asof
+    assert json.loads(feature.feature_json)["signal_context"]["asof_timestamp"] == (
+        early_close_asof.isoformat()
+    )
 
 
 def test_m4_daily_signal_context_persists_attempts_lineage_and_pit_context(db_session):

@@ -32,6 +32,7 @@ from alpha.db.models import (
     UniverseSnapshot,
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.market_calendar import us_equity_session_close_timestamp
 from alpha.patterns.contracts import (
     BasePatternDetector,
     PatternDetectionResult,
@@ -150,6 +151,7 @@ def check_lookahead_guard(
     trading_date: str,
     *,
     max_asof_timestamp: Optional[datetime] = None,
+    max_asof_label: str = "allowed asof",
 ) -> Tuple[bool, Optional[str]]:
     """Real lookahead guard — not hardcoded True.
 
@@ -176,7 +178,7 @@ def check_lookahead_guard(
             return (
                 False,
                 "asof_timestamp "
-                f"{inp.asof_timestamp.isoformat()} is after canonical scan asof "
+                f"{inp.asof_timestamp.isoformat()} is after {max_asof_label} "
                 f"{max_asof_timestamp.isoformat()}",
             )
     # Check lineage hashes are present and nonblank — proves data provenance exists.
@@ -201,6 +203,22 @@ def _utc_aware_datetime(value: datetime) -> datetime:
 
 def _market_date(value: datetime) -> date:
     return _utc_aware_datetime(value).astimezone(MARKET_TIMEZONE).date()
+
+
+def _input_asof_ceiling(
+    inp: PatternInput,
+    scan_asof_timestamp: Optional[datetime],
+    trading_date: str,
+) -> Tuple[Optional[datetime], str]:
+    evidence_session_date = inp.market_data.get("evidence_session_date")
+    if isinstance(evidence_session_date, str) and evidence_session_date:
+        evidence_day = date.fromisoformat(evidence_session_date)
+        if evidence_day > date.fromisoformat(trading_date):
+            raise ValueError(
+                f"future_evidence_session_date:{evidence_session_date}>{trading_date}"
+            )
+        return us_equity_session_close_timestamp(evidence_day), "evidence session close"
+    return scan_asof_timestamp, "canonical scan asof"
 
 
 def _result_guard_passed(result: PatternDetectionResult) -> Tuple[bool, Optional[str]]:
@@ -565,14 +583,35 @@ class DetectorOrchestrationJob(BaseJob):
                 continue
 
             # Lookahead guard
+            try:
+                max_asof_timestamp, max_asof_label = _input_asof_ceiling(
+                    inp,
+                    scan_asof_timestamp,
+                    trading_date,
+                )
+            except ValueError as exc:
+                diag.lookahead_failure_count += 1
+                diag.skipped_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": f"invalid_evidence_session_date:{exc}",
+                })
+                continue
             pit_passed, pit_reason = check_lookahead_guard(
                 inp,
                 trading_date,
-                max_asof_timestamp=scan_asof_timestamp,
+                max_asof_timestamp=max_asof_timestamp,
+                max_asof_label=max_asof_label,
             )
             if not pit_passed:
                 diag.lookahead_failure_count += 1
                 diag.skipped_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "error": f"lookahead_guard_failed:{pit_reason}",
+                })
                 continue
 
             # Run detector
