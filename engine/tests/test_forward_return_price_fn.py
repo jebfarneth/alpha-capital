@@ -31,6 +31,8 @@ from alpha.jobs.forward_return import (
     M4_PRICE_SOURCE,
     M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF,
     ForwardReturnJob,
+    _canonical_cik10,
+    _security_identity_from_payload,
     current_forward_path_rows,
     m4_entry_exit_plan,
 )
@@ -146,6 +148,100 @@ class FakeHistoricalAdapter:
                 error=self.survivorship_errors_by_ticker[ticker],
             )
         return AdapterResponse(data=events, lineage=lineage)
+
+
+class FakeCikSurvivorshipAdapter:
+    def __init__(self, events_by_ticker: Optional[Dict[str, object]] = None):
+        self.events_by_ticker = events_by_ticker or {}
+        self.calls = []
+
+    def get_survivorship_events(
+        self,
+        ticker,
+        from_date=None,
+        to_date=None,
+        asof=None,
+        cik=None,
+    ):
+        self.calls.append({
+            "ticker": ticker,
+            "from_date": from_date,
+            "to_date": to_date,
+            "asof": asof,
+            "cik": cik,
+        })
+        raw_events = self.events_by_ticker.get(ticker, [])
+        events = [raw_events] if isinstance(raw_events, dict) else list(raw_events or [])
+        return AdapterResponse(
+            data=events,
+            lineage=LineageMeta(
+                provider="TEST_CIK_SURVIVORSHIP",
+                endpoint="/test/cik-survivorship-events",
+                request_timestamp=REQUEST_TS,
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash(events),
+                source_authority="test",
+            ),
+        )
+
+
+class FakeLegacySurvivorshipAdapter:
+    def __init__(self):
+        self.calls = []
+
+    def get_survivorship_events(
+        self,
+        ticker,
+        from_date=None,
+        to_date=None,
+        asof=None,
+    ):
+        self.calls.append({
+            "ticker": ticker,
+            "from_date": from_date,
+            "to_date": to_date,
+            "asof": asof,
+        })
+        return AdapterResponse(
+            data=[],
+            lineage=LineageMeta(
+                provider="TEST_LEGACY_SURVIVORSHIP",
+                endpoint="/test/legacy-survivorship-events",
+                request_timestamp=REQUEST_TS,
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash([]),
+                source_authority="test",
+            ),
+        )
+
+
+class FakeCikHistoricalAdapter(FakeHistoricalAdapter):
+    def get_survivorship_events(
+        self,
+        ticker,
+        from_date=None,
+        to_date=None,
+        asof=None,
+        cik=None,
+    ):
+        self.survivorship_calls.append({
+            "ticker": ticker,
+            "from_date": from_date,
+            "to_date": to_date,
+            "asof": asof,
+            "cik": cik,
+        })
+        return AdapterResponse(
+            data=[],
+            lineage=LineageMeta(
+                provider="TEST_HISTORICAL_CIK_SURVIVORSHIP",
+                endpoint="/test/historical-cik-survivorship-events",
+                request_timestamp=REQUEST_TS,
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash([]),
+                source_authority="test",
+            ),
+        )
 
 
 class FakeBenzingaAdapter:
@@ -758,6 +854,166 @@ def test_missing_exit_price_runs_survivorship_resolver_and_requires_review(db_se
     event = db_session.query(ForwardReturnObservationEvent).one()
     assert event.status == "survivorship_unresolved_review"
     assert "survivorship_request" in json.loads(event.provider_request_json)
+
+
+def test_survivorship_events_source_adapter_receives_signal_cik(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "320193"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    survivorship = FakeCikSurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[survivorship])
+
+    assert survivorship.calls[0]["cik"] == "0000320193"
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert payload["request"]["cik"] == "0000320193"
+    assert payload["request"]["cik_sent"] is True
+
+
+def test_survivorship_events_primary_adapter_receives_signal_cik(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "0000320193"},
+    )
+    adapter = FakeCikHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+
+    _run_job(db_session, adapter)
+
+    assert adapter.survivorship_calls[0]["cik"] == "0000320193"
+
+
+def test_survivorship_events_legacy_adapter_without_cik_signature_still_works(
+    db_session,
+):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "320193"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    survivorship = FakeLegacySurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[survivorship])
+
+    assert survivorship.calls[0]["ticker"] == "ACME"
+    assert "cik" not in survivorship.calls[0]
+    assert _obs(db_session).status == "survivorship_unresolved_review"
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert "cik" not in payload["request"]
+    assert payload["request"]["cik_sent"] is False
+
+
+def test_survivorship_events_without_signal_cik_remains_ticker_only(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    survivorship = FakeCikSurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[survivorship])
+
+    assert survivorship.calls[0]["ticker"] == "ACME"
+    assert survivorship.calls[0]["cik"] is None
+
+
+def test_security_identity_from_payload_extracts_normalized_cik():
+    assert _security_identity_from_payload({
+        "security_identity": {"cik": "320193"},
+    })["cik"] == "0000320193"
+    assert _security_identity_from_payload({
+        "signal_context": {
+            "identity": {
+                "security_identity": {"central_index_key": "0000320193"}
+            }
+        },
+    })["cik"] == "0000320193"
+
+
+@pytest.mark.parametrize("value", [
+    "320193",
+    "0000320193",
+    "CIK0000320193",
+    " cik 0000320193 ",
+    320193,
+])
+def test_canonical_cik10_accepts_clean_cik_forms(value):
+    assert _canonical_cik10(value) == "0000320193"
+
+
+@pytest.mark.parametrize("value", [
+    "0000320193-extra-99",
+    "BBG000B9XRY4",
+    "3.20193e5",
+    "320000.0",
+    "1234567890123",
+    "",
+    "0000000000",
+    None,
+])
+def test_canonical_cik10_rejects_malformed_cik_values(value):
+    assert _canonical_cik10(value) is None
+
+
+def test_malformed_signal_cik_fails_safe_to_ticker_only_survivorship(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "BBG000B9XRY4"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    survivorship = FakeCikSurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[survivorship])
+
+    assert survivorship.calls[0]["ticker"] == "ACME"
+    assert survivorship.calls[0]["cik"] is None
+    assert _obs(db_session).status == "survivorship_unresolved_review"
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert "cik" not in payload["request"]
+    assert payload["request"]["cik_sent"] is False
+
+
+def test_survivorship_events_source_no_match_primary_fallback_order_preserved(
+    db_session,
+):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "320193"},
+    )
+    adapter = FakeHistoricalAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        survivorship_by_ticker={
+            "ACME": {
+                "type": "delisting",
+                "classification": "performance",
+                "source_backed": True,
+            }
+        },
+    )
+    survivorship = FakeCikSurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[survivorship])
+
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    attempts = json.loads(event.provider_request_json)["survivorship_request"][
+        "source_attempts"
+    ]
+    assert survivorship.calls[0]["cik"] == "0000320193"
+    assert adapter.survivorship_calls[0]["ticker"] == "ACME"
+    assert attempts[0]["source"] == "survivorship_events"
+    assert attempts[0]["status"] == "no_match"
+    assert attempts[1]["source"] == "survivorship_events"
+    assert attempts[1]["status"] == "matched"
 
 
 def test_source_backed_performance_delisting_computes_terminal_loss(db_session):

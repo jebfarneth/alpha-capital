@@ -198,6 +198,43 @@ class TestSecEdgarAdapter:
     def _adapter(self, mock_session):
         return SecEdgarAdapter(_edgar_config(), session=mock_session)
 
+    def _edgar_submissions_payload(
+        self,
+        *,
+        accessions=None,
+        forms=None,
+        acceptances=None,
+        files=None,
+    ):
+        accessions = accessions or []
+        row_count = len(accessions)
+        payload = {
+            "filings": {
+                "recent": {
+                    "accessionNumber": accessions,
+                    "form": forms or ["8-K"] * row_count,
+                    "filingDate": ["2026-06-01"] * row_count,
+                    "reportDate": ["2026-06-01"] * row_count,
+                    "acceptanceDateTime": (
+                        acceptances
+                        or ["2026-06-01T12:00:00Z"] * row_count
+                    ),
+                }
+            }
+        }
+        if files is not None:
+            payload["filings"]["files"] = [
+                {"name": name, "filingCount": 1}
+                for name in files
+            ]
+        return payload
+
+    def _edgar_overflow_file_names(self, count):
+        return [
+            f"CIK0000000001-submissions-{idx:03d}.json"
+            for idx in range(1, count + 1)
+        ]
+
     def test_get_company_tickers_parses_exchange_mapping_and_headers(self):
         session = MagicMock(spec=requests.Session)
         session.get.return_value = _mock_response(
@@ -223,6 +260,7 @@ class TestSecEdgarAdapter:
         assert resp.lineage.provider == "SEC_EDGAR"
         assert resp.lineage.endpoint == "/files/company_tickers_exchange.json"
         assert resp.lineage.source_authority == "SEC_EDGAR"
+        assert not (resp.lineage.data_quality_flags or {}).get("cache_hit")
         session.get.assert_called_once_with(
             "https://www.sec.gov/files/company_tickers_exchange.json",
             params={},
@@ -266,6 +304,23 @@ class TestSecEdgarAdapter:
             session.get.call_args.args[0]
             == "https://data.sec.gov/submissions/CIK0000320193.json"
         )
+
+    def test_edgar_non_sec_base_url_is_visible_in_lineage_quality_flags(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {"cik": "320193", "filings": {"recent": {}}},
+        )
+        cfg = SecEdgarConfig(
+            user_agent="Alpha Capital test@example.com",
+            data_base_url="https://example.test",
+        )
+        adapter = SecEdgarAdapter(cfg, session=session)
+
+        resp = adapter.get_company_submissions("320193")
+
+        assert resp.ok
+        assert resp.lineage.data_quality_flags["non_sec_host"] == "example.test"
 
     def test_get_company_submissions_rejects_invalid_cik(self):
         session = MagicMock(spec=requests.Session)
@@ -313,7 +368,7 @@ class TestSecEdgarAdapter:
             forms=["25", "25-NSE"],
             from_date=date(2026, 6, 1),
             to_date=date(2026, 6, 4),
-            asof=datetime(2026, 6, 3, 13, 0, tzinfo=timezone.utc),
+            asof=datetime(2026, 6, 3, 17, 0, tzinfo=timezone.utc),
         )
 
         assert resp.ok
@@ -324,7 +379,7 @@ class TestSecEdgarAdapter:
         assert filing.filing_date == date(2026, 6, 3)
         assert filing.report_date == date(2026, 6, 2)
         assert filing.acceptance_datetime == datetime(
-            2026, 6, 3, 12, 30, tzinfo=timezone.utc
+            2026, 6, 3, 16, 30, tzinfo=timezone.utc
         )
         assert filing.primary_document == "xslF25X02/form25.xml"
         assert filing.size == 1234
@@ -372,6 +427,67 @@ class TestSecEdgarAdapter:
         assert [filing.accession_number for filing in resp.data] == ["known"]
         assert resp.lineage.data_quality_flags["pit_excluded_count"] == 2
 
+    def test_edgar_acceptance_datetime_interpreted_as_eastern_wall_clock(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["summer", "winter"],
+                        "form": ["25", "25"],
+                        "filingDate": ["2022-10-28", "2022-12-01"],
+                        "reportDate": ["2022-10-28", "2022-12-01"],
+                        "acceptanceDateTime": [
+                            "2022-10-28T20:22:36.000Z",
+                            "2022-12-01T20:22:36.000Z",
+                        ],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "0001418091",
+            forms=["25"],
+            asof=datetime(2022, 12, 2, 2, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert [filing.acceptance_datetime for filing in resp.data] == [
+            datetime(2022, 12, 2, 1, 22, 36, tzinfo=timezone.utc),
+            datetime(2022, 10, 29, 0, 22, 36, tzinfo=timezone.utc),
+        ]
+
+    def test_get_filings_excludes_after_close_eastern_acceptance_at_pit_cutoff(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["after-close"],
+                        "form": ["25"],
+                        "filingDate": ["2026-06-04"],
+                        "reportDate": ["2026-06-04"],
+                        "acceptanceDateTime": ["2026-06-04T17:00:00Z"],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "0000000001",
+            forms=["25"],
+            asof=datetime(2026, 6, 4, 20, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.data_quality_flags["pit_excluded_count"] == 1
+
     def test_get_filings_rejects_naive_asof(self):
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
@@ -384,6 +500,17 @@ class TestSecEdgarAdapter:
         assert not resp.ok
         assert resp.error.error_type == "validation"
         assert "timezone-aware" in resp.error.message
+        session.get.assert_not_called()
+
+    def test_edgar_invalid_asof_lineage_keeps_source_authority(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_tickers(asof=datetime(2026, 6, 2, 12, 0))
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert resp.lineage.source_authority == "SEC_EDGAR"
         session.get.assert_not_called()
 
     def test_get_filings_handles_transport_errors_without_secrets(self):
@@ -402,17 +529,188 @@ class TestSecEdgarAdapter:
         session = MagicMock(spec=requests.Session)
         adapter = self._adapter(session)
 
-        session.get.return_value = _mock_response(429, text="Too many")
+        session.get.return_value = _mock_response(
+            429,
+            text="Too many",
+            headers={"Retry-After": "17"},
+        )
         rate_limited = adapter.get_company_submissions("1")
         assert not rate_limited.ok
         assert rate_limited.error.error_type == "rate_limit"
         assert rate_limited.error.retryable is True
+        assert "Retry-After: 17" in rate_limited.error.message
+        assert rate_limited.lineage.data_quality_flags["retry_after"] == "17"
 
         session.get.return_value = _mock_response(403, text="Forbidden")
         forbidden = adapter.get_company_submissions("1")
         assert not forbidden.ok
         assert forbidden.error.error_type == "auth"
         assert forbidden.error.retryable is False
+
+    def test_get_company_ticker_reuses_company_ticker_cache(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "fields": ["cik", "name", "ticker", "exchange"],
+                "data": [
+                    [320193, "Apple Inc.", "AAPL", "Nasdaq"],
+                    [789019, "Microsoft Corp", "MSFT", "Nasdaq"],
+                    [1045810, "Nvidia Corp", "NVDA", "Nasdaq"],
+                ],
+            },
+        )
+        adapter = self._adapter(session)
+
+        assert adapter.get_company_ticker("AAPL").data.cik_str == "0000320193"
+        assert adapter.get_company_ticker("MSFT").data.cik_str == "0000789019"
+        assert adapter.get_company_ticker("NVDA").data.cik_str == "0001045810"
+
+        session.get.assert_called_once()
+
+    def test_get_company_tickers_cache_hit_uses_current_asof_lineage(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "fields": ["cik", "name", "ticker", "exchange"],
+                "data": [[320193, "Apple Inc.", "AAPL", "Nasdaq"]],
+            },
+        )
+        adapter = self._adapter(session)
+        first_asof = datetime(2026, 6, 1, 20, 0, tzinfo=timezone.utc)
+        second_asof = datetime(2026, 6, 2, 20, 0, tzinfo=timezone.utc)
+
+        first = adapter.get_company_tickers(asof=first_asof)
+        first.data.append("caller mutation")
+        second = adapter.get_company_tickers(asof=second_asof)
+        ticker = adapter.get_company_ticker("AAPL", asof=second_asof)
+        invalid = adapter.get_company_tickers(asof=datetime(2026, 6, 3, 12, 0))
+
+        assert first.ok
+        assert second.ok
+        assert ticker.ok
+        assert second.lineage.asof_timestamp == second_asof
+        assert second.lineage.request_timestamp == first.lineage.request_timestamp
+        assert second.lineage.raw_payload_hash == first.lineage.raw_payload_hash
+        assert second.lineage.data_quality_flags["cache_hit"] is True
+        assert ticker.lineage.asof_timestamp == second_asof
+        assert ticker.lineage.data_quality_flags["cache_hit"] is True
+        assert len(second.data) == 1
+        assert not invalid.ok
+        assert invalid.error.error_type == "validation"
+        session.get.assert_called_once()
+
+    def test_get_filings_fetches_overflow_pages_for_specific_forms(self):
+        recent_rows = 1000
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": [
+                                f"recent-{idx}" for idx in range(recent_rows)
+                            ],
+                            "form": ["8-K"] * recent_rows,
+                            "filingDate": ["2026-06-01"] * recent_rows,
+                            "reportDate": ["2026-06-01"] * recent_rows,
+                            "acceptanceDateTime": [
+                                "2026-06-01T12:00:00Z"
+                            ] * recent_rows,
+                        },
+                        "files": [
+                            {
+                                "name": "CIK0000000001-submissions-001.json",
+                                "filingCount": 1,
+                            }
+                        ],
+                    }
+                },
+            ),
+            _mock_response(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": ["overflow-25"],
+                            "form": ["25-NSE"],
+                            "filingDate": ["2026-05-15"],
+                            "reportDate": ["2026-05-15"],
+                            "acceptanceDateTime": ["2026-05-15T12:00:00Z"],
+                        }
+                    }
+                },
+            ),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "1",
+            forms=["25", "25-NSE"],
+            asof=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert [filing.accession_number for filing in resp.data] == ["overflow-25"]
+        assert session.get.call_count == 2
+        assert (
+            session.get.call_args_list[1].args[0]
+            == "https://data.sec.gov/submissions/CIK0000000001-submissions-001.json"
+        )
+        assert resp.lineage.data_quality_flags["overflow_pages_available"] == 1
+        assert resp.lineage.data_quality_flags["overflow_pages_fetched"] == 1
+        assert resp.lineage.data_quality_flags["truncated"] is False
+
+    def test_get_filings_deduplicates_accessions_and_orders_deterministically(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["dup", "dup", "amend", "base"],
+                        "form": ["25-NSE", "25-NSE", "25-NSE/A", "25-NSE"],
+                        "filingDate": [
+                            "2026-06-01",
+                            "2026-06-01",
+                            "2026-06-01",
+                            "2026-06-01",
+                        ],
+                        "reportDate": [
+                            "2026-06-01",
+                            "2026-06-01",
+                            "2026-06-01",
+                            "2026-06-01",
+                        ],
+                        "acceptanceDateTime": [
+                            "2026-06-01T12:00:00Z",
+                            "2026-06-01T12:01:00Z",
+                            "2026-06-01T12:02:00Z",
+                            "2026-06-01T12:03:00Z",
+                        ],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "1",
+            forms=["25-NSE"],
+            asof=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert [
+            (filing.accession_number, filing.form)
+            for filing in resp.data
+        ] == [
+            ("base", "25-NSE"),
+            ("amend", "25-NSE/A"),
+            ("dup", "25-NSE"),
+        ]
 
     def test_get_survivorship_events_resolves_ticker_and_returns_form25_event(self):
         session = MagicMock(spec=requests.Session)
@@ -447,7 +745,7 @@ class TestSecEdgarAdapter:
             "acme",
             from_date=date(2026, 6, 1),
             to_date=date(2026, 6, 5),
-            asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
+            asof=datetime(2026, 6, 5, 2, 0, tzinfo=timezone.utc),
         )
 
         assert resp.ok
@@ -461,12 +759,13 @@ class TestSecEdgarAdapter:
         assert event["cik"] == "0001234567"
         assert event["company_name"] == "Acme Corp"
         assert event["event_date"] == "2026-06-04"
-        assert event["knowledge_timestamp"] == "2026-06-04T21:15:00+00:00"
+        assert event["effective_date"] is None
+        assert event["knowledge_timestamp"] == "2026-06-05T01:15:00+00:00"
         assert resp.lineage.endpoint == "sec_edgar_survivorship_events"
         assert resp.lineage.data_quality_flags["survivorship_event_count"] == 1
         assert resp.lineage.data_quality_flags["pit_excluded_count"] == 0
 
-    def test_get_survivorship_events_unknown_ticker_returns_empty_success(self):
+    def test_get_survivorship_events_unknown_ticker_returns_unresolved_error(self):
         session = MagicMock(spec=requests.Session)
         session.get.return_value = _mock_response(
             200,
@@ -484,8 +783,10 @@ class TestSecEdgarAdapter:
             asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
         )
 
-        assert resp.ok
-        assert resp.data == []
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "unresolved_entity"
+        assert resp.error.retryable is False
         assert resp.lineage.endpoint == "sec_edgar_survivorship_events"
         assert resp.lineage.data_quality_flags["ticker_resolved"] is False
 
@@ -512,7 +813,7 @@ class TestSecEdgarAdapter:
             cik="1234567",
             from_date=date(2026, 6, 1),
             to_date=date(2026, 6, 5),
-            asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
+            asof=datetime(2026, 6, 5, 2, 0, tzinfo=timezone.utc),
         )
 
         assert resp.ok
@@ -522,6 +823,159 @@ class TestSecEdgarAdapter:
             session.get.call_args.args[0]
             == "https://data.sec.gov/submissions/CIK0001234567.json"
         )
+
+    def test_get_survivorship_events_truncated_overflow_without_form25_errors(self):
+        files = self._edgar_overflow_file_names(21)
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "fields": ["cik", "name", "ticker", "exchange"],
+                    "data": [[1, "Acme Corp", "ACME", "NYSE"]],
+                },
+            ),
+            _mock_response(
+                200,
+                self._edgar_submissions_payload(files=files),
+            ),
+            *[
+                _mock_response(
+                    200,
+                    self._edgar_submissions_payload(
+                        accessions=[f"page-{idx}-8k"],
+                        forms=["8-K"],
+                    ),
+                )
+                for idx in range(20)
+            ],
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "ACME",
+            asof=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "incomplete_window"
+        assert resp.error.retryable is False
+        flags = resp.lineage.data_quality_flags
+        assert flags["truncated"] is True
+        assert flags["overflow_pages_available"] == 21
+        assert flags["overflow_pages_fetched"] == 20
+        assert resp.lineage.source_authority == "SEC_EDGAR"
+
+    def test_get_survivorship_events_exact_cap_empty_overflow_is_valid_empty(self):
+        files = self._edgar_overflow_file_names(20)
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                self._edgar_submissions_payload(files=files),
+            ),
+            *[
+                _mock_response(
+                    200,
+                    self._edgar_submissions_payload(
+                        accessions=[f"page-{idx}-8k"],
+                        forms=["8-K"],
+                    ),
+                )
+                for idx in range(20)
+            ],
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "ACME",
+            cik="1",
+            asof=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data == []
+        flags = resp.lineage.data_quality_flags
+        assert flags["truncated"] is False
+        assert flags["overflow_pages_available"] == 20
+        assert flags["overflow_pages_fetched"] == 20
+        assert flags["survivorship_event_count"] == 0
+
+    def test_get_survivorship_events_truncation_errors_even_when_form25_found(self):
+        files = self._edgar_overflow_file_names(21)
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                self._edgar_submissions_payload(files=files),
+            ),
+            _mock_response(
+                200,
+                self._edgar_submissions_payload(
+                    accessions=["overflow-25"],
+                    forms=["25-NSE"],
+                ),
+            ),
+            *[
+                _mock_response(
+                    200,
+                    self._edgar_submissions_payload(
+                        accessions=[f"page-{idx}-8k"],
+                        forms=["8-K"],
+                    ),
+                )
+                for idx in range(1, 20)
+            ],
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "ACME",
+            cik="1",
+            asof=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "incomplete_window"
+        flags = resp.lineage.data_quality_flags
+        assert flags["truncated"] is True
+        assert flags["included_count"] == 1
+        assert flags["overflow_pages_fetched"] == 20
+
+    def test_get_survivorship_events_direct_cik_truncated_overflow_errors(self):
+        files = self._edgar_overflow_file_names(21)
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                self._edgar_submissions_payload(files=files),
+            ),
+            *[
+                _mock_response(
+                    200,
+                    self._edgar_submissions_payload(
+                        accessions=[f"page-{idx}-8k"],
+                        forms=["8-K"],
+                    ),
+                )
+                for idx in range(20)
+            ],
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "ACME",
+            cik="1",
+            asof=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "incomplete_window"
+        assert resp.lineage.data_quality_flags["ticker_resolved"] is True
+        assert resp.lineage.data_quality_flags["truncated"] is True
 
 
 # ---------------------------------------------------------------------------

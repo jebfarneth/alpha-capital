@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -33,6 +36,9 @@ COMPANY_TICKERS_EXCHANGE_ENDPOINT = "/files/company_tickers_exchange.json"
 SUBMISSIONS_ENDPOINT_TEMPLATE = "/submissions/CIK{cik}.json"
 SURVIVORSHIP_EVENTS_ENDPOINT = "sec_edgar_survivorship_events"
 FORM_25_FORMS = ("25", "25-NSE")
+SEC_MAX_REQUESTS_PER_SECOND = 10
+MAX_SUBMISSIONS_OVERFLOW_PAGES = 20
+EDGAR_ACCEPTANCE_TIMEZONE = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,9 @@ class SecEdgarAdapter:
             "Accept-Encoding": "gzip, deflate",
             "Accept": "application/json",
         }
+        self._company_tickers_cache: Optional[List[SecCompanyTicker]] = None
+        self._company_tickers_lineage: Optional[LineageMeta] = None
+        self._last_request_monotonic: Optional[float] = None
 
     def _request(
         self,
@@ -93,7 +102,9 @@ class SecEdgarAdapter:
         params: Optional[Dict[str, Any]] = None,
         asof: Optional[datetime] = None,
     ) -> AdapterResponse[Any]:
-        url = f"{base_url or self._config.data_base_url}{endpoint}"
+        request_base_url = base_url or self._config.data_base_url
+        url = f"{request_base_url}{endpoint}"
+        quality_flags = _request_data_quality_flags(url)
         request_ts = utcnow()
         if asof is None:
             asof_ts = request_ts
@@ -108,6 +119,8 @@ class SecEdgarAdapter:
                         request_timestamp=request_ts,
                         asof_timestamp=request_ts,
                         raw_payload_hash="",
+                        source_authority=SOURCE_AUTHORITY,
+                        data_quality_flags=quality_flags,
                     ),
                     error=ProviderError(
                         provider=PROVIDER,
@@ -120,6 +133,7 @@ class SecEdgarAdapter:
                 )
 
         try:
+            self._rate_gate()
             resp = self._session.get(
                 url,
                 params=params or {},
@@ -135,6 +149,8 @@ class SecEdgarAdapter:
                     request_timestamp=request_ts,
                     asof_timestamp=asof_ts,
                     raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                    data_quality_flags=quality_flags,
                 ),
                 error=ProviderError(
                     provider=PROVIDER,
@@ -154,6 +170,8 @@ class SecEdgarAdapter:
                     request_timestamp=request_ts,
                     asof_timestamp=asof_ts,
                     raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                    data_quality_flags=quality_flags,
                 ),
                 error=ProviderError(
                     provider=PROVIDER,
@@ -175,18 +193,29 @@ class SecEdgarAdapter:
             raw_payload_hash=payload_hash,
             freshness_seconds=freshness,
             source_authority=SOURCE_AUTHORITY,
+            data_quality_flags=quality_flags,
         )
 
         if resp.status_code == 429:
+            retry_after = _clean_string(resp.headers.get("Retry-After"))
+            message = "SEC EDGAR rate limit exceeded"
+            if retry_after:
+                message = f"{message}; Retry-After: {retry_after}"
             return AdapterResponse(
                 data=None,
-                lineage=lineage,
+                lineage=replace(
+                    lineage,
+                    data_quality_flags={
+                        **(lineage.data_quality_flags or {}),
+                        **({"retry_after": retry_after} if retry_after else {}),
+                    },
+                ),
                 error=ProviderError(
                     provider=PROVIDER,
                     endpoint=endpoint,
                     status_code=429,
                     error_type="rate_limit",
-                    message="SEC EDGAR rate limit exceeded",
+                    message=message,
                     retryable=True,
                 ),
             )
@@ -237,12 +266,50 @@ class SecEdgarAdapter:
 
         return AdapterResponse(data=data, lineage=lineage)
 
+    def _rate_gate(self) -> None:
+        interval = 1.0 / SEC_MAX_REQUESTS_PER_SECOND
+        now = time.monotonic()
+        if self._last_request_monotonic is not None:
+            elapsed = now - self._last_request_monotonic
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+                now = time.monotonic()
+        self._last_request_monotonic = now
+
     def get_company_tickers(
         self,
         *,
         asof: Optional[datetime] = None,
     ) -> AdapterResponse[List[SecCompanyTicker]]:
-        """Fetch SEC's current company CIK/ticker/exchange mapping."""
+        """Fetch SEC's current company CIK/ticker/exchange mapping.
+
+        Warm-cache hits reuse current snapshot bytes, which is traceable via
+        the preserved request_timestamp/cache_hit=True but not PIT-historical.
+        """
+
+        if asof is not None and _asof_utc(asof) is None:
+            resp = self._request(
+                COMPANY_TICKERS_EXCHANGE_ENDPOINT,
+                base_url=self._config.sec_base_url,
+                asof=asof,
+            )
+            return AdapterResponse(data=None, lineage=resp.lineage, error=resp.error)
+        if self._company_tickers_cache is not None:
+            cache_lineage = self._company_tickers_lineage
+            if cache_lineage is not None:
+                cache_asof = _asof_utc(asof)
+                cache_lineage = replace(
+                    cache_lineage,
+                    asof_timestamp=cache_asof or utcnow(),
+                    data_quality_flags={
+                        **(cache_lineage.data_quality_flags or {}),
+                        "cache_hit": True,
+                    },
+                )
+            return AdapterResponse(
+                data=list(self._company_tickers_cache),
+                lineage=cache_lineage,
+            )
 
         resp = self._request(
             COMPANY_TICKERS_EXCHANGE_ENDPOINT,
@@ -252,6 +319,8 @@ class SecEdgarAdapter:
         if not resp.ok:
             return AdapterResponse(data=None, lineage=resp.lineage, error=resp.error)
         rows = _parse_company_tickers(resp.data)
+        self._company_tickers_cache = list(rows)
+        self._company_tickers_lineage = resp.lineage
         return AdapterResponse(data=rows, lineage=resp.lineage)
 
     def get_company_ticker(
@@ -347,7 +416,30 @@ class SecEdgarAdapter:
         if not resp.ok:
             return AdapterResponse(data=None, lineage=resp.lineage, error=resp.error)
 
-        parsed = _parse_recent_filings(_cik10(cik) or "", resp.data or {})
+        cik10 = _cik10(cik) or ""
+        parsed = _parse_recent_filings(cik10, resp.data or {})
+        overflow_flags = _overflow_quality_flags(resp.data or {})
+        if forms:
+            overflow_resp = self._get_overflow_filings(
+                cik10,
+                resp.data or {},
+                asof=asof_ts,
+            )
+            overflow_flags = overflow_resp["flags"]
+            if overflow_resp["error"] is not None:
+                return AdapterResponse(
+                    data=None,
+                    lineage=replace(
+                        resp.lineage,
+                        data_quality_flags={
+                            **(resp.lineage.data_quality_flags or {}),
+                            **overflow_flags,
+                        },
+                    ),
+                    error=overflow_resp["error"],
+                )
+            parsed.extend(overflow_resp["filings"])
+        parsed = _dedupe_and_sort_filings(parsed)
         filtered, flags = _filter_filings(
             parsed,
             forms=forms,
@@ -359,10 +451,36 @@ class SecEdgarAdapter:
             resp.lineage,
             data_quality_flags={
                 **(resp.lineage.data_quality_flags or {}),
+                **overflow_flags,
                 **flags,
             },
         )
         return AdapterResponse(data=filtered, lineage=lineage)
+
+    def _get_overflow_filings(
+        self,
+        cik: str,
+        payload: Dict[str, Any],
+        *,
+        asof: datetime,
+    ) -> Dict[str, Any]:
+        names = _submission_overflow_file_names(payload)
+        selected = names[:MAX_SUBMISSIONS_OVERFLOW_PAGES]
+        filings: List[SecEdgarFiling] = []
+        flags = {
+            "overflow_pages_available": len(names),
+            "overflow_pages_fetched": 0,
+            "truncated": len(names) > MAX_SUBMISSIONS_OVERFLOW_PAGES,
+        }
+        for name in selected:
+            endpoint = f"/submissions/{name}"
+            resp = self._request(endpoint, asof=asof)
+            if not resp.ok:
+                flags["overflow_fetch_error_endpoint"] = endpoint
+                return {"filings": filings, "flags": flags, "error": resp.error}
+            filings.extend(_parse_recent_filings(cik, resp.data or {}))
+            flags["overflow_pages_fetched"] += 1
+        return {"filings": filings, "flags": flags, "error": None}
 
     def get_survivorship_events(
         self,
@@ -427,7 +545,21 @@ class SecEdgarAdapter:
                         "ticker_resolved": False,
                     },
                 )
-                return AdapterResponse(data=[], lineage=lineage)
+                return AdapterResponse(
+                    data=None,
+                    lineage=lineage,
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=SURVIVORSHIP_EVENTS_ENDPOINT,
+                        status_code=None,
+                        error_type="unresolved_entity",
+                        message=(
+                            "SEC EDGAR survivorship lookup requires a resolved "
+                            "CIK; ticker-only lookup failed"
+                        ),
+                        retryable=False,
+                    ),
+                )
             resolved_cik = ticker_row.cik_str
 
         filings_resp = self.get_filings(
@@ -442,6 +574,45 @@ class SecEdgarAdapter:
                 data=None,
                 lineage=filings_resp.lineage,
                 error=filings_resp.error,
+            )
+        filing_flags = filings_resp.lineage.data_quality_flags or {}
+        overflow_pages_available = filing_flags.get("overflow_pages_available")
+        if filing_flags.get("truncated") is True or (
+            isinstance(overflow_pages_available, int)
+            and overflow_pages_available > MAX_SUBMISSIONS_OVERFLOW_PAGES
+        ):
+            lineage = replace(
+                filings_resp.lineage,
+                endpoint=SURVIVORSHIP_EVENTS_ENDPOINT,
+                raw_payload_hash=stable_hash(
+                    {
+                        "ticker": ticker,
+                        "cik": resolved_cik,
+                        "from": _date_iso(from_date),
+                        "to": _date_iso(to_date),
+                        "truncated": True,
+                    }
+                ),
+                data_quality_flags={
+                    **filing_flags,
+                    "ticker_resolved": ticker_row is not None or cik is not None,
+                    "forms": list(FORM_25_FORMS),
+                },
+            )
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=SURVIVORSHIP_EVENTS_ENDPOINT,
+                    status_code=None,
+                    error_type="incomplete_window",
+                    message=(
+                        "SEC EDGAR survivorship window truncated; "
+                        "Form 25 completeness not guaranteed"
+                    ),
+                    retryable=False,
+                ),
             )
 
         events = [
@@ -550,6 +721,29 @@ def _parse_recent_filings(cik: str, payload: Dict[str, Any]) -> List[SecEdgarFil
     return rows
 
 
+def _submission_overflow_file_names(payload: Dict[str, Any]) -> List[str]:
+    files = payload.get("filings", {}).get("files", [])
+    if not isinstance(files, list):
+        return []
+    names: List[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_string(item.get("name"))
+        if name:
+            names.append(name.lstrip("/"))
+    return names
+
+
+def _overflow_quality_flags(payload: Dict[str, Any]) -> Dict[str, Any]:
+    names = _submission_overflow_file_names(payload)
+    return {
+        "overflow_pages_available": len(names),
+        "overflow_pages_fetched": 0,
+        "truncated": len(names) > MAX_SUBMISSIONS_OVERFLOW_PAGES,
+    }
+
+
 def _filing_from_recent_row(cik: str, raw: Dict[str, Any]) -> Optional[SecEdgarFiling]:
     accession = _clean_string(raw.get("accessionNumber"))
     form = _clean_string(raw.get("form"))
@@ -614,6 +808,20 @@ def _filter_filings(
     }
 
 
+def _dedupe_and_sort_filings(
+    filings: Iterable[SecEdgarFiling],
+) -> List[SecEdgarFiling]:
+    by_accession: Dict[str, SecEdgarFiling] = {}
+    for filing in sorted(
+        sorted(filings, key=lambda item: item.accession_number),
+        key=lambda item: item.acceptance_datetime
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    ):
+        by_accession.setdefault(filing.accession_number, filing)
+    return list(by_accession.values())
+
+
 def _normalized_forms(forms: Optional[Sequence[str]]) -> Tuple[str, ...]:
     if not forms:
         return ()
@@ -639,6 +847,12 @@ def _filing_to_survivorship_event(
     ticker: str,
     ticker_row: Optional[SecCompanyTicker],
 ) -> Dict[str, Any]:
+    """Convert Form 25 notice metadata without fabricating effective date.
+
+    Form 25 effectiveness is generally post-filing and must be modeled by the
+    consumer; submissions metadata does not carry a reliable effective date.
+    """
+
     knowledge_ts = filing.acceptance_datetime
     event_date = filing.filing_date or filing.report_date
     return {
@@ -658,6 +872,7 @@ def _filing_to_survivorship_event(
         "filing_date": filing.filing_date.isoformat() if filing.filing_date else None,
         "report_date": filing.report_date.isoformat() if filing.report_date else None,
         "event_date": event_date.isoformat() if event_date else None,
+        "effective_date": None,
         "knowledge_timestamp": (
             knowledge_ts.isoformat() if knowledge_ts is not None else None
         ),
@@ -671,6 +886,10 @@ def _filing_to_survivorship_event(
 
 
 def _parse_acceptance_datetime(value: Any) -> Optional[datetime]:
+    """EDGAR acceptanceDateTime is Eastern wall-clock; offsets are stripped
+    before localizing to America/New_York.
+    """
+
     text = _clean_string(value)
     if not text:
         return None
@@ -678,9 +897,9 @@ def _parse_acceptance_datetime(value: Any) -> Optional[datetime]:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return parsed.replace(tzinfo=None).replace(
+        tzinfo=EDGAR_ACCEPTANCE_TIMEZONE
+    ).astimezone(timezone.utc)
 
 
 def _coerce_date(value: Any) -> Optional[date]:
@@ -698,6 +917,13 @@ def _coerce_date(value: Any) -> Optional[date]:
 def _date_iso(value: Any) -> Optional[str]:
     parsed = _coerce_date(value)
     return parsed.isoformat() if parsed is not None else None
+
+
+def _request_data_quality_flags(url: str) -> Dict[str, Any]:
+    host = (urlparse(url).hostname or "").lower()
+    if host == "sec.gov" or host.endswith(".sec.gov"):
+        return {}
+    return {"non_sec_host": host}
 
 
 def _clean_string(value: Any) -> Optional[str]:

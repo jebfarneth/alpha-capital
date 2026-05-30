@@ -9,6 +9,7 @@ spine tests and simple non-production fixtures.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 from dataclasses import dataclass, replace
@@ -2097,6 +2098,7 @@ def resolve_missing_exit_survivorship(
             session=session,
             adapter=source_adapter,
             ticker=ticker,
+            signal_identity=signal_identity,
             entry_session_date=entry_session_date,
             exit_session_date=exit_session_date,
             entry_price=entry_price,
@@ -2136,6 +2138,7 @@ def resolve_missing_exit_survivorship(
             session=session,
             adapter=adapter,
             ticker=ticker,
+            signal_identity=signal_identity,
             entry_session_date=entry_session_date,
             exit_session_date=exit_session_date,
             entry_price=entry_price,
@@ -2258,22 +2261,30 @@ def _resolve_from_survivorship_events(
     entry_price: float,
     asof: datetime,
     job_run_id: Optional[str],
+    signal_identity: Optional[Dict[str, str]] = None,
     source_attempts: Optional[List[Dict[str, Any]]] = None,
     source_lineage_ids: Optional[List[str]] = None,
 ) -> Optional[SurvivorshipResolution]:
+    cik = (signal_identity or {}).get("cik")
+    cik_sent = bool(cik) and _survivorship_events_accepts_cik(adapter)
     provider_request = {
         "ticker": ticker,
         "from": entry_session_date.isoformat(),
         "to": exit_session_date.isoformat(),
         "event_basis": "missing_mature_exit_survivorship_review",
         "endpoint": "get_survivorship_events",
+        "cik_sent": cik_sent,
     }
-    resp = adapter.get_survivorship_events(
-        ticker,
-        from_date=entry_session_date,
-        to_date=exit_session_date,
-        asof=asof,
-    )
+    if cik_sent:
+        provider_request["cik"] = cik
+    call_kwargs = {
+        "from_date": entry_session_date,
+        "to_date": exit_session_date,
+        "asof": asof,
+    }
+    if cik_sent:
+        call_kwargs["cik"] = cik
+    resp = adapter.get_survivorship_events(ticker, **call_kwargs)
     payload = {
         "request": provider_request,
         "events": _jsonable_survivorship_payload(resp.data),
@@ -2721,8 +2732,28 @@ def _security_identity_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
         nested = payload.get(nested_key)
         if isinstance(nested, dict):
             search.append(nested)
+    signal_context = payload.get("signal_context")
+    if isinstance(signal_context, dict):
+        context_identity = signal_context.get("identity")
+        if isinstance(context_identity, dict):
+            search.append(context_identity)
+            context_security_identity = context_identity.get("security_identity")
+            if isinstance(context_security_identity, dict):
+                search.append(context_security_identity)
     identity: Dict[str, str] = {}
     for item in search:
+        if "cik" not in identity:
+            cik = _canonical_cik10(
+                _first_payload_value(
+                    item,
+                    "cik",
+                    "security_cik",
+                    "issuer_cik",
+                    "central_index_key",
+                )
+            )
+            if cik is not None:
+                identity["cik"] = cik
         if "cusip" not in identity:
             cusip = _canonical_cusip(
                 _first_payload_value(
@@ -2748,6 +2779,22 @@ def _security_identity_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
             if isin is not None:
                 identity["isin"] = isin
     return identity
+
+
+def _survivorship_events_accepts_cik(adapter: Any) -> bool:
+    method = getattr(adapter, "get_survivorship_events", None)
+    if method is None:
+        return False
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "cik":
+            return True
+    return False
 
 
 def _first_payload_value(payload: Dict[str, Any], *keys: str) -> Any:
@@ -3565,6 +3612,20 @@ def _canonical_isin(value: Any) -> Optional[str]:
         return None
     normalized = text.strip().upper().replace("-", "").replace(" ", "")
     return normalized if len(normalized) == 12 and normalized.isalnum() else None
+
+
+def _canonical_cik10(value: Any) -> Optional[str]:
+    text = _stringish(value)
+    if text is None:
+        return None
+    normalized = text.strip()
+    if normalized.upper().startswith("CIK"):
+        normalized = normalized[3:].strip()
+    if not normalized or not normalized.isascii() or not normalized.isdigit():
+        return None
+    if len(normalized) > 10 or set(normalized) == {"0"}:
+        return None
+    return normalized.zfill(10)
 
 
 def _stringish(value: Any) -> Optional[str]:
