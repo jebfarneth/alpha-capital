@@ -88,6 +88,25 @@ class PolygonConfig:
 
 
 @dataclass(frozen=True)
+class SecEdgarConfig:
+    """Configuration for SEC EDGAR public data APIs."""
+
+    user_agent: str
+    data_base_url: str = "https://data.sec.gov"
+    sec_base_url: str = "https://www.sec.gov"
+
+    @classmethod
+    def from_env(cls) -> SecEdgarConfig:
+        """Build SEC EDGAR configuration from process environment variables."""
+
+        return cls(
+            user_agent=_require("SEC_USER_AGENT"),
+            data_base_url=_optional("SEC_DATA_BASE_URL", cls.data_base_url),
+            sec_base_url=_optional("SEC_BASE_URL", cls.sec_base_url),
+        )
+
+
+@dataclass(frozen=True)
 class BenzingaConfig:
     """Configuration for Benzinga event-data adapters."""
 

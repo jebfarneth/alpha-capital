@@ -2,6 +2,7 @@
 
 from alpha.data.benzinga import BenzingaAdapter, BenzingaMergerAcquisition
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, RateLimitInfo
+from alpha.data.edgar import SecEdgarAdapter, SecEdgarFiling, SecCompanyTicker
 
 __all__ = [
     "AdapterResponse",
@@ -10,4 +11,7 @@ __all__ = [
     "LineageMeta",
     "ProviderError",
     "RateLimitInfo",
+    "SecCompanyTicker",
+    "SecEdgarAdapter",
+    "SecEdgarFiling",
 ]

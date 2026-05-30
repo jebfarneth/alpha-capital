@@ -29,10 +29,12 @@ from alpha.data.config import (
     ConfigError,
     FmpConfig,
     PolygonConfig,
+    SecEdgarConfig,
 )
 from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
+from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.polygon import PolygonAdapter
 from alpha.jobs.security_type import (
     ADR,
@@ -84,6 +86,10 @@ def _polygon_config():
 
 def _benzinga_config():
     return BenzingaConfig(api_key="test-benzinga-key")
+
+
+def _edgar_config():
+    return SecEdgarConfig(user_agent="Alpha Capital test@example.com")
 
 
 def _fixture_json(name: str):
@@ -140,6 +146,11 @@ class TestConfig:
         with pytest.raises(ConfigError, match="POLYGON_API_KEY"):
             PolygonConfig.from_env()
 
+    def test_edgar_missing_user_agent_raises(self, monkeypatch):
+        monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+        with pytest.raises(ConfigError, match="SEC_USER_AGENT"):
+            SecEdgarConfig.from_env()
+
     def test_benzinga_missing_key_raises(self, monkeypatch):
         monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
         monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
@@ -170,6 +181,347 @@ class TestConfig:
         monkeypatch.setenv("BENZINGA_TOKEN", "bz-token")
         cfg = BenzingaConfig.from_env()
         assert cfg.api_key == "bz-token"
+
+    def test_edgar_from_env_success(self, monkeypatch):
+        monkeypatch.setenv("SEC_USER_AGENT", "Alpha Capital ops@example.com")
+        cfg = SecEdgarConfig.from_env()
+        assert cfg.user_agent == "Alpha Capital ops@example.com"
+        assert cfg.data_base_url == "https://data.sec.gov"
+        assert cfg.sec_base_url == "https://www.sec.gov"
+
+
+# ---------------------------------------------------------------------------
+# SEC EDGAR adapter
+# ---------------------------------------------------------------------------
+
+class TestSecEdgarAdapter:
+    def _adapter(self, mock_session):
+        return SecEdgarAdapter(_edgar_config(), session=mock_session)
+
+    def test_get_company_tickers_parses_exchange_mapping_and_headers(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "fields": ["cik", "name", "ticker", "exchange"],
+                "data": [
+                    [320193, "Apple Inc.", "AAPL", "Nasdaq"],
+                    [789019, "Microsoft Corp", "MSFT", "Nasdaq"],
+                ],
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_tickers(
+            asof=datetime(2026, 5, 29, 20, 0, tzinfo=timezone.utc)
+        )
+
+        assert resp.ok
+        assert [row.ticker for row in resp.data] == ["AAPL", "MSFT"]
+        assert resp.data[0].cik_str == "0000320193"
+        assert resp.data[0].exchange == "Nasdaq"
+        assert resp.lineage.provider == "SEC_EDGAR"
+        assert resp.lineage.endpoint == "/files/company_tickers_exchange.json"
+        assert resp.lineage.source_authority == "SEC_EDGAR"
+        session.get.assert_called_once_with(
+            "https://www.sec.gov/files/company_tickers_exchange.json",
+            params={},
+            headers={
+                "User-Agent": "Alpha Capital test@example.com",
+                "Accept-Encoding": "gzip, deflate",
+                "Accept": "application/json",
+            },
+            timeout=30,
+        )
+
+    def test_get_company_ticker_returns_none_for_unknown_ticker(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "fields": ["cik", "name", "ticker", "exchange"],
+                "data": [[320193, "Apple Inc.", "AAPL", "Nasdaq"]],
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_ticker("MISSING")
+
+        assert resp.ok
+        assert resp.data is None
+
+    def test_get_company_submissions_pads_cik(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {"cik": "320193", "filings": {"recent": {}}},
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_submissions("320193")
+
+        assert resp.ok
+        session.get.assert_called_once()
+        assert (
+            session.get.call_args.args[0]
+            == "https://data.sec.gov/submissions/CIK0000320193.json"
+        )
+
+    def test_get_company_submissions_rejects_invalid_cik(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_submissions("not-a-cik")
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert "CIK" in resp.error.message
+        session.get.assert_not_called()
+
+    def test_get_filings_parses_recent_columnar_payload_and_filters_forms(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["0001-25-000001", "0001-25-000002"],
+                        "form": ["25-NSE", "8-K"],
+                        "filingDate": ["2026-06-03", "2026-06-03"],
+                        "reportDate": ["2026-06-02", "2026-06-02"],
+                        "acceptanceDateTime": [
+                            "2026-06-03T12:30:00.000Z",
+                            "2026-06-03T12:31:00.000Z",
+                        ],
+                        "primaryDocument": ["xslF25X02/form25.xml", "a8k.htm"],
+                        "primaryDocDescription": ["NOTIFICATION", "8-K"],
+                        "act": ["34", "34"],
+                        "fileNumber": ["001-00001", "001-00001"],
+                        "filmNumber": ["26999999", "26999998"],
+                        "items": ["", "2.02"],
+                        "size": [1234, 4321],
+                        "isXBRL": [0, 0],
+                        "isInlineXBRL": [0, 1],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            1,
+            forms=["25", "25-NSE"],
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 4),
+            asof=datetime(2026, 6, 3, 13, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        filing = resp.data[0]
+        assert filing.accession_number == "0001-25-000001"
+        assert filing.form == "25-NSE"
+        assert filing.filing_date == date(2026, 6, 3)
+        assert filing.report_date == date(2026, 6, 2)
+        assert filing.acceptance_datetime == datetime(
+            2026, 6, 3, 12, 30, tzinfo=timezone.utc
+        )
+        assert filing.primary_document == "xslF25X02/form25.xml"
+        assert filing.size == 1234
+        assert filing.is_xbrl is False
+        assert filing.is_inline_xbrl is False
+        assert resp.lineage.data_quality_flags["included_count"] == 1
+        assert resp.lineage.data_quality_flags["form_filtered_count"] == 1
+
+    def test_get_filings_excludes_future_and_missing_acceptance_for_pit(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": [
+                            "known",
+                            "future-knowledge",
+                            "missing-knowledge",
+                        ],
+                        "form": ["25", "25", "25"],
+                        "filingDate": ["2026-06-02", "2026-06-02", "2026-06-02"],
+                        "reportDate": ["2026-06-02", "2026-06-02", "2026-06-02"],
+                        "acceptanceDateTime": [
+                            "2026-06-02T12:00:00Z",
+                            "2026-06-03T12:00:00Z",
+                            None,
+                        ],
+                        "primaryDocument": ["known.htm", "future.htm", "missing.htm"],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "0000000001",
+            forms=["25"],
+            from_date="2026-06-01",
+            to_date="2026-06-04",
+            asof=datetime(2026, 6, 2, 23, 59, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert [filing.accession_number for filing in resp.data] == ["known"]
+        assert resp.lineage.data_quality_flags["pit_excluded_count"] == 2
+
+    def test_get_filings_rejects_naive_asof(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_filings(
+            "0000000001",
+            asof=datetime(2026, 6, 2, 12, 0),
+        )
+
+        assert not resp.ok
+        assert resp.error.error_type == "validation"
+        assert "timezone-aware" in resp.error.message
+        session.get.assert_not_called()
+
+    def test_get_filings_handles_transport_errors_without_secrets(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = requests.exceptions.ConnectionError("boom secret")
+        adapter = self._adapter(session)
+
+        resp = adapter.get_company_submissions("1")
+
+        assert not resp.ok
+        assert resp.error.error_type == "http"
+        assert resp.error.message == "SEC EDGAR request failed: ConnectionError"
+        assert "secret" not in resp.error.message
+
+    def test_get_filings_maps_rate_limit_and_auth_errors(self):
+        session = MagicMock(spec=requests.Session)
+        adapter = self._adapter(session)
+
+        session.get.return_value = _mock_response(429, text="Too many")
+        rate_limited = adapter.get_company_submissions("1")
+        assert not rate_limited.ok
+        assert rate_limited.error.error_type == "rate_limit"
+        assert rate_limited.error.retryable is True
+
+        session.get.return_value = _mock_response(403, text="Forbidden")
+        forbidden = adapter.get_company_submissions("1")
+        assert not forbidden.ok
+        assert forbidden.error.error_type == "auth"
+        assert forbidden.error.retryable is False
+
+    def test_get_survivorship_events_resolves_ticker_and_returns_form25_event(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "fields": ["cik", "name", "ticker", "exchange"],
+                    "data": [[1234567, "Acme Corp", "ACME", "NYSE"]],
+                },
+            ),
+            _mock_response(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": ["0001234567-26-000025"],
+                            "form": ["25-NSE"],
+                            "filingDate": ["2026-06-04"],
+                            "reportDate": ["2026-06-03"],
+                            "acceptanceDateTime": ["2026-06-04T21:15:00Z"],
+                            "primaryDocument": ["form25.xml"],
+                            "primaryDocDescription": ["Form 25 NSE"],
+                        }
+                    }
+                },
+            ),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "acme",
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 5),
+            asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        event = resp.data[0]
+        assert event["id"] == "0001234567-26-000025"
+        assert event["event_type"] == "delisting_notice"
+        assert event["classification"] == "sec_form_25-nse"
+        assert event["source_backed"] is True
+        assert event["ticker"] == "ACME"
+        assert event["cik"] == "0001234567"
+        assert event["company_name"] == "Acme Corp"
+        assert event["event_date"] == "2026-06-04"
+        assert event["knowledge_timestamp"] == "2026-06-04T21:15:00+00:00"
+        assert resp.lineage.endpoint == "sec_edgar_survivorship_events"
+        assert resp.lineage.data_quality_flags["survivorship_event_count"] == 1
+        assert resp.lineage.data_quality_flags["pit_excluded_count"] == 0
+
+    def test_get_survivorship_events_unknown_ticker_returns_empty_success(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "fields": ["cik", "name", "ticker", "exchange"],
+                "data": [[1234567, "Acme Corp", "ACME", "NYSE"]],
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "NOPE",
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 5),
+            asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data == []
+        assert resp.lineage.endpoint == "sec_edgar_survivorship_events"
+        assert resp.lineage.data_quality_flags["ticker_resolved"] is False
+
+    def test_get_survivorship_events_accepts_direct_cik_without_ticker_lookup(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["direct"],
+                        "form": ["25"],
+                        "filingDate": ["2026-06-04"],
+                        "reportDate": ["2026-06-03"],
+                        "acceptanceDateTime": ["2026-06-04T21:15:00Z"],
+                    }
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_survivorship_events(
+            "ACME",
+            cik="1234567",
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 5),
+            asof=datetime(2026, 6, 4, 22, 0, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert [event["id"] for event in resp.data] == ["direct"]
+        session.get.assert_called_once()
+        assert (
+            session.get.call_args.args[0]
+            == "https://data.sec.gov/submissions/CIK0001234567.json"
+        )
 
 
 # ---------------------------------------------------------------------------
