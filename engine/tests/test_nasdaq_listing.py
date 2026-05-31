@@ -31,6 +31,20 @@ def _nasdaq_directory(rows, *, footer="File Creation Time: 0529202621:31|||||||"
     return "\n".join([header, *body, footer])
 
 
+def _nasdaq_directory_full(rows, *, footer="File Creation Time: 0529202621:31|||||||"):
+    header = "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares"
+    body = []
+    for row in rows:
+        if len(row) == 2:
+            symbol, name = row
+            test_issue = "N"
+            etf = "N"
+        else:
+            symbol, name, test_issue, etf = row
+        body.append(f"{symbol}|{name}|Q|{test_issue}|N|100|{etf}|N")
+    return "\n".join([header, *body, footer])
+
+
 def _other_directory(rows, *, footer="File Creation Time: 0529202621:31||||||"):
     header = "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol"
     body = [
@@ -52,12 +66,16 @@ def _adds_deletes(rows=(), *, footer="File Creation Time: 0529202621:32|||||"):
 def _halt_rss(items=()):
     body = []
     for item in items:
-        symbol, reason, halt_date, halt_time = item
+        if len(item) == 4:
+            symbol, reason, halt_date, halt_time = item
+            item_pub = "Fri, 29 May 2026 04:00:00 GMT"
+        else:
+            symbol, reason, halt_date, halt_time, item_pub = item
         body.append(
             f"""
       <item>
         <title>{symbol}</title>
-        <pubDate>Fri, 29 May 2026 04:00:00 GMT</pubDate>
+        <pubDate>{item_pub}</pubDate>
         <ndaq:IssueSymbol>{symbol}</ndaq:IssueSymbol>
         <ndaq:IssueName>{symbol} Test Common Stock</ndaq:IssueName>
         <ndaq:Mkt>Q</ndaq:Mkt>
@@ -189,6 +207,47 @@ class TestNasdaqTraderListingAdapter:
         assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
         assert resp.data.matched_symbol == "BRK-B"
 
+    def test_compact_variant_does_not_cross_match_distinct_issuer(self):
+        for query, compact in (("NE.A", "NEA"), ("CTV.B", "CTVB")):
+            adapter, _ = _adapter_for(
+                _nasdaq_directory([(compact, "Different Listed Issuer Common Stock"), *_rows("N", 1000)]),
+                _other_directory(_rows("O", 1001)),
+                _adds_deletes(),
+                _halt_rss(),
+            )
+
+            resp = adapter.get_listing_status(query, asof=ASOF_AFTER_FILE)
+
+            assert resp.ok
+            assert resp.data.status is not NasdaqListingStatus.LISTED_ACTIVE
+            assert resp.data.matched_symbol != compact
+
+    def test_unit_suffix_compact_bridge_still_matches_same_issuer_unit(self):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory([("XU", "Example Acquisition Corp. - Units"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+        )
+
+        resp = adapter.get_listing_status("X.U", asof=ASOF_AFTER_FILE)
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert resp.data.matched_symbol == "XU"
+
+    def test_unit_suffix_compact_bridge_does_not_match_common_stock_ending_u(self):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory([("ACIU", "AC Immune SA - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            _halt_rss(),
+        )
+
+        resp = adapter.get_listing_status("ACI.U", asof=ASOF_AFTER_FILE)
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert resp.data.status is not NasdaqListingStatus.LISTED_ACTIVE
+
     def test_normalization_does_not_confuse_common_with_unit_or_warrant(self):
         adapter, _ = _adapter_for(
             _nasdaq_directory([("AACIU", "Armada Acquisition Corp. III - Units"), *_rows("N", 1000)]),
@@ -201,6 +260,25 @@ class TestNasdaqTraderListingAdapter:
 
         assert resp.ok
         assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+
+    def test_test_issue_etf_and_noncommon_rows_are_not_listed_active(self):
+        cases = [
+            ("ZVZZT", "NASDAQ TEST STOCK", "Y", "N"),
+            ("ETFZ", "Example ETF", "N", "Y"),
+            ("WRTZ", "Example Co. - Warrants", "N", "N"),
+        ]
+        for symbol, name, test_issue, etf in cases:
+            adapter, _ = _adapter_for(
+                _nasdaq_directory_full([(symbol, name, test_issue, etf), *_rows("N", 1000)]),
+                _other_directory(_rows("O", 1001)),
+                _adds_deletes(),
+                _halt_rss(),
+            )
+
+            resp = adapter.get_listing_status(symbol, asof=ASOF_AFTER_FILE)
+
+            assert resp.ok
+            assert resp.data.status is not NasdaqListingStatus.LISTED_ACTIVE
 
     def test_missing_trailer_is_unavailable(self):
         adapter, _ = _adapter_for(
@@ -248,7 +326,7 @@ class TestNasdaqTraderListingAdapter:
         assert resp.data.status is NasdaqListingStatus.UNAVAILABLE
         assert resp.error.error_type == "timeout"
 
-    def test_live_snapshot_before_asof_is_flagged_not_pit_knowable(self):
+    def test_live_snapshot_before_asof_is_inconclusive_not_confident_status(self):
         before_file_creation = datetime(2026, 5, 29, 20, 0, tzinfo=timezone.utc)
         adapter, _ = _adapter_for(
             _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
@@ -258,8 +336,9 @@ class TestNasdaqTraderListingAdapter:
         resp = adapter.get_listing_status("AAPL", asof=before_file_creation)
 
         assert resp.ok
-        assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
         assert resp.data.pit_knowable_at_asof is False
+        assert resp.data.reason == "directory_match_not_knowable_at_asof"
 
     def test_delisted_years_ago_before_deletion_asof_is_inconclusive(self):
         before_deletion = datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc)
@@ -277,6 +356,52 @@ class TestNasdaqTraderListingAdapter:
         assert resp.ok
         assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
         assert resp.data.pit_knowable_at_asof is False
+        assert resp.data.reason == "adds_deletes_delete_not_knowable_at_asof"
+
+    def test_halt_after_asof_is_inconclusive_not_delisted(self):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(_rows("N", 1001)),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            _halt_rss([(
+                "DEAD",
+                "D",
+                "05/29/2026",
+                "19:50:00.000",
+                "Fri, 29 May 2026 23:59:00 GMT",
+            )]),
+        )
+
+        resp = adapter.get_listing_status(
+            "DEAD",
+            asof=datetime(2026, 5, 29, 23, 51, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert resp.data.pit_knowable_at_asof is False
+        assert resp.data.reason == "halt_reason_D_not_knowable_at_asof"
+
+    def test_duplicate_header_body_row_is_unavailable(self):
+        header = "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares"
+        adapter, _ = _adapter_for(
+            "\n".join([
+                header,
+                header,
+                *[
+                    f"N{idx:04d}|N filler {idx}|Q|N|N|100|N|N"
+                    for idx in range(1001)
+                ],
+                "File Creation Time: 0529202621:31|||||||",
+            ])
+        )
+
+        resp = adapter.get_listing_status("AAPL", asof=ASOF_AFTER_FILE)
+
+        assert not resp.ok
+        assert resp.data.status is NasdaqListingStatus.UNAVAILABLE
+        assert resp.error.error_type == "parse"
+        assert "Duplicate Nasdaq header" in resp.error.message
 
     def test_batch_reports_inconclusive_rate_telemetry(self):
         adapter, _ = _adapter_for(
@@ -328,6 +453,17 @@ class TestNasdaqTraderListingAdapter:
         )
         assert archived.ok
         assert archived.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+        stale = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            archive_session=db_session,
+            use_live=False,
+        )
+        assert stale.ok
+        assert stale.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert stale.data.pit_knowable_at_asof is False
+        assert stale.data.reason == "archived_snapshot_stale_for_asof"
 
     def test_feed_timestamp_is_interpreted_as_eastern_time(self):
         parsed = _parse_feed_datetime("05/29/2026", "19:50:00.000")

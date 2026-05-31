@@ -50,6 +50,25 @@ OTHER_LISTED_MIN_ROWS = 1000
 NASDAQ_TZ = ZoneInfo("America/New_York")
 DIRECTORY_FOOTER_PREFIX = "File Creation Time:"
 REASON_SECURITY_DELETION = "D"
+UNIT_SUFFIX_RE = re.compile(r"^[A-Z0-9]+[.\-/]U$")
+NON_COMMON_SECURITY_NAME_PATTERNS = (
+    " UNIT",
+    " UNITS",
+    " WARRANT",
+    " WARRANTS",
+    " RIGHT",
+    " RIGHTS",
+    " PREFERRED",
+    " PREFERENCE",
+    " NOTE",
+    " NOTES",
+    " BOND",
+    " BONDS",
+    " DEBENTURE",
+    " ETF",
+    " ETN",
+    " FUND",
+)
 
 
 class NasdaqListingStatus(str, Enum):
@@ -198,7 +217,10 @@ class NasdaqTraderListingAdapter:
             )
         directories = directories_resp.data or ()
         directory_status = _status_from_directories(symbol, asof_ts, directories)
-        if directory_status.status is NasdaqListingStatus.LISTED_ACTIVE:
+        if (
+            directory_status.status is NasdaqListingStatus.LISTED_ACTIVE
+            or directory_status.reason != "symbol_absent_from_current_snapshot"
+        ):
             return AdapterResponse(data=directory_status, lineage=directories_resp.lineage)
 
         deletes_resp = self.get_current_adds_deletes(asof=asof_ts)
@@ -564,6 +586,28 @@ class NasdaqTraderListingAdapter:
             .first()
         )
         if row is not None:
+            if not _archive_snapshot_covers_asof(latest_snapshot, asof):
+                result = NasdaqListingStatusResult(
+                    symbol=str(symbol or "").strip(),
+                    normalized_symbol=_normalize_symbol(symbol),
+                    status=NasdaqListingStatus.INCONCLUSIVE,
+                    asof_timestamp=asof,
+                    source_knowledge_timestamp=latest_snapshot.source_knowledge_timestamp,
+                    pit_knowable_at_asof=False,
+                    source="nasdaq_self_archive",
+                    reason="archived_snapshot_stale_for_asof",
+                    matched_symbol=row.symbol,
+                    raw=_json_or_none(row.raw_json),
+                )
+                return AdapterResponse(
+                    data=result,
+                    lineage=_lineage(
+                        "nasdaq_listing_status_archive",
+                        asof,
+                        stable_hash(result),
+                        {"archive_hit": True, "archive_stale_for_asof": True},
+                    ),
+                )
             result = NasdaqListingStatusResult(
                 symbol=str(symbol or "").strip(),
                 normalized_symbol=_normalize_symbol(symbol),
@@ -673,12 +717,28 @@ def symbol_variants(symbol: Any) -> Tuple[str, ...]:
         if value and value not in variants:
             variants.append(value)
 
+    for variant in _punctuation_preserving_symbol_variants(text):
+        add(variant)
+    unit_compact = _unit_compact_symbol(text)
+    if unit_compact is not None:
+        add(unit_compact)
+    return tuple(variants)
+
+
+def _punctuation_preserving_symbol_variants(symbol: str) -> Tuple[str, ...]:
+    text = _normalize_symbol(symbol)
+    variants: List[str] = []
+
+    def add(value: str) -> None:
+        value = _normalize_symbol(value)
+        if value and value not in variants:
+            variants.append(value)
+
     add(text)
     add(text.replace(".", "-"))
     add(text.replace("-", "."))
     add(text.replace("/", "."))
     add(text.replace("/", "-"))
-    add(re.sub(r"[.\-/\s]+", "", text))
     return tuple(variants)
 
 
@@ -868,9 +928,27 @@ def _status_from_directories(
     files: Sequence[NasdaqSourceFile],
 ) -> NasdaqListingStatusResult:
     variants = tuple(symbol_variants(symbol))
+    ineligible_match: Optional[Tuple[NasdaqSourceFile, NasdaqDirectoryRecord]] = None
     for file in files:
         for record in file.records:
             if isinstance(record, NasdaqDirectoryRecord) and record.symbol in variants:
+                if not _directory_record_is_eligible(record, symbol, record.symbol):
+                    if ineligible_match is None:
+                        ineligible_match = (file, record)
+                    continue
+                if file.knowledge_timestamp > asof:
+                    return NasdaqListingStatusResult(
+                        symbol=str(symbol or "").strip(),
+                        normalized_symbol=_normalize_symbol(symbol),
+                        status=NasdaqListingStatus.INCONCLUSIVE,
+                        asof_timestamp=asof,
+                        source_knowledge_timestamp=file.knowledge_timestamp,
+                        pit_knowable_at_asof=False,
+                        source=file.source,
+                        reason="directory_match_not_knowable_at_asof",
+                        matched_symbol=record.symbol,
+                        raw={"record": record.raw, "footer": file.footer},
+                    )
                 return NasdaqListingStatusResult(
                     symbol=str(symbol or "").strip(),
                     normalized_symbol=_normalize_symbol(symbol),
@@ -883,6 +961,20 @@ def _status_from_directories(
                     matched_symbol=record.symbol,
                     raw={"record": record.raw, "footer": file.footer},
                 )
+    if ineligible_match is not None:
+        file, record = ineligible_match
+        return NasdaqListingStatusResult(
+            symbol=str(symbol or "").strip(),
+            normalized_symbol=_normalize_symbol(symbol),
+            status=NasdaqListingStatus.INCONCLUSIVE,
+            asof_timestamp=asof,
+            source_knowledge_timestamp=file.knowledge_timestamp,
+            pit_knowable_at_asof=file.knowledge_timestamp <= asof,
+            source=file.source,
+            reason="directory_record_not_common_stock_listing",
+            matched_symbol=record.symbol,
+            raw={"record": record.raw, "footer": file.footer},
+        )
     knowledge = max(file.knowledge_timestamp for file in files) if files else None
     return NasdaqListingStatusResult(
         symbol=str(symbol or "").strip(),
@@ -913,14 +1005,25 @@ def _status_from_adds_deletes(
             continue
         if record.effective_date is None or record.effective_date > asof_day:
             continue
-        if file.knowledge_timestamp > asof:
-            continue
         actions = {
             _normalize_symbol(record.nasdaq_action),
             _normalize_symbol(record.bx_action),
             _normalize_symbol(record.psx_action),
         }
         if "DELETE" in actions:
+            if file.knowledge_timestamp > asof:
+                return NasdaqListingStatusResult(
+                    symbol=str(symbol or "").strip(),
+                    normalized_symbol=_normalize_symbol(symbol),
+                    status=NasdaqListingStatus.INCONCLUSIVE,
+                    asof_timestamp=asof,
+                    source_knowledge_timestamp=file.knowledge_timestamp,
+                    pit_knowable_at_asof=False,
+                    source=file.source,
+                    reason="adds_deletes_delete_not_knowable_at_asof",
+                    matched_symbol=record.symbol,
+                    raw={"record": record.raw, "footer": file.footer},
+                )
             return NasdaqListingStatusResult(
                 symbol=str(symbol or "").strip(),
                 normalized_symbol=_normalize_symbol(symbol),
@@ -954,6 +1057,19 @@ def _status_from_halt_events(
         if event.halt_timestamp is not None and event.halt_timestamp > asof:
             continue
         knowledge = event.published_timestamp or file.knowledge_timestamp
+        if knowledge > asof:
+            return NasdaqListingStatusResult(
+                symbol=str(symbol or "").strip(),
+                normalized_symbol=_normalize_symbol(symbol),
+                status=NasdaqListingStatus.INCONCLUSIVE,
+                asof_timestamp=asof,
+                source_knowledge_timestamp=knowledge,
+                pit_knowable_at_asof=False,
+                source=file.source,
+                reason="halt_reason_D_not_knowable_at_asof",
+                matched_symbol=event.symbol,
+                raw={"record": event.raw},
+            )
         return NasdaqListingStatusResult(
             symbol=str(symbol or "").strip(),
             normalized_symbol=_normalize_symbol(symbol),
@@ -1056,6 +1172,11 @@ def _pipe_rows(
         if not line.strip():
             continue
         parts = line.split("|")
+        if parts == header or parts[:2] == header[:2]:
+            return _parse_error(
+                source,
+                "Duplicate Nasdaq header row in data section",
+            )
         if len(parts) != len(header):
             return _parse_error(
                 source,
@@ -1231,6 +1352,65 @@ def _clean_xml_text(text: str) -> str:
 
 def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _unit_compact_symbol(symbol: str) -> Optional[str]:
+    text = _normalize_symbol(symbol)
+    if UNIT_SUFFIX_RE.match(text):
+        return re.sub(r"[.\-/]", "", text)
+    return None
+
+
+def _directory_record_is_eligible(
+    record: NasdaqDirectoryRecord,
+    query_symbol: Any,
+    matched_symbol: str,
+) -> bool:
+    if _normalize_symbol(record.test_issue) == "Y":
+        return False
+    if _normalize_symbol(record.etf) == "Y":
+        return False
+    security_name = f" {record.security_name.upper()} "
+    punctuation_variants = _punctuation_preserving_symbol_variants(
+        _normalize_symbol(query_symbol)
+    )
+    unit_compact = _unit_compact_symbol(_normalize_symbol(query_symbol))
+    if (
+        unit_compact is not None
+        and matched_symbol == unit_compact
+        and matched_symbol not in punctuation_variants
+    ):
+        return " UNIT" in security_name or " UNITS" in security_name
+    if not any(
+        pattern in security_name
+        for pattern in NON_COMMON_SECURITY_NAME_PATTERNS
+    ):
+        return True
+    if (
+        unit_compact is not None
+        and matched_symbol == unit_compact
+        and (" UNIT" in security_name or " UNITS" in security_name)
+    ):
+        return True
+    return False
+
+
+def _archive_snapshot_covers_asof(
+    snapshot: NasdaqListingSnapshot,
+    asof: datetime,
+) -> bool:
+    source_ts = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+    if source_ts is None or source_ts > asof:
+        return False
+    return _et_date(source_ts) == _et_date(asof)
+
+
+def _archive_source_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _clean_optional(value: Any) -> Optional[str]:
