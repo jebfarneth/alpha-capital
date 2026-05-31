@@ -183,7 +183,16 @@ class NasdaqTraderListingAdapter:
         archive_session: Any = None,
         use_live: bool = True,
     ) -> AdapterResponse[NasdaqListingStatusResult]:
-        """Return listing status for one symbol without treating absence as delisted."""
+        """Return daily-grain listing status without treating absence as delisted.
+
+        Contract for the future survivorship gate: directory rosters are
+        end-of-day facts. A directory-derived LISTED_ACTIVE is PIT-knowable
+        when its source timestamp is at or before asof, or when the source
+        timestamp and asof share the same ET trading date. LISTED_ACTIVE may
+        suppress an EDGAR review only when no same-trading-date knowable DELETE
+        or reason-D halt exists; those delisting records outrank directory
+        presence and keep strict timestamp knowledge.
+        """
 
         asof_ts = aware_utc_or_none(asof)
         if asof_ts is None:
@@ -213,11 +222,6 @@ class NasdaqTraderListingAdapter:
             )
         directories = directories_resp.data or ()
         directory_status = _status_from_directories(symbol, asof_ts, directories)
-        if (
-            directory_status.status is NasdaqListingStatus.LISTED_ACTIVE
-            or directory_status.reason != "symbol_absent_from_current_snapshot"
-        ):
-            return AdapterResponse(data=directory_status, lineage=directories_resp.lineage)
 
         deletes_resp = self.get_current_adds_deletes(asof=asof_ts)
         if not deletes_resp.ok:
@@ -231,16 +235,6 @@ class NasdaqTraderListingAdapter:
         deletion_status = _status_from_adds_deletes(
             symbol, asof_ts, deletes_resp.data
         )
-        if deletion_status is not None:
-            return AdapterResponse(
-                data=deletion_status,
-                lineage=_combined_lineage(
-                    "nasdaq_listing_status",
-                    asof_ts,
-                    [directories_resp.lineage, deletes_resp.lineage],
-                    {"sources": [NASDAQ_LISTED, OTHER_LISTED, ADDS_DELETES]},
-                ),
-            )
 
         halt_resp = self.get_halt_events(asof=asof_ts, halt_date=_et_date(asof_ts))
         if not halt_resp.ok:
@@ -252,9 +246,10 @@ class NasdaqTraderListingAdapter:
                 lineage=halt_resp.lineage,
             )
         halt_status = _status_from_halt_events(symbol, asof_ts, halt_resp.data)
-        if halt_status is not None:
+        delisting_status = _select_delisting_status(deletion_status, halt_status)
+        if delisting_status is not None:
             return AdapterResponse(
-                data=halt_status,
+                data=delisting_status,
                 lineage=_combined_lineage(
                     "nasdaq_listing_status",
                     asof_ts,
@@ -263,24 +258,8 @@ class NasdaqTraderListingAdapter:
                 ),
             )
 
-        result = NasdaqListingStatusResult(
-            symbol=str(symbol or "").strip(),
-            normalized_symbol=_normalize_symbol(symbol),
-            status=NasdaqListingStatus.INCONCLUSIVE,
-            asof_timestamp=asof_ts,
-            source_knowledge_timestamp=max(
-                file.knowledge_timestamp for file in directories
-            ),
-            pit_knowable_at_asof=False,
-            source="current_directory_snapshot",
-            reason="symbol_absent_from_current_snapshot",
-            raw={
-                "symbol_variants": list(symbol_variants(symbol)),
-                "safety": "current snapshot absence is inconclusive, never delisted",
-            },
-        )
         return AdapterResponse(
-            data=result,
+            data=directory_status,
             lineage=_combined_lineage(
                 "nasdaq_listing_status",
                 asof_ts,
@@ -534,28 +513,30 @@ class NasdaqTraderListingAdapter:
         archive_session: Any,
     ) -> AdapterResponse[NasdaqListingStatusResult]:
         variants = tuple(symbol_variants(symbol))
-        asof_day = _et_date(asof)
-        snapshots = (
-            archive_session.query(NasdaqListingSnapshot)
-            .filter(
-                NasdaqListingSnapshot.source_type.in_([NASDAQ_LISTED, OTHER_LISTED]),
-            )
-            .order_by(NasdaqListingSnapshot.source_knowledge_timestamp.desc())
-            .all()
+        directory_snapshots, latest_prior_snapshot = _latest_archive_snapshots_by_source(
+            archive_session,
+            (NASDAQ_LISTED, OTHER_LISTED),
+            asof,
         )
-        latest_snapshot = None
-        latest_prior_snapshot = None
-        for snapshot in snapshots:
-            source_ts = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
-            if source_ts is None:
-                continue
-            source_day = _et_date(source_ts)
-            if source_day == asof_day:
-                latest_snapshot = snapshot
-                break
-            if source_day < asof_day and latest_prior_snapshot is None:
-                latest_prior_snapshot = snapshot
-        if latest_snapshot is None:
+        delisting_status = _status_from_archived_delisting_evidence(
+            symbol,
+            asof,
+            archive_session,
+        )
+        if delisting_status is not None:
+            return AdapterResponse(
+                data=delisting_status,
+                lineage=_lineage(
+                    "nasdaq_listing_status_archive",
+                    asof,
+                    stable_hash(delisting_status),
+                    {
+                        "archive_hit": True,
+                        "delisting_overlay": True,
+                    },
+                ),
+            )
+        if not directory_snapshots:
             if latest_prior_snapshot is not None:
                 result = NasdaqListingStatusResult(
                     symbol=str(symbol or "").strip(),
@@ -603,99 +584,13 @@ class NasdaqTraderListingAdapter:
                     {"archive_hit": False},
                 ),
             )
-        row = (
-            archive_session.query(NasdaqListingSnapshotRow)
-            .join(
-                NasdaqListingSnapshot,
-                NasdaqListingSnapshotRow.snapshot_id == NasdaqListingSnapshot.snapshot_id,
-            )
-            .filter(
-                NasdaqListingSnapshot.source_type.in_([NASDAQ_LISTED, OTHER_LISTED]),
-                NasdaqListingSnapshot.source_knowledge_timestamp
-                == latest_snapshot.source_knowledge_timestamp,
-                NasdaqListingSnapshotRow.symbol.in_(variants),
-            )
-            .first()
+        result = _status_from_archived_directories(
+            symbol,
+            variants,
+            asof,
+            archive_session,
+            tuple(directory_snapshots.values()),
         )
-        source_ts = _archive_source_timestamp(latest_snapshot.source_knowledge_timestamp)
-        if row is not None:
-            if not _archive_snapshot_covers_asof(latest_snapshot, asof):
-                result = NasdaqListingStatusResult(
-                    symbol=str(symbol or "").strip(),
-                    normalized_symbol=_normalize_symbol(symbol),
-                    status=NasdaqListingStatus.INCONCLUSIVE,
-                    asof_timestamp=asof,
-                    source_knowledge_timestamp=latest_snapshot.source_knowledge_timestamp,
-                    pit_knowable_at_asof=False,
-                    source="nasdaq_self_archive",
-                    reason="archived_snapshot_stale_for_asof",
-                    matched_symbol=row.symbol,
-                    raw=_json_or_none(row.raw_json),
-                )
-                return AdapterResponse(
-                    data=result,
-                    lineage=_lineage(
-                        "nasdaq_listing_status_archive",
-                        asof,
-                        stable_hash(result),
-                        {"archive_hit": True, "archive_stale_for_asof": True},
-                    ),
-                )
-            if not _archive_directory_row_is_eligible(row, symbol):
-                result = NasdaqListingStatusResult(
-                    symbol=str(symbol or "").strip(),
-                    normalized_symbol=_normalize_symbol(symbol),
-                    status=NasdaqListingStatus.INCONCLUSIVE,
-                    asof_timestamp=asof,
-                    source_knowledge_timestamp=latest_snapshot.source_knowledge_timestamp,
-                    pit_knowable_at_asof=(
-                        source_ts is not None and source_ts <= asof
-                    ),
-                    source="nasdaq_self_archive",
-                    reason="directory_record_not_common_stock_listing",
-                    matched_symbol=row.symbol,
-                    raw=_json_or_none(row.raw_json),
-                )
-                return AdapterResponse(
-                    data=result,
-                    lineage=_lineage(
-                        "nasdaq_listing_status_archive",
-                        asof,
-                        stable_hash(result),
-                        {"archive_hit": True},
-                    ),
-                )
-            result = NasdaqListingStatusResult(
-                symbol=str(symbol or "").strip(),
-                normalized_symbol=_normalize_symbol(symbol),
-                status=NasdaqListingStatus.LISTED_ACTIVE,
-                asof_timestamp=asof,
-                source_knowledge_timestamp=latest_snapshot.source_knowledge_timestamp,
-                pit_knowable_at_asof=(
-                    source_ts is not None and source_ts <= asof
-                ),
-                source="nasdaq_self_archive",
-                reason="symbol_present_in_archived_directory",
-                matched_symbol=row.symbol,
-                raw=_json_or_none(row.raw_json),
-            )
-        else:
-            result = NasdaqListingStatusResult(
-                symbol=str(symbol or "").strip(),
-                normalized_symbol=_normalize_symbol(symbol),
-                status=NasdaqListingStatus.INCONCLUSIVE,
-                asof_timestamp=asof,
-                source_knowledge_timestamp=latest_snapshot.source_knowledge_timestamp,
-                pit_knowable_at_asof=(
-                    source_ts is not None and source_ts <= asof
-                ),
-                source="nasdaq_self_archive",
-                reason="symbol_absent_from_archived_directory",
-                raw={
-                    "symbol_variants": list(variants),
-                    "safety": "archive absence is inconclusive, never delisted",
-                },
-            )
         return AdapterResponse(
             data=result,
             lineage=_lineage(
@@ -997,7 +892,10 @@ def _status_from_directories(
                     if ineligible_match is None:
                         ineligible_match = (file, record)
                     continue
-                if file.knowledge_timestamp > asof:
+                if not _directory_status_pit_knowable(
+                    file.knowledge_timestamp,
+                    asof,
+                ):
                     return NasdaqListingStatusResult(
                         symbol=str(symbol or "").strip(),
                         normalized_symbol=_normalize_symbol(symbol),
@@ -1016,7 +914,10 @@ def _status_from_directories(
                     status=NasdaqListingStatus.LISTED_ACTIVE,
                     asof_timestamp=asof,
                     source_knowledge_timestamp=file.knowledge_timestamp,
-                    pit_knowable_at_asof=file.knowledge_timestamp <= asof,
+                    pit_knowable_at_asof=_directory_status_pit_knowable(
+                        file.knowledge_timestamp,
+                        asof,
+                    ),
                     source=file.source,
                     reason="symbol_present_in_current_directory",
                     matched_symbol=record.symbol,
@@ -1030,7 +931,10 @@ def _status_from_directories(
             status=NasdaqListingStatus.INCONCLUSIVE,
             asof_timestamp=asof,
             source_knowledge_timestamp=file.knowledge_timestamp,
-            pit_knowable_at_asof=file.knowledge_timestamp <= asof,
+            pit_knowable_at_asof=_directory_status_pit_knowable(
+                file.knowledge_timestamp,
+                asof,
+            ),
             source=file.source,
             reason="directory_record_not_common_stock_listing",
             matched_symbol=record.symbol,
@@ -1064,7 +968,7 @@ def _status_from_adds_deletes(
             continue
         if record.symbol not in variants:
             continue
-        if record.effective_date is None or record.effective_date > asof_day:
+        if record.effective_date != asof_day:
             continue
         actions = {
             _normalize_symbol(record.nasdaq_action),
@@ -1116,6 +1020,8 @@ def _status_from_halt_events(
             continue
         if (event.reason_code or "").upper() != REASON_SECURITY_DELETION:
             continue
+        if event.halt_timestamp is None or _et_date(event.halt_timestamp) != _et_date(asof):
+            continue
         if event.halt_timestamp is not None and event.halt_timestamp > asof:
             continue
         knowledge = event.published_timestamp or file.knowledge_timestamp
@@ -1145,6 +1051,254 @@ def _status_from_halt_events(
             reason="trade_halt_reason_D_security_deletion",
             matched_symbol=event.symbol,
             raw={"record": event.raw},
+        )
+    return future_knowledge_result
+
+
+def _select_delisting_status(
+    *statuses: Optional[NasdaqListingStatusResult],
+) -> Optional[NasdaqListingStatusResult]:
+    inconclusive: Optional[NasdaqListingStatusResult] = None
+    for status in statuses:
+        if status is None:
+            continue
+        if status.status is NasdaqListingStatus.DELISTED:
+            return status
+        if (
+            status.status is NasdaqListingStatus.INCONCLUSIVE
+            and inconclusive is None
+        ):
+            inconclusive = status
+    return inconclusive
+
+
+def _status_from_archived_directories(
+    symbol: str,
+    variants: Sequence[str],
+    asof: datetime,
+    archive_session: Any,
+    snapshots: Sequence[NasdaqListingSnapshot],
+) -> NasdaqListingStatusResult:
+    snapshot_by_id = {snapshot.snapshot_id: snapshot for snapshot in snapshots}
+    rows = (
+        archive_session.query(NasdaqListingSnapshotRow, NasdaqListingSnapshot)
+        .join(
+            NasdaqListingSnapshot,
+            NasdaqListingSnapshotRow.snapshot_id == NasdaqListingSnapshot.snapshot_id,
+        )
+        .filter(
+            NasdaqListingSnapshot.snapshot_id.in_(tuple(snapshot_by_id)),
+            NasdaqListingSnapshotRow.symbol.in_(tuple(variants)),
+        )
+        .all()
+    )
+    ineligible_match: Optional[Tuple[NasdaqListingSnapshotRow, NasdaqListingSnapshot]] = None
+    for row, snapshot in rows:
+        if not _archive_snapshot_covers_asof(snapshot, asof):
+            continue
+        if not _archive_directory_row_is_eligible(row, symbol):
+            if ineligible_match is None:
+                ineligible_match = (row, snapshot)
+            continue
+        source_ts = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+        return NasdaqListingStatusResult(
+            symbol=str(symbol or "").strip(),
+            normalized_symbol=_normalize_symbol(symbol),
+            status=NasdaqListingStatus.LISTED_ACTIVE,
+            asof_timestamp=asof,
+            source_knowledge_timestamp=snapshot.source_knowledge_timestamp,
+            pit_knowable_at_asof=_directory_status_pit_knowable(source_ts, asof),
+            source="nasdaq_self_archive",
+            reason="symbol_present_in_archived_directory",
+            matched_symbol=row.symbol,
+            raw=_json_or_none(row.raw_json),
+        )
+    if ineligible_match is not None:
+        row, snapshot = ineligible_match
+        source_ts = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+        return NasdaqListingStatusResult(
+            symbol=str(symbol or "").strip(),
+            normalized_symbol=_normalize_symbol(symbol),
+            status=NasdaqListingStatus.INCONCLUSIVE,
+            asof_timestamp=asof,
+            source_knowledge_timestamp=snapshot.source_knowledge_timestamp,
+            pit_knowable_at_asof=_directory_status_pit_knowable(source_ts, asof),
+            source="nasdaq_self_archive",
+            reason="directory_record_not_common_stock_listing",
+            matched_symbol=row.symbol,
+            raw=_json_or_none(row.raw_json),
+        )
+    knowledge = _latest_snapshot_timestamp(snapshots)
+    return NasdaqListingStatusResult(
+        symbol=str(symbol or "").strip(),
+        normalized_symbol=_normalize_symbol(symbol),
+        status=NasdaqListingStatus.INCONCLUSIVE,
+        asof_timestamp=asof,
+        source_knowledge_timestamp=knowledge,
+        pit_knowable_at_asof=False,
+        source="nasdaq_self_archive",
+        reason="symbol_absent_from_archived_directory",
+        raw={
+            "symbol_variants": list(variants),
+            "safety": "archive absence is inconclusive, never delisted",
+        },
+    )
+
+
+def _status_from_archived_delisting_evidence(
+    symbol: str,
+    asof: datetime,
+    archive_session: Any,
+) -> Optional[NasdaqListingStatusResult]:
+    adds_snapshots, _ = _latest_archive_snapshots_by_source(
+        archive_session,
+        (ADDS_DELETES,),
+        asof,
+    )
+    halt_snapshots, _ = _latest_archive_snapshots_by_source(
+        archive_session,
+        (HALT_RSS,),
+        asof,
+    )
+    return _select_delisting_status(
+        _status_from_archived_adds_deletes(
+            symbol,
+            asof,
+            archive_session,
+            tuple(adds_snapshots.values()),
+        ),
+        _status_from_archived_halt_events(
+            symbol,
+            asof,
+            archive_session,
+            tuple(halt_snapshots.values()),
+        ),
+    )
+
+
+def _status_from_archived_adds_deletes(
+    symbol: str,
+    asof: datetime,
+    archive_session: Any,
+    snapshots: Sequence[NasdaqListingSnapshot],
+) -> Optional[NasdaqListingStatusResult]:
+    if not snapshots:
+        return None
+    variants = tuple(symbol_variants(symbol))
+    asof_day = _et_date(asof)
+    rows = (
+        archive_session.query(NasdaqListingSnapshotRow, NasdaqListingSnapshot)
+        .join(
+            NasdaqListingSnapshot,
+            NasdaqListingSnapshotRow.snapshot_id == NasdaqListingSnapshot.snapshot_id,
+        )
+        .filter(
+            NasdaqListingSnapshot.snapshot_id.in_(
+                tuple(snapshot.snapshot_id for snapshot in snapshots)
+            ),
+            NasdaqListingSnapshotRow.symbol.in_(variants),
+        )
+        .all()
+    )
+    for row, snapshot in rows:
+        if _parse_iso_date(row.effective_date) != asof_day:
+            continue
+        actions = {
+            _normalize_symbol(action)
+            for action in str(row.action or "").split("|")
+        }
+        if "DELETE" not in actions:
+            continue
+        knowledge = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+        if knowledge is None or knowledge > asof:
+            return NasdaqListingStatusResult(
+                symbol=str(symbol or "").strip(),
+                normalized_symbol=_normalize_symbol(symbol),
+                status=NasdaqListingStatus.INCONCLUSIVE,
+                asof_timestamp=asof,
+                source_knowledge_timestamp=snapshot.source_knowledge_timestamp,
+                pit_knowable_at_asof=False,
+                source=row.source_type,
+                reason="adds_deletes_delete_not_knowable_at_asof",
+                matched_symbol=row.symbol,
+                raw=_json_or_none(row.raw_json),
+            )
+        return NasdaqListingStatusResult(
+            symbol=str(symbol or "").strip(),
+            normalized_symbol=_normalize_symbol(symbol),
+            status=NasdaqListingStatus.DELISTED,
+            asof_timestamp=asof,
+            source_knowledge_timestamp=knowledge,
+            pit_knowable_at_asof=True,
+            source=row.source_type,
+            reason="trading_system_adds_deletes_delete",
+            matched_symbol=row.symbol,
+            raw=_json_or_none(row.raw_json),
+        )
+    return None
+
+
+def _status_from_archived_halt_events(
+    symbol: str,
+    asof: datetime,
+    archive_session: Any,
+    snapshots: Sequence[NasdaqListingSnapshot],
+) -> Optional[NasdaqListingStatusResult]:
+    if not snapshots:
+        return None
+    variants = tuple(symbol_variants(symbol))
+    asof_day = _et_date(asof)
+    future_knowledge_result: Optional[NasdaqListingStatusResult] = None
+    rows = (
+        archive_session.query(NasdaqListingSnapshotRow, NasdaqListingSnapshot)
+        .join(
+            NasdaqListingSnapshot,
+            NasdaqListingSnapshotRow.snapshot_id == NasdaqListingSnapshot.snapshot_id,
+        )
+        .filter(
+            NasdaqListingSnapshot.snapshot_id.in_(
+                tuple(snapshot.snapshot_id for snapshot in snapshots)
+            ),
+            NasdaqListingSnapshotRow.symbol.in_(variants),
+        )
+        .all()
+    )
+    for row, snapshot in rows:
+        if _normalize_symbol(row.reason_code) != REASON_SECURITY_DELETION:
+            continue
+        if _parse_iso_date(row.effective_date) != asof_day:
+            continue
+        knowledge = _archived_halt_row_knowledge(row, snapshot)
+        if knowledge is None or knowledge > asof:
+            if future_knowledge_result is None:
+                future_knowledge_result = NasdaqListingStatusResult(
+                    symbol=str(symbol or "").strip(),
+                    normalized_symbol=_normalize_symbol(symbol),
+                    status=NasdaqListingStatus.INCONCLUSIVE,
+                    asof_timestamp=asof,
+                    source_knowledge_timestamp=(
+                        snapshot.source_knowledge_timestamp
+                        if knowledge is None
+                        else knowledge
+                    ),
+                    pit_knowable_at_asof=False,
+                    source=row.source_type,
+                    reason="halt_reason_D_not_knowable_at_asof",
+                    matched_symbol=row.symbol,
+                    raw=_json_or_none(row.raw_json),
+                )
+            continue
+        return NasdaqListingStatusResult(
+            symbol=str(symbol or "").strip(),
+            normalized_symbol=_normalize_symbol(symbol),
+            status=NasdaqListingStatus.DELISTED,
+            asof_timestamp=asof,
+            source_knowledge_timestamp=knowledge,
+            pit_knowable_at_asof=True,
+            source=row.source_type,
+            reason="trade_halt_reason_D_security_deletion",
+            matched_symbol=row.symbol,
+            raw=_json_or_none(row.raw_json),
         )
     return future_knowledge_result
 
@@ -1471,7 +1625,13 @@ def _archive_directory_row_is_eligible(
     row: NasdaqListingSnapshotRow,
     query_symbol: Any,
 ) -> bool:
-    raw = _json_or_none(row.raw_json) or {}
+    raw = _json_or_none(row.raw_json)
+    if (
+        raw is None
+        or raw.get("Test Issue") is None
+        or raw.get("ETF") is None
+    ):
+        return False
     record = NasdaqDirectoryRecord(
         source=row.source_type,
         symbol=row.symbol,
@@ -1484,6 +1644,46 @@ def _archive_directory_row_is_eligible(
     return _directory_record_is_eligible(record, query_symbol, row.symbol)
 
 
+def _latest_archive_snapshots_by_source(
+    session: Any,
+    source_types: Sequence[str],
+    asof: datetime,
+) -> Tuple[Dict[str, NasdaqListingSnapshot], Optional[NasdaqListingSnapshot]]:
+    asof_day = _et_date(asof)
+    snapshots = (
+        session.query(NasdaqListingSnapshot)
+        .filter(NasdaqListingSnapshot.source_type.in_(tuple(source_types)))
+        .order_by(NasdaqListingSnapshot.source_knowledge_timestamp.desc())
+        .all()
+    )
+    selected: Dict[str, NasdaqListingSnapshot] = {}
+    latest_prior: Optional[NasdaqListingSnapshot] = None
+    for snapshot in snapshots:
+        source_ts = _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+        if source_ts is None:
+            continue
+        source_day = _et_date(source_ts)
+        if source_day == asof_day and snapshot.source_type not in selected:
+            selected[snapshot.source_type] = snapshot
+            continue
+        if source_day < asof_day and latest_prior is None:
+            latest_prior = snapshot
+    return selected, latest_prior
+
+
+def _latest_snapshot_timestamp(
+    snapshots: Sequence[NasdaqListingSnapshot],
+) -> Optional[datetime]:
+    timestamps = [
+        _archive_source_timestamp(snapshot.source_knowledge_timestamp)
+        for snapshot in snapshots
+    ]
+    known = [timestamp for timestamp in timestamps if timestamp is not None]
+    if not known:
+        return None
+    return max(known)
+
+
 def _archive_snapshot_covers_asof(
     snapshot: NasdaqListingSnapshot,
     asof: datetime,
@@ -1494,12 +1694,41 @@ def _archive_snapshot_covers_asof(
     return _et_date(source_ts) == _et_date(asof)
 
 
+def _directory_status_pit_knowable(
+    source_ts: Optional[datetime],
+    asof: datetime,
+) -> bool:
+    if source_ts is None:
+        return False
+    return source_ts <= asof or _et_date(source_ts) == _et_date(asof)
+
+
 def _archive_source_timestamp(value: Any) -> Optional[datetime]:
     if not isinstance(value, datetime):
         return None
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _archived_halt_row_knowledge(
+    row: NasdaqListingSnapshotRow,
+    snapshot: NasdaqListingSnapshot,
+) -> Optional[datetime]:
+    raw = _json_or_none(row.raw_json) or {}
+    published = _parse_rss_pubdate(raw.get("pubDate"))
+    if published is not None:
+        return published
+    return _archive_source_timestamp(snapshot.source_knowledge_timestamp)
 
 
 def _clean_optional(value: Any) -> Optional[str]:
