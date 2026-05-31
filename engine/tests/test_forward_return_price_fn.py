@@ -1304,6 +1304,105 @@ def test_security_identity_from_payload_extracts_normalized_cik():
     })["cik"] == "0000320193"
 
 
+def test_security_identity_suppresses_cik_manufactured_from_numeric_cusip(
+    db_session,
+):
+    """Suppress only a CIK numerically equal to a co-present all-numeric CUSIP.
+
+    A genuine issuer CIK should not equal the record's own CUSIP. In the
+    unlikely event this suppresses a real CIK, the failure mode is safer than a
+    wrong-issuer EDGAR query: EDGAR is skipped and other survivorship channels
+    remain available. The diagnostic flag is inert because resolver consumers
+    read explicit identity keys instead of iterating unknown keys.
+    """
+
+    identity = _security_identity_from_payload({
+        "security_identity": {
+            "cik": "037833100",
+            "cusip": "037833100",
+        }
+    })
+    assert identity == {
+        "cusip": "037833100",
+        "cik_suppressed_reason": "cik_equals_numeric_cusip",
+    }
+
+    _make_signal(
+        db_session,
+        security_identity={
+            "cik": "037833100",
+            "cusip": "037833100",
+        },
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "wrong-issuer-must-not-query",
+                "type": "delisting_notice",
+                "source_backed": True,
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    assert edgar.calls == []
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+    assert attempts[0]["source"] == "sec_edgar_survivorship_events"
+    assert attempts[0]["status"] == "error"
+    assert attempts[0]["identity_status"] == "identity_unavailable"
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert payload["request"]["cik_sent"] is False
+    assert "cik" not in payload["request"]
+
+
+def test_security_identity_preserves_real_cik_with_different_cusip(db_session):
+    identity = _security_identity_from_payload({
+        "security_identity": {
+            "cik": "0000320193",
+            "cusip": "037833100",
+        }
+    })
+    assert identity == {"cik": "0000320193", "cusip": "037833100"}
+
+    _make_signal(
+        db_session,
+        security_identity={
+            "cik": "0000320193",
+            "cusip": "037833100",
+        },
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter()
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    assert edgar.calls[0]["cik"] == "0000320193"
+
+
+def test_security_identity_preserves_cik_when_cusip_absent():
+    identity = _security_identity_from_payload({
+        "security_identity": {"cik": "0000320193"}
+    })
+    assert identity == {"cik": "0000320193"}
+
+
+def test_security_identity_rejects_alphanumeric_cusip_in_cik_field():
+    identity = _security_identity_from_payload({
+        "security_identity": {
+            "cik": "38259P508",
+            "cusip": "38259P508",
+        }
+    })
+    assert identity == {"cusip": "38259P508"}
+
+
 @pytest.mark.parametrize("value", [
     "320193",
     "0000320193",

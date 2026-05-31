@@ -2899,7 +2899,21 @@ def _security_identity_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
             )
             if isin is not None:
                 identity["isin"] = isin
+    _suppress_cik_equal_to_numeric_cusip(identity)
     return identity
+
+
+def _suppress_cik_equal_to_numeric_cusip(identity: Dict[str, str]) -> None:
+    cik = identity.get("cik")
+    cusip = identity.get("cusip")
+    if (
+        cik
+        and cusip
+        and cusip.isdigit()
+        and cik == _canonical_cik10(cusip)
+    ):
+        identity.pop("cik", None)
+        identity["cik_suppressed_reason"] = "cik_equals_numeric_cusip"
 
 
 def _survivorship_events_accepts_cik(adapter: Any) -> bool:
