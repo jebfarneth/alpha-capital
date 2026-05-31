@@ -574,6 +574,7 @@ class TestSchemaCompleteness:
             "signal_registry",
             "forward_return_observations",
             "forward_return_path_rows",
+            "forward_context_path_rows",
             "forward_return_observation_events",
             "trade_candidates",
             "optimizer_runs",
@@ -606,6 +607,7 @@ class TestSchemaCompleteness:
                     "data_lineage",
                     "security_profile_scan_snapshots",
                     "signal_registry",
+                    "forward_context_path_rows",
                     "trade_candidates",
                     "universe_snapshots",
                     "shadow_positions",
@@ -629,6 +631,14 @@ class TestSchemaCompleteness:
         } <= columns["signal_registry"]
         assert signal_columns["signal_identity_hash"]["nullable"] is False
         assert "raw_payload_json" in columns["data_lineage"]
+        assert {
+            "signal_id",
+            "forward_session_date",
+            "path_sequence",
+            "asof_timestamp",
+            "context_json",
+            "source_attempts_json",
+        } <= columns["forward_context_path_rows"]
         assert "country" in columns["universe_snapshots"]
         assert {
             "scan_id",

@@ -50,7 +50,7 @@ from alpha.db.models import (
     UniverseScan,
     UniverseSnapshot,
 )
-from alpha.jobs import run_m4_daily, run_universe
+from alpha.jobs import run_forward_context, run_m4_daily, run_universe
 from alpha.market_calendar import (
     is_us_equity_session,
     resolve_us_equity_session,
@@ -93,6 +93,14 @@ SOURCE_STATUS_SPLIT_KEYS = (
     "pit_excluded",
     "no_data",
 )
+FORWARD_CONTEXT_REQUIRED_PROVIDERS = ("polygon", "benzinga")
+FORWARD_CONTEXT_USABLE_PROVIDER_STATUSES = {"matched", "no_data", "pit_excluded"}
+FORWARD_CONTEXT_HARD_PROVIDER_FAILURE_STATUSES = {
+    "provider_error",
+    "parse_error",
+    "validation_error",
+    "unavailable",
+}
 
 
 @dataclass(frozen=True)
@@ -367,6 +375,66 @@ def _nonnegative_int_metric(value: Any) -> int:
             return 0
         return parsed if parsed > 0 else 0
     return 0
+
+
+def _forward_context_panel_capture_ok(metrics: Optional[Dict[str, Any]]) -> bool:
+    if metrics is None:
+        return True
+    if metrics.get("no_op_reason"):
+        return True
+    eligible = _nonnegative_int_metric(metrics.get("eligible_signal_count"))
+    if eligible == 0:
+        return True
+    if _forward_context_metrics_show_dead_required_provider(metrics):
+        return False
+    captured = (
+        _nonnegative_int_metric(metrics.get("rows_inserted"))
+        + _nonnegative_int_metric(metrics.get("rows_existing"))
+    )
+    return captured >= eligible
+
+
+def _forward_context_metrics_show_dead_required_provider(
+    metrics: Dict[str, Any],
+) -> bool:
+    if _nonnegative_int_metric(metrics.get("degraded_signal_count")) > 0:
+        return True
+    provider_counts = metrics.get("required_provider_status_counts")
+    if isinstance(provider_counts, dict):
+        for provider in FORWARD_CONTEXT_REQUIRED_PROVIDERS:
+            counts = _status_count_map(provider_counts.get(provider))
+            if _forward_context_provider_dead(counts):
+                return True
+        return False
+
+    counts = _status_count_map(metrics.get("source_attempt_status_counts"))
+    return _forward_context_provider_dead(counts)
+
+
+def _status_count_map(value: Any) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(status): _nonnegative_int_metric(count)
+        for status, count in value.items()
+    }
+
+
+def _forward_context_provider_dead(counts: Dict[str, int]) -> bool:
+    if not counts:
+        return False
+    usable = sum(
+        counts.get(status, 0)
+        for status in FORWARD_CONTEXT_USABLE_PROVIDER_STATUSES
+    )
+    if usable > 0:
+        return False
+    hard = sum(
+        counts.get(status, 0)
+        for status in FORWARD_CONTEXT_HARD_PROVIDER_FAILURE_STATUSES
+    )
+    total = sum(counts.values())
+    return hard > 0 and hard == total
 
 
 def _scan_json_for_secrets(value: Any, env_values: List[str]) -> Dict[str, bool]:
@@ -756,6 +824,8 @@ def build_m4_health_report(
     rerun_m4_run_id: Optional[str] = None,
     rerun_m4_metrics: Optional[Dict[str, Any]] = None,
     universe_run_id: Optional[str] = None,
+    forward_context_run_id: Optional[str] = None,
+    forward_context_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the structured M4 accumulation health report (sections a-j)."""
 
@@ -939,6 +1009,9 @@ def build_m4_health_report(
     signal_count = len(signals)
     duplicate_signal_count = _duplicate_signal_count(signals)
     has_successful_m4_run = bool(current_m4_run_ids)
+    forward_context_capture_ok = _forward_context_panel_capture_ok(
+        forward_context_metrics
+    )
 
     verdict_checks = {
         "has_signals": signal_count > 0,
@@ -950,6 +1023,7 @@ def build_m4_health_report(
         "no_fired_signal_context_errors": fired_hard_error_count == 0,
         "no_duplicate_signals": duplicate_signal_count == 0,
         "no_persistence_mismatch": (primary_mismatch + rerun_mismatch) == 0,
+        "forward_context_panel_captured": forward_context_capture_ok,
     }
     failing = sorted(name for name, ok in verdict_checks.items() if not ok)
 
@@ -1033,6 +1107,33 @@ def build_m4_health_report(
             "forward_returns_run": False,
             "forward_return_contamination_detected": forward_rows_created > 0,
         },
+        "forward_context_panel": {
+            "job_run_id": forward_context_run_id,
+            "schema_version": (forward_context_metrics or {}).get("schema_version"),
+            "forward_session_date": (forward_context_metrics or {}).get(
+                "forward_session_date"
+            ),
+            "asof_timestamp": (forward_context_metrics or {}).get("asof_timestamp"),
+            "active_signal_count": (forward_context_metrics or {}).get(
+                "active_signal_count"
+            ),
+            "eligible_signal_count": (forward_context_metrics or {}).get(
+                "eligible_signal_count"
+            ),
+            "pending_signal_count": (forward_context_metrics or {}).get(
+                "pending_signal_count"
+            ),
+            "rows_inserted": (forward_context_metrics or {}).get("rows_inserted"),
+            "rows_existing": (forward_context_metrics or {}).get("rows_existing"),
+            "ticker_fetch_count": (forward_context_metrics or {}).get(
+                "ticker_fetch_count"
+            ),
+            "source_attempt_status_counts": (forward_context_metrics or {}).get(
+                "source_attempt_status_counts"
+            ),
+            "no_op_reason": (forward_context_metrics or {}).get("no_op_reason"),
+            "capture_complete": forward_context_capture_ok,
+        },
         "source_attempts": {
             "source_attempt_status_counts": source_attempt_status_counts,
             "fired_source_attempt_status_counts": fired_status_counts,
@@ -1110,11 +1211,14 @@ def _print_report(report: Dict[str, Any]) -> None:
         "m4_signals",
         "data_quality",
         "forward_return_guard",
+        "forward_context_panel",
         "source_attempts",
         "freeze_reuse",
         "idempotency_rerun",
         "run_diagnostics",
     ):
+        if section not in report:
+            continue
         print(f"\n[{section}]")
         for key in sorted(report[section]):
             print(f"  {key}: {report[section][key]}")
@@ -1192,6 +1296,26 @@ def _run_m4(
     )
 
 
+def _run_forward_context(
+    *,
+    schema: Optional[str],
+    run_timestamp: str,
+    decision_date: str,
+) -> RunInvocation:
+    argv = ["--live", "--run-timestamp", run_timestamp, "--pattern-id", "M4"]
+    if schema:
+        argv += ["--schema", schema, "--create-tables"]
+    print("\n== Forward context panel ==")
+    exit_code = run_forward_context.main(argv)
+    return _recover_invocation(
+        url=os.environ.get("DATABASE_URL", ""),
+        schema=schema,
+        job_name="forward_context_panel_collector",
+        decision_date=decision_date,
+        exit_code=exit_code,
+    )
+
+
 def _coerce_invocation(value: Any) -> RunInvocation:
     if isinstance(value, RunInvocation):
         return value
@@ -1260,6 +1384,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help="Skip Polygon identity enrichment in the universe build.")
     parser.add_argument("--skip-rerun", action="store_true",
                         help="Skip the idempotency freeze/reuse rerun.")
+    parser.add_argument("--skip-forward-context", action="store_true",
+                        help="Skip the post-M4 forward-context panel collector.")
     parser.add_argument("--signal-context-breakout-buffer", type=float, default=0.02)
     parser.add_argument("--retry-backoff-seconds", type=float, default=0.25)
     parser.add_argument("--profile-max-workers", type=int, default=20)
@@ -1324,7 +1450,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dry_run:
         print("\nDry run: no database writes and no provider API calls performed.")
-        print("Planned steps: universe build -> M4 daily -> health report.")
+        print(
+            "Planned steps: universe build -> M4 daily -> "
+            "forward context panel -> health report."
+        )
         return 0
 
     if args.live:
@@ -1397,6 +1526,48 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("ERROR: M4 idempotency rerun returned exit 0 without a finished job run")
             return 1
 
+    forward_context_invocation = RunInvocation(
+        exit_code=0,
+        run_status="finished",
+        metrics={},
+    )
+    if args.skip_forward_context:
+        forward_context_invocation = RunInvocation(
+            exit_code=0,
+            run_status="finished",
+            metrics={"no_op_reason": "skipped_by_cli"},
+        )
+        print("\nForward context panel skipped by --skip-forward-context.")
+    elif args.decision_date:
+        # A historical decision-date override may anchor effective_run_timestamp
+        # to a past close. Forward context is capture-or-lose live evidence, so
+        # do not pretend a historical rerun can recover that panel.
+        forward_context_invocation = RunInvocation(
+            exit_code=0,
+            run_status="finished",
+            metrics={"no_op_reason": "skipped_for_decision_date_override"},
+        )
+        print("\nForward context panel skipped for explicit decision-date rerun.")
+    else:
+        reset_globals()
+        forward_context_invocation = _coerce_invocation(_run_forward_context(
+            schema=schema,
+            run_timestamp=effective_run_timestamp,
+            decision_date=decision_date,
+        ))
+        if forward_context_invocation.exit_code != 0:
+            print(
+                "ERROR: forward context panel failed with exit "
+                f"{forward_context_invocation.exit_code}"
+            )
+            return forward_context_invocation.exit_code
+        if (
+            not forward_context_invocation.run_id
+            or forward_context_invocation.run_status not in SUCCESS_RUN_STATUSES
+        ):
+            print("ERROR: forward context panel returned exit 0 without a finished job run")
+            return 1
+
     engine, session = _report_session(url, schema)
     try:
         report = build_m4_health_report(
@@ -1415,6 +1586,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             primary_m4_run_id=primary_m4_invocation.run_id,
             rerun_m4_run_id=rerun_m4_invocation.run_id,
             rerun_m4_metrics=rerun_m4_invocation.metrics,
+            forward_context_run_id=forward_context_invocation.run_id,
+            forward_context_metrics=forward_context_invocation.metrics,
         )
     finally:
         session.close()

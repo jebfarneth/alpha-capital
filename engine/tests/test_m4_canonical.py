@@ -302,7 +302,7 @@ def _run_m4_daily_into(db_session, *, polygon=None, benzinga=None):
     return result
 
 
-def _build_report(db_session, *, m4_metrics=None):
+def _build_report(db_session, *, m4_metrics=None, forward_context_metrics=None):
     return build_m4_health_report(
         db_session,
         mode="scratch",
@@ -314,6 +314,7 @@ def _build_report(db_session, *, m4_metrics=None):
         next_execution_session="2026-05-26",
         run_timestamp="2026-05-26T08:00:00+00:00",
         m4_metrics=m4_metrics,
+        forward_context_metrics=forward_context_metrics,
     )
 
 
@@ -495,6 +496,7 @@ def test_health_report_has_all_sections(db_session):
         "m4_signals",
         "data_quality",
         "forward_return_guard",
+        "forward_context_panel",
         "source_attempts",
         "freeze_reuse",
         "idempotency_rerun",
@@ -522,6 +524,81 @@ def test_clean_run_is_healthy(db_session):
     assert report["health"] is True
     assert report["health_verdict"]["failing_checks"] == []
     assert report["freeze_reuse"]["fired_missing_signal_context_count"] == 0
+
+
+def test_forward_context_panel_gap_fails_health(db_session):
+    _add_feature(db_session, "feature-forward-context-gap", "FCG")
+    _add_signal(db_session, "signal-forward-context-gap", "feature-forward-context-gap", "FCG")
+
+    report = _build_report(
+        db_session,
+        forward_context_metrics={
+            "eligible_signal_count": 2,
+            "pending_signal_count": 2,
+            "rows_inserted": 1,
+            "rows_existing": 0,
+        },
+    )
+
+    assert report["health"] is False
+    assert report["forward_context_panel"]["capture_complete"] is False
+    assert "forward_context_panel_captured" in report["health_verdict"]["failing_checks"]
+
+
+def test_forward_context_panel_complete_but_dead_provider_metrics_fail_health(db_session):
+    _add_feature(db_session, "feature-forward-context-dead", "FCD")
+    _add_signal(db_session, "signal-forward-context-dead", "feature-forward-context-dead", "FCD")
+
+    report = _build_report(
+        db_session,
+        forward_context_metrics={
+            "eligible_signal_count": 2,
+            "pending_signal_count": 2,
+            "rows_inserted": 2,
+            "rows_existing": 0,
+            "degraded_signal_count": 2,
+            "required_provider_status_counts": {
+                "polygon": {"provider_error": 10},
+                "benzinga": {"no_data": 10},
+            },
+        },
+    )
+
+    assert report["health"] is False
+    assert report["forward_context_panel"]["capture_complete"] is False
+    assert "forward_context_panel_captured" in report["health_verdict"]["failing_checks"]
+
+
+@pytest.mark.parametrize(
+    "forward_context_metrics",
+    [
+        {"eligible_signal_count": 0, "pending_signal_count": 0, "rows_inserted": 0, "rows_existing": 0},
+        {"no_op_reason": "skipped_by_cli"},
+        {"no_op_reason": "skipped_for_decision_date_override"},
+        {
+            "eligible_signal_count": 2,
+            "pending_signal_count": 2,
+            "rows_inserted": 2,
+            "rows_existing": 0,
+            "required_provider_status_counts": {
+                "polygon": {"no_data": 5},
+                "benzinga": {"pit_excluded": 2, "no_data": 8},
+            },
+        },
+    ],
+)
+def test_forward_context_panel_expected_skips_pass_health(db_session, forward_context_metrics):
+    _add_feature(db_session, "feature-forward-context-pass", "FCP")
+    _add_signal(db_session, "signal-forward-context-pass", "feature-forward-context-pass", "FCP")
+
+    report = _build_report(
+        db_session,
+        forward_context_metrics=forward_context_metrics,
+    )
+
+    assert report["health"] is True
+    assert report["forward_context_panel"]["capture_complete"] is True
+    assert "forward_context_panel_captured" not in report["health_verdict"]["failing_checks"]
 
 
 # ---------------------------------------------------------------------------
@@ -1625,6 +1702,94 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
     assert build_kwargs["rerun_m4_metrics"]["signal_context"]["context_reused_from_persistence_count"] == 1
     assert output.exists()
     assert json.loads(output.read_text())["run_metadata"]["asof_timestamp"] == "2026-05-26T20:00:00+00:00"
+
+
+def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    calls = []
+
+    def fake_universe(**kwargs):
+        calls.append(("universe", kwargs))
+        return run_m4_canonical.RunInvocation(
+            exit_code=0,
+            run_id="universe-run",
+            run_status="finished",
+            metrics={"included": 3},
+        )
+
+    def fake_m4(**kwargs):
+        calls.append(("m4", kwargs))
+        return run_m4_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m4-primary",
+            run_status="finished",
+            metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_forward_context(**kwargs):
+        calls.append(("forward_context", kwargs))
+        return run_m4_canonical.RunInvocation(
+            exit_code=0,
+            run_id="forward-context-run",
+            run_status="finished",
+            metrics={"rows_inserted": 4, "forward_session_date": "2026-05-29"},
+        )
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def fake_report_session(url, schema):
+        return FakeEngine(), FakeSession()
+
+    def fake_build_report(session, **kwargs):
+        calls.append(("build_report", kwargs))
+        assert kwargs["forward_context_run_id"] == "forward-context-run"
+        assert kwargs["forward_context_metrics"]["rows_inserted"] == 4
+        return {
+            "health": True,
+            "run_metadata": {},
+            "universe": {},
+            "m4_assembly": {},
+            "m4_signals": {},
+            "data_quality": {},
+            "forward_return_guard": {},
+            "forward_context_panel": {},
+            "source_attempts": {},
+            "freeze_reuse": {},
+            "idempotency_rerun": {},
+            "run_diagnostics": {},
+            "fired_signal_table": [],
+            "health_verdict": {"failing_checks": []},
+        }
+
+    monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_m4_canonical, "_run_forward_context", fake_forward_context)
+    monkeypatch.setattr(run_m4_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fake_build_report)
+
+    rc = run_m4_canonical.main([
+        "--scratch",
+        "--schema", "scratch_schema",
+        "--run-timestamp", "2026-05-29T20:00:00-04:00",
+        "--skip-rerun",
+    ])
+
+    assert rc == 0
+    assert [name for name, _payload in calls] == [
+        "universe",
+        "m4",
+        "forward_context",
+        "build_report",
+    ]
+    forward_kwargs = [payload for name, payload in calls if name == "forward_context"][0]
+    assert forward_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
 
 
 def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):

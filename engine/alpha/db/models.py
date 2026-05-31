@@ -520,6 +520,9 @@ class SignalRegistry(Base):
     forward_return_path_rows = relationship(
         "ForwardReturnPathRow", back_populates="signal"
     )
+    forward_context_path_rows = relationship(
+        "ForwardContextPathRow", back_populates="signal"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +704,68 @@ class ForwardReturnPathRow(Base):
 
     observation = relationship("ForwardReturnObservation", back_populates="path_rows")
     signal = relationship("SignalRegistry", back_populates="forward_return_path_rows")
+
+
+# ---------------------------------------------------------------------------
+# forward_context_path_rows
+# ---------------------------------------------------------------------------
+class ForwardContextPathRow(Base):
+    """Per-forward-session context snapshot for a live signal.
+
+    These rows are observational panel data only. They must never feed entry
+    signal generation or signal_identity_hash construction; consumers may read
+    rows only up to their own decision moment.
+    """
+
+    __tablename__ = "forward_context_path_rows"
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_id",
+            "forward_session_date",
+            name="ux_forward_context_path_rows_signal_session",
+        ),
+        UniqueConstraint(
+            "signal_id",
+            "path_sequence",
+            name="ux_forward_context_path_rows_signal_sequence",
+        ),
+        Index(
+            "ix_forward_context_path_rows_signal_session",
+            "signal_id",
+            "forward_session_date",
+        ),
+        Index(
+            "ix_forward_context_path_rows_pattern_ticker_session",
+            "pattern_id",
+            "ticker",
+            "forward_session_date",
+        ),
+    )
+
+    forward_context_path_row_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), nullable=False
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    signal_horizon = Column(String, nullable=True)
+    forward_session_date = Column(String, nullable=False)
+    path_sequence = Column(Integer, nullable=False)
+    asof_timestamp = Column(DateTime(timezone=True), nullable=False)
+    context_json = Column(Text, nullable=False)
+    source_attempts_json = Column(Text, nullable=False)
+    data_lineage_ids = Column(Text, nullable=False)
+    context_hash = Column(String, nullable=False)
+    is_terminal_snapshot = Column(Boolean, nullable=False, default=False)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal = relationship("SignalRegistry", back_populates="forward_context_path_rows")
 
 
 # ---------------------------------------------------------------------------
