@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 import os
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -108,6 +109,7 @@ def _adapter_for(*texts):
 
 
 ASOF_AFTER_FILE = datetime(2026, 5, 30, 3, 0, tzinfo=timezone.utc)
+ET = ZoneInfo("America/New_York")
 
 
 class TestNasdaqTraderListingAdapter:
@@ -123,6 +125,28 @@ class TestNasdaqTraderListingAdapter:
         assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
         assert resp.data.matched_symbol == "AAPL"
         assert resp.data.pit_knowable_at_asof is True
+
+    def test_common_word_substrings_are_not_noncommon_descriptors(self):
+        cases = [
+            ("ACU", "Acme United Corporation. Common Stock"),
+            ("UBCP", "United Bancorp, Inc. - Common Stock"),
+            ("UG", "United-Guardian, Inc. - Common Stock"),
+            ("FUNDG", "Example Funding Corp. Common Stock"),
+            ("NOTEZ", "Example Noted Corp. Common Stock"),
+            ("BONDH", "Example Bondholder Corp. Common Stock"),
+            ("RGHTZ", "Example Righthand Corp. Common Stock"),
+        ]
+        for symbol, name in cases:
+            adapter, _ = _adapter_for(
+                _nasdaq_directory(_rows("N", 1001)),
+                _other_directory([(symbol, name), *_rows("O", 1000)]),
+            )
+
+            resp = adapter.get_listing_status(symbol, asof=ASOF_AFTER_FILE)
+
+            assert resp.ok
+            assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
+            assert resp.data.matched_symbol == symbol
 
     def test_absent_symbol_is_inconclusive_not_delisted_for_known_residuals(self):
         for symbol in ["GLTO", "LITM", "OTH", "TTSH", "VBIX", "VVPR", "ZGM"]:
@@ -265,7 +289,14 @@ class TestNasdaqTraderListingAdapter:
         cases = [
             ("ZVZZT", "NASDAQ TEST STOCK", "Y", "N"),
             ("ETFZ", "Example ETF", "N", "Y"),
+            ("UNITZ", "Example Co. - Units", "N", "N"),
             ("WRTZ", "Example Co. - Warrants", "N", "N"),
+            ("RGHTZ", "Example Co. - Rights", "N", "N"),
+            ("PREFZ", "Example Co. - Preferred Stock", "N", "N"),
+            ("NOTEZ", "Example Co. - Notes", "N", "N"),
+            ("BONDZ", "Example Co. - Bonds", "N", "N"),
+            ("DEBTZ", "Example Co. - Debenture", "N", "N"),
+            ("FUNDZ", "Example Fund", "N", "N"),
         ]
         for symbol, name, test_issue, etf in cases:
             adapter, _ = _adapter_for(
@@ -382,6 +413,34 @@ class TestNasdaqTraderListingAdapter:
         assert resp.data.pit_knowable_at_asof is False
         assert resp.data.reason == "halt_reason_D_not_knowable_at_asof"
 
+    def test_halt_future_knowledge_does_not_hide_known_d(self):
+        for items in (
+            [
+                ("DEAD", "D", "05/29/2026", "19:50:00.000", "Fri, 29 May 2026 23:59:00 GMT"),
+                ("DEAD", "D", "05/29/2026", "19:51:00.000", "Fri, 29 May 2026 23:40:00 GMT"),
+            ],
+            [
+                ("DEAD", "D", "05/29/2026", "19:51:00.000", "Fri, 29 May 2026 23:40:00 GMT"),
+                ("DEAD", "D", "05/29/2026", "19:50:00.000", "Fri, 29 May 2026 23:59:00 GMT"),
+            ],
+        ):
+            adapter, _ = _adapter_for(
+                _nasdaq_directory(_rows("N", 1001)),
+                _other_directory(_rows("O", 1001)),
+                _adds_deletes(),
+                _halt_rss(items),
+            )
+
+            resp = adapter.get_listing_status(
+                "DEAD",
+                asof=datetime(2026, 5, 29, 23, 55, tzinfo=timezone.utc),
+            )
+
+            assert resp.ok
+            assert resp.data.status is NasdaqListingStatus.DELISTED
+            assert resp.data.reason == "trade_halt_reason_D_security_deletion"
+            assert resp.data.pit_knowable_at_asof is True
+
     def test_duplicate_header_body_row_is_unavailable(self):
         header = "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares"
         adapter, _ = _adapter_for(
@@ -433,7 +492,7 @@ class TestNasdaqTraderListingAdapter:
         assert captured.data.inserted_snapshots == 3
         assert captured.data.inserted_rows == 2002
 
-        before_capture = datetime(2026, 5, 29, 20, 0, tzinfo=timezone.utc)
+        before_capture = datetime(2026, 5, 28, 20, 0, tzinfo=timezone.utc)
         precapture = adapter.get_listing_status(
             "AAPL",
             asof=before_capture,
@@ -464,6 +523,138 @@ class TestNasdaqTraderListingAdapter:
         assert stale.data.status is NasdaqListingStatus.INCONCLUSIVE
         assert stale.data.pit_knowable_at_asof is False
         assert stale.data.reason == "archived_snapshot_stale_for_asof"
+
+    def test_archive_same_session_evening_snapshot_covers_session_close_asof(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [
+                    ("AAPL", "Apple Inc. - Common Stock"),
+                    ("AACBU", "Artius II Acquisition Inc. - Units"),
+                    ("ACIU", "AC Immune SA - Common Stock"),
+                    *_rows("N", 1000),
+                ],
+                footer="File Creation Time: 0601202618:15|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 0601202618:15||||||"),
+            _adds_deletes(footer="File Creation Time: 0601202618:15|||||"),
+        )
+        captured = adapter.archive_current_snapshot(
+            db_session,
+            asof=datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+        )
+        assert captured.ok
+
+        session_close = datetime(2026, 6, 1, 16, 0, tzinfo=ET)
+        archived = adapter.get_listing_status(
+            "AAPL",
+            asof=session_close,
+            archive_session=db_session,
+            use_live=False,
+        )
+        after_source = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 20, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+        next_day = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 2, 0, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+        absent = adapter.get_listing_status(
+            "ZZZZNOTREAL",
+            asof=session_close,
+            archive_session=db_session,
+            use_live=False,
+        )
+        unit = adapter.get_listing_status(
+            "AACB.U",
+            asof=session_close,
+            archive_session=db_session,
+            use_live=False,
+        )
+        common_ending_u = adapter.get_listing_status(
+            "ACI.U",
+            asof=session_close,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert archived.ok
+        assert archived.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert archived.data.pit_knowable_at_asof is False
+        assert after_source.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert after_source.data.pit_knowable_at_asof is True
+        assert next_day.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert next_day.data.reason == "archived_snapshot_stale_for_asof"
+        assert absent.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert absent.data.reason == "symbol_absent_from_archived_directory"
+        assert absent.data.pit_knowable_at_asof is False
+        assert unit.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert unit.data.matched_symbol == "AACBU"
+        assert common_ending_u.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert common_ending_u.data.reason == "directory_record_not_common_stock_listing"
+
+    def test_archive_prior_session_snapshot_does_not_cover_later_asof(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)],
+                footer="File Creation Time: 0529202618:15|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 0529202618:15||||||"),
+            _adds_deletes(footer="File Creation Time: 0529202618:15|||||"),
+        )
+        assert adapter.archive_current_snapshot(
+            db_session,
+            asof=datetime(2026, 5, 29, 18, 15, tzinfo=ET),
+        ).ok
+
+        resp = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert resp.data.reason == "archived_snapshot_stale_for_asof"
+
+    def test_archive_future_session_snapshot_does_not_answer_prior_asof(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)],
+                footer="File Creation Time: 0602202600:00|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 0602202600:00||||||"),
+            _adds_deletes(footer="File Creation Time: 0602202600:00|||||"),
+        )
+        assert adapter.archive_current_snapshot(
+            db_session,
+            asof=datetime(2026, 6, 2, 0, 0, tzinfo=ET),
+        ).ok
+
+        resp = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert resp.data.reason == "no_archived_snapshot_for_asof"
 
     def test_feed_timestamp_is_interpreted_as_eastern_time(self):
         parsed = _parse_feed_datetime("05/29/2026", "19:50:00.000")
