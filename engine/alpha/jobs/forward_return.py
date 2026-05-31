@@ -2092,6 +2092,7 @@ def resolve_missing_exit_survivorship(
     source_attempts: List[Dict[str, Any]] = []
     source_lineage_ids: List[str] = []
     pending_benzinga_resolution: Optional[SurvivorshipResolution] = None
+    pending_edgar_review_resolution: Optional[SurvivorshipResolution] = None
 
     for source_adapter in source_adapters:
         if not hasattr(source_adapter, "get_survivorship_events"):
@@ -2110,6 +2111,15 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
+            if _is_sec_edgar_review_resolution(resolution):
+                pending_edgar_review_resolution = resolution
+                continue
+            if pending_edgar_review_resolution is not None:
+                pending_edgar_review_resolution = _add_survivorship_conflict_summary(
+                    pending_edgar_review_resolution,
+                    conflicting=resolution,
+                )
+                continue
             return _with_survivorship_source_attempts(
                 resolution,
                 source_attempts=source_attempts,
@@ -2132,7 +2142,15 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            pending_benzinga_resolution = resolution
+            if pending_edgar_review_resolution is not None:
+                pending_edgar_review_resolution = (
+                    _add_survivorship_corroboration_summary(
+                        pending_edgar_review_resolution,
+                        corroborating=resolution,
+                    )
+                )
+            else:
+                pending_benzinga_resolution = resolution
             break
 
     if hasattr(adapter, "get_survivorship_events"):
@@ -2150,11 +2168,17 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            return _with_survivorship_source_attempts(
-                resolution,
-                source_attempts=source_attempts,
-                source_lineage_ids=source_lineage_ids,
-            )
+            if pending_edgar_review_resolution is not None:
+                pending_edgar_review_resolution = _add_survivorship_conflict_summary(
+                    pending_edgar_review_resolution,
+                    conflicting=resolution,
+                )
+            else:
+                return _with_survivorship_source_attempts(
+                    resolution,
+                    source_attempts=source_attempts,
+                    source_lineage_ids=source_lineage_ids,
+                )
 
     if hasattr(adapter, "get_delisted_companies"):
         resolution = _resolve_from_fmp_delisted_companies(
@@ -2169,6 +2193,22 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
+            if pending_edgar_review_resolution is not None:
+                if (
+                    resolution.decision.reason
+                    != "survivorship_unresolved_no_source_event"
+                ):
+                    pending_edgar_review_resolution = (
+                        _add_survivorship_conflict_summary(
+                            pending_edgar_review_resolution,
+                            conflicting=resolution,
+                        )
+                    )
+                return _with_survivorship_source_attempts(
+                    pending_edgar_review_resolution,
+                    source_attempts=source_attempts,
+                    source_lineage_ids=source_lineage_ids,
+                )
             if pending_benzinga_resolution is not None:
                 if (
                     resolution.decision.reason
@@ -2190,6 +2230,13 @@ def resolve_missing_exit_survivorship(
                 source_attempts=source_attempts,
                 source_lineage_ids=source_lineage_ids,
             )
+
+    if pending_edgar_review_resolution is not None:
+        return _with_survivorship_source_attempts(
+            pending_edgar_review_resolution,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
 
     if pending_benzinga_resolution is not None:
         return _with_survivorship_source_attempts(
@@ -2747,6 +2794,37 @@ def _add_survivorship_conflict_summary(
         "provider_request": conflicting.provider_request,
     }
     return replace(resolution, provider_request=provider_request)
+
+
+def _add_survivorship_corroboration_summary(
+    resolution: SurvivorshipResolution,
+    *,
+    corroborating: SurvivorshipResolution,
+) -> SurvivorshipResolution:
+    provider_request = dict(resolution.provider_request or {})
+    existing = provider_request.get("authority_corroboration")
+    corroboration = list(existing) if isinstance(existing, list) else []
+    corroboration.append(
+        {
+            "status": corroborating.decision.status,
+            "reason": corroborating.decision.reason,
+            "provider": corroborating.provider,
+            "endpoint": corroborating.endpoint,
+            "provider_request": corroborating.provider_request,
+        }
+    )
+    provider_request["authority_corroboration"] = corroboration
+    return replace(resolution, provider_request=provider_request)
+
+
+def _is_sec_edgar_review_resolution(resolution: SurvivorshipResolution) -> bool:
+    return (
+        resolution.provider == SEC_EDGAR_PROVIDER
+        or resolution.endpoint == SEC_EDGAR_SURVIVORSHIP_ENDPOINT
+    ) and resolution.decision.status in {
+        STATUS_CORPORATE_ACTION_REVIEW,
+        STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+    }
 
 
 def _signal_security_identity(sig: SignalRegistry) -> Dict[str, str]:

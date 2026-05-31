@@ -1119,6 +1119,99 @@ def test_sec_edgar_form25_note_like_event_routes_to_review_not_terminal(db_sessi
     assert obs.reason == "sec_edgar_form25_survivorship_review"
 
 
+def test_sec_edgar_review_collects_benzinga_and_fmp_corroboration(db_session):
+    sid = _make_signal(
+        db_session,
+        ticker="TCON",
+        security_identity={"cik": "1418091", "cusip": "004397105"},
+    )
+    adapter = FakeDelistedAdapter(
+        {"TCON": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={
+            0: [
+                FmpDelistedCompany(
+                    symbol="TCON",
+                    company_name="Ticker Conflict Corp",
+                    delisted_date=EXIT_DATE.isoformat(),
+                )
+            ]
+        },
+    )
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "TCON": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        }
+    )
+    benzinga = FakeBenzingaAdapter(
+        {
+            "TCON": {
+                "id": "deal-conflict",
+                "target_ticker": "TCON",
+                "target_cusip": "004397105",
+                "acquirer_ticker": "BUY",
+                "date_completed": EXIT_DATE.isoformat(),
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar, benzinga])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert len(edgar.calls) == 1
+    assert len(benzinga.calls) == 1
+    assert len(adapter.delisted_calls) >= 1
+    assert sig.forward_return_status == "corporate_action_review"
+    assert obs.provider == "SEC_EDGAR"
+    assert obs.endpoint == "sec_edgar_survivorship_events"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.forward_return is None
+    assert obs.exit_price is None
+    assert (
+        survivorship_request["authority_corroboration"][0]["provider"]
+        == "Benzinga"
+    )
+    assert (
+        survivorship_request["authority_corroboration"][0]["reason"]
+        == "benzinga_merger_acquisition_review"
+    )
+    assert survivorship_request["authority_conflict"]["provider"] == "FMP"
+    assert (
+        survivorship_request["authority_conflict"]["reason"]
+        == "delisting_unclassified_survivorship_review"
+    )
+    assert [attempt["source"] for attempt in attempts] == [
+        "sec_edgar_survivorship_events",
+        "benzinga_calendar_ma",
+        "survivorship_events",
+        "fmp_delisted_companies",
+    ]
+    assert [attempt["status"] for attempt in attempts] == [
+        "matched",
+        "matched",
+        "no_match",
+        "matched",
+    ]
+    authorities = [
+        db_session.get(DataLineage, attempt["lineage_id"]).source_authority
+        for attempt in attempts
+    ]
+    assert authorities == ["SEC_EDGAR", "Benzinga", "test", "FMP"]
+
+
 def test_sec_edgar_incomplete_window_routes_to_review_with_lineage(db_session):
     _make_signal(
         db_session,
