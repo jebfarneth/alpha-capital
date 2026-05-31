@@ -13,6 +13,7 @@ from alpha.data.nasdaq import (
     ADDS_DELETES,
     HALT_RSS,
     NASDAQ_LISTED,
+    OTHER_LISTED,
     NasdaqListingStatus,
     NasdaqTraderListingAdapter,
     _parse_feed_datetime,
@@ -69,7 +70,7 @@ def _adds_deletes(rows=(), *, footer="File Creation Time: 0529202621:32|||||"):
     return "\n".join([header, *body, footer])
 
 
-def _halt_rss(items=()):
+def _halt_rss(items=(), *, channel_pub="Sun, 31 May 2026 10:00:00 GMT"):
     body = []
     for item in items:
         if len(item) == 4:
@@ -96,7 +97,7 @@ def _halt_rss(items=()):
 <rss version="2.0" xmlns:ndaq="http://www.nasdaqtrader.com/">
   <channel>
     <title>NASDAQTrader.com</title>
-    <pubDate>Sun, 31 May 2026 10:00:00 GMT</pubDate>
+    <pubDate>{channel_pub}</pubDate>
     <ndaq:numItems>{len(items)}</ndaq:numItems>
     {''.join(body)}
   </channel>
@@ -157,10 +158,39 @@ class TestNasdaqTraderListingAdapter:
             ("ACU", "Acme United Corporation. Common Stock"),
             ("UBCP", "United Bancorp, Inc. - Common Stock"),
             ("UG", "United-Guardian, Inc. - Common Stock"),
+            ("UNITY", "Unity Bancorp, Inc. - Common Stock"),
+            ("UNITI", "Uniti Group Inc. - Common Stock"),
             ("FUNDG", "Example Funding Corp. Common Stock"),
+            ("FUNDX", "Example Fundamental Corp. Common Stock"),
+            ("FNKO", "Funko, Inc. - Common Stock"),
             ("NOTEZ", "Example Noted Corp. Common Stock"),
+            ("NOTEW", "Example Noteworthy Corp. Common Stock"),
             ("BONDH", "Example Bondholder Corp. Common Stock"),
             ("RGHTZ", "Example Righthand Corp. Common Stock"),
+        ]
+        for symbol, name in cases:
+            adapter, _ = _adapter_for(
+                _nasdaq_directory(_rows("N", 1001)),
+                _other_directory([(symbol, name), *_rows("O", 1000)]),
+                _adds_deletes(),
+                _halt_rss(),
+            )
+
+            resp = adapter.get_listing_status(symbol, asof=ASOF_AFTER_FILE)
+
+            assert resp.ok
+            assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
+            assert resp.data.matched_symbol == symbol
+
+    def test_cvi_and_lp_equity_units_remain_eligible(self):
+        # CVI is CVR Energy common stock, not a contingent-value right. These
+        # LP listings are equity-like common/class-share rows, so future
+        # descriptor vocabulary must not reject them as generic non-common units.
+        cases = [
+            ("CVI", "CVR Energy Inc. Common Stock"),
+            ("PAGP", "Plains GP Holdings, L.P. Class A Shares"),
+            ("HESM", "Hess Midstream LP Class A Share"),
+            ("NRP", "Natural Resource Partners L.P. Common Units Representing Limited Partner Interests"),
         ]
         for symbol, name in cases:
             adapter, _ = _adapter_for(
@@ -427,6 +457,60 @@ class TestNasdaqTraderListingAdapter:
         assert resp.data.status is NasdaqListingStatus.LISTED_ACTIVE
         assert resp.data.pit_knowable_at_asof is True
 
+    def test_same_day_live_snapshot_before_session_close_is_not_knowable(self):
+        pre_close = datetime(2026, 5, 29, 9, 45, tzinfo=ET)
+        adapter, _ = _adapter_for(
+            _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            _halt_rss(),
+        )
+
+        resp = adapter.get_listing_status("AAPL", asof=pre_close)
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert resp.data.reason == "directory_match_not_knowable_at_asof"
+        assert resp.data.pit_knowable_at_asof is False
+
+    def test_same_day_live_snapshot_uses_real_half_day_close(self):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)],
+                footer="File Creation Time: 1127202618:15|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 1127202618:15||||||"),
+            _adds_deletes(footer="File Creation Time: 1127202618:15|||||"),
+            _halt_rss(channel_pub="Fri, 27 Nov 2026 22:15:00 GMT"),
+        )
+
+        at_half_day_close = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 11, 27, 13, 0, tzinfo=ET),
+        )
+
+        assert at_half_day_close.ok
+        assert at_half_day_close.data.status is NasdaqListingStatus.LISTED_ACTIVE
+        assert at_half_day_close.data.pit_knowable_at_asof is True
+
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)],
+                footer="File Creation Time: 1127202618:15|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 1127202618:15||||||"),
+            _adds_deletes(footer="File Creation Time: 1127202618:15|||||"),
+            _halt_rss(channel_pub="Fri, 27 Nov 2026 22:15:00 GMT"),
+        )
+        before_half_day_close = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 11, 27, 12, 59, tzinfo=ET),
+        )
+
+        assert before_half_day_close.ok
+        assert before_half_day_close.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert before_half_day_close.data.reason == "directory_match_not_knowable_at_asof"
+
     def test_live_snapshot_future_day_stays_inconclusive_for_past_asof(self):
         past_asof = datetime(2026, 5, 28, 20, 0, tzinfo=timezone.utc)
         adapter, _ = _adapter_for(
@@ -558,13 +642,15 @@ class TestNasdaqTraderListingAdapter:
             _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
             _other_directory(_rows("O", 1001)),
             _adds_deletes(),
+            _halt_rss(),
         )
 
         captured = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
 
         assert captured.ok
-        assert captured.data.inserted_snapshots == 3
+        assert captured.data.inserted_snapshots == 4
         assert captured.data.inserted_rows == 2002
+        assert HALT_RSS in captured.data.captured_sources
 
         before_capture = datetime(2026, 5, 28, 20, 0, tzinfo=timezone.utc)
         precapture = adapter.get_listing_status(
@@ -598,6 +684,91 @@ class TestNasdaqTraderListingAdapter:
         assert stale.data.pit_knowable_at_asof is False
         assert stale.data.reason == "archived_snapshot_stale_for_asof"
 
+    def test_archive_capture_persists_halt_rss_and_replays_reason_d(
+        self,
+        db_session,
+    ):
+        directory = _nasdaq_directory(
+            [("HALTD", "Halt Deleted Co. - Common Stock"), *_rows("N", 1000)],
+            footer="File Creation Time: 0601202618:15|||||||",
+        )
+        other = _other_directory(_rows("O", 1001), footer="File Creation Time: 0601202618:15||||||")
+        adds = _adds_deletes(footer="File Creation Time: 0601202618:15|||||")
+        halt_with_delete = _halt_rss(
+            [("HALTD", "D", "06/01/2026", "15:50:00.000", "Mon, 01 Jun 2026 19:55:00 GMT")],
+            channel_pub="Mon, 01 Jun 2026 20:00:00 GMT",
+        )
+        changed_halt_feed_without_haltd = _halt_rss(
+            [("OTHERD", "D", "06/01/2026", "15:51:00.000", "Mon, 01 Jun 2026 19:56:00 GMT")],
+            channel_pub="Mon, 01 Jun 2026 20:00:00 GMT",
+        )
+        adapter, _ = _adapter_for(
+            directory,
+            other,
+            adds,
+            halt_with_delete,
+            directory,
+            other,
+            adds,
+            halt_with_delete,
+            directory,
+            other,
+            adds,
+            changed_halt_feed_without_haltd,
+        )
+
+        archive_asof = datetime(2026, 6, 1, 18, 15, tzinfo=ET)
+        first = adapter.archive_current_snapshot(db_session, asof=archive_asof)
+        second = adapter.archive_current_snapshot(db_session, asof=archive_asof)
+        third = adapter.archive_current_snapshot(db_session, asof=archive_asof)
+
+        assert first.ok
+        assert HALT_RSS in first.data.captured_sources
+        assert first.data.inserted_snapshots == 4
+        assert first.data.inserted_rows == 2003
+        assert second.ok
+        assert second.data.inserted_snapshots == 0
+        assert second.data.existing_snapshots == 4
+        assert second.data.inserted_rows == 0
+        assert third.ok
+        assert third.data.inserted_snapshots == 1
+        assert third.data.inserted_rows == 1
+
+        replay = adapter.get_listing_status(
+            "HALTD",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert replay.ok
+        assert replay.data.status is NasdaqListingStatus.DELISTED
+        assert replay.data.reason == "trade_halt_reason_D_security_deletion"
+
+    def test_archive_capture_degrades_when_halt_rss_fails(
+        self,
+        db_session,
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(text=_nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]
+            )),
+            _mock_response(text=_other_directory(_rows("O", 1001))),
+            _mock_response(text=_adds_deletes()),
+            requests.exceptions.Timeout(),
+        ]
+        adapter = NasdaqTraderListingAdapter(session=session)
+
+        captured = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+
+        assert captured.ok
+        assert captured.data.failed_sources == (HALT_RSS,)
+        assert HALT_RSS not in captured.data.captured_sources
+        assert captured.data.inserted_snapshots == 3
+        assert captured.data.inserted_rows == 2002
+        assert captured.lineage.data_quality_flags["failed_sources"] == [HALT_RSS]
+
     def test_archive_same_session_evening_snapshot_covers_session_close_asof(
         self,
         db_session,
@@ -614,6 +785,7 @@ class TestNasdaqTraderListingAdapter:
             ),
             _other_directory(_rows("O", 1001), footer="File Creation Time: 0601202618:15||||||"),
             _adds_deletes(footer="File Creation Time: 0601202618:15|||||"),
+            _halt_rss(channel_pub="Mon, 01 Jun 2026 22:15:00 GMT"),
         )
         captured = adapter.archive_current_snapshot(
             db_session,
@@ -622,6 +794,12 @@ class TestNasdaqTraderListingAdapter:
         assert captured.ok
 
         session_close = datetime(2026, 6, 1, 16, 0, tzinfo=ET)
+        pre_close = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 9, 45, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
         archived = adapter.get_listing_status(
             "AAPL",
             asof=session_close,
@@ -659,6 +837,10 @@ class TestNasdaqTraderListingAdapter:
             use_live=False,
         )
 
+        assert pre_close.ok
+        assert pre_close.data.status is NasdaqListingStatus.INCONCLUSIVE
+        assert pre_close.data.reason == "directory_match_not_knowable_at_asof"
+        assert pre_close.data.pit_knowable_at_asof is False
         assert archived.ok
         assert archived.data.status is NasdaqListingStatus.LISTED_ACTIVE
         assert archived.data.pit_knowable_at_asof is True
@@ -688,6 +870,7 @@ class TestNasdaqTraderListingAdapter:
                 footer="File Creation Time: 0601202618:14||||||",
             ),
             _adds_deletes(footer="File Creation Time: 0601202618:15|||||"),
+            _halt_rss(channel_pub="Mon, 01 Jun 2026 22:15:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
@@ -721,6 +904,7 @@ class TestNasdaqTraderListingAdapter:
                 footer="File Creation Time: 0601202618:15||||||",
             ),
             _adds_deletes(footer="File Creation Time: 0601202618:15|||||"),
+            _halt_rss(channel_pub="Mon, 01 Jun 2026 22:15:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
@@ -754,6 +938,7 @@ class TestNasdaqTraderListingAdapter:
                 [("AAPL", "Apple Inc.", "Delete", "Delete", "Delete", "6/1/2026", "Q")],
                 footer="File Creation Time: 0601202615:50|||||",
             ),
+            _halt_rss(channel_pub="Mon, 01 Jun 2026 22:15:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
@@ -762,6 +947,142 @@ class TestNasdaqTraderListingAdapter:
 
         resp = adapter.get_listing_status(
             "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.DELISTED
+        assert resp.data.reason == "trading_system_adds_deletes_delete"
+
+    def test_archive_unions_all_same_day_delete_snapshots_before_directory(
+        self,
+        db_session,
+    ):
+        _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=NASDAQ_LISTED,
+                    symbol="DELA",
+                    normalized_symbol="DELA",
+                    security_name="Delete A Common Stock",
+                    raw_json=json.dumps({
+                        "ETF": "N",
+                        "Security Name": "Delete A Common Stock",
+                        "Symbol": "DELA",
+                        "Test Issue": "N",
+                    }),
+                ),
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 15, 50, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=ADDS_DELETES,
+                    symbol="DELA",
+                    normalized_symbol="DELA",
+                    security_name="Delete A",
+                    action="Delete|Delete|Delete",
+                    effective_date="2026-06-01",
+                    raw_json=json.dumps({"Symbol": "DELA"}),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=ADDS_DELETES,
+                    symbol="OTHER",
+                    normalized_symbol="OTHER",
+                    security_name="Other",
+                    action="Add|Add|Add",
+                    effective_date="2026-06-01",
+                    raw_json=json.dumps({"Symbol": "OTHER"}),
+                ),
+            ],
+        )
+        adapter = NasdaqTraderListingAdapter()
+
+        resp = adapter.get_listing_status(
+            "DELA",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.DELISTED
+        assert resp.data.reason == "trading_system_adds_deletes_delete"
+
+    def test_archive_known_delete_wins_over_future_knowledge_delete(
+        self,
+        db_session,
+    ):
+        _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=NASDAQ_LISTED,
+                    symbol="DELF",
+                    normalized_symbol="DELF",
+                    security_name="Delete Fold Common Stock",
+                    raw_json=json.dumps({
+                        "ETF": "N",
+                        "Security Name": "Delete Fold Common Stock",
+                        "Symbol": "DELF",
+                        "Test Issue": "N",
+                    }),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=ADDS_DELETES,
+                    symbol="DELF",
+                    normalized_symbol="DELF",
+                    security_name="Delete Fold",
+                    action="Delete|Delete|Delete",
+                    effective_date="2026-06-01",
+                    raw_json=json.dumps({"Symbol": "DELF"}),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 15, 50, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=ADDS_DELETES,
+                    symbol="DELF",
+                    normalized_symbol="DELF",
+                    security_name="Delete Fold",
+                    action="Delete|Delete|Delete",
+                    effective_date="2026-06-01",
+                    raw_json=json.dumps({"Symbol": "DELF"}),
+                )
+            ],
+        )
+        adapter = NasdaqTraderListingAdapter()
+
+        resp = adapter.get_listing_status(
+            "DELF",
             asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
             archive_session=db_session,
             use_live=False,
@@ -785,6 +1106,7 @@ class TestNasdaqTraderListingAdapter:
                 [("AAPL", "Apple Inc.", "Delete", "Delete", "Delete", "6/1/2026", "Q")],
                 footer="File Creation Time: 0601202618:15|||||",
             ),
+            _halt_rss(channel_pub="Mon, 01 Jun 2026 22:15:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
@@ -912,6 +1234,7 @@ class TestNasdaqTraderListingAdapter:
             ),
             _other_directory(_rows("O", 1001), footer="File Creation Time: 0529202618:15||||||"),
             _adds_deletes(footer="File Creation Time: 0529202618:15|||||"),
+            _halt_rss(channel_pub="Fri, 29 May 2026 22:15:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
@@ -940,6 +1263,7 @@ class TestNasdaqTraderListingAdapter:
             ),
             _other_directory(_rows("O", 1001), footer="File Creation Time: 0602202600:00||||||"),
             _adds_deletes(footer="File Creation Time: 0602202600:00|||||"),
+            _halt_rss(channel_pub="Tue, 02 Jun 2026 04:00:00 GMT"),
         )
         assert adapter.archive_current_snapshot(
             db_session,
