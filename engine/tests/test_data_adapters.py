@@ -35,7 +35,7 @@ from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.edgar import SecEdgarAdapter
-from alpha.data.polygon import PolygonAdapter
+from alpha.data.polygon import PolygonAdapter, _normalized_cik
 from alpha.jobs.security_type import (
     ADR,
     BUSINESS_DEVELOPMENT_COMPANY,
@@ -1737,6 +1737,34 @@ class TestAlpacaAdapter:
 class TestPolygonAdapter:
     def _adapter(self, mock_session):
         return PolygonAdapter(_polygon_config(), session=mock_session)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("320193", "0000320193"),
+            ("0000320193", "0000320193"),
+            ("CIK0000320193", "0000320193"),
+            ("cik320193", "0000320193"),
+        ],
+    )
+    def test_polygon_normalized_cik_accepts_cik_shaped_values(self, raw, expected):
+        assert _normalized_cik(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "BBG000B9XB24",
+            "037833100A",
+            "abc123",
+            "",
+            "   ",
+            "0",
+            "0000000000",
+            "12345678901",
+        ],
+    )
+    def test_polygon_normalized_cik_rejects_non_cik_shaped_values(self, raw):
+        assert _normalized_cik(raw) is None
 
     def test_get_short_interest_ok(self):
         session = MagicMock(spec=requests.Session)
@@ -4758,6 +4786,33 @@ class TestPolygonAdapter:
             timeout=30,
         )
 
+    def test_get_ticker_details_figi_in_cik_field_does_not_fabricate_cik(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "ticker": "AAPL",
+                "name": "Apple Inc.",
+                "market": "stocks",
+                "locale": "us",
+                "primary_exchange": "XNAS",
+                "type": "CS",
+                "active": True,
+                "cik": "BBG000B9XB24",
+                "composite_figi": "BBG000B9XRY4",
+                "share_class_figi": "BBG001S5N8V8",
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_details("AAPL")
+
+        assert resp.ok
+        assert resp.data.cik is None
+        assert resp.data.composite_figi == "BBG000B9XRY4"
+        assert resp.data.share_class_figi == "BBG001S5N8V8"
+
     def test_get_ticker_details_no_data(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -5138,6 +5193,35 @@ class TestPolygonAdapter:
         assert flags["identity_continuity_mismatch_rows"] == 1
         assert flags["identity_continuity_not_applicable_rows"] == 0
         assert flags["event_types_present"] == ["ticker_change"]
+
+    def test_get_ticker_events_figi_in_cik_field_does_not_fabricate_cik(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = {
+            "results": {
+                "events": [
+                    {
+                        "type": "ticker_change",
+                        "date": "2022-06-10",
+                        "cik": "BBG000B9XB24",
+                        "ticker_change": {
+                            "ticker": "OLD",
+                            "new_ticker": "NEW",
+                        },
+                    }
+                ]
+            }
+        }
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_ticker_events("NEW")
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        assert resp.data[0].cik is None
+        assert resp.data[0].old_cik is None
+        assert resp.data[0].new_cik is None
 
     def test_get_ticker_events_skips_undated_ticker_change_rows(self):
         session = MagicMock(spec=requests.Session)

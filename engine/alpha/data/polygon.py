@@ -2100,10 +2100,17 @@ def _normalized_cik(value: Any) -> Optional[str]:
     text = _str_or_none(value)
     if text is None:
         return None
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if not digits:
+    if text.upper().startswith("CIK"):
+        text = text[3:].strip()
+    if (
+        not text
+        or not text.isascii()
+        or not text.isdigit()
+        or len(text) > 10
+        or set(text) == {"0"}
+    ):
         return None
-    return digits.zfill(10)
+    return text.zfill(10)
 
 
 def _safe_url_path(value: Optional[str]) -> Optional[str]:
