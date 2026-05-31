@@ -562,6 +562,8 @@ class TestSchemaCompleteness:
             "security_profiles",
             "security_profile_scan_snapshots",
             "security_identity_snapshots",
+            "nasdaq_listing_snapshots",
+            "nasdaq_listing_snapshot_rows",
             "universe_scans",
             "canonical_universe_scans",
             "universe_snapshots",

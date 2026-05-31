@@ -115,6 +115,82 @@ class EvidenceDataset(Base):
 
 
 # ---------------------------------------------------------------------------
+# nasdaq_listing_snapshots
+# ---------------------------------------------------------------------------
+class NasdaqListingSnapshot(Base):
+    """Archived raw Nasdaq Trader listing source payload."""
+
+    __tablename__ = "nasdaq_listing_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type",
+            "source_knowledge_timestamp",
+            "raw_payload_hash",
+            name="ux_nasdaq_listing_snapshot_source_time_hash",
+        ),
+        Index(
+            "ix_nasdaq_listing_snapshots_source_time",
+            "source_type",
+            "source_knowledge_timestamp",
+        ),
+    )
+
+    snapshot_id = Column(String, primary_key=True, default=_uuid)
+    captured_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    source_type = Column(String, nullable=False)
+    source_url = Column(Text, nullable=False)
+    source_knowledge_timestamp = Column(DateTime(timezone=True), nullable=False)
+    raw_payload_hash = Column(String, nullable=False)
+    raw_payload = Column(Text, nullable=False)
+    row_count = Column(Integer, nullable=False)
+    parse_status = Column(String, nullable=False, default="parsed")
+    data_quality_flags_json = Column(Text, nullable=True)
+
+    rows = relationship(
+        "NasdaqListingSnapshotRow",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+
+
+# ---------------------------------------------------------------------------
+# nasdaq_listing_snapshot_rows
+# ---------------------------------------------------------------------------
+class NasdaqListingSnapshotRow(Base):
+    """Parsed row from an archived Nasdaq Trader listing source."""
+
+    __tablename__ = "nasdaq_listing_snapshot_rows"
+    __table_args__ = (
+        Index(
+            "ix_nasdaq_listing_snapshot_rows_symbol",
+            "source_type",
+            "symbol",
+        ),
+        Index(
+            "ix_nasdaq_listing_snapshot_rows_effective",
+            "source_type",
+            "effective_date",
+        ),
+    )
+
+    snapshot_row_id = Column(String, primary_key=True, default=_uuid)
+    snapshot_id = Column(
+        String, ForeignKey("nasdaq_listing_snapshots.snapshot_id"), nullable=False
+    )
+    source_type = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    normalized_symbol = Column(String, nullable=False)
+    security_name = Column(Text, nullable=True)
+    market = Column(String, nullable=True)
+    action = Column(String, nullable=True)
+    effective_date = Column(String, nullable=True)
+    reason_code = Column(String, nullable=True)
+    raw_json = Column(Text, nullable=True)
+
+    snapshot = relationship("NasdaqListingSnapshot", back_populates="rows")
+
+
+# ---------------------------------------------------------------------------
 # evidence_snapshots
 # ---------------------------------------------------------------------------
 class EvidenceSnapshot(Base):
