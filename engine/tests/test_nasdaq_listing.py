@@ -70,7 +70,7 @@ def _adds_deletes(rows=(), *, footer="File Creation Time: 0529202621:32|||||"):
     return "\n".join([header, *body, footer])
 
 
-def _halt_rss(items=(), *, channel_pub="Sun, 31 May 2026 10:00:00 GMT"):
+def _halt_rss(items=(), *, channel_pub="Sat, 30 May 2026 01:31:00 GMT"):
     body = []
     for item in items:
         if len(item) == 4:
@@ -104,13 +104,28 @@ def _halt_rss(items=(), *, channel_pub="Sun, 31 May 2026 10:00:00 GMT"):
 </rss>"""
 
 
+INCAPSULA_HTML = """<html>
+<head>
+<META NAME="robots" CONTENT="noindex,nofollow">
+<script src="/_Incapsula_Resource?SWJIYLWA=5074a744e2e3d891814e9a2dace20bd4,719d34d31c8e3a6e6fffd425f7e032f3">
+</script>
+<body>
+</body></html>"""
+
+
 def _rows(prefix, count):
     return [(f"{prefix}{idx:04d}", f"{prefix} filler {idx}") for idx in range(count)]
 
 
 def _adapter_for(*texts):
     session = MagicMock(spec=requests.Session)
-    session.get.side_effect = [_mock_response(text=text) for text in texts]
+    side_effect = []
+    for text in texts:
+        if isinstance(text, BaseException):
+            side_effect.append(text)
+        else:
+            side_effect.append(_mock_response(text=text))
+    session.get.side_effect = side_effect
     return NasdaqTraderListingAdapter(session=session), session
 
 
@@ -131,6 +146,15 @@ def _insert_archive_snapshot(db_session, source_type, source_ts, rows):
         db_session.add(row)
     db_session.flush()
     return snapshot
+
+
+def _assert_archive_coverage_incomplete(resp, *missing_sources):
+    assert resp.ok
+    assert resp.data.status is NasdaqListingStatus.INCONCLUSIVE
+    assert resp.data.reason == "archive_source_coverage_incomplete"
+    assert resp.data.pit_knowable_at_asof is False
+    assert resp.data.raw["missing_sources"] == list(missing_sources)
+    assert resp.data.status is not NasdaqListingStatus.LISTED_ACTIVE
 
 
 ASOF_AFTER_FILE = datetime(2026, 5, 30, 3, 0, tzinfo=timezone.utc)
@@ -768,6 +792,370 @@ class TestNasdaqTraderListingAdapter:
         assert captured.data.inserted_snapshots == 3
         assert captured.data.inserted_rows == 2002
         assert captured.lineage.data_quality_flags["failed_sources"] == [HALT_RSS]
+
+    def test_archive_replay_blocks_listed_active_when_halt_coverage_missing(
+        self,
+        db_session,
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(text=_nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]
+            )),
+            _mock_response(text=_other_directory(_rows("O", 1001))),
+            _mock_response(text=_adds_deletes()),
+            requests.exceptions.Timeout(),
+        ]
+        adapter = NasdaqTraderListingAdapter(session=session)
+
+        captured = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+        replay = adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert captured.ok
+        assert captured.data.failed_sources == (HALT_RSS,)
+        assert db_session.query(NasdaqListingSnapshot).filter(
+            NasdaqListingSnapshot.source_type == HALT_RSS
+        ).count() == 0
+        _assert_archive_coverage_incomplete(replay, HALT_RSS)
+        assert replay.data.raw["captured_sources"] == [
+            NASDAQ_LISTED,
+            OTHER_LISTED,
+            ADDS_DELETES,
+        ]
+
+    def test_archive_replay_allows_listed_active_when_halt_success_empty(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            _halt_rss(),
+        )
+
+        captured = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+        replay = adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert captured.ok
+        assert HALT_RSS in captured.data.captured_sources
+        assert db_session.query(NasdaqListingSnapshot).filter(
+            NasdaqListingSnapshot.source_type == HALT_RSS
+        ).one().row_count == 0
+        assert replay.ok
+        assert replay.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+    def test_archive_replay_allows_listed_active_when_halt_success_non_d(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            _halt_rss([("QH", "LUDP", "05/29/2026", "09:30:39.140")]),
+        )
+
+        captured = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+        replay = adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert captured.ok
+        assert HALT_RSS in captured.data.captured_sources
+        assert replay.ok
+        assert replay.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+    def test_archive_replay_recovers_after_later_successful_halt_capture(
+        self,
+        db_session,
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(text=_nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]
+            )),
+            _mock_response(text=_other_directory(_rows("O", 1001))),
+            _mock_response(text=_adds_deletes()),
+            requests.exceptions.Timeout(),
+            _mock_response(text=_nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]
+            )),
+            _mock_response(text=_other_directory(_rows("O", 1001))),
+            _mock_response(text=_adds_deletes()),
+            _mock_response(text=_halt_rss()),
+        ]
+        adapter = NasdaqTraderListingAdapter(session=session)
+
+        first = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+        blocked = adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+        second = adapter.archive_current_snapshot(db_session, asof=ASOF_AFTER_FILE)
+        recovered = adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert first.ok
+        assert first.data.failed_sources == (HALT_RSS,)
+        _assert_archive_coverage_incomplete(blocked, HALT_RSS)
+        assert second.ok
+        assert second.data.inserted_snapshots == 1
+        assert second.data.existing_snapshots == 3
+        assert second.data.inserted_rows == 0
+        assert recovered.ok
+        assert recovered.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+    def test_archive_replay_blocks_when_adds_deletes_coverage_missing(
+        self,
+        db_session,
+    ):
+        _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=NASDAQ_LISTED,
+                    symbol="AAPL",
+                    normalized_symbol="AAPL",
+                    security_name="Apple Inc. - Common Stock",
+                    raw_json=json.dumps({
+                        "ETF": "N",
+                        "Security Name": "Apple Inc. - Common Stock",
+                        "Symbol": "AAPL",
+                        "Test Issue": "N",
+                    }),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            OTHER_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            HALT_RSS,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+
+        resp = NasdaqTraderListingAdapter().get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        _assert_archive_coverage_incomplete(resp, ADDS_DELETES)
+
+    def test_archive_replay_blocks_when_directory_family_missing(
+        self,
+        db_session,
+    ):
+        _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=NASDAQ_LISTED,
+                    symbol="AAPL",
+                    normalized_symbol="AAPL",
+                    security_name="Apple Inc. - Common Stock",
+                    raw_json=json.dumps({
+                        "ETF": "N",
+                        "Security Name": "Apple Inc. - Common Stock",
+                        "Symbol": "AAPL",
+                        "Test Issue": "N",
+                    }),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            HALT_RSS,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+
+        resp = NasdaqTraderListingAdapter().get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        _assert_archive_coverage_incomplete(resp, OTHER_LISTED)
+
+    def test_archive_replay_known_delete_returns_delisted_even_if_halt_missing(
+        self,
+        db_session,
+    ):
+        adapter, _ = _adapter_for(
+            _nasdaq_directory(
+                [("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)],
+                footer="File Creation Time: 0601202618:15|||||||",
+            ),
+            _other_directory(_rows("O", 1001), footer="File Creation Time: 0601202618:15||||||"),
+            _adds_deletes(
+                [("AAPL", "Apple Inc.", "Delete", "Delete", "Delete", "6/1/2026", "Q")],
+                footer="File Creation Time: 0601202615:50|||||",
+            ),
+            requests.exceptions.Timeout(),
+        )
+
+        captured = adapter.archive_current_snapshot(
+            db_session,
+            asof=datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+        )
+        resp = adapter.get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert captured.ok
+        assert captured.data.failed_sources == (HALT_RSS,)
+        assert resp.ok
+        assert resp.data.status is NasdaqListingStatus.DELISTED
+        assert resp.data.reason == "trading_system_adds_deletes_delete"
+
+    def test_archive_replay_coverage_is_et_date_scoped(
+        self,
+        db_session,
+    ):
+        _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [
+                NasdaqListingSnapshotRow(
+                    source_type=NASDAQ_LISTED,
+                    symbol="AAPL",
+                    normalized_symbol="AAPL",
+                    security_name="Apple Inc. - Common Stock",
+                    raw_json=json.dumps({
+                        "ETF": "N",
+                        "Security Name": "Apple Inc. - Common Stock",
+                        "Symbol": "AAPL",
+                        "Test Issue": "N",
+                    }),
+                )
+            ],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            OTHER_LISTED,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            datetime(2026, 6, 1, 18, 15, tzinfo=ET),
+            [],
+        )
+        _insert_archive_snapshot(
+            db_session,
+            HALT_RSS,
+            datetime(2026, 5, 29, 18, 15, tzinfo=ET),
+            [],
+        )
+
+        resp = NasdaqTraderListingAdapter().get_listing_status(
+            "AAPL",
+            asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        _assert_archive_coverage_incomplete(resp, HALT_RSS)
+
+    def test_incapsula_html_does_not_count_as_halt_coverage(
+        self,
+        db_session,
+    ):
+        halt_adapter, _ = _adapter_for(INCAPSULA_HTML)
+        halt_resp = halt_adapter.get_halt_events(asof=ASOF_AFTER_FILE)
+        assert not halt_resp.ok
+        assert halt_resp.error.error_type == "parse"
+
+        archive_adapter, _ = _adapter_for(
+            _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            _adds_deletes(),
+            INCAPSULA_HTML,
+        )
+        captured = archive_adapter.archive_current_snapshot(
+            db_session,
+            asof=ASOF_AFTER_FILE,
+        )
+        replay = archive_adapter.get_listing_status(
+            "AAPL",
+            asof=ASOF_AFTER_FILE,
+            archive_session=db_session,
+            use_live=False,
+        )
+
+        assert captured.ok
+        assert captured.data.failed_sources == (HALT_RSS,)
+        assert db_session.query(NasdaqListingSnapshot).filter(
+            NasdaqListingSnapshot.source_type == HALT_RSS
+        ).count() == 0
+        _assert_archive_coverage_incomplete(replay, HALT_RSS)
+
+    def test_incapsula_html_on_directory_or_adds_aborts_without_persistence(
+        self,
+        db_session,
+    ):
+        directory_adapter, _ = _adapter_for(INCAPSULA_HTML)
+        directory_capture = directory_adapter.archive_current_snapshot(
+            db_session,
+            asof=ASOF_AFTER_FILE,
+        )
+        assert not directory_capture.ok
+        assert db_session.query(NasdaqListingSnapshot).count() == 0
+
+        adds_adapter, _ = _adapter_for(
+            _nasdaq_directory([("AAPL", "Apple Inc. - Common Stock"), *_rows("N", 1000)]),
+            _other_directory(_rows("O", 1001)),
+            INCAPSULA_HTML,
+        )
+        adds_capture = adds_adapter.archive_current_snapshot(
+            db_session,
+            asof=ASOF_AFTER_FILE,
+        )
+        assert not adds_capture.ok
+        assert db_session.query(NasdaqListingSnapshot).count() == 0
 
     def test_archive_same_session_evening_snapshot_covers_session_close_asof(
         self,

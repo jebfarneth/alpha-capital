@@ -46,6 +46,12 @@ NASDAQ_LISTED = "nasdaqlisted"
 OTHER_LISTED = "otherlisted"
 ADDS_DELETES = "trading_system_adds_deletes"
 HALT_RSS = "trade_halt_rss"
+ARCHIVE_REQUIRED_SOURCE_TYPES = (
+    NASDAQ_LISTED,
+    OTHER_LISTED,
+    ADDS_DELETES,
+    HALT_RSS,
+)
 NASDAQ_LISTED_MIN_ROWS = 1000
 OTHER_LISTED_MIN_ROWS = 1000
 NASDAQ_TZ = ZoneInfo("America/New_York")
@@ -196,10 +202,10 @@ class NasdaqTraderListingAdapter:
         when its source timestamp is at or before asof, or when the source
         timestamp and asof share the same ET trading date and asof is at or
         after that session close. LISTED_ACTIVE may suppress an EDGAR review
-        only when no same-trading-date knowable DELETE or reason-D halt exists;
-        those delisting records outrank directory presence and keep strict
-        timestamp knowledge. Archive replay must consult every same-day
-        delisting-source snapshot captured for that trading date.
+        only when no same-trading-date knowable DELETE or reason-D halt exists,
+        and archive replay may return LISTED_ACTIVE only when all required
+        source families have same-ET-date parsed snapshots. Delisting records
+        outrank directory presence and keep strict timestamp knowledge.
         """
 
         asof_ts = aware_utc_or_none(asof)
@@ -607,6 +613,18 @@ class NasdaqTraderListingAdapter:
             archive_session,
             tuple(directory_snapshots.values()),
         )
+        if result.status is NasdaqListingStatus.LISTED_ACTIVE:
+            captured_sources, missing_sources = _archive_required_source_coverage(
+                archive_session,
+                asof,
+            )
+            if missing_sources:
+                result = _archive_source_coverage_incomplete_status(
+                    symbol,
+                    asof,
+                    captured_sources,
+                    missing_sources,
+                )
         return AdapterResponse(
             data=result,
             lineage=_lineage(
@@ -1735,6 +1753,53 @@ def _archive_snapshots_for_et_date(
         if source_ts is not None and _et_date(source_ts) == asof_day:
             same_day.append(snapshot)
     return tuple(same_day)
+
+
+def _archive_required_source_coverage(
+    session: Any,
+    asof: datetime,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    snapshots = _archive_snapshots_for_et_date(
+        session,
+        ARCHIVE_REQUIRED_SOURCE_TYPES,
+        asof,
+    )
+    captured_set = {
+        snapshot.source_type
+        for snapshot in snapshots
+        if (getattr(snapshot, "parse_status", None) or "parsed") == "parsed"
+    }
+    captured = tuple(
+        source for source in ARCHIVE_REQUIRED_SOURCE_TYPES if source in captured_set
+    )
+    missing = tuple(
+        source for source in ARCHIVE_REQUIRED_SOURCE_TYPES if source not in captured_set
+    )
+    return captured, missing
+
+
+def _archive_source_coverage_incomplete_status(
+    symbol: str,
+    asof: datetime,
+    captured_sources: Sequence[str],
+    missing_sources: Sequence[str],
+) -> NasdaqListingStatusResult:
+    return NasdaqListingStatusResult(
+        symbol=str(symbol or "").strip(),
+        normalized_symbol=_normalize_symbol(symbol),
+        status=NasdaqListingStatus.INCONCLUSIVE,
+        asof_timestamp=asof,
+        source_knowledge_timestamp=None,
+        pit_knowable_at_asof=False,
+        source="nasdaq_self_archive",
+        reason="archive_source_coverage_incomplete",
+        raw={
+            "required_sources": list(ARCHIVE_REQUIRED_SOURCE_TYPES),
+            "captured_sources": list(captured_sources),
+            "missing_sources": list(missing_sources),
+            "safety": "archive LISTED_ACTIVE requires complete same-ET-date source coverage",
+        },
+    )
 
 
 def _latest_snapshot_timestamp(
