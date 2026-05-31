@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from alpha.data.benzinga import BenzingaAdapter
-from alpha.data.config import BenzingaConfig, FmpConfig
+from alpha.data.config import BenzingaConfig, FmpConfig, SecEdgarConfig
+from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.fmp import FmpAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
 from alpha.jobs.forward_return import (
@@ -90,9 +91,15 @@ def _run_live(args: argparse.Namespace) -> int:
     try:
         adapter = FmpAdapter(FmpConfig.from_env())
         survivorship_adapters = []
+        if os.environ.get("SEC_USER_AGENT"):
+            survivorship_adapters.append(SecEdgarAdapter(SecEdgarConfig.from_env()))
         if os.environ.get("BENZINGA_API_KEY") or os.environ.get("BENZINGA_TOKEN"):
             survivorship_adapters.append(BenzingaAdapter(BenzingaConfig.from_env()))
         survivorship_source_names = ["fmp_delisted_companies"] + [
+            "sec_edgar_survivorship_events"
+            for _source in survivorship_adapters
+            if isinstance(_source, SecEdgarAdapter)
+        ] + [
             "benzinga_calendar_ma"
             for _source in survivorship_adapters
             if isinstance(_source, BenzingaAdapter)

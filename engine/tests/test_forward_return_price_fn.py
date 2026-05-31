@@ -25,6 +25,8 @@ from alpha.db.models import (
     SignalRegistry,
 )
 from alpha.evidence.writer import record_feature_snapshot, record_signal
+from alpha.jobs import run_forward_return
+from alpha.jobs.contracts import JobResult
 from alpha.jobs.forward_return import (
     LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON,
     M4_EXIT_GEOMETRY,
@@ -44,6 +46,7 @@ from alpha.market_calendar import next_us_equity_session
 ENTRY_DATE = date(2026, 5, 26)
 EXIT_DATE = date(2026, 6, 15)
 MATURE_RUN_TS = datetime(2026, 6, 16, 21, 0, tzinfo=timezone.utc)
+EXIT_SESSION_CLOSE_TS = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)
 IMMATURE_RUN_TS = datetime(2026, 6, 10, 21, 0, tzinfo=timezone.utc)
 SIGNAL_TS = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
 REQUEST_TS = datetime(2026, 6, 16, 21, 1, tzinfo=timezone.utc)
@@ -242,6 +245,48 @@ class FakeCikHistoricalAdapter(FakeHistoricalAdapter):
                 source_authority="test",
             ),
         )
+
+
+class FakeEdgarSurvivorshipAdapter:
+    requires_cik_for_survivorship_events = True
+
+    def __init__(
+        self,
+        events_by_ticker: Optional[Dict[str, object]] = None,
+        error: Optional[ProviderError] = None,
+    ):
+        self.events_by_ticker = events_by_ticker or {}
+        self.error = error
+        self.calls = []
+
+    def get_survivorship_events(
+        self,
+        ticker,
+        from_date=None,
+        to_date=None,
+        asof=None,
+        cik=None,
+    ):
+        self.calls.append({
+            "ticker": ticker,
+            "from_date": from_date,
+            "to_date": to_date,
+            "asof": asof,
+            "cik": cik,
+        })
+        raw_events = self.events_by_ticker.get(ticker, [])
+        events = [raw_events] if isinstance(raw_events, dict) else list(raw_events or [])
+        lineage = LineageMeta(
+            provider="SEC_EDGAR",
+            endpoint="sec_edgar_survivorship_events",
+            request_timestamp=REQUEST_TS,
+            asof_timestamp=asof,
+            raw_payload_hash=stable_hash(events),
+            source_authority="SEC_EDGAR",
+        )
+        if self.error is not None:
+            return AdapterResponse(data=None, lineage=lineage, error=self.error)
+        return AdapterResponse(data=events, lineage=lineage)
 
 
 class FakeBenzingaAdapter:
@@ -497,6 +542,100 @@ def test_live_future_timestamp_guard_rejects_future_time():
         "live run_timestamp is in the future; use explicit audited "
         "historical/backfill mode instead of --live time travel"
     )
+
+
+def test_run_forward_return_wires_sec_edgar_when_user_agent_is_set(monkeypatch, capsys):
+    monkeypatch.setenv("FMP_API_KEY", "fmp-key")
+    monkeypatch.setenv("SEC_USER_AGENT", "Alpha Capital ops@example.com")
+    monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+    monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeFmpAdapter:
+        def __init__(self, _config):
+            pass
+
+    class FakeSecEdgarAdapter:
+        def __init__(self, _config):
+            pass
+
+    captured = {}
+
+    def fake_run_job(session, job, params):
+        captured["session"] = session
+        captured["job"] = job
+        captured["params"] = params
+        return JobResult(status="finished", metrics={})
+
+    monkeypatch.setattr(run_forward_return, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(run_forward_return, "FmpAdapter", FakeFmpAdapter)
+    monkeypatch.setattr(run_forward_return, "SecEdgarAdapter", FakeSecEdgarAdapter)
+    monkeypatch.setattr(run_forward_return, "run_job", fake_run_job)
+
+    exit_code = run_forward_return.main([
+        "--live",
+        "--run-timestamp",
+        MATURE_RUN_TS.isoformat(),
+    ])
+
+    assert exit_code == 0
+    assert any(
+        isinstance(adapter, FakeSecEdgarAdapter)
+        for adapter in captured["job"]._survivorship_adapters
+    )
+    assert captured["params"]["survivorship_sources"] == [
+        "fmp_delisted_companies",
+        "sec_edgar_survivorship_events",
+    ]
+    assert "sec_edgar_survivorship_events" in capsys.readouterr().out
+
+
+def test_run_forward_return_skips_sec_edgar_without_user_agent(monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "fmp-key")
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+    monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeFmpAdapter:
+        def __init__(self, _config):
+            pass
+
+    class ExplodingSecEdgarAdapter:
+        def __init__(self, _config):
+            raise AssertionError("SEC EDGAR should be key-gated off")
+
+    captured = {}
+
+    def fake_run_job(session, job, params):
+        captured["job"] = job
+        captured["params"] = params
+        return JobResult(status="finished", metrics={})
+
+    monkeypatch.setattr(run_forward_return, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(run_forward_return, "FmpAdapter", FakeFmpAdapter)
+    monkeypatch.setattr(run_forward_return, "SecEdgarAdapter", ExplodingSecEdgarAdapter)
+    monkeypatch.setattr(run_forward_return, "run_job", fake_run_job)
+
+    exit_code = run_forward_return.main([
+        "--live",
+        "--run-timestamp",
+        MATURE_RUN_TS.isoformat(),
+    ])
+
+    assert exit_code == 0
+    assert captured["job"]._survivorship_adapters == []
+    assert captured["params"]["survivorship_sources"] == ["fmp_delisted_companies"]
 
 
 def test_fresh_signal_before_entry_open_stays_pending_without_fetch(db_session):
@@ -874,6 +1013,142 @@ def test_survivorship_events_source_adapter_receives_signal_cik(db_session):
     payload = json.loads(lineage.raw_payload_json)
     assert payload["request"]["cik"] == "0000320193"
     assert payload["request"]["cik_sent"] is True
+
+
+def test_sec_edgar_survivorship_channel_receives_signal_cik_and_persists_authority(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    assert edgar.calls[0]["cik"] == "0001418091"
+    obs = _obs(db_session)
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.forward_return is None
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    survivorship_request = provider_request["survivorship_request"]
+    attempts = survivorship_request["source_attempts"]
+    assert attempts[0]["source"] == "sec_edgar_survivorship_events"
+    assert attempts[0]["status"] == "matched"
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert lineage.source_authority == "SEC_EDGAR"
+    assert payload["request"]["cik"] == "0001418091"
+    assert payload["request"]["cik_sent"] is True
+    assert payload["request"]["asof"] == EXIT_SESSION_CLOSE_TS.isoformat()
+
+
+def test_sec_edgar_without_signal_cik_records_identity_unavailable_not_ticker_lookup(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "ticker-only-must-not-match",
+                "type": "delisting_notice",
+                "source_backed": True,
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    assert edgar.calls == []
+    obs = _obs(db_session)
+    assert obs.status == "survivorship_unresolved_review"
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+    assert attempts[0]["source"] == "sec_edgar_survivorship_events"
+    assert attempts[0]["status"] == "error"
+    assert attempts[0]["identity_status"] == "identity_unavailable"
+    assert attempts[0]["error"]["error_type"] == "unresolved_entity"
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    payload = json.loads(lineage.raw_payload_json)
+    assert lineage.source_authority == "SEC_EDGAR"
+    assert payload["request"]["cik_sent"] is False
+    assert payload["request"]["identity_status"] == "identity_unavailable"
+    assert payload["request"]["asof"] == EXIT_SESSION_CLOSE_TS.isoformat()
+    assert "cik" not in payload["request"]
+
+
+def test_sec_edgar_form25_note_like_event_routes_to_review_not_terminal(db_session):
+    sid = _make_signal(
+        db_session,
+        security_identity={"cik": "789019"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0000789019-24-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25",
+                "source_backed": True,
+                "form": "25",
+                "security_title": "2.525% Notes due 2050",
+                "cik": "0000789019",
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    assert sig.forward_return_status == "corporate_action_review"
+    assert sig.forward_return is None
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+
+
+def test_sec_edgar_incomplete_window_routes_to_review_with_lineage(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        error=ProviderError(
+            provider="SEC_EDGAR",
+            endpoint="sec_edgar_survivorship_events",
+            status_code=None,
+            error_type="incomplete_window",
+            message="truncated submissions window",
+            retryable=False,
+        )
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    provider_request = json.loads(event.provider_request_json)
+    attempts = provider_request["survivorship_request"]["source_attempts"]
+    assert obs.status == "survivorship_unresolved_review"
+    assert obs.reason == "survivorship_source_error:incomplete_window"
+    assert attempts[0]["source"] == "sec_edgar_survivorship_events"
+    assert attempts[0]["status"] == "error"
+    assert attempts[0]["error"]["error_type"] == "incomplete_window"
+    lineage = db_session.get(DataLineage, attempts[0]["lineage_id"])
+    assert lineage.source_authority == "SEC_EDGAR"
 
 
 def test_survivorship_events_primary_adapter_receives_signal_cik(db_session):

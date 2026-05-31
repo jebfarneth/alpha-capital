@@ -78,6 +78,8 @@ class SecEdgarFiling:
 class SecEdgarAdapter:
     """SEC EDGAR REST adapter returning typed public filing metadata."""
 
+    requires_cik_for_survivorship_events = True
+
     def __init__(
         self,
         config: SecEdgarConfig,

@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from alpha.data.contracts import stable_hash
+from alpha.data.contracts import ProviderError, stable_hash
 from alpha.data.fmp import (
     DELISTED_COMPANIES_ENDPOINT,
     FmpBar,
@@ -110,6 +110,8 @@ M4_PATTERN_ID = "M4"
 M4_SIGNAL_HORIZON = "15d"
 M4_PRICE_SOURCE = "fmp_full_split_adjusted_regular_session_open"
 M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF = "fmp_full_ohlc_split_adjusted_contract_open"
+SEC_EDGAR_PROVIDER = "SEC_EDGAR"
+SEC_EDGAR_SURVIVORSHIP_ENDPOINT = "sec_edgar_survivorship_events"
 MAX_FORWARD_RETURN_ATTEMPTS = 3
 DEFAULT_FINALITY_LAG_SESSIONS = 1
 DEFAULT_REVISION_WINDOW_SESSIONS = 10
@@ -2266,17 +2268,34 @@ def _resolve_from_survivorship_events(
     source_lineage_ids: Optional[List[str]] = None,
 ) -> Optional[SurvivorshipResolution]:
     cik = (signal_identity or {}).get("cik")
-    cik_sent = bool(cik) and _survivorship_events_accepts_cik(adapter)
+    accepts_cik = _survivorship_events_accepts_cik(adapter)
+    requires_cik = _survivorship_events_requires_cik(adapter)
+    cik_sent = bool(cik) and accepts_cik
     provider_request = {
         "ticker": ticker,
         "from": entry_session_date.isoformat(),
         "to": exit_session_date.isoformat(),
+        "asof": asof.isoformat(),
         "event_basis": "missing_mature_exit_survivorship_review",
         "endpoint": "get_survivorship_events",
         "cik_sent": cik_sent,
     }
+    if requires_cik:
+        provider_request["source"] = SEC_EDGAR_SURVIVORSHIP_ENDPOINT
     if cik_sent:
         provider_request["cik"] = cik
+    elif requires_cik:
+        return _record_cik_required_survivorship_identity_unavailable(
+            session=session,
+            ticker=ticker,
+            entry_session_date=entry_session_date,
+            exit_session_date=exit_session_date,
+            asof=asof,
+            job_run_id=job_run_id,
+            provider_request=provider_request,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
     call_kwargs = {
         "from_date": entry_session_date,
         "to_date": exit_session_date,
@@ -2300,7 +2319,7 @@ def _resolve_from_survivorship_events(
     _append_survivorship_source_attempt(
         source_attempts,
         source_lineage_ids,
-        source="survivorship_events",
+        source=_survivorship_events_source_name(adapter, resp.lineage.provider),
         provider=resp.lineage.provider,
         endpoint=resp.lineage.endpoint,
         ticker=ticker,
@@ -2311,6 +2330,21 @@ def _resolve_from_survivorship_events(
         error=resp.error,
     )
     if not resp.ok:
+        if _survivorship_events_error_requires_review(resp):
+            reason = "survivorship_source_error"
+            if resp.error is not None and resp.error.error_type:
+                reason = f"{reason}:{resp.error.error_type}"
+            return _survivorship_unresolved(
+                reason=reason,
+                provider=resp.lineage.provider,
+                endpoint=resp.lineage.endpoint,
+                provider_request={
+                    **provider_request,
+                    "error": _provider_error_payload(resp.error),
+                },
+                data_lineage_ids=lineage_ids,
+                primary_data_lineage_id=lineage.data_lineage_id,
+            )
         return None
 
     event = _first_survivorship_source_event(resp.data)
@@ -2325,7 +2359,16 @@ def _resolve_from_survivorship_events(
         status="matched",
         matched_id=_event_value(event, "id") or _event_value(event, "event_id"),
     )
-    decision = _survivorship_decision(event, entry_price=entry_price)
+    if _is_sec_edgar_survivorship_response(resp):
+        decision = SurvivorshipDecision(
+            status=STATUS_CORPORATE_ACTION_REVIEW,
+            reason="sec_edgar_form25_survivorship_review",
+            exit_price=None,
+            exit_price_source=None,
+            exit_basis_proof=None,
+        )
+    else:
+        decision = _survivorship_decision(event, entry_price=entry_price)
     if decision is None:
         decision = SurvivorshipDecision(
             status=STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
@@ -2795,6 +2838,98 @@ def _survivorship_events_accepts_cik(adapter: Any) -> bool:
         if parameter.name == "cik":
             return True
     return False
+
+
+def _survivorship_events_requires_cik(adapter: Any) -> bool:
+    return bool(getattr(adapter, "requires_cik_for_survivorship_events", False))
+
+
+def _is_sec_edgar_survivorship_response(resp: Any) -> bool:
+    lineage = getattr(resp, "lineage", None)
+    return (
+        getattr(lineage, "provider", None) == SEC_EDGAR_PROVIDER
+        or getattr(lineage, "source_authority", None) == SEC_EDGAR_PROVIDER
+        or getattr(lineage, "endpoint", None) == SEC_EDGAR_SURVIVORSHIP_ENDPOINT
+    )
+
+
+def _survivorship_events_source_name(
+    adapter: Any,
+    provider: Optional[str],
+) -> str:
+    if (
+        _survivorship_events_requires_cik(adapter)
+        or provider == SEC_EDGAR_PROVIDER
+    ):
+        return SEC_EDGAR_SURVIVORSHIP_ENDPOINT
+    return "survivorship_events"
+
+
+def _survivorship_events_error_requires_review(resp: Any) -> bool:
+    if not _is_sec_edgar_survivorship_response(resp):
+        return False
+    error = getattr(resp, "error", None)
+    return error is not None
+
+
+def _record_cik_required_survivorship_identity_unavailable(
+    *,
+    session: Session,
+    ticker: str,
+    entry_session_date: date,
+    exit_session_date: date,
+    asof: datetime,
+    job_run_id: Optional[str],
+    provider_request: Dict[str, Any],
+    source_attempts: Optional[List[Dict[str, Any]]],
+    source_lineage_ids: Optional[List[str]],
+) -> None:
+    error = ProviderError(
+        provider=SEC_EDGAR_PROVIDER,
+        endpoint=SEC_EDGAR_SURVIVORSHIP_ENDPOINT,
+        status_code=None,
+        error_type="unresolved_entity",
+        message="SEC EDGAR survivorship lookup requires signal CIK identity",
+        retryable=False,
+    )
+    request = {
+        **provider_request,
+        "identity_status": "identity_unavailable",
+    }
+    raw_payload = {
+        "request": request,
+        "events": None,
+        "error": _provider_error_payload(error),
+    }
+    lineage = record_data_lineage(
+        session,
+        provider=SEC_EDGAR_PROVIDER,
+        endpoint=SEC_EDGAR_SURVIVORSHIP_ENDPOINT,
+        asof_timestamp=asof,
+        raw_payload=raw_payload,
+        raw_payload_hash=stable_hash(raw_payload),
+        request_timestamp=datetime.now(timezone.utc),
+        source_authority=SEC_EDGAR_PROVIDER,
+        data_quality_flags={
+            "identity_unavailable": True,
+            "cik_sent": False,
+        },
+        job_run_id=job_run_id,
+    )
+    _append_survivorship_source_attempt(
+        source_attempts,
+        source_lineage_ids,
+        source=SEC_EDGAR_SURVIVORSHIP_ENDPOINT,
+        provider=SEC_EDGAR_PROVIDER,
+        endpoint=SEC_EDGAR_SURVIVORSHIP_ENDPOINT,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        lineage_id=lineage.data_lineage_id,
+        status="error",
+        error=error,
+        extra={"identity_status": "identity_unavailable"},
+    )
 
 
 def _first_payload_value(payload: Dict[str, Any], *keys: str) -> Any:
