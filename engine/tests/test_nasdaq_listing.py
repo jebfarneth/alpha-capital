@@ -129,7 +129,7 @@ def _adapter_for(*texts):
     return NasdaqTraderListingAdapter(session=session), session
 
 
-def _insert_archive_snapshot(db_session, source_type, source_ts, rows):
+def _insert_archive_snapshot(db_session, source_type, source_ts, rows, *, parse_status="parsed"):
     snapshot = NasdaqListingSnapshot(
         source_type=source_type,
         source_url=f"https://example.test/{source_type}",
@@ -137,6 +137,7 @@ def _insert_archive_snapshot(db_session, source_type, source_ts, rows):
         raw_payload_hash=f"{source_type}-{source_ts.isoformat()}-{len(rows)}",
         raw_payload="scratch payload",
         row_count=len(rows),
+        parse_status=parse_status,
         data_quality_flags_json=json.dumps({"source": source_type}),
     )
     db_session.add(snapshot)
@@ -155,6 +156,77 @@ def _assert_archive_coverage_incomplete(resp, *missing_sources):
     assert resp.data.pit_knowable_at_asof is False
     assert resp.data.raw["missing_sources"] == list(missing_sources)
     assert resp.data.status is not NasdaqListingStatus.LISTED_ACTIVE
+
+
+def _archive_directory_row(symbol="AAPL", name="Apple Inc. - Common Stock"):
+    return NasdaqListingSnapshotRow(
+        source_type=NASDAQ_LISTED,
+        symbol=symbol,
+        normalized_symbol=symbol,
+        security_name=name,
+        raw_json=json.dumps({
+            "ETF": "N",
+            "Security Name": name,
+            "Symbol": symbol,
+            "Test Issue": "N",
+        }),
+    )
+
+
+def _archive_halt_row(symbol="AAPL"):
+    return NasdaqListingSnapshotRow(
+        source_type=HALT_RSS,
+        symbol=symbol,
+        normalized_symbol=symbol,
+        security_name=f"{symbol} Test Common Stock",
+        reason_code="LUDP",
+        effective_date="2026-06-01",
+        raw_json=json.dumps({
+            "ReasonCode": "LUDP",
+            "pubDate": "Mon, 01 Jun 2026 15:45:00 GMT",
+        }),
+    )
+
+
+def _seed_archive_coverage_statuses(db_session, *, halt_parse_status="parsed", halt_rows=()):
+    source_ts = datetime(2026, 6, 1, 18, 15, tzinfo=ET)
+    snapshots = {
+        NASDAQ_LISTED: _insert_archive_snapshot(
+            db_session,
+            NASDAQ_LISTED,
+            source_ts,
+            [_archive_directory_row()],
+        ),
+        OTHER_LISTED: _insert_archive_snapshot(
+            db_session,
+            OTHER_LISTED,
+            source_ts,
+            [],
+        ),
+        ADDS_DELETES: _insert_archive_snapshot(
+            db_session,
+            ADDS_DELETES,
+            source_ts,
+            [],
+        ),
+        HALT_RSS: _insert_archive_snapshot(
+            db_session,
+            HALT_RSS,
+            source_ts,
+            list(halt_rows),
+            parse_status=halt_parse_status,
+        ),
+    }
+    return snapshots
+
+
+def _archive_replay(db_session, symbol="AAPL"):
+    return NasdaqTraderListingAdapter().get_listing_status(
+        symbol,
+        asof=datetime(2026, 6, 1, 16, 0, tzinfo=ET),
+        archive_session=db_session,
+        use_live=False,
+    )
 
 
 ASOF_AFTER_FILE = datetime(2026, 5, 30, 3, 0, tzinfo=timezone.utc)
@@ -876,6 +948,71 @@ class TestNasdaqTraderListingAdapter:
 
         assert captured.ok
         assert HALT_RSS in captured.data.captured_sources
+        assert replay.ok
+        assert replay.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+    def test_archive_replay_rejects_null_parse_status_as_coverage(
+        self,
+        db_session,
+    ):
+        snapshots = _seed_archive_coverage_statuses(db_session)
+        snapshots[HALT_RSS].parse_status = None
+        original_autoflush = db_session.autoflush
+        db_session.autoflush = False
+        try:
+            replay = _archive_replay(db_session)
+        finally:
+            db_session.autoflush = original_autoflush
+
+        _assert_archive_coverage_incomplete(replay, HALT_RSS)
+
+    def test_archive_replay_rejects_empty_parse_status_as_coverage(
+        self,
+        db_session,
+    ):
+        _seed_archive_coverage_statuses(db_session, halt_parse_status="")
+
+        replay = _archive_replay(db_session)
+
+        _assert_archive_coverage_incomplete(replay, HALT_RSS)
+
+    @pytest.mark.parametrize("parse_status", ["failed", "parse_error", "unavailable"])
+    def test_archive_replay_rejects_nonparsed_parse_status_as_coverage(
+        self,
+        db_session,
+        parse_status,
+    ):
+        _seed_archive_coverage_statuses(
+            db_session,
+            halt_parse_status=parse_status,
+        )
+
+        replay = _archive_replay(db_session)
+
+        _assert_archive_coverage_incomplete(replay, HALT_RSS)
+
+    def test_archive_replay_allows_listed_active_when_all_sources_parsed(
+        self,
+        db_session,
+    ):
+        _seed_archive_coverage_statuses(
+            db_session,
+            halt_rows=[_archive_halt_row()],
+        )
+
+        replay = _archive_replay(db_session)
+
+        assert replay.ok
+        assert replay.data.status is NasdaqListingStatus.LISTED_ACTIVE
+
+    def test_archive_replay_counts_parsed_zero_row_halt_as_coverage(
+        self,
+        db_session,
+    ):
+        _seed_archive_coverage_statuses(db_session, halt_rows=[])
+
+        replay = _archive_replay(db_session)
+
         assert replay.ok
         assert replay.data.status is NasdaqListingStatus.LISTED_ACTIVE
 

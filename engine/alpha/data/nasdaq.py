@@ -1767,7 +1767,7 @@ def _archive_required_source_coverage(
     captured_set = {
         snapshot.source_type
         for snapshot in snapshots
-        if (getattr(snapshot, "parse_status", None) or "parsed") == "parsed"
+        if getattr(snapshot, "parse_status", None) == "parsed"
     }
     captured = tuple(
         source for source in ARCHIVE_REQUIRED_SOURCE_TYPES if source in captured_set
