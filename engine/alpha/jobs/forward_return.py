@@ -19,12 +19,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from alpha.data.contracts import ProviderError, stable_hash
+from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import (
     DELISTED_COMPANIES_ENDPOINT,
     FmpBar,
     HISTORICAL_PRICE_FULL_ENDPOINT,
 )
+from alpha.data.nasdaq import NasdaqListingStatus
 from alpha.db.models import (
     DataLineage,
     ForwardReturnObservation,
@@ -41,6 +42,13 @@ from alpha.market_calendar import (
     us_equity_session_close_timestamp,
     us_equity_session_open_timestamp,
 )
+
+
+@dataclass(frozen=True)
+class PendingEdgarReview:
+    resolution: "SurvivorshipResolution"
+    identity_adapter: Any
+
 
 STATUS_PENDING = "pending"
 STATUS_COMPUTED = "computed"
@@ -112,6 +120,11 @@ M4_PRICE_SOURCE = "fmp_full_split_adjusted_regular_session_open"
 M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF = "fmp_full_ohlc_split_adjusted_contract_open"
 SEC_EDGAR_PROVIDER = "SEC_EDGAR"
 SEC_EDGAR_SURVIVORSHIP_ENDPOINT = "sec_edgar_survivorship_events"
+NASDAQ_LISTING_STATUS_SOURCE = "nasdaq_listing_status"
+NASDAQ_LISTING_STATUS_ENDPOINT = "nasdaq_listing_status"
+NASDAQ_LISTING_SUPPRESSION_REASON = (
+    "listing_authority_active_suppresses_edgar_review"
+)
 MAX_FORWARD_RETURN_ATTEMPTS = 3
 DEFAULT_FINALITY_LAG_SESSIONS = 1
 DEFAULT_REVISION_WINDOW_SESSIONS = 10
@@ -500,6 +513,7 @@ class ForwardReturnJob(BaseJob):
         max_attempts: int = MAX_FORWARD_RETURN_ATTEMPTS,
         survivorship_resolver: Any = None,
         survivorship_adapters: Optional[List[Any]] = None,
+        listing_authority_adapter: Any = None,
         finality_lag_sessions: int = DEFAULT_FINALITY_LAG_SESSIONS,
         reconcile_computed: bool = False,
         revision_window_sessions: int = DEFAULT_REVISION_WINDOW_SESSIONS,
@@ -525,6 +539,7 @@ class ForwardReturnJob(BaseJob):
         self._max_attempts = max_attempts
         self._survivorship_resolver = survivorship_resolver
         self._survivorship_adapters = list(survivorship_adapters or [])
+        self._listing_authority_adapter = listing_authority_adapter
         self._finality_lag_sessions = finality_lag_sessions
         self._reconcile_computed = reconcile_computed
         self._revision_window_sessions = revision_window_sessions
@@ -1479,6 +1494,7 @@ class ForwardReturnJob(BaseJob):
             session=self._session,
             adapter=self._adapter,
             survivorship_adapters=self._survivorship_adapters,
+            listing_authority_adapter=self._listing_authority_adapter,
             ticker=sig.ticker,
             signal_identity=_signal_security_identity(sig),
             entry_session_date=plan.entry_session_date,
@@ -2068,6 +2084,7 @@ def resolve_missing_exit_survivorship(
     session: Session,
     adapter: Any,
     survivorship_adapters: Optional[List[Any]] = None,
+    listing_authority_adapter: Any = None,
     ticker: str,
     signal_identity: Optional[Dict[str, str]] = None,
     entry_session_date: date,
@@ -2092,7 +2109,7 @@ def resolve_missing_exit_survivorship(
     source_attempts: List[Dict[str, Any]] = []
     source_lineage_ids: List[str] = []
     pending_benzinga_resolution: Optional[SurvivorshipResolution] = None
-    pending_edgar_review_resolution: Optional[SurvivorshipResolution] = None
+    pending_edgar_reviews: List[PendingEdgarReview] = []
 
     for source_adapter in source_adapters:
         if not hasattr(source_adapter, "get_survivorship_events"):
@@ -2112,11 +2129,16 @@ def resolve_missing_exit_survivorship(
         )
         if resolution is not None:
             if _is_sec_edgar_review_resolution(resolution):
-                pending_edgar_review_resolution = resolution
+                pending_edgar_reviews.append(
+                    PendingEdgarReview(
+                        resolution=resolution,
+                        identity_adapter=source_adapter,
+                    )
+                )
                 continue
-            if pending_edgar_review_resolution is not None:
-                pending_edgar_review_resolution = _add_survivorship_conflict_summary(
-                    pending_edgar_review_resolution,
+            if pending_edgar_reviews:
+                pending_edgar_reviews = _add_conflict_to_pending_edgar_reviews(
+                    pending_edgar_reviews,
                     conflicting=resolution,
                 )
                 continue
@@ -2142,12 +2164,10 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            if pending_edgar_review_resolution is not None:
-                pending_edgar_review_resolution = (
-                    _add_survivorship_corroboration_summary(
-                        pending_edgar_review_resolution,
-                        corroborating=resolution,
-                    )
+            if pending_edgar_reviews:
+                pending_edgar_reviews = _add_corroboration_to_pending_edgar_reviews(
+                    pending_edgar_reviews,
+                    corroborating=resolution,
                 )
             else:
                 pending_benzinga_resolution = resolution
@@ -2168,9 +2188,9 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            if pending_edgar_review_resolution is not None:
-                pending_edgar_review_resolution = _add_survivorship_conflict_summary(
-                    pending_edgar_review_resolution,
+            if pending_edgar_reviews:
+                pending_edgar_reviews = _add_conflict_to_pending_edgar_reviews(
+                    pending_edgar_reviews,
                     conflicting=resolution,
                 )
             else:
@@ -2193,17 +2213,30 @@ def resolve_missing_exit_survivorship(
             source_lineage_ids=source_lineage_ids,
         )
         if resolution is not None:
-            if pending_edgar_review_resolution is not None:
+            if pending_edgar_reviews:
                 if (
                     resolution.decision.reason
                     != "survivorship_unresolved_no_source_event"
                 ):
-                    pending_edgar_review_resolution = (
-                        _add_survivorship_conflict_summary(
-                            pending_edgar_review_resolution,
-                            conflicting=resolution,
-                        )
+                    pending_edgar_reviews = _add_conflict_to_pending_edgar_reviews(
+                        pending_edgar_reviews,
+                        conflicting=resolution,
                     )
+                pending_edgar_review_resolution = (
+                    _apply_listing_authority_to_pending_edgar_reviews(
+                        pending_edgar_reviews,
+                        listing_authority_adapter=listing_authority_adapter,
+                        session=session,
+                        ticker=ticker,
+                        signal_identity=signal_identity,
+                        entry_session_date=entry_session_date,
+                        exit_session_date=exit_session_date,
+                        asof=asof,
+                        job_run_id=job_run_id,
+                        source_attempts=source_attempts,
+                        source_lineage_ids=source_lineage_ids,
+                    )
+                )
                 return _with_survivorship_source_attempts(
                     pending_edgar_review_resolution,
                     source_attempts=source_attempts,
@@ -2231,7 +2264,22 @@ def resolve_missing_exit_survivorship(
                 source_lineage_ids=source_lineage_ids,
             )
 
-    if pending_edgar_review_resolution is not None:
+    if pending_edgar_reviews:
+        pending_edgar_review_resolution = (
+            _apply_listing_authority_to_pending_edgar_reviews(
+                pending_edgar_reviews,
+                listing_authority_adapter=listing_authority_adapter,
+                session=session,
+                ticker=ticker,
+                signal_identity=signal_identity,
+                entry_session_date=entry_session_date,
+                exit_session_date=exit_session_date,
+                asof=asof,
+                job_run_id=job_run_id,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+        )
         return _with_survivorship_source_attempts(
             pending_edgar_review_resolution,
             source_attempts=source_attempts,
@@ -2262,6 +2310,570 @@ def resolve_missing_exit_survivorship(
         resolution,
         source_attempts=source_attempts,
         source_lineage_ids=source_lineage_ids,
+    )
+
+
+def _apply_listing_authority_suppression(
+    edgar_resolution: SurvivorshipResolution,
+    *,
+    listing_authority_adapter: Any,
+    entity_identity_adapter: Any,
+    session: Session,
+    ticker: str,
+    signal_identity: Optional[Dict[str, str]],
+    entry_session_date: date,
+    exit_session_date: date,
+    asof: datetime,
+    job_run_id: Optional[str],
+    source_attempts: List[Dict[str, Any]],
+    source_lineage_ids: List[str],
+) -> SurvivorshipResolution:
+    if listing_authority_adapter is None or not hasattr(
+        listing_authority_adapter,
+        "get_listing_status",
+    ):
+        return edgar_resolution
+
+    provider_request = {
+        "ticker": ticker,
+        "from": entry_session_date.isoformat(),
+        "to": exit_session_date.isoformat(),
+        "event_basis": "edgar_form25_listing_authority_review",
+        "source": NASDAQ_LISTING_STATUS_SOURCE,
+        "endpoint": NASDAQ_LISTING_STATUS_ENDPOINT,
+        "asof": asof.isoformat(),
+        "use_live": False,
+        "archive_replay": True,
+    }
+    try:
+        resp = listing_authority_adapter.get_listing_status(
+            ticker,
+            asof=asof,
+            archive_session=session,
+            use_live=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive telemetry path.
+        error = ProviderError(
+            provider="NASDAQ_TRADER",
+            endpoint=NASDAQ_LISTING_STATUS_ENDPOINT,
+            status_code=None,
+            error_type="exception",
+            message=(
+                "Nasdaq listing authority raised during EDGAR review gate: "
+                f"{exc.__class__.__name__}"
+            ),
+            retryable=False,
+        )
+        raw_payload = {
+            "request": provider_request,
+            "result": None,
+            "error": _provider_error_payload(error),
+        }
+        resp = AdapterResponse(
+            data=None,
+            lineage=LineageMeta(
+                provider=error.provider,
+                endpoint=error.endpoint,
+                request_timestamp=datetime.now(timezone.utc),
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash(raw_payload),
+                source_authority="NASDAQ_TRADER_LISTING",
+                data_quality_flags={"listing_authority_exception": True},
+            ),
+            error=error,
+        )
+
+    result = resp.data
+    result_payload = _listing_status_result_payload(result)
+    raw_payload = {
+        "request": provider_request,
+        "result": result_payload,
+        "error": _provider_error_payload(resp.error),
+    }
+    lineage = _record_survivorship_lineage(
+        session,
+        resp=resp,
+        raw_payload=raw_payload,
+        job_run_id=job_run_id,
+    )
+
+    listing_status = result_payload.get("status")
+    is_authoritative_status = listing_status in {
+        NasdaqListingStatus.LISTED_ACTIVE.value,
+        NasdaqListingStatus.DELISTED.value,
+        NasdaqListingStatus.SUSPENDED.value,
+    }
+    listing_status_candidate = _listing_status_result_can_suppress(result)
+    entity_match = _confirm_listing_entity_match(
+        entity_identity_adapter=entity_identity_adapter,
+        session=session,
+        ticker=ticker,
+        signal_identity=signal_identity,
+        asof=asof,
+        job_run_id=job_run_id,
+        source_lineage_ids=source_lineage_ids,
+        should_evaluate=listing_status_candidate,
+    )
+    can_suppress = (
+        listing_status_candidate
+        and entity_match["entity_match"] is True
+    )
+    conflict_present = _edgar_review_has_authority_summary(edgar_resolution)
+    _append_survivorship_source_attempt(
+        source_attempts,
+        source_lineage_ids,
+        source=NASDAQ_LISTING_STATUS_SOURCE,
+        provider=resp.lineage.provider,
+        endpoint=resp.lineage.endpoint,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        lineage_id=lineage.data_lineage_id,
+        status=(
+            "error"
+            if not resp.ok
+            else "matched" if is_authoritative_status else "no_match"
+        ),
+        error=resp.error,
+        extra={
+            "listing_status": listing_status,
+            "listing_reason": result_payload.get("reason"),
+            "pit_knowable_at_asof": result_payload.get("pit_knowable_at_asof"),
+            "source_knowledge_timestamp": result_payload.get(
+                "source_knowledge_timestamp"
+            ),
+            "matched_symbol": result_payload.get("matched_symbol"),
+            "signal_cik": entity_match.get("signal_cik"),
+            "matched_cik": entity_match.get("matched_cik"),
+            "entity_match": entity_match.get("entity_match"),
+            "entity_match_status": entity_match.get("entity_match_status"),
+            "entity_match_refuse_reason": entity_match.get("refuse_reason"),
+            "entity_lineage_id": entity_match.get("lineage_id"),
+            "listing_status_candidate": listing_status_candidate,
+            "suppression_candidate": can_suppress,
+            "suppressed_edgar_review": bool(can_suppress and not conflict_present),
+        },
+    )
+
+    if not can_suppress or conflict_present:
+        refusal_payload = _listing_authority_refusal_payload(
+            result_payload=result_payload,
+            entity_match=entity_match,
+            conflict_present=conflict_present,
+            listing_status_candidate=listing_status_candidate,
+        )
+        if refusal_payload:
+            refused_request = dict(edgar_resolution.provider_request or {})
+            refused_request["listing_authority_refusal"] = refusal_payload
+            return replace(edgar_resolution, provider_request=refused_request)
+        return edgar_resolution
+
+    suppression_payload = {
+        "source": NASDAQ_LISTING_STATUS_SOURCE,
+        "provider": resp.lineage.provider,
+        "endpoint": resp.lineage.endpoint,
+        "lineage_id": lineage.data_lineage_id,
+        "status": listing_status,
+        "reason": result_payload.get("reason"),
+        "matched_symbol": result_payload.get("matched_symbol"),
+        "signal_cik": entity_match.get("signal_cik"),
+        "matched_cik": entity_match.get("matched_cik"),
+        "entity_match": entity_match.get("entity_match"),
+        "entity_match_status": entity_match.get("entity_match_status"),
+        "entity_lineage_id": entity_match.get("lineage_id"),
+        "pit_knowable_at_asof": result_payload.get("pit_knowable_at_asof"),
+        "source_knowledge_timestamp": result_payload.get(
+            "source_knowledge_timestamp"
+        ),
+    }
+    suppressed_request = dict(edgar_resolution.provider_request or {})
+    suppressed_request["listing_authority_suppression"] = suppression_payload
+
+    return replace(
+        edgar_resolution,
+        decision=SurvivorshipDecision(
+            status=STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+            reason=NASDAQ_LISTING_SUPPRESSION_REASON,
+            exit_price=None,
+            exit_price_source=None,
+            exit_basis_proof=None,
+        ),
+        data_lineage_ids=_dedupe_list(
+            list(edgar_resolution.data_lineage_ids or []) + [lineage.data_lineage_id]
+        ),
+        provider=resp.lineage.provider,
+        endpoint=resp.lineage.endpoint,
+        provider_request=suppressed_request,
+        primary_data_lineage_id=lineage.data_lineage_id,
+    )
+
+
+def _apply_listing_authority_to_pending_edgar_reviews(
+    pending_reviews: List[PendingEdgarReview],
+    *,
+    listing_authority_adapter: Any,
+    session: Session,
+    ticker: str,
+    signal_identity: Optional[Dict[str, str]],
+    entry_session_date: date,
+    exit_session_date: date,
+    asof: datetime,
+    job_run_id: Optional[str],
+    source_attempts: List[Dict[str, Any]],
+    source_lineage_ids: List[str],
+) -> Optional[SurvivorshipResolution]:
+    if not pending_reviews:
+        return None
+
+    evaluated: List[SurvivorshipResolution] = []
+    for pending in pending_reviews:
+        evaluated.append(
+            _apply_listing_authority_suppression(
+                pending.resolution,
+                listing_authority_adapter=listing_authority_adapter,
+                entity_identity_adapter=pending.identity_adapter,
+                session=session,
+                ticker=ticker,
+                signal_identity=signal_identity,
+                entry_session_date=entry_session_date,
+                exit_session_date=exit_session_date,
+                asof=asof,
+                job_run_id=job_run_id,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+        )
+    for resolution in evaluated:
+        if resolution.decision.reason != NASDAQ_LISTING_SUPPRESSION_REASON:
+            return resolution
+    return evaluated[0]
+
+
+def _listing_authority_refusal_payload(
+    *,
+    result_payload: Dict[str, Any],
+    entity_match: Dict[str, Any],
+    conflict_present: bool,
+    listing_status_candidate: bool,
+) -> Optional[Dict[str, Any]]:
+    if not listing_status_candidate and not conflict_present:
+        return None
+    reason = entity_match.get("refuse_reason")
+    if conflict_present:
+        reason = "authority_conflict_or_corroboration_present"
+    return {
+        "source": NASDAQ_LISTING_STATUS_SOURCE,
+        "reason": reason or "listing_authority_suppression_refused",
+        "listing_status": result_payload.get("status"),
+        "listing_reason": result_payload.get("reason"),
+        "matched_symbol": result_payload.get("matched_symbol"),
+        "signal_cik": entity_match.get("signal_cik"),
+        "matched_cik": entity_match.get("matched_cik"),
+        "matched_ciks": entity_match.get("matched_ciks"),
+        "entity_match": entity_match.get("entity_match"),
+        "entity_match_status": entity_match.get("entity_match_status"),
+        "entity_lineage_id": entity_match.get("lineage_id"),
+        "pit_knowable_at_asof": result_payload.get("pit_knowable_at_asof"),
+        "source_knowledge_timestamp": result_payload.get(
+            "source_knowledge_timestamp"
+        ),
+    }
+
+
+def _add_conflict_to_pending_edgar_reviews(
+    pending_reviews: List[PendingEdgarReview],
+    *,
+    conflicting: SurvivorshipResolution,
+) -> List[PendingEdgarReview]:
+    return [
+        PendingEdgarReview(
+            resolution=_add_survivorship_conflict_summary(
+                pending.resolution,
+                conflicting=conflicting,
+            ),
+            identity_adapter=pending.identity_adapter,
+        )
+        for pending in pending_reviews
+    ]
+
+
+def _add_corroboration_to_pending_edgar_reviews(
+    pending_reviews: List[PendingEdgarReview],
+    *,
+    corroborating: SurvivorshipResolution,
+) -> List[PendingEdgarReview]:
+    return [
+        PendingEdgarReview(
+            resolution=_add_survivorship_corroboration_summary(
+                pending.resolution,
+                corroborating=corroborating,
+            ),
+            identity_adapter=pending.identity_adapter,
+        )
+        for pending in pending_reviews
+    ]
+
+
+def _listing_status_result_can_suppress(result: Any) -> bool:
+    return (
+        _listing_status_value(getattr(result, "status", None))
+        == NasdaqListingStatus.LISTED_ACTIVE.value
+        and getattr(result, "pit_knowable_at_asof", None) is True
+    )
+
+
+def _confirm_listing_entity_match(
+    *,
+    entity_identity_adapter: Any,
+    session: Session,
+    ticker: str,
+    signal_identity: Optional[Dict[str, str]],
+    asof: datetime,
+    job_run_id: Optional[str],
+    source_lineage_ids: List[str],
+    should_evaluate: bool,
+) -> Dict[str, Any]:
+    identity = signal_identity or {}
+    signal_cik = _canonical_cik10(identity.get("cik"))
+    if signal_cik is None:
+        return {
+            "signal_cik": None,
+            "matched_cik": None,
+            "matched_ciks": [],
+            "entity_match": "unresolved",
+            "entity_match_status": "unresolved",
+            "refuse_reason": (
+                identity.get("cik_suppressed_reason") or "signal_cik_unavailable"
+            ),
+            "lineage_id": None,
+        }
+    if not should_evaluate:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": None,
+            "matched_ciks": [],
+            "entity_match": "unresolved",
+            "entity_match_status": "not_evaluated",
+            "refuse_reason": "listing_status_not_pit_active",
+            "lineage_id": None,
+        }
+    if entity_identity_adapter is None or not hasattr(
+        entity_identity_adapter,
+        "get_company_tickers",
+    ):
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": None,
+            "matched_ciks": [],
+            "entity_match": "unresolved",
+            "entity_match_status": "unresolved",
+            "refuse_reason": "entity_identity_adapter_unavailable",
+            "lineage_id": None,
+        }
+
+    request = {
+        "ticker": ticker,
+        "signal_cik": signal_cik,
+        "asof": asof.isoformat(),
+        "source": "sec_edgar_company_tickers_exchange",
+        "pit_approximation": (
+            "current SEC company_tickers_exchange mapping; suppression "
+            "refuses on mismatch or unresolved identity"
+        ),
+    }
+    try:
+        resp = entity_identity_adapter.get_company_tickers(asof=asof)
+    except Exception as exc:  # pragma: no cover - defensive telemetry path.
+        error = ProviderError(
+            provider=SEC_EDGAR_PROVIDER,
+            endpoint="sec_edgar_company_tickers_exchange",
+            status_code=None,
+            error_type="exception",
+            message=(
+                "SEC EDGAR entity identity check raised during listing gate: "
+                f"{exc.__class__.__name__}"
+            ),
+            retryable=False,
+        )
+        raw_payload = {
+            "request": request,
+            "rows": [],
+            "error": _provider_error_payload(error),
+        }
+        resp = AdapterResponse(
+            data=None,
+            lineage=LineageMeta(
+                provider=SEC_EDGAR_PROVIDER,
+                endpoint="sec_edgar_company_tickers_exchange",
+                request_timestamp=datetime.now(timezone.utc),
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash(raw_payload),
+                source_authority=SEC_EDGAR_PROVIDER,
+                data_quality_flags={"listing_entity_identity_exception": True},
+            ),
+            error=error,
+        )
+
+    rows = list(resp.data or [])
+    normalized_ticker = str(ticker or "").strip().upper()
+    ticker_rows = [
+        row for row in rows
+        if str(getattr(row, "ticker", "") or "").strip().upper() == normalized_ticker
+    ]
+    same_entity_rows = [
+        row for row in ticker_rows
+        if _canonical_cik10(
+            getattr(row, "cik_str", None) or getattr(row, "cik", None)
+        ) == signal_cik
+    ]
+    signal_cik_rows = [
+        row for row in rows
+        if _canonical_cik10(
+            getattr(row, "cik_str", None) or getattr(row, "cik", None)
+        ) == signal_cik
+    ]
+    raw_payload = {
+        "request": request,
+        "ticker_rows": [_company_ticker_row_payload(row) for row in ticker_rows],
+        "signal_cik_rows": [
+            _company_ticker_row_payload(row) for row in signal_cik_rows
+        ],
+        "error": _provider_error_payload(resp.error),
+    }
+    lineage = _record_survivorship_lineage(
+        session,
+        resp=resp,
+        raw_payload=raw_payload,
+        job_run_id=job_run_id,
+    )
+    source_lineage_ids.append(lineage.data_lineage_id)
+
+    if not resp.ok:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": None,
+            "matched_ciks": [],
+            "entity_match": "unresolved",
+            "entity_match_status": "unresolved",
+            "refuse_reason": (
+                f"entity_mapping_error:{getattr(resp.error, 'error_type', None)}"
+            ),
+            "lineage_id": lineage.data_lineage_id,
+        }
+    ticker_ciks = _dedupe_list([
+        cik for cik in (
+            _canonical_cik10(
+                getattr(row, "cik_str", None) or getattr(row, "cik", None)
+            )
+            for row in ticker_rows
+        )
+        if cik is not None
+    ])
+    if len(ticker_ciks) > 1 and signal_cik in ticker_ciks:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": signal_cik,
+            "matched_ciks": ticker_ciks,
+            "entity_match": False,
+            "entity_match_status": "ambiguous",
+            "refuse_reason": "ambiguous_ticker_multiple_active_ciks",
+            "lineage_id": lineage.data_lineage_id,
+        }
+    if same_entity_rows and ticker_ciks == [signal_cik]:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": signal_cik,
+            "matched_ciks": [signal_cik],
+            "entity_match": True,
+            "entity_match_status": "matched",
+            "refuse_reason": None,
+            "lineage_id": lineage.data_lineage_id,
+        }
+    if ticker_ciks:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": ticker_ciks[0],
+            "matched_ciks": ticker_ciks,
+            "entity_match": False,
+            "entity_match_status": "mismatch",
+            "refuse_reason": "active_listing_cik_mismatch",
+            "lineage_id": lineage.data_lineage_id,
+        }
+    if signal_cik_rows:
+        return {
+            "signal_cik": signal_cik,
+            "matched_cik": signal_cik,
+            "matched_ciks": [signal_cik],
+            "entity_match": False,
+            "entity_match_status": "mismatch",
+            "refuse_reason": "signal_cik_does_not_claim_ticker",
+            "lineage_id": lineage.data_lineage_id,
+        }
+    return {
+        "signal_cik": signal_cik,
+        "matched_cik": None,
+        "matched_ciks": [],
+        "entity_match": "unresolved",
+        "entity_match_status": "unresolved",
+        "refuse_reason": "signal_cik_not_in_current_company_tickers",
+        "lineage_id": lineage.data_lineage_id,
+    }
+
+
+def _company_ticker_row_payload(row: Any) -> Dict[str, Any]:
+    return {
+        "cik": _canonical_cik10(
+            getattr(row, "cik_str", None) or getattr(row, "cik", None)
+        ),
+        "ticker": getattr(row, "ticker", None),
+        "company_name": getattr(row, "company_name", None),
+        "exchange": getattr(row, "exchange", None),
+    }
+
+
+def _listing_status_result_payload(result: Any) -> Dict[str, Any]:
+    if result is None:
+        return {
+            "status": None,
+            "reason": None,
+            "matched_symbol": None,
+            "source_knowledge_timestamp": None,
+            "pit_knowable_at_asof": None,
+            "raw": None,
+        }
+    source_ts = getattr(result, "source_knowledge_timestamp", None)
+    return {
+        "symbol": getattr(result, "symbol", None),
+        "normalized_symbol": getattr(result, "normalized_symbol", None),
+        "status": _listing_status_value(getattr(result, "status", None)),
+        "reason": getattr(result, "reason", None),
+        "matched_symbol": getattr(result, "matched_symbol", None),
+        "source": getattr(result, "source", None),
+        "source_knowledge_timestamp": (
+            source_ts.isoformat() if hasattr(source_ts, "isoformat") else source_ts
+        ),
+        "pit_knowable_at_asof": getattr(result, "pit_knowable_at_asof", None),
+        "raw": getattr(result, "raw", None),
+    }
+
+
+def _listing_status_value(status: Any) -> Optional[str]:
+    if isinstance(status, NasdaqListingStatus):
+        return status.value
+    if status is None:
+        return None
+    return str(status)
+
+
+def _edgar_review_has_authority_summary(
+    resolution: SurvivorshipResolution,
+) -> bool:
+    provider_request = resolution.provider_request or {}
+    # Fail closed: any corroboration/conflict means another authority saw
+    # potentially relevant evidence, so Nasdaq must not erase the EDGAR review.
+    return bool(
+        provider_request.get("authority_conflict")
+        or provider_request.get("authority_corroboration")
     )
 
 

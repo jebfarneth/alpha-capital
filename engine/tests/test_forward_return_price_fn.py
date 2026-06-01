@@ -10,11 +10,21 @@ import pytest
 from sqlalchemy import text
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
+from alpha.data.edgar import SecCompanyTicker
 from alpha.data.fmp import (
     DELISTED_COMPANIES_ENDPOINT,
     FmpBar,
     FmpDelistedCompany,
     HISTORICAL_PRICE_FULL_ENDPOINT,
+)
+from alpha.data.nasdaq import (
+    ADDS_DELETES,
+    HALT_RSS,
+    NASDAQ_LISTED,
+    OTHER_LISTED,
+    NasdaqListingStatus,
+    NasdaqListingStatusResult,
+    NasdaqTraderListingAdapter,
 )
 from alpha.db.engine import schema_connect_args
 from alpha.db.models import (
@@ -22,6 +32,8 @@ from alpha.db.models import (
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     ForwardReturnPathRow,
+    NasdaqListingSnapshot,
+    NasdaqListingSnapshotRow,
     SignalRegistry,
 )
 from alpha.evidence.writer import record_feature_snapshot, record_signal
@@ -32,7 +44,9 @@ from alpha.jobs.forward_return import (
     M4_EXIT_GEOMETRY,
     M4_PRICE_SOURCE,
     M4_SPLIT_ADJUSTED_OPEN_BASIS_PROOF,
+    NASDAQ_LISTING_SUPPRESSION_REASON,
     ForwardReturnJob,
+    _apply_listing_authority_to_pending_edgar_reviews,
     _canonical_cik10,
     _security_identity_from_payload,
     current_forward_path_rows,
@@ -254,10 +268,15 @@ class FakeEdgarSurvivorshipAdapter:
         self,
         events_by_ticker: Optional[Dict[str, object]] = None,
         error: Optional[ProviderError] = None,
+        company_ticker_rows: Optional[List[SecCompanyTicker]] = None,
+        company_tickers_error: Optional[ProviderError] = None,
     ):
         self.events_by_ticker = events_by_ticker or {}
         self.error = error
+        self.company_ticker_rows = company_ticker_rows or []
+        self.company_tickers_error = company_tickers_error
         self.calls = []
+        self.company_ticker_calls = []
 
     def get_survivorship_events(
         self,
@@ -287,6 +306,84 @@ class FakeEdgarSurvivorshipAdapter:
         if self.error is not None:
             return AdapterResponse(data=None, lineage=lineage, error=self.error)
         return AdapterResponse(data=events, lineage=lineage)
+
+    def get_company_tickers(self, *, asof=None):
+        self.company_ticker_calls.append({"asof": asof})
+        rows = list(self.company_ticker_rows)
+        lineage = LineageMeta(
+            provider="SEC_EDGAR",
+            endpoint="/files/company_tickers_exchange.json",
+            request_timestamp=REQUEST_TS,
+            asof_timestamp=asof,
+            raw_payload_hash=stable_hash([
+                {
+                    "cik": row.cik_str,
+                    "ticker": row.ticker,
+                    "company_name": row.company_name,
+                    "exchange": row.exchange,
+                }
+                for row in rows
+            ]),
+            source_authority="SEC_EDGAR",
+        )
+        if self.company_tickers_error is not None:
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=self.company_tickers_error,
+            )
+        return AdapterResponse(data=rows, lineage=lineage)
+
+
+class FakeOptionalCikEdgarSurvivorshipAdapter(FakeEdgarSurvivorshipAdapter):
+    requires_cik_for_survivorship_events = False
+
+
+class FakeListingAuthorityAdapter:
+    def __init__(
+        self,
+        result: Optional[NasdaqListingStatusResult] = None,
+        error: Optional[ProviderError] = None,
+    ):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def get_listing_status(
+        self,
+        symbol,
+        *,
+        asof,
+        archive_session=None,
+        use_live=True,
+    ):
+        self.calls.append({
+            "symbol": symbol,
+            "asof": asof,
+            "archive_session": archive_session,
+            "use_live": use_live,
+        })
+        payload = {
+            "symbol": symbol,
+            "status": (
+                self.result.status.value
+                if isinstance(getattr(self.result, "status", None), NasdaqListingStatus)
+                else getattr(self.result, "status", None)
+            ),
+            "error": self.error.error_type if self.error else None,
+        }
+        return AdapterResponse(
+            data=None if self.error else self.result,
+            lineage=LineageMeta(
+                provider="NASDAQ_TRADER",
+                endpoint="nasdaq_listing_status_archive",
+                request_timestamp=REQUEST_TS,
+                asof_timestamp=asof,
+                raw_payload_hash=stable_hash(payload),
+                source_authority="NASDAQ_TRADER_LISTING",
+            ),
+            error=self.error,
+        )
 
 
 class FakeBenzingaAdapter:
@@ -409,6 +506,97 @@ def _bars(
     ]
 
 
+def _listing_status_result(
+    status: NasdaqListingStatus = NasdaqListingStatus.LISTED_ACTIVE,
+    *,
+    pit_knowable: bool = True,
+    reason: str = "symbol_present_in_archived_directory",
+    matched_symbol: str = "ACME",
+    source_ts: datetime = EXIT_SESSION_CLOSE_TS,
+) -> NasdaqListingStatusResult:
+    return NasdaqListingStatusResult(
+        symbol="ACME",
+        normalized_symbol="ACME",
+        status=status,
+        asof_timestamp=EXIT_SESSION_CLOSE_TS,
+        source_knowledge_timestamp=source_ts,
+        pit_knowable_at_asof=pit_knowable,
+        source="nasdaq_self_archive",
+        reason=reason,
+        matched_symbol=matched_symbol,
+        raw={"test": True},
+    )
+
+
+def _sec_company_ticker(
+    ticker: str = "ACME",
+    cik: str = "0001418091",
+    *,
+    company_name: str = "ACME Corp.",
+    exchange: str = "Nasdaq",
+) -> SecCompanyTicker:
+    cik10 = cik.zfill(10)
+    return SecCompanyTicker(
+        cik=int(cik10),
+        cik_str=cik10,
+        ticker=ticker,
+        company_name=company_name,
+        exchange=exchange,
+        raw={"ticker": ticker, "cik": cik10},
+    )
+
+
+def _insert_nasdaq_archive_snapshot(
+    db_session,
+    source_type,
+    source_ts,
+    rows,
+):
+    snapshot = NasdaqListingSnapshot(
+        source_type=source_type,
+        source_url=f"https://example.test/{source_type}",
+        source_knowledge_timestamp=source_ts,
+        raw_payload_hash=f"{source_type}-{source_ts.isoformat()}-{len(rows)}",
+        raw_payload="test payload",
+        row_count=len(rows),
+        parse_status="parsed",
+        data_quality_flags_json=json.dumps({"source": source_type}),
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    for row in rows:
+        row.snapshot_id = snapshot.snapshot_id
+        db_session.add(row)
+    db_session.flush()
+    return snapshot
+
+
+def _seed_nasdaq_archive_for_acme(db_session):
+    source_ts = datetime(2026, 6, 15, 22, 15, tzinfo=timezone.utc)
+    _insert_nasdaq_archive_snapshot(
+        db_session,
+        NASDAQ_LISTED,
+        source_ts,
+        [
+            NasdaqListingSnapshotRow(
+                source_type=NASDAQ_LISTED,
+                symbol="ACME",
+                normalized_symbol="ACME",
+                security_name="ACME Corp. - Common Stock",
+                market="Q",
+                raw_json=json.dumps({
+                    "ETF": "N",
+                    "Security Name": "ACME Corp. - Common Stock",
+                    "Symbol": "ACME",
+                    "Test Issue": "N",
+                }),
+            )
+        ],
+    )
+    for source_type in (OTHER_LISTED, ADDS_DELETES, HALT_RSS):
+        _insert_nasdaq_archive_snapshot(db_session, source_type, source_ts, [])
+
+
 def _session_window(start: date, end: date) -> List[date]:
     sessions = []
     cursor = next_us_equity_session(start)
@@ -470,6 +658,7 @@ def _run_job(
     price_drift_abs_tol=0.01,
     price_drift_rel_tol=0.0005,
     survivorship_adapters=None,
+    listing_authority_adapter=None,
 ):
     return run_job(
         db_session,
@@ -477,6 +666,7 @@ def _run_job(
             session=db_session,
             adapter=adapter,
             survivorship_adapters=survivorship_adapters,
+            listing_authority_adapter=listing_authority_adapter,
             run_timestamp=run_ts,
             max_attempts=max_attempts,
             finality_lag_sessions=finality_lag_sessions,
@@ -549,6 +739,7 @@ def test_run_forward_return_wires_sec_edgar_when_user_agent_is_set(monkeypatch, 
     monkeypatch.setenv("SEC_USER_AGENT", "Alpha Capital ops@example.com")
     monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
     monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.delenv("NASDAQ_LISTING_AUTHORITY_ENABLED", raising=False)
     monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
     monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
 
@@ -600,6 +791,7 @@ def test_run_forward_return_skips_sec_edgar_without_user_agent(monkeypatch):
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
     monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.delenv("NASDAQ_LISTING_AUTHORITY_ENABLED", raising=False)
     monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
     monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
 
@@ -636,6 +828,62 @@ def test_run_forward_return_skips_sec_edgar_without_user_agent(monkeypatch):
     assert exit_code == 0
     assert captured["job"]._survivorship_adapters == []
     assert captured["params"]["survivorship_sources"] == ["fmp_delisted_companies"]
+
+
+def test_run_forward_return_wires_nasdaq_listing_authority_when_enabled(
+    monkeypatch,
+):
+    monkeypatch.setenv("FMP_API_KEY", "fmp-key")
+    monkeypatch.setenv("NASDAQ_LISTING_AUTHORITY_ENABLED", "1")
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+    monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeFmpAdapter:
+        def __init__(self, _config):
+            pass
+
+    class FakeNasdaqListingAuthority:
+        pass
+
+    captured = {}
+
+    def fake_run_job(session, job, params):
+        captured["job"] = job
+        captured["params"] = params
+        return JobResult(status="finished", metrics={})
+
+    monkeypatch.setattr(run_forward_return, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(run_forward_return, "FmpAdapter", FakeFmpAdapter)
+    monkeypatch.setattr(
+        run_forward_return,
+        "NasdaqTraderListingAdapter",
+        FakeNasdaqListingAuthority,
+    )
+    monkeypatch.setattr(run_forward_return, "run_job", fake_run_job)
+
+    exit_code = run_forward_return.main([
+        "--live",
+        "--run-timestamp",
+        MATURE_RUN_TS.isoformat(),
+    ])
+
+    assert exit_code == 0
+    assert isinstance(
+        captured["job"]._listing_authority_adapter,
+        FakeNasdaqListingAuthority,
+    )
+    assert captured["job"]._survivorship_adapters == []
+    assert captured["params"]["survivorship_sources"] == [
+        "fmp_delisted_companies",
+        "nasdaq_listing_status",
+    ]
 
 
 def test_fresh_signal_before_entry_open_stays_pending_without_fetch(db_session):
@@ -1031,7 +1279,8 @@ def test_sec_edgar_survivorship_channel_receives_signal_cik_and_persists_authori
                 "form": "25-NSE",
                 "cik": "0001418091",
             }
-        }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0001418091")],
     )
 
     _run_job(db_session, adapter, survivorship_adapters=[edgar])
@@ -1053,6 +1302,784 @@ def test_sec_edgar_survivorship_channel_receives_signal_cik_and_persists_authori
     assert payload["request"]["cik"] == "0001418091"
     assert payload["request"]["cik_sent"] is True
     assert payload["request"]["asof"] == EXIT_SESSION_CLOSE_TS.isoformat()
+
+
+def test_sec_edgar_form25_review_suppressed_by_pit_listed_active_authority(
+    db_session,
+):
+    sid = _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0001418091")],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert listing.calls == [
+        {
+            "symbol": "ACME",
+            "asof": EXIT_SESSION_CLOSE_TS,
+            "archive_session": db_session,
+            "use_live": False,
+        }
+    ]
+    assert sig.forward_return_status == "survivorship_unresolved_review"
+    assert sig.outcome_unavailable_reason == NASDAQ_LISTING_SUPPRESSION_REASON
+    assert obs.status == "survivorship_unresolved_review"
+    assert obs.reason == NASDAQ_LISTING_SUPPRESSION_REASON
+    assert obs.provider == "NASDAQ_TRADER"
+    assert obs.endpoint == "nasdaq_listing_status_archive"
+    assert obs.exit_price is None
+    assert obs.forward_return is None
+    assert survivorship_request["listing_authority_suppression"]["status"] == (
+        "LISTED_ACTIVE"
+    )
+    assert survivorship_request["listing_authority_suppression"]["signal_cik"] == (
+        "0001418091"
+    )
+    assert survivorship_request["listing_authority_suppression"]["matched_cik"] == (
+        "0001418091"
+    )
+    assert survivorship_request["listing_authority_suppression"]["entity_match"] is True
+    assert [attempt["source"] for attempt in attempts] == [
+        "sec_edgar_survivorship_events",
+        "survivorship_events",
+        "nasdaq_listing_status",
+    ]
+    assert [attempt["status"] for attempt in attempts] == [
+        "matched",
+        "no_match",
+        "matched",
+    ]
+    assert attempts[-1]["suppressed_edgar_review"] is True
+    assert attempts[-1]["entity_match"] is True
+    assert attempts[-1]["signal_cik"] == "0001418091"
+    assert attempts[-1]["matched_cik"] == "0001418091"
+    authorities = [
+        db_session.get(DataLineage, attempt["lineage_id"]).source_authority
+        for attempt in attempts
+    ]
+    assert authorities == ["SEC_EDGAR", "test", "NASDAQ_TRADER_LISTING"]
+
+
+def test_sec_edgar_suppression_uses_real_nasdaq_archive_replay(db_session):
+    _seed_nasdaq_archive_for_acme(db_session)
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0001418091")],
+    )
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=NasdaqTraderListingAdapter(),
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "survivorship_unresolved_review"
+    assert obs.reason == NASDAQ_LISTING_SUPPRESSION_REASON
+    assert survivorship_request["listing_authority_suppression"]["reason"] == (
+        "symbol_present_in_archived_directory"
+    )
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["listing_status"] == "LISTED_ACTIVE"
+    assert attempts[-1]["pit_knowable_at_asof"] is True
+    assert attempts[-1]["entity_match"] is True
+    assert db_session.get(DataLineage, attempts[-1]["lineage_id"]).source_authority == (
+        "NASDAQ_TRADER_LISTING"
+    )
+
+
+def test_sec_edgar_suppression_applies_after_fmp_clean_no_match(db_session):
+    _make_signal(
+        db_session,
+        ticker="TCON",
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeDelistedAdapter(
+        {"TCON": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={},
+    )
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "TCON": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("TCON", "0001418091")],
+    )
+    listing = FakeListingAuthorityAdapter(
+        _listing_status_result(matched_symbol="TCON")
+    )
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "survivorship_unresolved_review"
+    assert obs.reason == NASDAQ_LISTING_SUPPRESSION_REASON
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["suppressed_edgar_review"] is True
+    assert attempts[-1]["entity_match"] is True
+    assert "authority_conflict" not in survivorship_request
+
+
+def test_listing_authority_pending_reviews_empty_list_noop(db_session):
+    class ExplodingListingAdapter:
+        def get_listing_status(self, *args, **kwargs):
+            raise AssertionError("empty pending reviews should not query Nasdaq")
+
+    source_attempts = []
+    source_lineage_ids = []
+
+    result = _apply_listing_authority_to_pending_edgar_reviews(
+        [],
+        listing_authority_adapter=ExplodingListingAdapter(),
+        session=db_session,
+        ticker="ACME",
+        signal_identity={"cik": "1111"},
+        entry_session_date=ENTRY_DATE,
+        exit_session_date=EXIT_DATE,
+        asof=EXIT_SESSION_CLOSE_TS,
+        job_run_id=None,
+        source_attempts=source_attempts,
+        source_lineage_ids=source_lineage_ids,
+    )
+
+    assert result is None
+    assert source_attempts == []
+    assert source_lineage_ids == []
+
+
+def test_recycled_ticker_cik_mismatch_does_not_suppress_edgar_review(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1111"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0000001111-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0000001111",
+            }
+        },
+        company_ticker_rows=[
+            _sec_company_ticker("ACME", "0000002222"),
+            _sec_company_ticker("OLD", "0000001111"),
+        ],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.provider == "SEC_EDGAR"
+    assert obs.exit_price is None
+    assert obs.forward_return is None
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["listing_status"] == "LISTED_ACTIVE"
+    assert attempts[-1]["signal_cik"] == "0000001111"
+    assert attempts[-1]["matched_cik"] == "0000002222"
+    assert attempts[-1]["entity_match"] is False
+    assert attempts[-1]["entity_match_status"] == "mismatch"
+    assert attempts[-1]["entity_match_refuse_reason"] == (
+        "active_listing_cik_mismatch"
+    )
+    assert attempts[-1]["suppression_candidate"] is False
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_mixed_cik_ambiguity_refuses_listing_suppression(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1111"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0000001111-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0000001111",
+            }
+        },
+        company_ticker_rows=[
+            _sec_company_ticker("ACME", "0000001111"),
+            _sec_company_ticker("ACME", "0000002222"),
+        ],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+    refusal = survivorship_request["listing_authority_refusal"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.exit_price is None
+    assert obs.forward_return is None
+    assert "listing_authority_suppression" not in survivorship_request
+    assert refusal["reason"] == "ambiguous_ticker_multiple_active_ciks"
+    assert refusal["signal_cik"] == "0000001111"
+    assert refusal["matched_cik"] == "0000001111"
+    assert refusal["matched_ciks"] == ["0000001111", "0000002222"]
+    assert refusal["entity_match"] is False
+    assert refusal["entity_match_status"] == "ambiguous"
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["entity_match_refuse_reason"] == (
+        "ambiguous_ticker_multiple_active_ciks"
+    )
+    assert attempts[-1]["suppression_candidate"] is False
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_recycled_ticker_cik_mismatch_does_not_suppress_after_fmp_clean_no_match(
+    db_session,
+):
+    _make_signal(
+        db_session,
+        ticker="TCON",
+        security_identity={"cik": "1111"},
+    )
+    adapter = FakeDelistedAdapter(
+        {"TCON": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={},
+    )
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "TCON": {
+                "id": "0000001111-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0000001111",
+            }
+        },
+        company_ticker_rows=[
+            _sec_company_ticker("TCON", "0000002222"),
+            _sec_company_ticker("OLD", "0000001111"),
+        ],
+    )
+    listing = FakeListingAuthorityAdapter(
+        _listing_status_result(matched_symbol="TCON")
+    )
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["entity_match"] is False
+    assert attempts[-1]["entity_match_refuse_reason"] == (
+        "active_listing_cik_mismatch"
+    )
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_suppressed_numeric_cusip_cik_does_not_suppress_edgar_review(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "037833100", "cusip": "037833100"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeOptionalCikEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "bad-cusip-cik",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0037833100",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0037833100")],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["signal_cik"] is None
+    assert attempts[-1]["entity_match"] == "unresolved"
+    assert attempts[-1]["entity_match_refuse_reason"] == "cik_equals_numeric_cusip"
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_lone_numeric_cusip_in_cik_field_does_not_suppress_on_entity_mismatch(
+    db_session,
+):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "037833100"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "wrong-cik-form25",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0037833100",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0001418091")],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["signal_cik"] == "0037833100"
+    assert attempts[-1]["matched_cik"] == "0001418091"
+    assert attempts[-1]["entity_match"] is False
+    assert attempts[-1]["entity_match_refuse_reason"] == (
+        "active_listing_cik_mismatch"
+    )
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_multi_edgar_reviews_use_their_own_identity_adapters(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1111"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar_matching = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "matching-edgar-review",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0000001111",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0000001111")],
+    )
+    edgar_mismatch = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "mismatched-edgar-review",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0000001111",
+            }
+        },
+        company_ticker_rows=[_sec_company_ticker("ACME", "0000002222")],
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar_matching, edgar_mismatch],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+    listing_attempts = [
+        attempt for attempt in attempts
+        if attempt["source"] == "nasdaq_listing_status"
+    ]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert len(listing.calls) == 2
+    assert len(edgar_matching.company_ticker_calls) == 1
+    assert len(edgar_mismatch.company_ticker_calls) == 1
+    assert len(listing_attempts) == 2
+    assert listing_attempts[0]["entity_match"] is True
+    assert listing_attempts[0]["suppressed_edgar_review"] is True
+    assert listing_attempts[1]["entity_match"] is False
+    assert listing_attempts[1]["matched_cik"] == "0000002222"
+    assert listing_attempts[1]["entity_match_refuse_reason"] == (
+        "active_listing_cik_mismatch"
+    )
+    first_identity_lineage = db_session.get(
+        DataLineage,
+        listing_attempts[0]["entity_lineage_id"],
+    )
+    second_identity_lineage = db_session.get(
+        DataLineage,
+        listing_attempts[1]["entity_lineage_id"],
+    )
+    first_payload = json.loads(first_identity_lineage.raw_payload_json)
+    second_payload = json.loads(second_identity_lineage.raw_payload_json)
+    assert first_payload["ticker_rows"][0]["cik"] == "0000001111"
+    assert second_payload["ticker_rows"][0]["cik"] == "0000002222"
+
+
+def test_listing_entity_mapping_error_does_not_suppress_edgar_review(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        },
+        company_tickers_error=ProviderError(
+            provider="SEC_EDGAR",
+            endpoint="/files/company_tickers_exchange.json",
+            status_code=503,
+            error_type="http",
+            message="SEC temporarily unavailable",
+            retryable=True,
+        ),
+    )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["entity_match"] == "unresolved"
+    assert attempts[-1]["entity_match_refuse_reason"] == "entity_mapping_error:http"
+    assert attempts[-1]["entity_lineage_id"]
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+@pytest.mark.parametrize(
+    ("listing_result", "expected_reason"),
+    [
+        (
+            _listing_status_result(
+                NasdaqListingStatus.LISTED_ACTIVE,
+                pit_knowable=False,
+                reason="directory_match_not_knowable_at_asof",
+            ),
+            "directory_match_not_knowable_at_asof",
+        ),
+        (
+            _listing_status_result(
+                NasdaqListingStatus.INCONCLUSIVE,
+                reason="archive_source_coverage_incomplete",
+            ),
+            "archive_source_coverage_incomplete",
+        ),
+        (
+            _listing_status_result(
+                NasdaqListingStatus.UNAVAILABLE,
+                reason="provider_error",
+            ),
+            "provider_error",
+        ),
+        (
+            _listing_status_result(
+                NasdaqListingStatus.DELISTED,
+                reason="archived_adds_deletes_delete",
+            ),
+            "archived_adds_deletes_delete",
+        ),
+    ],
+)
+def test_sec_edgar_review_not_suppressed_without_pit_active_listing(
+    db_session,
+    listing_result,
+    expected_reason,
+):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        }
+    )
+    listing = FakeListingAuthorityAdapter(listing_result)
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.provider == "SEC_EDGAR"
+    assert "listing_authority_suppression" not in survivorship_request
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["listing_reason"] == expected_reason
+    assert attempts[-1]["suppressed_edgar_review"] is False
+
+
+def test_sec_edgar_review_not_suppressed_when_listing_authority_errors(
+    db_session,
+):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        }
+    )
+    listing = FakeListingAuthorityAdapter(
+        error=ProviderError(
+            provider="NASDAQ_TRADER",
+            endpoint="nasdaq_listing_status_archive",
+            status_code=None,
+            error_type="coverage_incomplete",
+            message="missing archive coverage",
+            retryable=True,
+        )
+    )
+
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar],
+        listing_authority_adapter=listing,
+    )
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert attempts[-1]["source"] == "nasdaq_listing_status"
+    assert attempts[-1]["status"] == "error"
+    assert attempts[-1]["error"]["error_type"] == "coverage_incomplete"
+
+
+def test_listing_authority_absent_preserves_sec_edgar_review_shape(db_session):
+    _make_signal(
+        db_session,
+        security_identity={"cik": "1418091"},
+    )
+    adapter = FakeHistoricalAdapter({"ACME": [_bar(ENTRY_DATE, 10.0)]})
+    edgar = FakeEdgarSurvivorshipAdapter(
+        events_by_ticker={
+            "ACME": {
+                "id": "0001418091-22-000001",
+                "type": "delisting_notice",
+                "classification": "sec_form_25-nse",
+                "source_backed": True,
+                "form": "25-NSE",
+                "cik": "0001418091",
+            }
+        }
+    )
+
+    _run_job(db_session, adapter, survivorship_adapters=[edgar])
+
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "sec_edgar_form25_survivorship_review"
+    assert obs.provider == "SEC_EDGAR"
+    assert [attempt["source"] for attempt in survivorship_request["source_attempts"]] == [
+        "sec_edgar_survivorship_events",
+        "survivorship_events",
+    ]
+    assert "listing_authority_suppression" not in survivorship_request
 
 
 def test_sec_edgar_without_signal_cik_records_identity_unavailable_not_ticker_lookup(db_session):
@@ -1160,8 +2187,14 @@ def test_sec_edgar_review_collects_benzinga_and_fmp_corroboration(db_session):
             }
         }
     )
+    listing = FakeListingAuthorityAdapter(_listing_status_result())
 
-    _run_job(db_session, adapter, survivorship_adapters=[edgar, benzinga])
+    _run_job(
+        db_session,
+        adapter,
+        survivorship_adapters=[edgar, benzinga],
+        listing_authority_adapter=listing,
+    )
 
     sig = db_session.get(SignalRegistry, sid)
     obs = _obs(db_session)
@@ -1193,23 +2226,33 @@ def test_sec_edgar_review_collects_benzinga_and_fmp_corroboration(db_session):
         survivorship_request["authority_conflict"]["reason"]
         == "delisting_unclassified_survivorship_review"
     )
+    assert "listing_authority_suppression" not in survivorship_request
     assert [attempt["source"] for attempt in attempts] == [
         "sec_edgar_survivorship_events",
         "benzinga_calendar_ma",
         "survivorship_events",
         "fmp_delisted_companies",
+        "nasdaq_listing_status",
     ]
     assert [attempt["status"] for attempt in attempts] == [
         "matched",
         "matched",
         "no_match",
         "matched",
+        "matched",
     ]
+    assert attempts[-1]["suppressed_edgar_review"] is False
     authorities = [
         db_session.get(DataLineage, attempt["lineage_id"]).source_authority
         for attempt in attempts
     ]
-    assert authorities == ["SEC_EDGAR", "Benzinga", "test", "FMP"]
+    assert authorities == [
+        "SEC_EDGAR",
+        "Benzinga",
+        "test",
+        "FMP",
+        "NASDAQ_TRADER_LISTING",
+    ]
 
 
 def test_sec_edgar_incomplete_window_routes_to_review_with_lineage(db_session):

@@ -18,6 +18,7 @@ from alpha.data.benzinga import BenzingaAdapter
 from alpha.data.config import BenzingaConfig, FmpConfig, SecEdgarConfig
 from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.fmp import FmpAdapter
+from alpha.data.nasdaq import NasdaqTraderListingAdapter
 from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
 from alpha.jobs.forward_return import (
     DEFAULT_FINALITY_LAG_SESSIONS,
@@ -30,6 +31,7 @@ from alpha.jobs.runner import run_job
 from alpha.runtime_env import load_runtime_env
 
 LIVE_RUN_TIMESTAMP_SKEW_TOLERANCE = timedelta(minutes=5)
+NASDAQ_LISTING_AUTHORITY_ENV = "NASDAQ_LISTING_AUTHORITY_ENABLED"
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -67,6 +69,11 @@ def _live_timestamp_error(
     return None
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _run_live(args: argparse.Namespace) -> int:
     load_runtime_env()
     if args.database_url:
@@ -95,6 +102,9 @@ def _run_live(args: argparse.Namespace) -> int:
             survivorship_adapters.append(SecEdgarAdapter(SecEdgarConfig.from_env()))
         if os.environ.get("BENZINGA_API_KEY") or os.environ.get("BENZINGA_TOKEN"):
             survivorship_adapters.append(BenzingaAdapter(BenzingaConfig.from_env()))
+        listing_authority_adapter = None
+        if _env_flag(NASDAQ_LISTING_AUTHORITY_ENV):
+            listing_authority_adapter = NasdaqTraderListingAdapter()
         survivorship_source_names = ["fmp_delisted_companies"] + [
             "sec_edgar_survivorship_events"
             for _source in survivorship_adapters
@@ -104,10 +114,13 @@ def _run_live(args: argparse.Namespace) -> int:
             for _source in survivorship_adapters
             if isinstance(_source, BenzingaAdapter)
         ]
+        if listing_authority_adapter is not None:
+            survivorship_source_names.append("nasdaq_listing_status")
         job = ForwardReturnJob(
             session=session,
             adapter=adapter,
             survivorship_adapters=survivorship_adapters,
+            listing_authority_adapter=listing_authority_adapter,
             run_timestamp=_parse_timestamp(args.run_timestamp),
             max_attempts=args.max_attempts,
             pattern_id=args.pattern_id,
