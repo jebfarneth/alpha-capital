@@ -7,15 +7,18 @@ tradeability, or re-derive PIT/survivorship truth.
 One firing is one ``signal_id``. If producer input identity changes for a fixed
 signal, stale ``(signal_id, input_hash)`` rows are excluded and the canonical
 observation is the latest persisted row by ``updated_at``, ``created_at``, then
-primary key. Pattern-filtered runs are scoped reporting, not a global drift
-sentinel; only an unfiltered run fails loud on a globally unknown status.
+primary key. That recency choice is corpus-load-bearing, so timestamps are
+compared as aware UTC datetimes rather than strings; missing timestamps sort
+oldest. Pattern-filtered runs are scoped reporting, not a global drift sentinel;
+only an unfiltered run fails loud on a globally unknown status.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from statistics import mean, median
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -81,9 +84,16 @@ ROLLUP_STATUS_BUCKETS: Mapping[str, frozenset[str]] = {
 class ScoreboardPartitionError(RuntimeError):
     """Raised when persisted observations no longer match the status universe."""
 
-    def __init__(self, message: str, *, unknown_status_counts: Optional[Dict[str, int]] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        unknown_status_counts: Optional[Dict[str, int]] = None,
+        unknown_status_details: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ):
         super().__init__(message)
         self.unknown_status_counts = unknown_status_counts or {}
+        self.unknown_status_details = unknown_status_details or {}
 
 
 @dataclass(frozen=True)
@@ -204,23 +214,34 @@ def build_measurement_scoreboard(
 
     validate_status_partition()
     raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
+    canonical_rows = _canonical_observation_rows(raw_rows)
+    canonical_observation_ids = {
+        row["forward_return_observation_id"] for row in canonical_rows
+    }
 
     per_status_counts = {status: 0 for status in REQUIRED_FORWARD_RETURN_STATUSES}
     unknown_status_counts: Dict[str, int] = {}
+    unknown_status_details: Dict[str, List[Dict[str, Any]]] = {}
     for row in raw_rows:
         status = row["status"]
         if status in per_status_counts:
             continue
         else:
             unknown_status_counts[status] = unknown_status_counts.get(status, 0) + 1
+            unknown_status_details.setdefault(status, []).append({
+                "signal_id": row["signal_id"],
+                "observation_id": row["forward_return_observation_id"],
+                "stale": row["forward_return_observation_id"] not in canonical_observation_ids,
+            })
 
     if unknown_status_counts:
         raise ScoreboardPartitionError(
             f"unknown forward-return statuses present: {unknown_status_counts}",
             unknown_status_counts=unknown_status_counts,
+            unknown_status_details=unknown_status_details,
         )
 
-    rows = _canonical_observation_rows(raw_rows)
+    rows = canonical_rows
     stale_duplicate_count = len(raw_rows) - len(rows)
     for row in rows:
         per_status_counts[row["status"]] += 1
@@ -301,6 +322,7 @@ def _load_observation_rows(
         ForwardReturnObservation.pattern_id,
         ForwardReturnObservation.ticker,
         ForwardReturnObservation.direction,
+        ForwardReturnObservation.signal_timestamp,
         ForwardReturnObservation.entry_session_date,
         ForwardReturnObservation.exit_session_date,
         ForwardReturnObservation.created_at,
@@ -326,19 +348,29 @@ def _canonical_observation_rows(
     return sorted(
         by_signal.values(),
         key=lambda row: (
-            str(row.get("signal_timestamp") or ""),
+            _timestamp_sort_key(row.get("signal_timestamp")),
             str(row.get("ticker") or ""),
             str(row.get("forward_return_observation_id") or ""),
         ),
     )
 
 
-def _canonical_sort_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+def _canonical_sort_key(row: Mapping[str, Any]) -> Tuple[Tuple[int, datetime], Tuple[int, datetime], str]:
     return (
-        str(row.get("updated_at") or ""),
-        str(row.get("created_at") or ""),
+        _timestamp_sort_key(row.get("updated_at")),
+        _timestamp_sort_key(row.get("created_at")),
         str(row.get("forward_return_observation_id") or ""),
     )
+
+
+def _timestamp_sort_key(value: Any) -> Tuple[int, datetime]:
+    if value is None:
+        return (0, datetime.min.replace(tzinfo=timezone.utc))
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            return (1, value.replace(tzinfo=timezone.utc))
+        return (1, value.astimezone(timezone.utc))
+    raise TypeError(f"expected datetime or None, got {type(value).__name__}")
 
 
 def _status_to_bucket() -> Dict[str, str]:

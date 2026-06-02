@@ -145,6 +145,7 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
     }
     if isinstance(exc, ScoreboardPartitionError):
         payload["unknown_status_counts"] = exc.unknown_status_counts
+        payload["unknown_status_details"] = exc.unknown_status_details
     return payload
 
 

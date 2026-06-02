@@ -46,6 +46,7 @@ from alpha.jobs.measurement_scoreboard import (
     BUCKET_TERMINAL_UNAVAILABLE,
     ROLLUP_STATUS_BUCKETS,
     ScoreboardPartitionError,
+    _canonical_observation_rows,
     build_measurement_scoreboard,
     validate_status_partition,
 )
@@ -53,7 +54,14 @@ from alpha.jobs.measurement_scoreboard import (
 SIGNAL_TS = datetime(2026, 6, 1, 20, 0, tzinfo=timezone.utc)
 
 
-def _add_signal(db_session, signal_id: str, *, pattern_id: str = "M4", ticker: str = "ACME") -> SignalRegistry:
+def _add_signal(
+    db_session,
+    signal_id: str,
+    *,
+    pattern_id: str = "M4",
+    ticker: str = "ACME",
+    signal_timestamp: datetime = SIGNAL_TS,
+) -> SignalRegistry:
     feature = FeatureSnapshot(
         feature_snapshot_id=f"feature-{signal_id}",
         pattern_id=pattern_id,
@@ -70,7 +78,7 @@ def _add_signal(db_session, signal_id: str, *, pattern_id: str = "M4", ticker: s
         pattern_id=pattern_id,
         ticker=ticker,
         direction="long",
-        signal_timestamp=SIGNAL_TS,
+        signal_timestamp=signal_timestamp,
         raw_signal_strength=1.0,
         raw_expected_edge=0.1,
         signal_horizon="15d",
@@ -114,16 +122,23 @@ def _add_observation(
     input_hash: Optional[str] = None,
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None,
+    signal_timestamp: datetime = SIGNAL_TS,
 ) -> ForwardReturnObservation:
     if signal is None:
-        signal = _add_signal(db_session, f"signal-{obs_id}", pattern_id=pattern_id, ticker=ticker)
+        signal = _add_signal(
+            db_session,
+            f"signal-{obs_id}",
+            pattern_id=pattern_id,
+            ticker=ticker,
+            signal_timestamp=signal_timestamp,
+        )
     obs = ForwardReturnObservation(
         forward_return_observation_id=obs_id,
         signal_id=signal.signal_id,
         pattern_id=pattern_id,
         ticker=ticker,
         direction="long",
-        signal_timestamp=SIGNAL_TS,
+        signal_timestamp=signal_timestamp,
         signal_horizon="15d",
         next_execution_session="2026-06-02",
         entry_session_date="2026-06-02",
@@ -172,6 +187,119 @@ def test_unknown_status_fails_loud(db_session):
         build_measurement_scoreboard(db_session)
 
     assert exc_info.value.unknown_status_counts == {"future_new_status": 1}
+    assert exc_info.value.unknown_status_details == {
+        "future_new_status": [{
+            "signal_id": "signal-unknown",
+            "observation_id": "unknown",
+            "stale": False,
+        }]
+    }
+
+
+def test_unknown_status_payload_marks_stale_duplicate_locus(db_session):
+    signal = _add_signal(db_session, "signal-with-stale-unknown")
+    _add_observation(
+        db_session,
+        "stale-unknown",
+        signal=signal,
+        status="future_new_status",
+        input_hash="old-input",
+        updated_at=SIGNAL_TS + timedelta(minutes=1),
+    )
+    _add_observation(
+        db_session,
+        "canonical-valid",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        input_hash="new-input",
+        updated_at=SIGNAL_TS + timedelta(minutes=2),
+    )
+
+    with pytest.raises(ScoreboardPartitionError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.unknown_status_counts == {"future_new_status": 1}
+    assert exc_info.value.unknown_status_details["future_new_status"] == [{
+        "signal_id": "signal-with-stale-unknown",
+        "observation_id": "stale-unknown",
+        "stale": True,
+    }]
+
+
+def test_canonical_recency_uses_aware_utc_not_timestamp_strings():
+    older_clock_later_string = _scoreboard_row(
+        "old",
+        updated_at=datetime(2026, 6, 1, 23, 30, tzinfo=timezone(timedelta(hours=14))),
+    )
+    genuinely_later = _scoreboard_row(
+        "new",
+        updated_at=datetime(2026, 6, 1, 10, 0),
+    )
+
+    [canonical] = _canonical_observation_rows([
+        older_clock_later_string,
+        genuinely_later,
+    ])
+
+    assert canonical["forward_return_observation_id"] == "new"
+
+
+def test_canonical_recency_tie_is_deterministic_for_aware_and_naive_utc():
+    aware = _scoreboard_row(
+        "same-a",
+        updated_at=datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+    )
+    naive = _scoreboard_row(
+        "same-b",
+        updated_at=datetime(2026, 6, 1, 10, 0),
+    )
+
+    [canonical] = _canonical_observation_rows([aware, naive])
+
+    assert canonical["forward_return_observation_id"] == "same-b"
+
+
+def test_canonical_recency_preserves_microsecond_ordering():
+    bare = _scoreboard_row("bare", updated_at=datetime(2026, 6, 1, 10, 0, 0))
+    micros = _scoreboard_row(
+        "micros",
+        updated_at=datetime(2026, 6, 1, 10, 0, 0, 123456),
+    )
+
+    [canonical] = _canonical_observation_rows([micros, bare])
+
+    assert canonical["forward_return_observation_id"] == "micros"
+
+
+def test_canonical_recency_null_timestamps_sort_oldest_and_created_at_breaks_ties():
+    missing_updated = _scoreboard_row(
+        "missing-updated",
+        updated_at=None,
+        created_at=datetime(2026, 6, 1, 10, 1),
+    )
+    present_updated = _scoreboard_row(
+        "present-updated",
+        updated_at=datetime(2026, 6, 1, 10, 0),
+        created_at=datetime(2026, 6, 1, 9, 0),
+    )
+    [canonical] = _canonical_observation_rows([missing_updated, present_updated])
+
+    assert canonical["forward_return_observation_id"] == "present-updated"
+
+    created_old = _scoreboard_row(
+        "created-old",
+        updated_at=None,
+        created_at=datetime(2026, 6, 1, 9, 0),
+    )
+    created_new = _scoreboard_row(
+        "created-new",
+        updated_at=None,
+        created_at=datetime(2026, 6, 1, 9, 1),
+    )
+    [canonical] = _canonical_observation_rows([created_old, created_new])
+
+    assert canonical["forward_return_observation_id"] == "created-new"
 
 
 def test_one_signal_counts_only_latest_canonical_observation(db_session):
@@ -255,6 +383,28 @@ def test_anomalies_are_surfaced_and_excluded_from_stats(db_session):
     assert result.graded_rollup_reconciliation.computed_sample_n == 1
     assert result.graded_rollup_reconciliation.computed_missing_forward_return == 1
     assert result.graded_rollup_reconciliation.reconciles is True
+
+
+def test_anomaly_id_truncation_is_stable_by_signal_timestamp(db_session):
+    expected_first_twenty = []
+    for index in range(25):
+        obs_id = f"{25 - index:02d}-computed-null"
+        if index < 20:
+            expected_first_twenty.append(obs_id)
+        _add_observation(
+            db_session,
+            obs_id,
+            status=STATUS_COMPUTED,
+            forward_return=None,
+            signal_timestamp=SIGNAL_TS + timedelta(minutes=index),
+        )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.anomalies.computed_missing_forward_return == 25
+    assert result.anomalies.computed_missing_forward_return_ids == tuple(
+        expected_first_twenty
+    )
 
 
 def test_partition_integrity_excludes_pending_retry_and_review_from_stats(db_session):
@@ -427,6 +577,13 @@ def test_json_error_path_is_parseable_and_human_error_remains_plain_text(
     assert payload["status"] == "error"
     assert payload["error_type"] == "ScoreboardPartitionError"
     assert payload["unknown_status_counts"] == {"future_new_status": 1}
+    assert payload["unknown_status_details"] == {
+        "future_new_status": [{
+            "signal_id": "signal-unknown-status",
+            "observation_id": "unknown-status",
+            "stale": False,
+        }]
+    }
 
     rc = run_measurement_scoreboard.main(["--live", "--database-url", db_url])
     captured = capsys.readouterr()
@@ -562,6 +719,40 @@ def _forward_return_table_counts(db_session) -> dict[str, int]:
         "forward_return_path_rows": db_session.scalar(
             select(func.count()).select_from(ForwardReturnPathRow)
         ),
+    }
+
+
+def _scoreboard_row(
+    observation_id: str,
+    *,
+    updated_at: Optional[datetime],
+    created_at: Optional[datetime] = None,
+) -> dict:
+    return {
+        "forward_return_observation_id": observation_id,
+        "signal_id": "same-signal",
+        "input_hash": f"input-{observation_id}",
+        "status": STATUS_COMPUTED,
+        "forward_return": 0.10,
+        "max_close_return": None,
+        "min_close_return": None,
+        "max_favorable_excursion": None,
+        "max_adverse_excursion": None,
+        "mfe_session_date": None,
+        "mae_session_date": None,
+        "hit_t1_intraday": None,
+        "hit_t2_intraday": None,
+        "hit_t3_intraday": None,
+        "hit_stop_intraday": None,
+        "same_day_barrier_ambiguity": None,
+        "pattern_id": "M4",
+        "ticker": "ACME",
+        "direction": "long",
+        "signal_timestamp": SIGNAL_TS,
+        "entry_session_date": "2026-06-02",
+        "exit_session_date": "2026-06-23",
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
