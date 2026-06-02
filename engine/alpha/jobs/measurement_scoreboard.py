@@ -15,6 +15,7 @@ only an unfiltered run fails loud on a globally unknown status.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from statistics import mean, median
@@ -209,8 +210,8 @@ def build_measurement_scoreboard(
     Tail events use an inclusive ``>=`` boundary.
     """
 
-    if mfe_tail_threshold < 0:
-        raise ValueError("mfe_tail_threshold must be non-negative")
+    if not math.isfinite(mfe_tail_threshold) or mfe_tail_threshold < 0:
+        raise ValueError("mfe_tail_threshold must be a finite, non-negative fraction")
 
     validate_status_partition()
     raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
@@ -256,7 +257,7 @@ def build_measurement_scoreboard(
         status = row["status"]
         rollup_counts[status_to_bucket[status]] += 1
         forward_return = row["forward_return"]
-        if status == STATUS_COMPUTED and forward_return is None:
+        if status == STATUS_COMPUTED and not _is_finite_number(forward_return):
             computed_missing_forward_return_ids.append(row["forward_return_observation_id"])
             continue
         if status != STATUS_COMPUTED and forward_return is not None:
@@ -450,7 +451,7 @@ def _computed_stats(
     tail_event_count = sum(
         1
         for value in (row["max_favorable_excursion"] for row in rows)
-        if value is not None and float(value) >= mfe_tail_threshold
+        if _is_finite_number(value) and float(value) >= mfe_tail_threshold
     )
 
     return ComputedStats(
@@ -487,7 +488,13 @@ def _computed_stats(
 
 
 def _float_values(values: Iterable[Any]) -> List[float]:
-    return [float(value) for value in values if value is not None]
+    return [float(value) for value in values if _is_finite_number(value)]
+
+
+def _is_finite_number(value: Any) -> bool:
+    if value is None:
+        return False
+    return math.isfinite(float(value))
 
 
 def _truthy_count(values: Iterable[Any]) -> int:

@@ -385,6 +385,33 @@ def test_anomalies_are_surfaced_and_excluded_from_stats(db_session):
     assert result.graded_rollup_reconciliation.reconciles is True
 
 
+def test_nonfinite_computed_return_uses_missing_return_anomaly(db_session):
+    _add_observation(
+        db_session,
+        "computed-inf",
+        status=STATUS_COMPUTED,
+        forward_return=float("inf"),
+    )
+    _add_observation(
+        db_session,
+        "valid-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.anomalies.computed_missing_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_ids == ("computed-inf",)
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.20)
+    assert result.rollup_counts[BUCKET_GRADED] == 2
+    assert result.graded_rollup_reconciliation.graded_rollup_count == 2
+    assert result.graded_rollup_reconciliation.computed_sample_n == 1
+    assert result.graded_rollup_reconciliation.computed_missing_forward_return == 1
+    assert result.graded_rollup_reconciliation.reconciles is True
+
+
 def test_anomaly_id_truncation_is_stable_by_signal_timestamp(db_session):
     expected_first_twenty = []
     for index in range(25):
@@ -516,6 +543,112 @@ def test_tail_counter_threshold_is_inclusive(db_session):
 
     assert stats.tail_event_count == 2
     assert stats.tail_event_fraction == pytest.approx(2 / 3)
+
+
+def test_nonfinite_mfe_and_mae_do_not_poison_stats_or_tail_counter(db_session):
+    _add_observation(
+        db_session,
+        "clean",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        mfe=0.30,
+        mae=-0.10,
+    )
+    _add_observation(
+        db_session,
+        "nonfinite-excursions",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        mfe=float("inf"),
+        mae=float("-inf"),
+    )
+
+    stats = build_measurement_scoreboard(
+        db_session,
+        mfe_tail_threshold=0.25,
+    ).computed_stats
+
+    assert stats.n == 2
+    assert stats.mfe_max == pytest.approx(0.30)
+    assert stats.mfe_mean == pytest.approx(0.30)
+    assert stats.mae_worst == pytest.approx(-0.10)
+    assert stats.mae_mean == pytest.approx(-0.10)
+    assert stats.tail_event_count == 1
+    assert stats.tail_event_fraction == pytest.approx(1 / 2)
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.01])
+def test_tail_threshold_must_be_finite_non_negative(db_session, threshold):
+    with pytest.raises(
+        ValueError,
+        match="mfe_tail_threshold must be a finite, non-negative fraction",
+    ):
+        build_measurement_scoreboard(db_session, mfe_tail_threshold=threshold)
+
+
+def test_tail_threshold_accepts_fraction(db_session):
+    result = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25)
+
+    assert result.mfe_tail_threshold == pytest.approx(0.25)
+
+@pytest.mark.parametrize("threshold", ["nan", "inf"])
+def test_json_error_path_rejects_nonfinite_tail_threshold(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    threshold,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    db_url = _seed_file_database(
+        tmp_path,
+        f"threshold-{threshold}.db",
+        [("computed", STATUS_COMPUTED, 0.10)],
+    )
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        db_url,
+        "--mfe-tail-threshold",
+        threshold,
+        "--json",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
+    assert payload["message"] == "mfe_tail_threshold must be a finite, non-negative fraction"
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf"])
+def test_human_error_path_rejects_nonfinite_tail_threshold(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    threshold,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    db_url = _seed_file_database(
+        tmp_path,
+        f"threshold-{threshold}-human.db",
+        [("computed", STATUS_COMPUTED, 0.10)],
+    )
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        db_url,
+        "--mfe-tail-threshold",
+        threshold,
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == (
+        "ERROR: mfe_tail_threshold must be a finite, non-negative fraction\n"
+    )
 
 
 def test_zero_graded_is_explicit_and_has_no_nan(db_session):
