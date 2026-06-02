@@ -46,6 +46,12 @@ from alpha.jobs.forward_return import (
 
 DEFAULT_MFE_TAIL_THRESHOLD = 0.25
 
+# forward_return is a raw price return with no direction term, so the
+# win/loss, expectancy, and tail math is only correct for long positions.
+# Until the scoreboard signs returns by direction, it refuses to grade
+# anything that is not long.
+SUPPORTED_DIRECTION = "long"
+
 BUCKET_GRADED = "graded"
 BUCKET_PENDING_LIKE = "pending_like"
 BUCKET_RETRY_IN_FLIGHT = "retry_in_flight"
@@ -95,6 +101,28 @@ class ScoreboardPartitionError(RuntimeError):
         super().__init__(message)
         self.unknown_status_counts = unknown_status_counts or {}
         self.unknown_status_details = unknown_status_details or {}
+
+
+class ScoreboardDirectionError(RuntimeError):
+    """Raised when an observation carries a direction the scoreboard cannot grade.
+
+    forward_return is a raw price return with no direction term, so the
+    win/loss, expectancy, and tail math is only correct for long positions. A
+    short (or unknown-direction) row would silently count losing trades as wins
+    and invert expectancy and the tail. The scoreboard fails loud until it signs
+    returns by direction.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        unsupported_direction_counts: Optional[Dict[str, int]] = None,
+        unsupported_direction_details: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ):
+        super().__init__(message)
+        self.unsupported_direction_counts = unsupported_direction_counts or {}
+        self.unsupported_direction_details = unsupported_direction_details or {}
 
 
 @dataclass(frozen=True)
@@ -242,6 +270,8 @@ def build_measurement_scoreboard(
             unknown_status_details=unknown_status_details,
         )
 
+    _assert_supported_direction(raw_rows, canonical_observation_ids)
+
     rows = canonical_rows
     stale_duplicate_count = len(raw_rows) - len(rows)
     for row in rows:
@@ -296,6 +326,40 @@ def build_measurement_scoreboard(
         graded_rollup_reconciliation=reconciliation,
         computed_stats=computed_stats,
     )
+
+
+def _assert_supported_direction(
+    rows: Sequence[Mapping[str, Any]],
+    canonical_observation_ids: set[str],
+) -> None:
+    """Fail loud if any observation is not a long position.
+
+    Scans the raw (pre-dedup) rows, mirroring the unknown-status check, so a
+    non-long direction trips the guard even on a stale duplicate row.
+    """
+
+    counts: Dict[str, int] = {}
+    details: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        direction = row["direction"]
+        if direction == SUPPORTED_DIRECTION:
+            continue
+        key = "null" if direction is None else str(direction)
+        counts[key] = counts.get(key, 0) + 1
+        details.setdefault(key, []).append({
+            "signal_id": row["signal_id"],
+            "observation_id": row["forward_return_observation_id"],
+            "status": row["status"],
+            "stale": row["forward_return_observation_id"] not in canonical_observation_ids,
+        })
+
+    if counts:
+        raise ScoreboardDirectionError(
+            "forward-return observations carry non-long direction the scoreboard "
+            f"cannot grade (raw return is unsigned): {counts}",
+            unsupported_direction_counts=counts,
+            unsupported_direction_details=details,
+        )
 
 
 def _load_observation_rows(

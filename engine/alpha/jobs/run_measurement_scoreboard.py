@@ -19,6 +19,7 @@ from alpha.db.engine import get_session, reset_globals
 from alpha.jobs.measurement_scoreboard import (
     DEFAULT_MFE_TAIL_THRESHOLD,
     ROLLUP_STATUS_BUCKETS,
+    ScoreboardDirectionError,
     ScoreboardPartitionError,
     ScoreboardResult,
     build_measurement_scoreboard,
@@ -57,7 +58,7 @@ def _run_live(args: argparse.Namespace) -> int:
             pattern_id=args.pattern_id,
             mfe_tail_threshold=args.mfe_tail_threshold,
         )
-    except (ScoreboardPartitionError, ValueError) as exc:
+    except (ScoreboardPartitionError, ScoreboardDirectionError, ValueError) as exc:
         if args.json:
             print(json.dumps(_error_payload(exc), sort_keys=True))
             return 1
@@ -146,6 +147,9 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
     if isinstance(exc, ScoreboardPartitionError):
         payload["unknown_status_counts"] = exc.unknown_status_counts
         payload["unknown_status_details"] = exc.unknown_status_details
+    if isinstance(exc, ScoreboardDirectionError):
+        payload["unsupported_direction_counts"] = exc.unsupported_direction_counts
+        payload["unsupported_direction_details"] = exc.unsupported_direction_details
     return payload
 
 

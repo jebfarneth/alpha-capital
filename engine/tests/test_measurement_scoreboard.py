@@ -45,6 +45,7 @@ from alpha.jobs.measurement_scoreboard import (
     BUCKET_REVIEW_UNRESOLVED,
     BUCKET_TERMINAL_UNAVAILABLE,
     ROLLUP_STATUS_BUCKETS,
+    ScoreboardDirectionError,
     ScoreboardPartitionError,
     _canonical_observation_rows,
     build_measurement_scoreboard,
@@ -123,6 +124,7 @@ def _add_observation(
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None,
     signal_timestamp: datetime = SIGNAL_TS,
+    direction: Optional[str] = "long",
 ) -> ForwardReturnObservation:
     if signal is None:
         signal = _add_signal(
@@ -137,7 +139,7 @@ def _add_observation(
         signal_id=signal.signal_id,
         pattern_id=pattern_id,
         ticker=ticker,
-        direction="long",
+        direction=direction,
         signal_timestamp=signal_timestamp,
         signal_horizon="15d",
         next_execution_session="2026-06-02",
@@ -223,6 +225,63 @@ def test_unknown_status_payload_marks_stale_duplicate_locus(db_session):
     assert exc_info.value.unknown_status_details["future_new_status"] == [{
         "signal_id": "signal-with-stale-unknown",
         "observation_id": "stale-unknown",
+        "stale": True,
+    }]
+
+
+def test_short_direction_fails_loud(db_session):
+    _add_observation(
+        db_session,
+        "short-graded",
+        status=STATUS_COMPUTED,
+        forward_return=-0.10,
+        direction="short",
+    )
+
+    with pytest.raises(ScoreboardDirectionError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.unsupported_direction_counts == {"short": 1}
+    assert exc_info.value.unsupported_direction_details == {
+        "short": [{
+            "signal_id": "signal-short-graded",
+            "observation_id": "short-graded",
+            "status": STATUS_COMPUTED,
+            "stale": False,
+        }]
+    }
+
+
+def test_short_direction_trips_guard_even_on_stale_duplicate(db_session):
+    signal = _add_signal(db_session, "signal-with-stale-short")
+    _add_observation(
+        db_session,
+        "stale-short",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=-0.10,
+        direction="short",
+        input_hash="old-input",
+        updated_at=SIGNAL_TS + timedelta(minutes=1),
+    )
+    _add_observation(
+        db_session,
+        "canonical-long",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        direction="long",
+        input_hash="new-input",
+        updated_at=SIGNAL_TS + timedelta(minutes=2),
+    )
+
+    with pytest.raises(ScoreboardDirectionError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.unsupported_direction_details["short"] == [{
+        "signal_id": "signal-with-stale-short",
+        "observation_id": "stale-short",
+        "status": STATUS_COMPUTED,
         "stale": True,
     }]
 
@@ -723,6 +782,37 @@ def test_json_error_path_is_parseable_and_human_error_remains_plain_text(
 
     assert rc == 1
     assert captured.out.startswith("ERROR: unknown forward-return statuses present")
+
+
+def test_json_error_path_surfaces_direction_guard(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "short.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_observation(
+            session,
+            "short-obs",
+            status=STATUS_COMPUTED,
+            forward_return=-0.10,
+            direction="short",
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ScoreboardDirectionError"
+    assert payload["unsupported_direction_counts"] == {"short": 1}
 
 
 @pytest.mark.parametrize(
