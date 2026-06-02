@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.orm import sessionmaker
 
 from alpha.db.models import (
+    Base,
     FeatureSnapshot,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     ForwardReturnPathRow,
     SignalRegistry,
 )
+from alpha.jobs import run_measurement_scoreboard
 from alpha.jobs.forward_return import (
     NASDAQ_LISTING_SUPPRESSION_REASON,
     REQUIRED_FORWARD_RETURN_STATUSES,
@@ -106,8 +110,13 @@ def _add_observation(
     hit_t3: Optional[bool] = None,
     hit_stop: Optional[bool] = None,
     same_day_ambiguity: Optional[bool] = None,
+    signal: Optional[SignalRegistry] = None,
+    input_hash: Optional[str] = None,
+    created_at: Optional[datetime] = None,
+    updated_at: Optional[datetime] = None,
 ) -> ForwardReturnObservation:
-    signal = _add_signal(db_session, f"signal-{obs_id}", pattern_id=pattern_id, ticker=ticker)
+    if signal is None:
+        signal = _add_signal(db_session, f"signal-{obs_id}", pattern_id=pattern_id, ticker=ticker)
     obs = ForwardReturnObservation(
         forward_return_observation_id=obs_id,
         signal_id=signal.signal_id,
@@ -134,9 +143,13 @@ def _add_observation(
         status=status,
         reason=reason,
         attempts=0,
-        input_hash=f"input-{obs_id}",
+        input_hash=input_hash or f"input-{obs_id}",
         outcome_hash=f"outcome-{obs_id}",
     )
+    if created_at is not None:
+        obs.created_at = created_at
+    if updated_at is not None:
+        obs.updated_at = updated_at
     db_session.add(obs)
     db_session.flush()
     return obs
@@ -159,6 +172,42 @@ def test_unknown_status_fails_loud(db_session):
         build_measurement_scoreboard(db_session)
 
     assert exc_info.value.unknown_status_counts == {"future_new_status": 1}
+
+
+def test_one_signal_counts_only_latest_canonical_observation(db_session):
+    signal = _add_signal(db_session, "signal-replanned")
+    old_ts = SIGNAL_TS + timedelta(minutes=1)
+    new_ts = SIGNAL_TS + timedelta(minutes=2)
+    _add_observation(
+        db_session,
+        "old-plan",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=-1.0,
+        input_hash="old-calendar-plan",
+        created_at=old_ts,
+        updated_at=old_ts,
+    )
+    _add_observation(
+        db_session,
+        "new-plan",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=0.50,
+        input_hash="new-calendar-plan",
+        created_at=new_ts,
+        updated_at=new_ts,
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.raw_observation_rows == 2
+    assert result.total_observations == 1
+    assert result.stale_duplicate_observation_rows == 1
+    assert result.per_status_counts[STATUS_COMPUTED] == 1
+    assert result.rollup_counts[BUCKET_GRADED] == 1
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.50)
 
 
 def test_suppressed_edgar_review_lands_in_review_bucket_and_not_stats(db_session):
@@ -201,6 +250,11 @@ def test_anomalies_are_surfaced_and_excluded_from_stats(db_session):
     assert result.anomalies.non_computed_with_forward_return_ids == ("pending-with-return",)
     assert result.computed_stats.n == 1
     assert result.computed_stats.expectancy == pytest.approx(0.20)
+    assert result.rollup_counts[BUCKET_GRADED] == 2
+    assert result.graded_rollup_reconciliation.graded_rollup_count == 2
+    assert result.graded_rollup_reconciliation.computed_sample_n == 1
+    assert result.graded_rollup_reconciliation.computed_missing_forward_return == 1
+    assert result.graded_rollup_reconciliation.reconciles is True
 
 
 def test_partition_integrity_excludes_pending_retry_and_review_from_stats(db_session):
@@ -353,6 +407,106 @@ def test_pattern_filter_limits_rows_without_cross_tabs(db_session):
     assert result.computed_stats.expectancy == pytest.approx(0.10)
 
 
+def test_json_error_path_is_parseable_and_human_error_remains_plain_text(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    db_url = _seed_file_database(
+        tmp_path,
+        "unknown.db",
+        [("unknown-status", "future_new_status", None)],
+    )
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", db_url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ScoreboardPartitionError"
+    assert payload["unknown_status_counts"] == {"future_new_status": 1}
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", db_url])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out.startswith("ERROR: unknown forward-return statuses present")
+
+
+@pytest.mark.parametrize(
+    ("threshold", "should_warn"),
+    [(0.25, False), (1.0, False), (25.0, True)],
+)
+def test_tail_threshold_warning_is_soft(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    threshold,
+    should_warn,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    db_url = _seed_file_database(
+        tmp_path,
+        f"threshold-{threshold}.db",
+        [("computed", STATUS_COMPUTED, 0.10)],
+    )
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        db_url,
+        "--mfe-tail-threshold",
+        str(threshold),
+        "--json",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert json.loads(captured.out)["mfe_tail_threshold"] == threshold
+    if should_warn:
+        assert "25 == +2500% - pass 0.25 for +25%" in captured.err
+    else:
+        assert captured.err == ""
+
+
+def test_cli_database_override_does_not_leak_between_in_process_calls(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    baseline_url = _seed_file_database(
+        tmp_path,
+        "baseline.db",
+        [("baseline", STATUS_COMPUTED, 0.20)],
+    )
+    override_url = _seed_file_database(
+        tmp_path,
+        "override.db",
+        [("override", STATUS_COMPUTED, 0.80)],
+    )
+    monkeypatch.setenv("DATABASE_URL", baseline_url)
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        override_url,
+        "--json",
+    ])
+    first = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert first["computed_stats"]["expectancy"] == pytest.approx(0.80)
+
+    rc = run_measurement_scoreboard.main(["--live", "--json"])
+    second = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert second["computed_stats"]["expectancy"] == pytest.approx(0.20)
+
+
 def test_each_required_status_maps_to_one_rollup_bucket():
     status_to_bucket = {}
     for bucket, statuses in ROLLUP_STATUS_BUCKETS.items():
@@ -409,3 +563,25 @@ def _forward_return_table_counts(db_session) -> dict[str, int]:
             select(func.count()).select_from(ForwardReturnPathRow)
         ),
     }
+
+
+def _seed_file_database(tmp_path, filename: str, rows) -> str:
+    path = tmp_path / filename
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        for obs_id, status, forward_return in rows:
+            _add_observation(
+                session,
+                obs_id,
+                status=status,
+                forward_return=forward_return,
+            )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+    return url

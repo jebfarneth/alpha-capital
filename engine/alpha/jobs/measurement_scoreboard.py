@@ -3,6 +3,12 @@
 The scoreboard consumes the all-firings forward-return spine exactly as
 persisted by ``forward_return.py``. It does not re-grade, filter for
 tradeability, or re-derive PIT/survivorship truth.
+
+One firing is one ``signal_id``. If producer input identity changes for a fixed
+signal, stale ``(signal_id, input_hash)`` rows are excluded and the canonical
+observation is the latest persisted row by ``updated_at``, ``created_at``, then
+primary key. Pattern-filtered runs are scoped reporting, not a global drift
+sentinel; only an unfiltered run fails loud on a globally unknown status.
 """
 
 from __future__ import annotations
@@ -126,14 +132,25 @@ class ComputedStats:
 
 
 @dataclass(frozen=True)
+class GradedRollupReconciliation:
+    graded_rollup_count: int
+    computed_sample_n: int
+    computed_missing_forward_return: int
+    reconciles: bool
+
+
+@dataclass(frozen=True)
 class ScoreboardResult:
     pattern_id: Optional[str]
     mfe_tail_threshold: float
     total_observations: int
+    raw_observation_rows: int
+    stale_duplicate_observation_rows: int
     per_status_counts: Dict[str, int]
     rollup_counts: Dict[str, int]
     unknown_status_counts: Dict[str, int]
     anomalies: AnomalySummary
+    graded_rollup_reconciliation: GradedRollupReconciliation
     computed_stats: ComputedStats
 
     def to_dict(self) -> Dict[str, Any]:
@@ -186,14 +203,14 @@ def build_measurement_scoreboard(
         raise ValueError("mfe_tail_threshold must be non-negative")
 
     validate_status_partition()
-    rows = _load_observation_rows(session, pattern_id=pattern_id)
+    raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
 
     per_status_counts = {status: 0 for status in REQUIRED_FORWARD_RETURN_STATUSES}
     unknown_status_counts: Dict[str, int] = {}
-    for row in rows:
+    for row in raw_rows:
         status = row["status"]
         if status in per_status_counts:
-            per_status_counts[status] += 1
+            continue
         else:
             unknown_status_counts[status] = unknown_status_counts.get(status, 0) + 1
 
@@ -202,6 +219,11 @@ def build_measurement_scoreboard(
             f"unknown forward-return statuses present: {unknown_status_counts}",
             unknown_status_counts=unknown_status_counts,
         )
+
+    rows = _canonical_observation_rows(raw_rows)
+    stale_duplicate_count = len(raw_rows) - len(rows)
+    for row in rows:
+        per_status_counts[row["status"]] += 1
 
     status_to_bucket = _status_to_bucket()
     rollup_counts = {bucket: 0 for bucket in ROLLUP_STATUS_BUCKETS}
@@ -228,16 +250,29 @@ def build_measurement_scoreboard(
         computed_missing_forward_return_ids=tuple(computed_missing_forward_return_ids[:20]),
         non_computed_with_forward_return_ids=tuple(non_computed_with_forward_return_ids[:20]),
     )
+    computed_stats = _computed_stats(computed_rows, mfe_tail_threshold=mfe_tail_threshold)
+    reconciliation = GradedRollupReconciliation(
+        graded_rollup_count=rollup_counts[BUCKET_GRADED],
+        computed_sample_n=computed_stats.n,
+        computed_missing_forward_return=anomalies.computed_missing_forward_return,
+        reconciles=(
+            rollup_counts[BUCKET_GRADED]
+            == computed_stats.n + anomalies.computed_missing_forward_return
+        ),
+    )
 
     return ScoreboardResult(
         pattern_id=pattern_id,
         mfe_tail_threshold=mfe_tail_threshold,
         total_observations=len(rows),
+        raw_observation_rows=len(raw_rows),
+        stale_duplicate_observation_rows=stale_duplicate_count,
         per_status_counts=per_status_counts,
         rollup_counts=rollup_counts,
         unknown_status_counts={},
         anomalies=anomalies,
-        computed_stats=_computed_stats(computed_rows, mfe_tail_threshold=mfe_tail_threshold),
+        graded_rollup_reconciliation=reconciliation,
+        computed_stats=computed_stats,
     )
 
 
@@ -248,6 +283,8 @@ def _load_observation_rows(
 ) -> List[Mapping[str, Any]]:
     columns = (
         ForwardReturnObservation.forward_return_observation_id,
+        ForwardReturnObservation.signal_id,
+        ForwardReturnObservation.input_hash,
         ForwardReturnObservation.status,
         ForwardReturnObservation.forward_return,
         ForwardReturnObservation.max_close_return,
@@ -266,6 +303,8 @@ def _load_observation_rows(
         ForwardReturnObservation.direction,
         ForwardReturnObservation.entry_session_date,
         ForwardReturnObservation.exit_session_date,
+        ForwardReturnObservation.created_at,
+        ForwardReturnObservation.updated_at,
     )
     statement = select(*columns)
     if pattern_id:
@@ -273,6 +312,33 @@ def _load_observation_rows(
     with session.no_autoflush:
         rows = session.execute(statement).all()
     return [dict(row._mapping) for row in rows]
+
+
+def _canonical_observation_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    by_signal: Dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        signal_id = row["signal_id"]
+        current = by_signal.get(signal_id)
+        if current is None or _canonical_sort_key(row) > _canonical_sort_key(current):
+            by_signal[signal_id] = row
+    return sorted(
+        by_signal.values(),
+        key=lambda row: (
+            str(row.get("signal_timestamp") or ""),
+            str(row.get("ticker") or ""),
+            str(row.get("forward_return_observation_id") or ""),
+        ),
+    )
+
+
+def _canonical_sort_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("updated_at") or ""),
+        str(row.get("created_at") or ""),
+        str(row.get("forward_return_observation_id") or ""),
+    )
 
 
 def _status_to_bucket() -> Dict[str, str]:
@@ -288,6 +354,13 @@ def _computed_stats(
     *,
     mfe_tail_threshold: float,
 ) -> ComputedStats:
+    """Compute graded-only stats.
+
+    Barrier hit rates are count(True) / n(graded); by convention the denominator
+    includes NULL barrier rows because the producer initializes mature barrier
+    flags to False.
+    """
+
     returns = [float(row["forward_return"]) for row in rows]
     if not returns:
         return ComputedStats(

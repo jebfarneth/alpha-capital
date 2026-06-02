@@ -13,7 +13,7 @@ import argparse
 import json
 import os
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from alpha.db.engine import get_session, reset_globals
 from alpha.jobs.measurement_scoreboard import (
@@ -26,36 +26,53 @@ from alpha.jobs.measurement_scoreboard import (
 from alpha.jobs.forward_return import REQUIRED_FORWARD_RETURN_STATUSES
 from alpha.runtime_env import load_runtime_env
 
+TAIL_THRESHOLD_WARNING = (
+    "WARNING: interpreting --mfe-tail-threshold as a fraction; "
+    "25 == +2500% - pass 0.25 for +25%"
+)
+
 
 def _run_live(args: argparse.Namespace) -> int:
+    previous_env = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "ALPHA_DB_SCHEMA": os.environ.get("ALPHA_DB_SCHEMA"),
+    }
+    session = None
     load_runtime_env()
-    if args.database_url:
-        os.environ["DATABASE_URL"] = args.database_url
-        reset_globals()
-    if args.schema:
-        os.environ["ALPHA_DB_SCHEMA"] = args.schema
-        reset_globals()
-
-    session = get_session()
     try:
+        if args.database_url:
+            os.environ["DATABASE_URL"] = args.database_url
+            reset_globals()
+        if args.schema:
+            os.environ["ALPHA_DB_SCHEMA"] = args.schema
+            reset_globals()
+        display_schema = args.schema or os.environ.get("ALPHA_DB_SCHEMA") or "default"
+        warning = _tail_threshold_warning(args.mfe_tail_threshold)
+        if warning:
+            print(warning, file=sys.stderr)
+
+        session = get_session()
         result = build_measurement_scoreboard(
             session,
             pattern_id=args.pattern_id,
             mfe_tail_threshold=args.mfe_tail_threshold,
         )
     except (ScoreboardPartitionError, ValueError) as exc:
+        if args.json:
+            print(json.dumps(_error_payload(exc), sort_keys=True))
+            return 1
         print(f"ERROR: {exc}")
         return 1
     finally:
-        session.close()
+        if session is not None:
+            session.close()
+        _restore_env(previous_env)
+        reset_globals()
 
     if args.json:
         print(json.dumps(result.to_dict(), sort_keys=True))
     else:
-        _print_scoreboard(
-            result,
-            schema=args.schema or os.environ.get("ALPHA_DB_SCHEMA") or "default",
-        )
+        _print_scoreboard(result, schema=display_schema)
     return 0
 
 
@@ -66,6 +83,8 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
     print(f"Pattern:                 {result.pattern_id or 'all'}")
     print(f"MFE tail threshold:      {result.mfe_tail_threshold:.6g} (fraction)")
     print(f"Total firings:           {result.total_observations}")
+    print(f"Raw observation rows:    {result.raw_observation_rows}")
+    print(f"Stale duplicate rows:    {result.stale_duplicate_observation_rows}")
     print("")
     print("Per-status counts:")
     for status in REQUIRED_FORWARD_RETURN_STATUSES:
@@ -78,6 +97,12 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
     print("Anomalies:")
     print(f"  computed_missing_forward_return: {result.anomalies.computed_missing_forward_return}")
     print(f"  non_computed_with_forward_return: {result.anomalies.non_computed_with_forward_return}")
+    print(
+        "  graded reconciliation: "
+        f"{result.graded_rollup_reconciliation.graded_rollup_count} = "
+        f"{result.graded_rollup_reconciliation.computed_sample_n} + "
+        f"{result.graded_rollup_reconciliation.computed_missing_forward_return}"
+    )
     print("")
     if stats.no_graded_firings:
         print("Graded stats:            no graded firings yet")
@@ -104,6 +129,31 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
 
 def _format_optional(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:.6g}"
+
+
+def _tail_threshold_warning(value: float) -> Optional[str]:
+    if value > 1.0:
+        return TAIL_THRESHOLD_WARNING
+    return None
+
+
+def _error_payload(exc: Exception) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "status": "error",
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if isinstance(exc, ScoreboardPartitionError):
+        payload["unknown_status_counts"] = exc.unknown_status_counts
+    return payload
+
+
+def _restore_env(previous_env: Dict[str, Optional[str]]) -> None:
+    for key, value in previous_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
