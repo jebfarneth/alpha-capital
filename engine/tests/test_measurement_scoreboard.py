@@ -1,0 +1,411 @@
+"""Measurement scoreboard tests."""
+
+from __future__ import annotations
+
+import math
+from datetime import datetime, timezone
+from typing import Optional
+
+import pytest
+from sqlalchemy import event, func, select
+
+from alpha.db.models import (
+    FeatureSnapshot,
+    ForwardReturnObservation,
+    ForwardReturnObservationEvent,
+    ForwardReturnPathRow,
+    SignalRegistry,
+)
+from alpha.jobs.forward_return import (
+    NASDAQ_LISTING_SUPPRESSION_REASON,
+    REQUIRED_FORWARD_RETURN_STATUSES,
+    STATUS_COMPUTED,
+    STATUS_CORPORATE_ACTION_REVIEW,
+    STATUS_HALTED_PENDING,
+    STATUS_INVALID_ENTRY_PRICE_RETRY,
+    STATUS_INVALID_EXIT_PRICE_RETRY,
+    STATUS_MISSING_ENTRY_PRICE_RETRY,
+    STATUS_MISSING_EXIT_PRICE_RETRY,
+    STATUS_OUTCOME_UNAVAILABLE,
+    STATUS_PENDING,
+    STATUS_PRICE_DRIFT_REVIEW,
+    STATUS_PRICE_FINALITY_PENDING,
+    STATUS_PRICING_UNAVAILABLE_RETRY,
+    STATUS_PROVIDER_REVISION_REVIEW,
+    STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+)
+from alpha.jobs.measurement_scoreboard import (
+    BUCKET_GRADED,
+    BUCKET_PENDING_LIKE,
+    BUCKET_RETRY_IN_FLIGHT,
+    BUCKET_REVIEW_UNRESOLVED,
+    BUCKET_TERMINAL_UNAVAILABLE,
+    ROLLUP_STATUS_BUCKETS,
+    ScoreboardPartitionError,
+    build_measurement_scoreboard,
+    validate_status_partition,
+)
+
+SIGNAL_TS = datetime(2026, 6, 1, 20, 0, tzinfo=timezone.utc)
+
+
+def _add_signal(db_session, signal_id: str, *, pattern_id: str = "M4", ticker: str = "ACME") -> SignalRegistry:
+    feature = FeatureSnapshot(
+        feature_snapshot_id=f"feature-{signal_id}",
+        pattern_id=pattern_id,
+        ticker=ticker,
+        asof_timestamp=SIGNAL_TS,
+        feature_json="{}",
+        feature_hash=f"feature-hash-{signal_id}",
+        data_lineage_ids="[]",
+        point_in_time_passed=True,
+        lookahead_guard_passed=True,
+    )
+    signal = SignalRegistry(
+        signal_id=signal_id,
+        pattern_id=pattern_id,
+        ticker=ticker,
+        direction="long",
+        signal_timestamp=SIGNAL_TS,
+        raw_signal_strength=1.0,
+        raw_expected_edge=0.1,
+        signal_horizon="15d",
+        thesis_category=pattern_id,
+        route_class="base",
+        fidelity_tier="test",
+        data_confidence=1.0,
+        feature_snapshot=feature,
+        signal_status="active",
+        trading_date="2026-06-01",
+        next_execution_session="2026-06-02",
+        detector_version="test",
+        point_in_time_passed=True,
+        lookahead_guard_passed=True,
+        data_lineage_ids="[]",
+        signal_identity_hash=f"identity-{signal_id}",
+        forward_return_status=STATUS_PENDING,
+    )
+    db_session.add(signal)
+    db_session.flush()
+    return signal
+
+
+def _add_observation(
+    db_session,
+    obs_id: str,
+    *,
+    status: str,
+    forward_return: Optional[float] = None,
+    pattern_id: str = "M4",
+    ticker: str = "ACME",
+    reason: Optional[str] = None,
+    mfe: Optional[float] = None,
+    mae: Optional[float] = None,
+    hit_t1: Optional[bool] = None,
+    hit_t2: Optional[bool] = None,
+    hit_t3: Optional[bool] = None,
+    hit_stop: Optional[bool] = None,
+    same_day_ambiguity: Optional[bool] = None,
+) -> ForwardReturnObservation:
+    signal = _add_signal(db_session, f"signal-{obs_id}", pattern_id=pattern_id, ticker=ticker)
+    obs = ForwardReturnObservation(
+        forward_return_observation_id=obs_id,
+        signal_id=signal.signal_id,
+        pattern_id=pattern_id,
+        ticker=ticker,
+        direction="long",
+        signal_timestamp=SIGNAL_TS,
+        signal_horizon="15d",
+        next_execution_session="2026-06-02",
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-23",
+        forward_return=forward_return,
+        max_favorable_excursion=mfe,
+        max_adverse_excursion=mae,
+        mfe_session_date="2026-06-10" if mfe is not None else None,
+        mae_session_date="2026-06-11" if mae is not None else None,
+        max_close_return=mfe,
+        min_close_return=mae,
+        hit_t1_intraday=hit_t1,
+        hit_t2_intraday=hit_t2,
+        hit_t3_intraday=hit_t3,
+        hit_stop_intraday=hit_stop,
+        same_day_barrier_ambiguity=same_day_ambiguity,
+        status=status,
+        reason=reason,
+        attempts=0,
+        input_hash=f"input-{obs_id}",
+        outcome_hash=f"outcome-{obs_id}",
+    )
+    db_session.add(obs)
+    db_session.flush()
+    return obs
+
+
+def test_status_partition_is_exhaustive_and_disjoint():
+    validate_status_partition()
+    bucket_members = [status for statuses in ROLLUP_STATUS_BUCKETS.values() for status in statuses]
+
+    assert set(bucket_members) == set(REQUIRED_FORWARD_RETURN_STATUSES)
+    assert len(bucket_members) == len(set(bucket_members))
+    for status in REQUIRED_FORWARD_RETURN_STATUSES:
+        assert sum(status in statuses for statuses in ROLLUP_STATUS_BUCKETS.values()) == 1
+
+
+def test_unknown_status_fails_loud(db_session):
+    _add_observation(db_session, "unknown", status="future_new_status")
+
+    with pytest.raises(ScoreboardPartitionError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.unknown_status_counts == {"future_new_status": 1}
+
+
+def test_suppressed_edgar_review_lands_in_review_bucket_and_not_stats(db_session):
+    _add_observation(
+        db_session,
+        "suppressed-review",
+        status=STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+        reason=NASDAQ_LISTING_SUPPRESSION_REASON,
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.rollup_counts[BUCKET_REVIEW_UNRESOLVED] == 1
+    assert result.per_status_counts[STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW] == 1
+    assert result.computed_stats.n == 0
+    assert result.computed_stats.no_graded_firings is True
+
+
+def test_corporate_action_review_is_distinct_from_terminal_unavailable(db_session):
+    _add_observation(db_session, "corp-review", status=STATUS_CORPORATE_ACTION_REVIEW)
+    _add_observation(db_session, "terminal", status=STATUS_OUTCOME_UNAVAILABLE)
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.rollup_counts[BUCKET_REVIEW_UNRESOLVED] == 1
+    assert result.rollup_counts[BUCKET_TERMINAL_UNAVAILABLE] == 1
+    assert result.computed_stats.n == 0
+
+
+def test_anomalies_are_surfaced_and_excluded_from_stats(db_session):
+    _add_observation(db_session, "computed-null", status=STATUS_COMPUTED, forward_return=None)
+    _add_observation(db_session, "pending-with-return", status=STATUS_PENDING, forward_return=0.50)
+    _add_observation(db_session, "valid-computed", status=STATUS_COMPUTED, forward_return=0.20)
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.anomalies.computed_missing_forward_return == 1
+    assert result.anomalies.non_computed_with_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_ids == ("computed-null",)
+    assert result.anomalies.non_computed_with_forward_return_ids == ("pending-with-return",)
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.20)
+
+
+def test_partition_integrity_excludes_pending_retry_and_review_from_stats(db_session):
+    _add_observation(db_session, "pending", status=STATUS_PENDING)
+    _add_observation(db_session, "retry", status=STATUS_PRICING_UNAVAILABLE_RETRY)
+    _add_observation(db_session, "review", status=STATUS_PRICE_DRIFT_REVIEW)
+    _add_observation(db_session, "computed-a", status=STATUS_COMPUTED, forward_return=0.10)
+    _add_observation(db_session, "computed-b", status=STATUS_COMPUTED, forward_return=0.20)
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.rollup_counts[BUCKET_PENDING_LIKE] == 1
+    assert result.rollup_counts[BUCKET_RETRY_IN_FLIGHT] == 1
+    assert result.rollup_counts[BUCKET_REVIEW_UNRESOLVED] == 1
+    assert result.rollup_counts[BUCKET_GRADED] == 2
+    assert result.computed_stats.n == 2
+    assert result.computed_stats.expectancy == pytest.approx(0.15)
+
+
+def test_three_return_bins_and_barrier_stats(db_session):
+    _add_observation(
+        db_session,
+        "win",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        mfe=0.35,
+        mae=-0.02,
+        hit_t1=True,
+        hit_t2=True,
+        same_day_ambiguity=True,
+    )
+    _add_observation(
+        db_session,
+        "flat",
+        status=STATUS_COMPUTED,
+        forward_return=0.0,
+        mfe=0.05,
+        mae=-0.01,
+        hit_t1=False,
+    )
+    _add_observation(
+        db_session,
+        "loss",
+        status=STATUS_COMPUTED,
+        forward_return=-0.10,
+        mfe=0.02,
+        mae=-0.20,
+        hit_stop=True,
+    )
+
+    result = build_measurement_scoreboard(db_session)
+    stats = result.computed_stats
+
+    assert stats.n == 3
+    assert stats.win_count == 1
+    assert stats.flat_count == 1
+    assert stats.loss_count == 1
+    assert stats.avg_win == pytest.approx(0.20)
+    assert stats.avg_loss == pytest.approx(-0.10)
+    assert stats.win_loss_ratio == pytest.approx(2.0)
+    assert stats.hit_t1_count == 1
+    assert stats.hit_t1_rate == pytest.approx(1 / 3)
+    assert stats.hit_t2_count == 1
+    assert stats.hit_stop_count == 1
+    assert stats.same_day_barrier_ambiguity_count == 1
+    assert stats.mfe_mean == pytest.approx((0.35 + 0.05 + 0.02) / 3)
+    assert stats.mfe_median == pytest.approx(0.05)
+    assert stats.mfe_max == pytest.approx(0.35)
+    assert stats.mae_mean == pytest.approx((-0.02 - 0.01 - 0.20) / 3)
+    assert stats.mae_median == pytest.approx(-0.02)
+    assert stats.mae_worst == pytest.approx(-0.20)
+
+
+@pytest.mark.parametrize(
+    ("returns", "expected_avg_win", "expected_avg_loss", "expected_ratio"),
+    [
+        ([0.10, 0.20], 0.15, None, None),
+        ([-0.10, -0.20], None, -0.15, None),
+    ],
+)
+def test_all_win_and_all_loss_do_not_explode(
+    db_session,
+    returns,
+    expected_avg_win,
+    expected_avg_loss,
+    expected_ratio,
+):
+    for index, value in enumerate(returns):
+        _add_observation(
+            db_session,
+            f"computed-{index}",
+            status=STATUS_COMPUTED,
+            forward_return=value,
+        )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.avg_win == pytest.approx(expected_avg_win) if expected_avg_win is not None else stats.avg_win is None
+    assert stats.avg_loss == pytest.approx(expected_avg_loss) if expected_avg_loss is not None else stats.avg_loss is None
+    assert stats.win_loss_ratio == expected_ratio
+
+
+def test_tail_counter_threshold_is_inclusive(db_session):
+    _add_observation(db_session, "below", status=STATUS_COMPUTED, forward_return=0.01, mfe=0.249)
+    _add_observation(db_session, "boundary", status=STATUS_COMPUTED, forward_return=0.02, mfe=0.25)
+    _add_observation(db_session, "above", status=STATUS_COMPUTED, forward_return=0.03, mfe=0.30)
+
+    stats = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25).computed_stats
+
+    assert stats.tail_event_count == 2
+    assert stats.tail_event_fraction == pytest.approx(2 / 3)
+
+
+def test_zero_graded_is_explicit_and_has_no_nan(db_session):
+    _add_observation(db_session, "pending", status=STATUS_PENDING)
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.n == 0
+    assert stats.no_graded_firings is True
+    assert stats.expectancy is None
+    assert stats.tail_event_fraction is None
+    numeric_values = [
+        value
+        for value in stats.__dict__.values()
+        if isinstance(value, float)
+    ]
+    assert all(not math.isnan(value) for value in numeric_values)
+
+
+def test_all_required_statuses_have_counts_even_when_zero(db_session):
+    _add_observation(db_session, "one", status=STATUS_PENDING)
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert list(result.per_status_counts) == list(REQUIRED_FORWARD_RETURN_STATUSES)
+    assert result.per_status_counts[STATUS_PENDING] == 1
+    for status in REQUIRED_FORWARD_RETURN_STATUSES:
+        assert status in result.per_status_counts
+
+
+def test_pattern_filter_limits_rows_without_cross_tabs(db_session):
+    _add_observation(db_session, "m4-computed", status=STATUS_COMPUTED, forward_return=0.10, pattern_id="M4")
+    _add_observation(db_session, "m5-computed", status=STATUS_COMPUTED, forward_return=0.40, pattern_id="M5")
+
+    result = build_measurement_scoreboard(db_session, pattern_id="M4")
+
+    assert result.pattern_id == "M4"
+    assert result.total_observations == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.10)
+
+
+def test_each_required_status_maps_to_one_rollup_bucket():
+    status_to_bucket = {}
+    for bucket, statuses in ROLLUP_STATUS_BUCKETS.items():
+        for status in statuses:
+            assert status not in status_to_bucket
+            status_to_bucket[status] = bucket
+
+    assert set(status_to_bucket) == set(REQUIRED_FORWARD_RETURN_STATUSES)
+    assert status_to_bucket[STATUS_PENDING] == BUCKET_PENDING_LIKE
+    assert status_to_bucket[STATUS_HALTED_PENDING] == BUCKET_PENDING_LIKE
+    assert status_to_bucket[STATUS_PRICE_FINALITY_PENDING] == BUCKET_PENDING_LIKE
+    assert status_to_bucket[STATUS_MISSING_ENTRY_PRICE_RETRY] == BUCKET_RETRY_IN_FLIGHT
+    assert status_to_bucket[STATUS_MISSING_EXIT_PRICE_RETRY] == BUCKET_RETRY_IN_FLIGHT
+    assert status_to_bucket[STATUS_INVALID_ENTRY_PRICE_RETRY] == BUCKET_RETRY_IN_FLIGHT
+    assert status_to_bucket[STATUS_INVALID_EXIT_PRICE_RETRY] == BUCKET_RETRY_IN_FLIGHT
+    assert status_to_bucket[STATUS_PROVIDER_REVISION_REVIEW] == BUCKET_REVIEW_UNRESOLVED
+    assert status_to_bucket[STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW] == BUCKET_REVIEW_UNRESOLVED
+    assert status_to_bucket[STATUS_CORPORATE_ACTION_REVIEW] == BUCKET_REVIEW_UNRESOLVED
+    assert status_to_bucket[STATUS_OUTCOME_UNAVAILABLE] == BUCKET_TERMINAL_UNAVAILABLE
+
+
+def test_scoreboard_query_is_read_only(db_session):
+    _add_observation(db_session, "computed", status=STATUS_COMPUTED, forward_return=0.10)
+    before_counts = _forward_return_table_counts(db_session)
+    mutating_statements = []
+
+    def _record_mutation(conn, cursor, statement, parameters, context, executemany):
+        first = statement.strip().split(None, 1)[0].upper() if statement.strip() else ""
+        if first in {"INSERT", "UPDATE", "DELETE", "UPSERT", "ALTER", "DROP", "CREATE"}:
+            mutating_statements.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", _record_mutation)
+    try:
+        result = build_measurement_scoreboard(db_session)
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", _record_mutation)
+
+    assert result.computed_stats.n == 1
+    assert mutating_statements == []
+    assert _forward_return_table_counts(db_session) == before_counts
+    assert not db_session.new
+    assert not db_session.dirty
+
+
+def _forward_return_table_counts(db_session) -> dict[str, int]:
+    return {
+        "forward_return_observations": db_session.scalar(
+            select(func.count()).select_from(ForwardReturnObservation)
+        ),
+        "forward_return_observation_events": db_session.scalar(
+            select(func.count()).select_from(ForwardReturnObservationEvent)
+        ),
+        "forward_return_path_rows": db_session.scalar(
+            select(func.count()).select_from(ForwardReturnPathRow)
+        ),
+    }
