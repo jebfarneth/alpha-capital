@@ -27,6 +27,7 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardSignalIntegrityError,
     ScoreboardWindowIntegrityError,
     build_measurement_scoreboard,
+    build_measurement_scoreboard_by_horizon,
 )
 from alpha.jobs.forward_return import REQUIRED_FORWARD_RETURN_STATUSES
 from alpha.runtime_env import load_runtime_env
@@ -55,13 +56,23 @@ def _run_live(args: argparse.Namespace) -> int:
         warning = _tail_threshold_warning(args.mfe_tail_threshold)
         if warning:
             print(warning, file=sys.stderr)
+        if args.group_by_horizon and args.signal_horizon is not None:
+            raise ValueError("--group-by-horizon and --signal-horizon are mutually exclusive")
 
         session = get_session()
-        result = build_measurement_scoreboard(
-            session,
-            pattern_id=args.pattern_id,
-            mfe_tail_threshold=args.mfe_tail_threshold,
-        )
+        if args.group_by_horizon:
+            result = build_measurement_scoreboard_by_horizon(
+                session,
+                pattern_id=args.pattern_id,
+                mfe_tail_threshold=args.mfe_tail_threshold,
+            )
+        else:
+            result = build_measurement_scoreboard(
+                session,
+                pattern_id=args.pattern_id,
+                signal_horizon=args.signal_horizon,
+                mfe_tail_threshold=args.mfe_tail_threshold,
+            )
     except (
         ScoreboardPartitionError,
         ScoreboardDirectionError,
@@ -85,7 +96,10 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result.to_dict(), sort_keys=True))
     else:
-        _print_scoreboard(result, schema=display_schema)
+        if args.group_by_horizon:
+            _print_scoreboard_by_horizon(result, schema=display_schema)
+        else:
+            _print_scoreboard(result, schema=display_schema)
     return 0
 
 
@@ -152,6 +166,25 @@ def _format_optional(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:.6g}"
 
 
+def _print_scoreboard_by_horizon(result, *, schema: str) -> None:
+    print("Status:                  finished")
+    print(f"Schema:                  {schema}")
+    print(f"Pattern:                 {result.pattern_id or 'all'}")
+    print(f"MFE tail threshold:      {result.mfe_tail_threshold:.6g} (fraction)")
+    print("")
+    print("Graded stats by horizon:")
+    if not result.computed_stats_by_horizon:
+        print("  no graded firings yet")
+        return
+    for horizon, stats in result.computed_stats_by_horizon.items():
+        print(f"  {horizon}:")
+        print(f"    N:                   {stats.n}")
+        print(f"    Expectancy:          {_format_optional(stats.expectancy)}")
+        print(f"    Finite MFE / MAE N:  {stats.mfe_finite_count} / {stats.mae_finite_count}")
+        print(f"    Tail denominator:    {stats.tail_event_denominator}")
+        print(f"    Tail events:         {stats.tail_event_count} ({_format_optional(stats.tail_event_fraction)})")
+
+
 def _tail_threshold_warning(value: float) -> Optional[str]:
     if value > 1.0:
         return TAIL_THRESHOLD_WARNING
@@ -163,6 +196,13 @@ def _print_error(exc: Exception) -> None:
     if isinstance(exc, ScoreboardPoolingError):
         print(f"Pattern counts: {json.dumps(exc.pattern_counts, sort_keys=True)}")
         print(f"Pattern horizons: {json.dumps(exc.pattern_horizons, sort_keys=True)}")
+        if exc.horizon_counts:
+            print(f"Horizon counts: {json.dumps(exc.horizon_counts, sort_keys=True)}")
+        if exc.pattern_horizon_counts:
+            print(
+                "Pattern horizon counts: "
+                f"{json.dumps(exc.pattern_horizon_counts, sort_keys=True)}"
+            )
     if isinstance(exc, ScoreboardSignalIntegrityError):
         print("Orphan observations:")
         for orphan in exc.orphans[:20]:
@@ -198,6 +238,8 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
     if isinstance(exc, ScoreboardPoolingError):
         payload["pattern_counts"] = exc.pattern_counts
         payload["pattern_horizons"] = exc.pattern_horizons
+        payload["horizon_counts"] = exc.horizon_counts
+        payload["pattern_horizon_counts"] = exc.pattern_horizon_counts
     return payload
 
 
@@ -224,6 +266,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--pattern-id",
         default=None,
         help="Optional pattern id filter. Defaults to all patterns.",
+    )
+    parser.add_argument(
+        "--signal-horizon",
+        default=None,
+        help="Optional signal horizon filter, such as 15d or 9d.",
+    )
+    parser.add_argument(
+        "--group-by-horizon",
+        action="store_true",
+        help="Emit computed stats grouped by signal horizon instead of one headline block.",
     )
     parser.add_argument(
         "--mfe-tail-threshold",

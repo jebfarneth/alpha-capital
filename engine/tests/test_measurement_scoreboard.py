@@ -53,6 +53,7 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardWindowIntegrityError,
     _canonical_observation_rows,
     build_measurement_scoreboard,
+    build_measurement_scoreboard_by_horizon,
     validate_status_partition,
 )
 
@@ -1409,6 +1410,123 @@ def test_pattern_filter_isolates_one_graded_pattern_after_pooling_guard(db_sessi
     assert result.total_observations == 1
     assert result.computed_stats.n == 1
     assert result.computed_stats.expectancy == pytest.approx(0.10)
+
+
+def test_within_pattern_mixed_horizons_raise_pooling_error(db_session):
+    _add_observation(
+        db_session,
+        "m1-9d",
+        status=STATUS_COMPUTED,
+        forward_return=0.09,
+        pattern_id="M1",
+        ticker="NINE",
+        signal_horizon="9d",
+        mfe=0.30,
+        mae=-0.02,
+    )
+    _add_observation(
+        db_session,
+        "m1-13d",
+        status=STATUS_COMPUTED,
+        forward_return=0.13,
+        pattern_id="M1",
+        ticker="THIRTEEN",
+        signal_horizon="13d",
+        mfe=0.10,
+        mae=-0.04,
+    )
+
+    with pytest.raises(ScoreboardPoolingError) as exc_info:
+        build_measurement_scoreboard(db_session, pattern_id="M1", mfe_tail_threshold=0.25)
+
+    assert "--signal-horizon" in str(exc_info.value)
+    assert exc_info.value.pattern_counts == {"M1": 2}
+    assert exc_info.value.pattern_horizons == {"M1": "13d,9d"}
+    assert exc_info.value.horizon_counts == {"9d": 1, "13d": 1}
+    assert exc_info.value.pattern_horizon_counts == {
+        "M1": {"9d": 1, "13d": 1}
+    }
+
+
+def test_signal_horizon_filter_isolates_m1_variable_horizon_stats(db_session):
+    _add_observation(
+        db_session,
+        "m1-9d",
+        status=STATUS_COMPUTED,
+        forward_return=0.09,
+        pattern_id="M1",
+        ticker="NINE",
+        signal_horizon="9d",
+        mfe=0.30,
+        mae=-0.02,
+    )
+    _add_observation(
+        db_session,
+        "m1-13d",
+        status=STATUS_COMPUTED,
+        forward_return=0.13,
+        pattern_id="M1",
+        ticker="THIRTEEN",
+        signal_horizon="13d",
+        mfe=0.10,
+        mae=-0.04,
+    )
+
+    result = build_measurement_scoreboard(
+        db_session,
+        pattern_id="M1",
+        signal_horizon="9d",
+        mfe_tail_threshold=0.25,
+    )
+
+    assert result.pattern_id == "M1"
+    assert result.total_observations == 1
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.09)
+    assert result.computed_stats.mfe_finite_count == 1
+    assert result.computed_stats.tail_event_denominator == 1
+    assert result.computed_stats.tail_event_fraction == pytest.approx(1.0)
+
+
+def test_by_horizon_scoreboard_returns_m1_variable_horizon_groups(db_session):
+    _add_observation(
+        db_session,
+        "m1-9d",
+        status=STATUS_COMPUTED,
+        forward_return=0.09,
+        pattern_id="M1",
+        ticker="NINE",
+        signal_horizon="9d",
+        mfe=0.30,
+        mae=-0.02,
+    )
+    _add_observation(
+        db_session,
+        "m1-13d",
+        status=STATUS_COMPUTED,
+        forward_return=0.13,
+        pattern_id="M1",
+        ticker="THIRTEEN",
+        signal_horizon="13d",
+        mfe=0.10,
+        mae=-0.04,
+    )
+
+    result = build_measurement_scoreboard_by_horizon(
+        db_session,
+        pattern_id="M1",
+        mfe_tail_threshold=0.25,
+    )
+
+    assert set(result.computed_stats_by_horizon) == {"9d", "13d"}
+    nine = result.computed_stats_by_horizon["9d"]
+    thirteen = result.computed_stats_by_horizon["13d"]
+    assert nine.n == 1
+    assert nine.expectancy == pytest.approx(0.09)
+    assert nine.tail_event_fraction == pytest.approx(1.0)
+    assert thirteen.n == 1
+    assert thirteen.expectancy == pytest.approx(0.13)
+    assert thirteen.tail_event_fraction == pytest.approx(0.0)
 
 
 def test_pooling_guard_ignores_non_graded_patterns(db_session):

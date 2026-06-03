@@ -151,10 +151,14 @@ class ScoreboardPoolingError(RuntimeError):
         *,
         pattern_counts: Optional[Dict[str, int]] = None,
         pattern_horizons: Optional[Dict[str, str]] = None,
+        horizon_counts: Optional[Dict[str, int]] = None,
+        pattern_horizon_counts: Optional[Dict[str, Dict[str, int]]] = None,
     ):
         super().__init__(message)
         self.pattern_counts = pattern_counts or {}
         self.pattern_horizons = pattern_horizons or {}
+        self.horizon_counts = horizon_counts or {}
+        self.pattern_horizon_counts = pattern_horizon_counts or {}
 
 
 class ScoreboardPatternIntegrityError(RuntimeError):
@@ -269,6 +273,27 @@ class ScoreboardResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class HorizonScoreboardResult:
+    pattern_id: Optional[str]
+    mfe_tail_threshold: float
+    computed_stats_by_horizon: Dict[str, ComputedStats]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class _ScoreboardFold:
+    raw_rows: List[Mapping[str, Any]]
+    rows: List[Mapping[str, Any]]
+    stale_duplicate_count: int
+    per_status_counts: Dict[str, int]
+    rollup_counts: Dict[str, int]
+    computed_rows: List[Mapping[str, Any]]
+    anomalies: AnomalySummary
+
+
 def validate_status_partition() -> None:
     """Fail if the scoreboard buckets drift from the producer status universe."""
 
@@ -303,6 +328,7 @@ def build_measurement_scoreboard(
     session: Session,
     *,
     pattern_id: Optional[str] = None,
+    signal_horizon: Optional[str] = None,
     mfe_tail_threshold: float = DEFAULT_MFE_TAIL_THRESHOLD,
 ) -> ScoreboardResult:
     """Build a read-only scoreboard from ``forward_return_observations``.
@@ -317,9 +343,100 @@ def build_measurement_scoreboard(
         not isinstance(pattern_id, str) or pattern_id.strip() == ""
     ):
         raise ValueError("pattern_id must be a non-empty string")
+    if signal_horizon is not None and (
+        not isinstance(signal_horizon, str) or signal_horizon.strip() == ""
+    ):
+        raise ValueError("signal_horizon must be a non-empty string")
 
+    fold = _fold_scoreboard_rows(
+        session,
+        pattern_id=pattern_id,
+        signal_horizon=signal_horizon,
+    )
+    _assert_pattern_integrity(fold.computed_rows)
+    _assert_single_graded_pattern(fold.computed_rows)
+    if signal_horizon is None:
+        _assert_single_graded_horizon(fold.computed_rows)
+
+    computed_stats = _computed_stats(
+        fold.computed_rows,
+        mfe_tail_threshold=mfe_tail_threshold,
+    )
+    reconciliation = GradedRollupReconciliation(
+        graded_rollup_count=fold.rollup_counts[BUCKET_GRADED],
+        computed_sample_n=computed_stats.n,
+        computed_missing_forward_return=fold.anomalies.computed_missing_forward_return,
+        reconciles=(
+            fold.rollup_counts[BUCKET_GRADED]
+            == computed_stats.n + fold.anomalies.computed_missing_forward_return
+        ),
+    )
+
+    return ScoreboardResult(
+        pattern_id=pattern_id,
+        mfe_tail_threshold=mfe_tail_threshold,
+        total_observations=len(fold.rows),
+        raw_observation_rows=len(fold.raw_rows),
+        stale_duplicate_observation_rows=fold.stale_duplicate_count,
+        per_status_counts=fold.per_status_counts,
+        rollup_counts=fold.rollup_counts,
+        unknown_status_counts={},
+        anomalies=fold.anomalies,
+        graded_rollup_reconciliation=reconciliation,
+        computed_stats=computed_stats,
+    )
+
+
+def build_measurement_scoreboard_by_horizon(
+    session: Session,
+    *,
+    pattern_id: Optional[str] = None,
+    mfe_tail_threshold: float = DEFAULT_MFE_TAIL_THRESHOLD,
+) -> HorizonScoreboardResult:
+    """Build computed stats partitioned by persisted signal horizon."""
+
+    if pattern_id is not None and (
+        not isinstance(pattern_id, str) or pattern_id.strip() == ""
+    ):
+        raise ValueError("pattern_id must be a non-empty string")
+    if not math.isfinite(mfe_tail_threshold) or mfe_tail_threshold < 0:
+        raise ValueError("mfe_tail_threshold must be a finite, non-negative fraction")
+
+    fold = _fold_scoreboard_rows(
+        session,
+        pattern_id=pattern_id,
+        signal_horizon=None,
+    )
+    _assert_pattern_integrity(fold.computed_rows)
+    _assert_single_graded_pattern(fold.computed_rows)
+
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in fold.computed_rows:
+        horizon = _horizon_key(row)
+        grouped.setdefault(horizon, []).append(row)
+
+    return HorizonScoreboardResult(
+        pattern_id=pattern_id,
+        mfe_tail_threshold=mfe_tail_threshold,
+        computed_stats_by_horizon={
+            horizon: _computed_stats(rows, mfe_tail_threshold=mfe_tail_threshold)
+            for horizon, rows in sorted(grouped.items())
+        },
+    )
+
+
+def _fold_scoreboard_rows(
+    session: Session,
+    *,
+    pattern_id: Optional[str],
+    signal_horizon: Optional[str],
+) -> _ScoreboardFold:
     validate_status_partition()
-    raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
+    raw_rows = _load_observation_rows(
+        session,
+        pattern_id=pattern_id,
+        signal_horizon=signal_horizon,
+    )
     # Guard order is load-bearing: orphan integrity gates the denominator before
     # status/direction classification; a row missing its parent must fail loud,
     # never be classified or folded.
@@ -388,9 +505,6 @@ def build_measurement_scoreboard(
                 graded_missing_excursion_ids.append(row["forward_return_observation_id"])
             computed_rows.append(row)
 
-    _assert_pattern_integrity(computed_rows)
-    _assert_single_graded_pattern(computed_rows)
-
     anomalies = AnomalySummary(
         computed_missing_forward_return=len(computed_missing_forward_return_ids),
         non_computed_with_forward_return=len(non_computed_with_forward_return_ids),
@@ -400,29 +514,14 @@ def build_measurement_scoreboard(
         non_computed_with_forward_return_ids=tuple(non_computed_with_forward_return_ids[:20]),
         graded_missing_excursion_ids=tuple(graded_missing_excursion_ids[:20]),
     )
-    computed_stats = _computed_stats(computed_rows, mfe_tail_threshold=mfe_tail_threshold)
-    reconciliation = GradedRollupReconciliation(
-        graded_rollup_count=rollup_counts[BUCKET_GRADED],
-        computed_sample_n=computed_stats.n,
-        computed_missing_forward_return=anomalies.computed_missing_forward_return,
-        reconciles=(
-            rollup_counts[BUCKET_GRADED]
-            == computed_stats.n + anomalies.computed_missing_forward_return
-        ),
-    )
-
-    return ScoreboardResult(
-        pattern_id=pattern_id,
-        mfe_tail_threshold=mfe_tail_threshold,
-        total_observations=len(rows),
-        raw_observation_rows=len(raw_rows),
-        stale_duplicate_observation_rows=stale_duplicate_count,
+    return _ScoreboardFold(
+        raw_rows=raw_rows,
+        rows=rows,
+        stale_duplicate_count=stale_duplicate_count,
         per_status_counts=per_status_counts,
         rollup_counts=rollup_counts,
-        unknown_status_counts={},
+        computed_rows=computed_rows,
         anomalies=anomalies,
-        graded_rollup_reconciliation=reconciliation,
-        computed_stats=computed_stats,
     )
 
 
@@ -528,10 +627,45 @@ def _assert_single_graded_pattern(rows: Sequence[Mapping[str, Any]]) -> None:
         )
 
 
+def _assert_single_graded_horizon(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Fail loud before reducing multiple holding periods into one stat block."""
+
+    horizon_counts: Dict[str, int] = {}
+    pattern_counts: Dict[str, int] = {}
+    pattern_horizon_counts: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        pattern = str(row["signal_pattern_id"])
+        horizon = _horizon_key(row)
+        pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+        horizon_counts[horizon] = horizon_counts.get(horizon, 0) + 1
+        per_pattern = pattern_horizon_counts.setdefault(pattern, {})
+        per_pattern[horizon] = per_pattern.get(horizon, 0) + 1
+
+    if len(horizon_counts) > 1:
+        raise ScoreboardPoolingError(
+            "scoreboard headline stats cannot pool multiple graded horizons; "
+            "re-run with --signal-horizon <signal_horizon> or "
+            "--group-by-horizon to isolate holding periods",
+            pattern_counts=pattern_counts,
+            pattern_horizons={
+                pattern: ",".join(sorted(counts))
+                for pattern, counts in pattern_horizon_counts.items()
+            },
+            horizon_counts=horizon_counts,
+            pattern_horizon_counts=pattern_horizon_counts,
+        )
+
+
+def _horizon_key(row: Mapping[str, Any]) -> str:
+    horizon = row.get("signal_horizon")
+    return "null" if horizon is None else str(horizon)
+
+
 def _load_observation_rows(
     session: Session,
     *,
     pattern_id: Optional[str],
+    signal_horizon: Optional[str],
 ) -> List[Mapping[str, Any]]:
     columns = (
         ForwardReturnObservation.forward_return_observation_id,
@@ -572,6 +706,13 @@ def _load_observation_rows(
             or_(
                 ForwardReturnObservation.pattern_id == pattern_id,
                 SignalRegistry.pattern_id == pattern_id,
+            )
+        )
+    if signal_horizon is not None:
+        statement = statement.where(
+            or_(
+                ForwardReturnObservation.signal_horizon == signal_horizon,
+                SignalRegistry.signal_horizon == signal_horizon,
             )
         )
     with session.no_autoflush:
