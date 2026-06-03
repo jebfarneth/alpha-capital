@@ -49,12 +49,26 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardPatternIntegrityError,
     ScoreboardPartitionError,
     ScoreboardPoolingError,
+    ScoreboardSignalIntegrityError,
     _canonical_observation_rows,
     build_measurement_scoreboard,
     validate_status_partition,
 )
 
 SIGNAL_TS = datetime(2026, 6, 1, 20, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture()
+def db_session_without_fk():
+    """SQLite session for deliberate orphan-corruption injection."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    yield session
+    session.close()
+    engine.dispose()
 
 
 def _add_signal(
@@ -180,6 +194,39 @@ def _add_observation(
     return obs
 
 
+def _add_orphan_observation(
+    db_session,
+    obs_id: str,
+    *,
+    signal_id: str = "missing-parent",
+    status: str = STATUS_COMPUTED,
+    forward_return: Optional[float] = 0.10,
+    pattern_id: str = "M4",
+    ticker: str = "ORPH",
+    direction: str = "long",
+) -> ForwardReturnObservation:
+    obs = ForwardReturnObservation(
+        forward_return_observation_id=obs_id,
+        signal_id=signal_id,
+        pattern_id=pattern_id,
+        ticker=ticker,
+        direction=direction,
+        signal_timestamp=SIGNAL_TS,
+        signal_horizon="15d",
+        next_execution_session="2026-06-02",
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-23",
+        forward_return=forward_return,
+        status=status,
+        attempts=0,
+        input_hash=f"input-{obs_id}",
+        outcome_hash=f"outcome-{obs_id}",
+    )
+    db_session.add(obs)
+    db_session.flush()
+    return obs
+
+
 def test_status_partition_is_exhaustive_and_disjoint():
     validate_status_partition()
     bucket_members = [status for statuses in ROLLUP_STATUS_BUCKETS.values() for status in statuses]
@@ -235,6 +282,90 @@ def test_unknown_status_payload_marks_stale_duplicate_locus(db_session):
         "observation_id": "stale-unknown",
         "stale": True,
     }]
+
+
+def test_orphan_signal_integrity_error_fails_loud(db_session_without_fk):
+    _add_orphan_observation(
+        db_session_without_fk,
+        "orphan-computed",
+        signal_id="missing-signal",
+    )
+
+    with pytest.raises(ScoreboardSignalIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session_without_fk)
+
+    assert exc_info.value.orphans == [{
+        "observation_id": "orphan-computed",
+        "signal_id": "missing-signal",
+        "status": STATUS_COMPUTED,
+        "direction": "long",
+        "pattern_id": "M4",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("obs_id", "status", "direction"),
+    [
+        ("orphan-unknown-status", "future_new_status", "long"),
+        ("orphan-short", STATUS_COMPUTED, "short"),
+    ],
+)
+def test_orphan_signal_integrity_precedes_partition_and_direction(
+    db_session_without_fk,
+    obs_id,
+    status,
+    direction,
+):
+    _add_orphan_observation(
+        db_session_without_fk,
+        obs_id,
+        signal_id=f"missing-{obs_id}",
+        status=status,
+        direction=direction,
+    )
+
+    with pytest.raises(ScoreboardSignalIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session_without_fk)
+
+    assert exc_info.value.orphans == [{
+        "observation_id": obs_id,
+        "signal_id": f"missing-{obs_id}",
+        "status": status,
+        "direction": direction,
+        "pattern_id": "M4",
+    }]
+
+
+def test_orphan_signal_integrity_runs_on_pattern_filtered_rows(db_session_without_fk):
+    _add_orphan_observation(
+        db_session_without_fk,
+        "orphan-m4",
+        signal_id="missing-m4",
+        pattern_id="M4",
+    )
+    _add_observation(
+        db_session_without_fk,
+        "m5-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.40,
+        pattern_id="M5",
+    )
+
+    with pytest.raises(ScoreboardSignalIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session_without_fk, pattern_id="M4")
+
+    assert exc_info.value.orphans == [{
+        "observation_id": "orphan-m4",
+        "signal_id": "missing-m4",
+        "status": STATUS_COMPUTED,
+        "direction": "long",
+        "pattern_id": "M4",
+    }]
+
+    result = build_measurement_scoreboard(db_session_without_fk, pattern_id="M5")
+    assert result.raw_observation_rows == 1
+    assert result.total_observations == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.40)
 
 
 def test_short_direction_fails_loud(db_session):
@@ -1184,6 +1315,57 @@ def test_json_and_human_error_paths_surface_pattern_integrity_guard(
     assert "Pattern mismatches:" in captured.out
     assert '"observation_pattern_id": "M4"' in captured.out
     assert '"signal_pattern_id": "M5"' in captured.out
+
+
+def test_json_and_human_error_paths_surface_signal_integrity_guard(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "signal-integrity.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_orphan_observation(
+            session,
+            "orphan-cli",
+            signal_id="missing-cli",
+            status=STATUS_COMPUTED,
+            direction="long",
+            pattern_id="M4",
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    expected = [{
+        "observation_id": "orphan-cli",
+        "signal_id": "missing-cli",
+        "status": STATUS_COMPUTED,
+        "direction": "long",
+        "pattern_id": "M4",
+    }]
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["error_type"] == "ScoreboardSignalIntegrityError"
+    assert payload["orphans"] == expected
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Orphan observations:" in captured.out
+    assert '"observation_id": "orphan-cli"' in captured.out
+    assert '"signal_id": "missing-cli"' in captured.out
 
 
 def test_cli_rejects_empty_pattern_id(tmp_path, monkeypatch, capsys):

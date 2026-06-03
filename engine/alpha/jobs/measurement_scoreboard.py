@@ -125,6 +125,19 @@ class ScoreboardDirectionError(RuntimeError):
         self.unsupported_direction_details = unsupported_direction_details or {}
 
 
+class ScoreboardSignalIntegrityError(RuntimeError):
+    """Raised when an observation references a missing parent signal."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        orphans: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.orphans = orphans or []
+
+
 class ScoreboardPoolingError(RuntimeError):
     """Raised when headline stats would pool multiple pattern distributions."""
 
@@ -276,6 +289,10 @@ def build_measurement_scoreboard(
 
     validate_status_partition()
     raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
+    # Guard order is load-bearing: orphan integrity gates the denominator before
+    # status/direction classification; a row missing its parent must fail loud,
+    # never be classified or folded.
+    _assert_no_orphan_signals(raw_rows)
     canonical_rows = _canonical_observation_rows(raw_rows)
     canonical_observation_ids = {
         row["forward_return_observation_id"] for row in canonical_rows
@@ -368,6 +385,29 @@ def build_measurement_scoreboard(
         graded_rollup_reconciliation=reconciliation,
         computed_stats=computed_stats,
     )
+
+
+def _assert_no_orphan_signals(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Fail if any observation is missing its parent signal registry row."""
+
+    orphans: List[Dict[str, Any]] = []
+    for row in rows:
+        if row["signal_pattern_id"] is not None:
+            continue
+        orphans.append({
+            "observation_id": row["forward_return_observation_id"],
+            "signal_id": row["signal_id"],
+            "status": row["status"],
+            "direction": row["direction"],
+            "pattern_id": row["pattern_id"],
+        })
+
+    if orphans:
+        raise ScoreboardSignalIntegrityError(
+            "forward-return observations reference missing signal_registry "
+            "parent rows",
+            orphans=orphans,
+        )
 
 
 def _assert_supported_direction(
@@ -485,6 +525,7 @@ def _load_observation_rows(
     statement = select(*columns).join(
         SignalRegistry,
         SignalRegistry.signal_id == ForwardReturnObservation.signal_id,
+        isouter=True,
     )
     if pattern_id is not None:
         statement = statement.where(

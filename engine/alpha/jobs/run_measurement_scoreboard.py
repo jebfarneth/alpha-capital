@@ -24,6 +24,7 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardPartitionError,
     ScoreboardPoolingError,
     ScoreboardResult,
+    ScoreboardSignalIntegrityError,
     build_measurement_scoreboard,
 )
 from alpha.jobs.forward_return import REQUIRED_FORWARD_RETURN_STATUSES
@@ -63,6 +64,7 @@ def _run_live(args: argparse.Namespace) -> int:
     except (
         ScoreboardPartitionError,
         ScoreboardDirectionError,
+        ScoreboardSignalIntegrityError,
         ScoreboardPatternIntegrityError,
         ScoreboardPoolingError,
         ValueError,
@@ -151,6 +153,10 @@ def _print_error(exc: Exception) -> None:
     if isinstance(exc, ScoreboardPoolingError):
         print(f"Pattern counts: {json.dumps(exc.pattern_counts, sort_keys=True)}")
         print(f"Pattern horizons: {json.dumps(exc.pattern_horizons, sort_keys=True)}")
+    if isinstance(exc, ScoreboardSignalIntegrityError):
+        print("Orphan observations:")
+        for orphan in exc.orphans[:20]:
+            print(f"  {json.dumps(orphan, sort_keys=True)}")
     if isinstance(exc, ScoreboardPatternIntegrityError):
         print("Pattern mismatches:")
         for mismatch in exc.mismatches[:20]:
@@ -169,6 +175,8 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
     if isinstance(exc, ScoreboardDirectionError):
         payload["unsupported_direction_counts"] = exc.unsupported_direction_counts
         payload["unsupported_direction_details"] = exc.unsupported_direction_details
+    if isinstance(exc, ScoreboardSignalIntegrityError):
+        payload["orphans"] = exc.orphans
     if isinstance(exc, ScoreboardPatternIntegrityError):
         payload["mismatches"] = exc.mismatches
     if isinstance(exc, ScoreboardPoolingError):
