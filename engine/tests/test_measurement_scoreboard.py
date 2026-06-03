@@ -737,12 +737,16 @@ def test_three_return_bins_and_barrier_stats(db_session):
     assert stats.hit_t2_count == 1
     assert stats.hit_stop_count == 1
     assert stats.same_day_barrier_ambiguity_count == 1
+    assert stats.mfe_finite_count == 3
     assert stats.mfe_mean == pytest.approx((0.35 + 0.05 + 0.02) / 3)
     assert stats.mfe_median == pytest.approx(0.05)
     assert stats.mfe_max == pytest.approx(0.35)
+    assert stats.mae_finite_count == 3
     assert stats.mae_mean == pytest.approx((-0.02 - 0.01 - 0.20) / 3)
     assert stats.mae_median == pytest.approx(-0.02)
     assert stats.mae_worst == pytest.approx(-0.20)
+    assert stats.tail_event_denominator == 3
+    assert result.anomalies.graded_missing_excursion_count == 0
 
 
 @pytest.mark.parametrize(
@@ -782,7 +786,113 @@ def test_tail_counter_threshold_is_inclusive(db_session):
     stats = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25).computed_stats
 
     assert stats.tail_event_count == 2
+    assert stats.tail_event_denominator == 3
     assert stats.tail_event_fraction == pytest.approx(2 / 3)
+
+
+def test_missing_mfe_surfaces_excursion_gap_and_uses_finite_tail_denominator(db_session):
+    _add_observation(
+        db_session,
+        "tail",
+        status=STATUS_COMPUTED,
+        forward_return=0.30,
+        mfe=0.30,
+        mae=-0.05,
+    )
+    _add_observation(
+        db_session,
+        "non-tail",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        mfe=0.10,
+        mae=-0.02,
+    )
+    _add_observation(
+        db_session,
+        "missing-mfe",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        mfe=None,
+        mae=-0.01,
+    )
+
+    result = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25)
+    stats = result.computed_stats
+
+    assert stats.n == 3
+    assert stats.expectancy == pytest.approx(0.20)
+    assert stats.mfe_finite_count == 2
+    assert stats.mae_finite_count == 3
+    assert stats.mfe_mean == pytest.approx(0.20)
+    assert stats.tail_event_count == 1
+    assert stats.tail_event_denominator == 2
+    assert stats.tail_event_fraction == pytest.approx(1 / 2)
+    assert result.anomalies.graded_missing_excursion_count == 1
+    assert result.anomalies.graded_missing_excursion_ids == ("missing-mfe",)
+
+
+def test_missing_mae_surfaces_excursion_gap_and_excludes_mae_denominator(db_session):
+    _add_observation(
+        db_session,
+        "clean",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        mfe=0.30,
+        mae=-0.10,
+    )
+    _add_observation(
+        db_session,
+        "missing-mae",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        mfe=0.20,
+        mae=None,
+    )
+
+    result = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25)
+    stats = result.computed_stats
+
+    assert stats.n == 2
+    assert stats.mfe_finite_count == 2
+    assert stats.mae_finite_count == 1
+    assert stats.mae_mean == pytest.approx(-0.10)
+    assert stats.mae_median == pytest.approx(-0.10)
+    assert stats.mae_worst == pytest.approx(-0.10)
+    assert stats.tail_event_denominator == 2
+    assert result.anomalies.graded_missing_excursion_count == 1
+    assert result.anomalies.graded_missing_excursion_ids == ("missing-mae",)
+
+
+def test_no_finite_mfe_has_no_tail_fraction(db_session):
+    _add_observation(
+        db_session,
+        "missing-mfe-a",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        mfe=None,
+        mae=-0.10,
+    )
+    _add_observation(
+        db_session,
+        "missing-mfe-b",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        mfe=None,
+        mae=-0.20,
+    )
+
+    result = build_measurement_scoreboard(db_session, mfe_tail_threshold=0.25)
+    stats = result.computed_stats
+
+    assert stats.n == 2
+    assert stats.mfe_finite_count == 0
+    assert stats.mfe_mean is None
+    assert stats.mfe_median is None
+    assert stats.mfe_max is None
+    assert stats.tail_event_count == 0
+    assert stats.tail_event_denominator == 0
+    assert stats.tail_event_fraction is None
+    assert result.anomalies.graded_missing_excursion_count == 2
 
 
 def test_nonfinite_mfe_and_mae_do_not_poison_stats_or_tail_counter(db_session):
@@ -803,18 +913,24 @@ def test_nonfinite_mfe_and_mae_do_not_poison_stats_or_tail_counter(db_session):
         mae=float("-inf"),
     )
 
-    stats = build_measurement_scoreboard(
+    result = build_measurement_scoreboard(
         db_session,
         mfe_tail_threshold=0.25,
-    ).computed_stats
+    )
+    stats = result.computed_stats
 
     assert stats.n == 2
+    assert stats.mfe_finite_count == 1
+    assert stats.mae_finite_count == 1
     assert stats.mfe_max == pytest.approx(0.30)
     assert stats.mfe_mean == pytest.approx(0.30)
     assert stats.mae_worst == pytest.approx(-0.10)
     assert stats.mae_mean == pytest.approx(-0.10)
     assert stats.tail_event_count == 1
-    assert stats.tail_event_fraction == pytest.approx(1 / 2)
+    assert stats.tail_event_denominator == 1
+    assert stats.tail_event_fraction == pytest.approx(1.0)
+    assert result.anomalies.graded_missing_excursion_count == 1
+    assert result.anomalies.graded_missing_excursion_ids == ("nonfinite-excursions",)
 
 
 @pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -0.01])
@@ -1148,6 +1264,63 @@ def test_nonfinite_mislabeled_observation_is_attributed_by_parent_pattern(db_ses
     assert result.computed_stats.expectancy == pytest.approx(0.10)
     assert result.anomalies.computed_missing_forward_return == 1
     assert result.anomalies.computed_missing_forward_return_by_pattern == {"M5": 1}
+
+
+def test_success_output_surfaces_excursion_denominators_and_anomaly(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "excursion-output.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_observation(
+            session,
+            "clean",
+            status=STATUS_COMPUTED,
+            forward_return=0.10,
+            mfe=0.30,
+            mae=-0.10,
+        )
+        _add_observation(
+            session,
+            "missing-mfe",
+            status=STATUS_COMPUTED,
+            forward_return=0.20,
+            mfe=None,
+            mae=-0.20,
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload["computed_stats"]["n"] == 2
+    assert payload["computed_stats"]["mfe_finite_count"] == 1
+    assert payload["computed_stats"]["mae_finite_count"] == 2
+    assert payload["computed_stats"]["tail_event_denominator"] == 1
+    assert payload["computed_stats"]["tail_event_fraction"] == pytest.approx(1.0)
+    assert payload["anomalies"]["graded_missing_excursion_count"] == 1
+    assert payload["anomalies"]["graded_missing_excursion_ids"] == ["missing-mfe"]
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "  graded_missing_excursion: 1\n" in captured.out
+    assert "  Finite MFE / MAE N:    1 / 2\n" in captured.out
+    assert "  Tail denominator:      1\n" in captured.out
+    assert "  Tail events:           1 (1)\n" in captured.out
 
 
 def test_json_error_path_is_parseable_and_human_error_remains_plain_text(

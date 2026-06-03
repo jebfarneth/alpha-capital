@@ -108,6 +108,7 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
     print("Anomalies:")
     print(f"  computed_missing_forward_return: {result.anomalies.computed_missing_forward_return}")
     print(f"  non_computed_with_forward_return: {result.anomalies.non_computed_with_forward_return}")
+    print(f"  graded_missing_excursion: {result.anomalies.graded_missing_excursion_count}")
     print(
         "  graded reconciliation: "
         f"{result.graded_rollup_reconciliation.graded_rollup_count} = "
@@ -133,8 +134,10 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
     print(f"  Hit T3:                {stats.hit_t3_count} ({_format_optional(stats.hit_t3_rate)})")
     print(f"  Hit stop:              {stats.hit_stop_count} ({_format_optional(stats.hit_stop_rate)})")
     print(f"  Same-day ambiguity:    {stats.same_day_barrier_ambiguity_count}")
+    print(f"  Finite MFE / MAE N:    {stats.mfe_finite_count} / {stats.mae_finite_count}")
     print(f"  MFE mean/median/max:   {_format_optional(stats.mfe_mean)} / {_format_optional(stats.mfe_median)} / {_format_optional(stats.mfe_max)}")
     print(f"  MAE mean/median/worst: {_format_optional(stats.mae_mean)} / {_format_optional(stats.mae_median)} / {_format_optional(stats.mae_worst)}")
+    print(f"  Tail denominator:      {stats.tail_event_denominator}")
     print(f"  Tail events:           {stats.tail_event_count} ({_format_optional(stats.tail_event_fraction)})")
 
 

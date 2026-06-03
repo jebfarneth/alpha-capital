@@ -173,13 +173,19 @@ class ScoreboardPatternIntegrityError(RuntimeError):
 class AnomalySummary:
     computed_missing_forward_return: int
     non_computed_with_forward_return: int
+    graded_missing_excursion_count: int
     computed_missing_forward_return_by_pattern: Dict[str, int]
     computed_missing_forward_return_ids: tuple[str, ...]
     non_computed_with_forward_return_ids: tuple[str, ...]
+    graded_missing_excursion_ids: tuple[str, ...]
 
     @property
     def total(self) -> int:
-        return self.computed_missing_forward_return + self.non_computed_with_forward_return
+        return (
+            self.computed_missing_forward_return
+            + self.non_computed_with_forward_return
+            + self.graded_missing_excursion_count
+        )
 
 
 @dataclass(frozen=True)
@@ -205,6 +211,8 @@ class ComputedStats:
     hit_stop_count: int
     hit_stop_rate: Optional[float]
     same_day_barrier_ambiguity_count: int
+    mfe_finite_count: int
+    mae_finite_count: int
     mfe_mean: Optional[float]
     mfe_median: Optional[float]
     mfe_max: Optional[float]
@@ -212,6 +220,7 @@ class ComputedStats:
     mae_median: Optional[float]
     mae_worst: Optional[float]
     tail_event_count: int
+    tail_event_denominator: int
     tail_event_fraction: Optional[float]
 
 
@@ -336,6 +345,7 @@ def build_measurement_scoreboard(
     computed_missing_forward_return_ids: List[str] = []
     computed_missing_forward_return_by_pattern: Dict[str, int] = {}
     non_computed_with_forward_return_ids: List[str] = []
+    graded_missing_excursion_ids: List[str] = []
 
     for row in rows:
         status = row["status"]
@@ -352,6 +362,11 @@ def build_measurement_scoreboard(
             non_computed_with_forward_return_ids.append(row["forward_return_observation_id"])
             continue
         if status == STATUS_COMPUTED:
+            if (
+                not _is_finite_number(row["max_favorable_excursion"])
+                or not _is_finite_number(row["max_adverse_excursion"])
+            ):
+                graded_missing_excursion_ids.append(row["forward_return_observation_id"])
             computed_rows.append(row)
 
     _assert_pattern_integrity(computed_rows)
@@ -360,9 +375,11 @@ def build_measurement_scoreboard(
     anomalies = AnomalySummary(
         computed_missing_forward_return=len(computed_missing_forward_return_ids),
         non_computed_with_forward_return=len(non_computed_with_forward_return_ids),
+        graded_missing_excursion_count=len(graded_missing_excursion_ids),
         computed_missing_forward_return_by_pattern=computed_missing_forward_return_by_pattern,
         computed_missing_forward_return_ids=tuple(computed_missing_forward_return_ids[:20]),
         non_computed_with_forward_return_ids=tuple(non_computed_with_forward_return_ids[:20]),
+        graded_missing_excursion_ids=tuple(graded_missing_excursion_ids[:20]),
     )
     computed_stats = _computed_stats(computed_rows, mfe_tail_threshold=mfe_tail_threshold)
     reconciliation = GradedRollupReconciliation(
@@ -624,6 +641,8 @@ def _computed_stats(
             hit_stop_count=0,
             hit_stop_rate=None,
             same_day_barrier_ambiguity_count=0,
+            mfe_finite_count=0,
+            mae_finite_count=0,
             mfe_mean=None,
             mfe_median=None,
             mfe_max=None,
@@ -631,6 +650,7 @@ def _computed_stats(
             mae_median=None,
             mae_worst=None,
             tail_event_count=0,
+            tail_event_denominator=0,
             tail_event_fraction=None,
         )
 
@@ -654,11 +674,14 @@ def _computed_stats(
     )
     mfe_values = _float_values(row["max_favorable_excursion"] for row in rows)
     mae_values = _float_values(row["max_adverse_excursion"] for row in rows)
+    mfe_finite_count = len(mfe_values)
+    mae_finite_count = len(mae_values)
     tail_event_count = sum(
         1
         for value in (row["max_favorable_excursion"] for row in rows)
         if _is_finite_number(value) and float(value) >= mfe_tail_threshold
     )
+    tail_event_denominator = mfe_finite_count
 
     return ComputedStats(
         n=n,
@@ -682,6 +705,8 @@ def _computed_stats(
         hit_stop_count=hit_stop_count,
         hit_stop_rate=hit_stop_count / n,
         same_day_barrier_ambiguity_count=same_day_ambiguity_count,
+        mfe_finite_count=mfe_finite_count,
+        mae_finite_count=mae_finite_count,
         mfe_mean=_mean_or_none(mfe_values),
         mfe_median=_median_or_none(mfe_values),
         mfe_max=max(mfe_values) if mfe_values else None,
@@ -689,7 +714,11 @@ def _computed_stats(
         mae_median=_median_or_none(mae_values),
         mae_worst=min(mae_values) if mae_values else None,
         tail_event_count=tail_event_count,
-        tail_event_fraction=tail_event_count / n,
+        tail_event_denominator=tail_event_denominator,
+        tail_event_fraction=(
+            tail_event_count / tail_event_denominator
+            if tail_event_denominator else None
+        ),
     )
 
 
