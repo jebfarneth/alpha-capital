@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Canonical daily M4 signal accumulation runner.
+"""Canonical nightly signal-accumulation orchestrator.
 
 This entrypoint drives the production accumulation path: build the operating
-universe, run the M4 daily evidence/signal job (with frozen signal_context),
-then emit a structured health report. It NEVER runs forward returns and never
-re-implements M4 firing, detector, or price logic -- it orchestrates the same
-proven universe -> M4 daily flow used by the scratch rehearsal runner.
+universe, run the per-pattern daily evidence/signal jobs (with frozen
+signal_context), then emit a structured health report. It NEVER runs forward
+returns and never re-implements firing, detector, or price logic -- it
+orchestrates the same proven universe -> daily-assembly flow used by the
+scratch rehearsal runner across every wired pattern (M4, M1, ...).
 
 Three modes:
 

@@ -19,7 +19,7 @@ from alpha.jobs.forward_context import (
     ForwardContextCollectorJob,
     forward_context_rows_through,
 )
-from alpha.jobs.run_m4_canonical import _forward_context_panel_capture_ok
+from alpha.jobs.run_nightly_canonical import _forward_context_panel_capture_ok
 from alpha.jobs.runner import run_job
 from alpha.market_calendar import us_equity_session_close_timestamp
 

@@ -16,9 +16,9 @@ from alpha.db.models import (
     SignalRegistry,
     UniverseScan,
 )
-from alpha.jobs import run_m4_canonical
+from alpha.jobs import run_nightly_canonical
 from alpha.jobs.m4_daily import M4DailyAssemblyJob
-from alpha.jobs.run_m4_canonical import (
+from alpha.jobs.run_nightly_canonical import (
     CanonicalRunError,
     NonTradingDayNoOp,
     build_m4_health_report,
@@ -147,7 +147,7 @@ def test_default_holiday_timestamp_is_clean_noop():
 def test_live_without_confirm_is_refused(monkeypatch, capsys):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@db.example.supabase.co/postgres")
     monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
-    rc = run_m4_canonical.main(["--live", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
+    rc = run_nightly_canonical.main(["--live", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
     assert rc == 1
     assert "--confirm-canonical-write" in capsys.readouterr().out
 
@@ -164,7 +164,7 @@ def test_live_refuses_sqlite(monkeypatch):
 def test_live_cli_refuses_sqlite(monkeypatch, capsys):
     monkeypatch.setenv("DATABASE_URL", "sqlite:///alpha_capital.db")
     monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--live",
         "--confirm-canonical-write",
         "--run-timestamp", "2026-05-26T08:00:00+00:00",
@@ -197,7 +197,7 @@ def test_scratch_refuses_public_schema():
 
 def test_scratch_cli_without_schema_is_refused(monkeypatch, capsys):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
-    rc = run_m4_canonical.main(["--scratch", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
+    rc = run_nightly_canonical.main(["--scratch", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
     assert rc == 1
     assert "--schema" in capsys.readouterr().out
 
@@ -212,11 +212,11 @@ def test_dry_run_makes_no_writes_or_calls(monkeypatch, capsys):
     def _explode(*_a, **_k):  # pragma: no cover - must never be called
         raise AssertionError("dry-run must not orchestrate universe/M4")
 
-    monkeypatch.setattr(run_m4_canonical, "_run_universe", _explode)
-    monkeypatch.setattr(run_m4_canonical, "_run_m4", _explode)
-    monkeypatch.setattr(run_m4_canonical, "_report_session", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", _explode)
 
-    rc = run_m4_canonical.main(["--dry-run", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
+    rc = run_nightly_canonical.main(["--dry-run", "--run-timestamp", "2026-05-26T08:00:00+00:00"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "no database writes and no provider API calls" in out
@@ -229,12 +229,12 @@ def test_default_saturday_main_exits_zero_before_work(monkeypatch, capsys):
     def _explode(*_a, **_k):  # pragma: no cover - must never be called
         raise AssertionError("non-trading-day no-op must exit before DB/API work")
 
-    monkeypatch.setattr(run_m4_canonical, "verify_alembic_head", _explode)
-    monkeypatch.setattr(run_m4_canonical, "_run_universe", _explode)
-    monkeypatch.setattr(run_m4_canonical, "_run_m4", _explode)
-    monkeypatch.setattr(run_m4_canonical, "_report_session", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "verify_alembic_head", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", _explode)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", _explode)
 
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--live",
         "--confirm-canonical-write",
         "--run-timestamp", "2026-05-30T12:00:00-04:00",
@@ -248,7 +248,7 @@ def test_explicit_saturday_main_exits_one(monkeypatch, capsys):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
     monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
 
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--dry-run",
         "--run-timestamp", "2026-05-30T12:00:00-04:00",
         "--decision-date", "2026-05-30",
@@ -710,7 +710,7 @@ def test_structured_secret_leaks_fail_health_without_printing_values(db_session,
     _add_signal(db_session, "signal-secret", "feature-secret", "SEC")
 
     report = _build_report(db_session)
-    run_m4_canonical._print_report(report)
+    run_nightly_canonical._print_report(report)
     rendered = json.dumps(report, sort_keys=True)
     out = capsys.readouterr().out
 
@@ -728,7 +728,7 @@ def test_exact_env_secret_value_fails_health_without_printing_value(db_session, 
     _add_signal(db_session, "signal-env-secret", "feature-env-secret", "ENV")
 
     report = _build_report(db_session)
-    run_m4_canonical._print_report(report)
+    run_nightly_canonical._print_report(report)
     rendered = json.dumps(report, sort_keys=True)
     out = capsys.readouterr().out
 
@@ -1623,7 +1623,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
 
     def fake_universe(**kwargs):
         calls.append(("universe", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="universe-run",
             run_status="finished",
@@ -1632,7 +1632,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
 
     def fake_m4(**kwargs):
         calls.append(("m4", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="m4-rerun" if kwargs["rerun"] else "m4-primary",
             run_status="finished",
@@ -1648,7 +1648,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
 
     def fake_m1(**kwargs):
         calls.append(("m1", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="m1-run",
             run_status="finished",
@@ -1692,15 +1692,15 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
             "health_verdict": {"failing_checks": []},
         }
 
-    monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
-    monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
-    monkeypatch.setattr(run_m4_canonical, "_run_m1", fake_m1)
-    monkeypatch.setattr(run_m4_canonical, "_report_session", fake_report_session)
-    monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fake_build_report)
-    monkeypatch.setattr(run_m4_canonical, "_app_commit_sha", lambda: "deadbeef")
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
+    monkeypatch.setattr(run_nightly_canonical, "_app_commit_sha", lambda: "deadbeef")
 
     output = tmp_path / "report.json"
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--scratch",
         "--schema", "scratch_schema",
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
@@ -1728,7 +1728,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     def fake_universe(**kwargs):
         calls.append(("universe", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="universe-run",
             run_status="finished",
@@ -1737,7 +1737,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     def fake_m4(**kwargs):
         calls.append(("m4", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="m4-primary",
             run_status="finished",
@@ -1746,7 +1746,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     def fake_m1(**kwargs):
         calls.append(("m1", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="m1-run",
             run_status="finished",
@@ -1755,7 +1755,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     def fake_forward_context(**kwargs):
         calls.append(("forward_context", kwargs))
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="forward-context-run",
             run_status="finished",
@@ -1795,14 +1795,14 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
             "health_verdict": {"failing_checks": []},
         }
 
-    monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
-    monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
-    monkeypatch.setattr(run_m4_canonical, "_run_m1", fake_m1)
-    monkeypatch.setattr(run_m4_canonical, "_run_forward_context", fake_forward_context)
-    monkeypatch.setattr(run_m4_canonical, "_report_session", fake_report_session)
-    monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fake_build_report)
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_forward_context", fake_forward_context)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
 
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--scratch",
         "--schema", "scratch_schema",
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
@@ -1828,7 +1828,7 @@ def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):
     monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
 
     def fake_universe(**kwargs):
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id="universe-run",
             run_status="finished",
@@ -1836,7 +1836,7 @@ def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):
         )
 
     def fake_m4(**kwargs):
-        return run_m4_canonical.RunInvocation(
+        return run_nightly_canonical.RunInvocation(
             exit_code=0,
             run_id=None,
             run_status="failed",
@@ -1846,11 +1846,11 @@ def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):
     def fail_report(*_args, **_kwargs):  # pragma: no cover - must not be called
         raise AssertionError("health report must not build after invalid child run")
 
-    monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
-    monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
-    monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fail_report)
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fail_report)
 
-    rc = run_m4_canonical.main([
+    rc = run_nightly_canonical.main([
         "--scratch",
         "--schema", "scratch_schema",
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
@@ -1880,13 +1880,13 @@ def test_run_match_prefers_metric_decision_date_over_conflicting_params(db_sessi
     ))
     db_session.flush()
 
-    matched_metric_date = run_m4_canonical._latest_job_run_for_decision(
+    matched_metric_date = run_nightly_canonical._latest_job_run_for_decision(
         db_session,
         job_name="m4_daily_feature_assembly",
         decision_date="2026-05-26",
         success_only=True,
     )
-    matched_param_date = run_m4_canonical._latest_job_run_for_decision(
+    matched_param_date = run_nightly_canonical._latest_job_run_for_decision(
         db_session,
         job_name="m4_daily_feature_assembly",
         decision_date="2026-05-27",
