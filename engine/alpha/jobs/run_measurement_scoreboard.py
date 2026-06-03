@@ -20,7 +20,9 @@ from alpha.jobs.measurement_scoreboard import (
     DEFAULT_MFE_TAIL_THRESHOLD,
     ROLLUP_STATUS_BUCKETS,
     ScoreboardDirectionError,
+    ScoreboardPatternIntegrityError,
     ScoreboardPartitionError,
+    ScoreboardPoolingError,
     ScoreboardResult,
     build_measurement_scoreboard,
 )
@@ -58,11 +60,17 @@ def _run_live(args: argparse.Namespace) -> int:
             pattern_id=args.pattern_id,
             mfe_tail_threshold=args.mfe_tail_threshold,
         )
-    except (ScoreboardPartitionError, ScoreboardDirectionError, ValueError) as exc:
+    except (
+        ScoreboardPartitionError,
+        ScoreboardDirectionError,
+        ScoreboardPatternIntegrityError,
+        ScoreboardPoolingError,
+        ValueError,
+    ) as exc:
         if args.json:
             print(json.dumps(_error_payload(exc), sort_keys=True))
             return 1
-        print(f"ERROR: {exc}")
+        _print_error(exc)
         return 1
     finally:
         if session is not None:
@@ -138,6 +146,17 @@ def _tail_threshold_warning(value: float) -> Optional[str]:
     return None
 
 
+def _print_error(exc: Exception) -> None:
+    print(f"ERROR: {exc}")
+    if isinstance(exc, ScoreboardPoolingError):
+        print(f"Pattern counts: {json.dumps(exc.pattern_counts, sort_keys=True)}")
+        print(f"Pattern horizons: {json.dumps(exc.pattern_horizons, sort_keys=True)}")
+    if isinstance(exc, ScoreboardPatternIntegrityError):
+        print("Pattern mismatches:")
+        for mismatch in exc.mismatches[:20]:
+            print(f"  {json.dumps(mismatch, sort_keys=True)}")
+
+
 def _error_payload(exc: Exception) -> Dict[str, object]:
     payload: Dict[str, object] = {
         "status": "error",
@@ -150,6 +169,11 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
     if isinstance(exc, ScoreboardDirectionError):
         payload["unsupported_direction_counts"] = exc.unsupported_direction_counts
         payload["unsupported_direction_details"] = exc.unsupported_direction_details
+    if isinstance(exc, ScoreboardPatternIntegrityError):
+        payload["mismatches"] = exc.mismatches
+    if isinstance(exc, ScoreboardPoolingError):
+        payload["pattern_counts"] = exc.pattern_counts
+        payload["pattern_horizons"] = exc.pattern_horizons
     return payload
 
 

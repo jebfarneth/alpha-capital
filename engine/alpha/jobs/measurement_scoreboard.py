@@ -21,10 +21,10 @@ from datetime import datetime, timezone
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from alpha.db.models import ForwardReturnObservation
+from alpha.db.models import ForwardReturnObservation, SignalRegistry
 from alpha.jobs.forward_return import (
     REQUIRED_FORWARD_RETURN_STATUSES,
     RETRYABLE_FORWARD_RETURN_STATUSES,
@@ -125,10 +125,39 @@ class ScoreboardDirectionError(RuntimeError):
         self.unsupported_direction_details = unsupported_direction_details or {}
 
 
+class ScoreboardPoolingError(RuntimeError):
+    """Raised when headline stats would pool multiple pattern distributions."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pattern_counts: Optional[Dict[str, int]] = None,
+        pattern_horizons: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(message)
+        self.pattern_counts = pattern_counts or {}
+        self.pattern_horizons = pattern_horizons or {}
+
+
+class ScoreboardPatternIntegrityError(RuntimeError):
+    """Raised when an observation's pattern disagrees with its parent signal."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        mismatches: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.mismatches = mismatches or []
+
+
 @dataclass(frozen=True)
 class AnomalySummary:
     computed_missing_forward_return: int
     non_computed_with_forward_return: int
+    computed_missing_forward_return_by_pattern: Dict[str, int]
     computed_missing_forward_return_ids: tuple[str, ...]
     non_computed_with_forward_return_ids: tuple[str, ...]
 
@@ -240,6 +269,10 @@ def build_measurement_scoreboard(
 
     if not math.isfinite(mfe_tail_threshold) or mfe_tail_threshold < 0:
         raise ValueError("mfe_tail_threshold must be a finite, non-negative fraction")
+    if pattern_id is not None and (
+        not isinstance(pattern_id, str) or pattern_id.strip() == ""
+    ):
+        raise ValueError("pattern_id must be a non-empty string")
 
     validate_status_partition()
     raw_rows = _load_observation_rows(session, pattern_id=pattern_id)
@@ -281,6 +314,7 @@ def build_measurement_scoreboard(
     rollup_counts = {bucket: 0 for bucket in ROLLUP_STATUS_BUCKETS}
     computed_rows: List[Mapping[str, Any]] = []
     computed_missing_forward_return_ids: List[str] = []
+    computed_missing_forward_return_by_pattern: Dict[str, int] = {}
     non_computed_with_forward_return_ids: List[str] = []
 
     for row in rows:
@@ -289,6 +323,10 @@ def build_measurement_scoreboard(
         forward_return = row["forward_return"]
         if status == STATUS_COMPUTED and not _is_finite_number(forward_return):
             computed_missing_forward_return_ids.append(row["forward_return_observation_id"])
+            pattern = str(row["signal_pattern_id"])
+            computed_missing_forward_return_by_pattern[pattern] = (
+                computed_missing_forward_return_by_pattern.get(pattern, 0) + 1
+            )
             continue
         if status != STATUS_COMPUTED and forward_return is not None:
             non_computed_with_forward_return_ids.append(row["forward_return_observation_id"])
@@ -296,9 +334,13 @@ def build_measurement_scoreboard(
         if status == STATUS_COMPUTED:
             computed_rows.append(row)
 
+    _assert_pattern_integrity(computed_rows)
+    _assert_single_graded_pattern(computed_rows)
+
     anomalies = AnomalySummary(
         computed_missing_forward_return=len(computed_missing_forward_return_ids),
         non_computed_with_forward_return=len(non_computed_with_forward_return_ids),
+        computed_missing_forward_return_by_pattern=computed_missing_forward_return_by_pattern,
         computed_missing_forward_return_ids=tuple(computed_missing_forward_return_ids[:20]),
         non_computed_with_forward_return_ids=tuple(non_computed_with_forward_return_ids[:20]),
     )
@@ -362,6 +404,51 @@ def _assert_supported_direction(
         )
 
 
+def _assert_pattern_integrity(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Fail if a graded observation is attributed to a different parent pattern."""
+
+    mismatches: List[Dict[str, Any]] = []
+    for row in rows:
+        observation_pattern = row["pattern_id"]
+        signal_pattern = row["signal_pattern_id"]
+        if observation_pattern == signal_pattern:
+            continue
+        mismatches.append({
+            "signal_id": row["signal_id"],
+            "observation_id": row["forward_return_observation_id"],
+            "observation_pattern_id": observation_pattern,
+            "signal_pattern_id": signal_pattern,
+        })
+
+    if mismatches:
+        raise ScoreboardPatternIntegrityError(
+            "forward-return observation pattern_id does not match parent "
+            "signal_registry pattern_id",
+            mismatches=mismatches,
+        )
+
+
+def _assert_single_graded_pattern(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Fail loud before reducing multiple pattern distributions into one stat block."""
+
+    pattern_counts: Dict[str, int] = {}
+    pattern_horizons: Dict[str, str] = {}
+    for row in rows:
+        pattern = str(row["signal_pattern_id"])
+        pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+        horizon = row.get("signal_horizon")
+        if horizon is not None:
+            pattern_horizons.setdefault(pattern, str(horizon))
+
+    if len(pattern_counts) > 1:
+        raise ScoreboardPoolingError(
+            "scoreboard headline stats cannot pool multiple graded patterns; "
+            "re-run with --pattern-id <pattern_id> to isolate one pattern",
+            pattern_counts=pattern_counts,
+            pattern_horizons=pattern_horizons,
+        )
+
+
 def _load_observation_rows(
     session: Session,
     *,
@@ -385,17 +472,27 @@ def _load_observation_rows(
         ForwardReturnObservation.hit_stop_intraday,
         ForwardReturnObservation.same_day_barrier_ambiguity,
         ForwardReturnObservation.pattern_id,
+        SignalRegistry.pattern_id.label("signal_pattern_id"),
         ForwardReturnObservation.ticker,
         ForwardReturnObservation.direction,
+        ForwardReturnObservation.signal_horizon,
         ForwardReturnObservation.signal_timestamp,
         ForwardReturnObservation.entry_session_date,
         ForwardReturnObservation.exit_session_date,
         ForwardReturnObservation.created_at,
         ForwardReturnObservation.updated_at,
     )
-    statement = select(*columns)
-    if pattern_id:
-        statement = statement.where(ForwardReturnObservation.pattern_id == pattern_id)
+    statement = select(*columns).join(
+        SignalRegistry,
+        SignalRegistry.signal_id == ForwardReturnObservation.signal_id,
+    )
+    if pattern_id is not None:
+        statement = statement.where(
+            or_(
+                ForwardReturnObservation.pattern_id == pattern_id,
+                SignalRegistry.pattern_id == pattern_id,
+            )
+        )
     with session.no_autoflush:
         rows = session.execute(statement).all()
     return [dict(row._mapping) for row in rows]

@@ -46,7 +46,9 @@ from alpha.jobs.measurement_scoreboard import (
     BUCKET_TERMINAL_UNAVAILABLE,
     ROLLUP_STATUS_BUCKETS,
     ScoreboardDirectionError,
+    ScoreboardPatternIntegrityError,
     ScoreboardPartitionError,
+    ScoreboardPoolingError,
     _canonical_observation_rows,
     build_measurement_scoreboard,
     validate_status_partition,
@@ -62,6 +64,7 @@ def _add_signal(
     pattern_id: str = "M4",
     ticker: str = "ACME",
     signal_timestamp: datetime = SIGNAL_TS,
+    signal_horizon: str = "15d",
 ) -> SignalRegistry:
     feature = FeatureSnapshot(
         feature_snapshot_id=f"feature-{signal_id}",
@@ -82,7 +85,7 @@ def _add_signal(
         signal_timestamp=signal_timestamp,
         raw_signal_strength=1.0,
         raw_expected_edge=0.1,
-        signal_horizon="15d",
+        signal_horizon=signal_horizon,
         thesis_category=pattern_id,
         route_class="base",
         fidelity_tier="test",
@@ -109,7 +112,7 @@ def _add_observation(
     *,
     status: str,
     forward_return: Optional[float] = None,
-    pattern_id: str = "M4",
+    pattern_id: Optional[str] = None,
     ticker: str = "ACME",
     reason: Optional[str] = None,
     mfe: Optional[float] = None,
@@ -124,24 +127,29 @@ def _add_observation(
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None,
     signal_timestamp: datetime = SIGNAL_TS,
+    signal_horizon: str = "15d",
     direction: Optional[str] = "long",
 ) -> ForwardReturnObservation:
+    observation_pattern_id = pattern_id
+    if observation_pattern_id is None:
+        observation_pattern_id = signal.pattern_id if signal is not None else "M4"
     if signal is None:
         signal = _add_signal(
             db_session,
             f"signal-{obs_id}",
-            pattern_id=pattern_id,
+            pattern_id=observation_pattern_id,
             ticker=ticker,
             signal_timestamp=signal_timestamp,
+            signal_horizon=signal_horizon,
         )
     obs = ForwardReturnObservation(
         forward_return_observation_id=obs_id,
         signal_id=signal.signal_id,
-        pattern_id=pattern_id,
+        pattern_id=observation_pattern_id,
         ticker=ticker,
         direction=direction,
         signal_timestamp=signal_timestamp,
-        signal_horizon="15d",
+        signal_horizon=signal_horizon,
         next_execution_session="2026-06-02",
         entry_session_date="2026-06-02",
         exit_session_date="2026-06-23",
@@ -433,6 +441,7 @@ def test_anomalies_are_surfaced_and_excluded_from_stats(db_session):
 
     assert result.anomalies.computed_missing_forward_return == 1
     assert result.anomalies.non_computed_with_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_by_pattern == {"M4": 1}
     assert result.anomalies.computed_missing_forward_return_ids == ("computed-null",)
     assert result.anomalies.non_computed_with_forward_return_ids == ("pending-with-return",)
     assert result.computed_stats.n == 1
@@ -461,6 +470,7 @@ def test_nonfinite_computed_return_uses_missing_return_anomaly(db_session):
     result = build_measurement_scoreboard(db_session)
 
     assert result.anomalies.computed_missing_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_by_pattern == {"M4": 1}
     assert result.anomalies.computed_missing_forward_return_ids == ("computed-inf",)
     assert result.computed_stats.n == 1
     assert result.computed_stats.expectancy == pytest.approx(0.20)
@@ -749,6 +759,226 @@ def test_pattern_filter_limits_rows_without_cross_tabs(db_session):
     assert result.computed_stats.expectancy == pytest.approx(0.10)
 
 
+@pytest.mark.parametrize("pattern_id", ["", "   "])
+def test_pattern_filter_rejects_empty_or_whitespace_pattern_id(db_session, pattern_id):
+    with pytest.raises(ValueError, match="pattern_id must be a non-empty string"):
+        build_measurement_scoreboard(db_session, pattern_id=pattern_id)
+
+
+def test_single_graded_pattern_all_patterns_passes(db_session):
+    _add_observation(
+        db_session,
+        "m4-a",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m4-b",
+        status=STATUS_COMPUTED,
+        forward_return=0.30,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.computed_stats.n == 2
+    assert result.computed_stats.expectancy == pytest.approx(0.20)
+
+
+def test_pattern_integrity_error_refuses_mislabeled_graded_observation(db_session):
+    signal = _add_signal(
+        db_session,
+        "mislabeled-parent",
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+    _add_observation(
+        db_session,
+        "mislabeled-observation",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+
+    with pytest.raises(ScoreboardPatternIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.mismatches == [{
+        "signal_id": "mislabeled-parent",
+        "observation_id": "mislabeled-observation",
+        "observation_pattern_id": "M4",
+        "signal_pattern_id": "M5",
+    }]
+
+
+def test_pattern_integrity_error_refuses_mislabeled_filtered_observation(db_session):
+    signal = _add_signal(
+        db_session,
+        "mislabeled-filtered-parent",
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+    _add_observation(
+        db_session,
+        "mislabeled-filtered-observation",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+
+    with pytest.raises(ScoreboardPatternIntegrityError):
+        build_measurement_scoreboard(db_session, pattern_id="M4")
+    with pytest.raises(ScoreboardPatternIntegrityError):
+        build_measurement_scoreboard(db_session, pattern_id="M5")
+
+
+def test_multiple_graded_patterns_raise_pooling_error(db_session):
+    _add_observation(
+        db_session,
+        "m4-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m5-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.40,
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+
+    with pytest.raises(ScoreboardPoolingError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert "--pattern-id" in str(exc_info.value)
+    assert exc_info.value.pattern_counts == {"M4": 1, "M5": 1}
+    assert exc_info.value.pattern_horizons == {"M4": "15d", "M5": "7d"}
+
+
+def test_pattern_filter_isolates_one_graded_pattern_after_pooling_guard(db_session):
+    _add_observation(
+        db_session,
+        "m4-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m5-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.40,
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+
+    result = build_measurement_scoreboard(db_session, pattern_id="M4")
+
+    assert result.pattern_id == "M4"
+    assert result.total_observations == 1
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.10)
+
+
+def test_pooling_guard_ignores_non_graded_patterns(db_session):
+    _add_observation(
+        db_session,
+        "m4-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m5-pending",
+        status=STATUS_PENDING,
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.total_observations == 2
+    assert result.rollup_counts[BUCKET_GRADED] == 1
+    assert result.rollup_counts[BUCKET_PENDING_LIKE] == 1
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.10)
+
+
+def test_pooling_guard_uses_finite_graded_sample_only(db_session):
+    _add_observation(
+        db_session,
+        "m4-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m5-nonfinite",
+        status=STATUS_COMPUTED,
+        forward_return=float("inf"),
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.rollup_counts[BUCKET_GRADED] == 2
+    assert result.anomalies.computed_missing_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_by_pattern == {"M5": 1}
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.10)
+    assert result.graded_rollup_reconciliation.reconciles is True
+
+
+def test_nonfinite_mislabeled_observation_is_attributed_by_parent_pattern(db_session):
+    signal = _add_signal(
+        db_session,
+        "mislabeled-nonfinite-parent",
+        pattern_id="M5",
+        signal_horizon="7d",
+    )
+    _add_observation(
+        db_session,
+        "m4-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "mislabeled-nonfinite-observation",
+        signal=signal,
+        status=STATUS_COMPUTED,
+        forward_return=float("inf"),
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+
+    result = build_measurement_scoreboard(db_session)
+
+    assert result.computed_stats.n == 1
+    assert result.computed_stats.expectancy == pytest.approx(0.10)
+    assert result.anomalies.computed_missing_forward_return == 1
+    assert result.anomalies.computed_missing_forward_return_by_pattern == {"M5": 1}
+
+
 def test_json_error_path_is_parseable_and_human_error_remains_plain_text(
     tmp_path,
     monkeypatch,
@@ -813,6 +1043,171 @@ def test_json_error_path_surfaces_direction_guard(tmp_path, monkeypatch, capsys)
     assert payload["status"] == "error"
     assert payload["error_type"] == "ScoreboardDirectionError"
     assert payload["unsupported_direction_counts"] == {"short": 1}
+
+
+def test_json_error_path_surfaces_pattern_pooling_guard(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "pooling.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_observation(
+            session,
+            "m4-computed",
+            status=STATUS_COMPUTED,
+            forward_return=0.10,
+            pattern_id="M4",
+            signal_horizon="15d",
+        )
+        _add_observation(
+            session,
+            "m5-computed",
+            status=STATUS_COMPUTED,
+            forward_return=0.40,
+            pattern_id="M5",
+            signal_horizon="7d",
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ScoreboardPoolingError"
+    assert payload["pattern_counts"] == {"M4": 1, "M5": 1}
+    assert payload["pattern_horizons"] == {"M4": "15d", "M5": "7d"}
+
+
+def test_human_error_path_surfaces_pattern_pooling_details(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "pooling-human.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_observation(
+            session,
+            "m4-computed",
+            status=STATUS_COMPUTED,
+            forward_return=0.10,
+            pattern_id="M4",
+            signal_horizon="15d",
+        )
+        _add_observation(
+            session,
+            "m5-computed",
+            status=STATUS_COMPUTED,
+            forward_return=0.40,
+            pattern_id="M5",
+            signal_horizon="7d",
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "ERROR: scoreboard headline stats cannot pool" in captured.out
+    assert 'Pattern counts: {"M4": 1, "M5": 1}' in captured.out
+    assert 'Pattern horizons: {"M4": "15d", "M5": "7d"}' in captured.out
+
+
+def test_json_and_human_error_paths_surface_pattern_integrity_guard(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "integrity.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        signal = _add_signal(
+            session,
+            "mislabeled-parent",
+            pattern_id="M5",
+            signal_horizon="7d",
+        )
+        _add_observation(
+            session,
+            "mislabeled-observation",
+            signal=signal,
+            status=STATUS_COMPUTED,
+            forward_return=0.20,
+            pattern_id="M4",
+            signal_horizon="15d",
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    expected = [{
+        "signal_id": "mislabeled-parent",
+        "observation_id": "mislabeled-observation",
+        "observation_pattern_id": "M4",
+        "signal_pattern_id": "M5",
+    }]
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url, "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["error_type"] == "ScoreboardPatternIntegrityError"
+    assert payload["mismatches"] == expected
+
+    rc = run_measurement_scoreboard.main(["--live", "--database-url", url])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Pattern mismatches:" in captured.out
+    assert '"observation_pattern_id": "M4"' in captured.out
+    assert '"signal_pattern_id": "M5"' in captured.out
+
+
+def test_cli_rejects_empty_pattern_id(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    db_url = _seed_file_database(
+        tmp_path,
+        "empty-pattern.db",
+        [("computed", STATUS_COMPUTED, 0.10)],
+    )
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        db_url,
+        "--pattern-id",
+        "",
+        "--json",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["error_type"] == "ValueError"
+    assert payload["message"] == "pattern_id must be a non-empty string"
 
 
 @pytest.mark.parametrize(
@@ -969,8 +1364,10 @@ def _scoreboard_row(
         "hit_stop_intraday": None,
         "same_day_barrier_ambiguity": None,
         "pattern_id": "M4",
+        "signal_pattern_id": "M4",
         "ticker": "ACME",
         "direction": "long",
+        "signal_horizon": "15d",
         "signal_timestamp": SIGNAL_TS,
         "entry_session_date": "2026-06-02",
         "exit_session_date": "2026-06-23",
