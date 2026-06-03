@@ -123,7 +123,7 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
         return
     print("Graded stats:")
     print(f"  N:                     {stats.n}")
-    print(f"  Total firings:         {stats.total_firings}")
+    print(f"  Graded firings:        {stats.total_firings}")
     print(f"  Distinct tickers:      {stats.distinct_tickers}")
     print(f"  Overlap firings:       {stats.overlapping_window_firings}")
     print(f"  Max same-ticker conc:  {stats.max_concurrent_same_ticker}")

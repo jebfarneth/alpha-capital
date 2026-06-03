@@ -764,13 +764,11 @@ def _window_overlap_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 
     distinct_tickers = len({window["ticker"] for window in windows})
     same_ticker_concurrency: Dict[Tuple[str, date], int] = {}
-    session_concurrency: Dict[date, int] = {}
     for window in windows:
         ticker = window["ticker"]
         for session_date in window["sessions"]:
             same_key = (ticker, session_date)
             same_ticker_concurrency[same_key] = same_ticker_concurrency.get(same_key, 0) + 1
-            session_concurrency[session_date] = session_concurrency.get(session_date, 0) + 1
 
     overlapping_window_firings = sum(
         1
@@ -781,7 +779,10 @@ def _window_overlap_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         )
     )
     effective_sample_size = sum(
-        mean(1 / session_concurrency[session_date] for session_date in window["sessions"])
+        mean(
+            1 / same_ticker_concurrency[(window["ticker"], session_date)]
+            for session_date in window["sessions"]
+        )
         for window in windows
     )
 

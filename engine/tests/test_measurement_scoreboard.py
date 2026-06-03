@@ -848,6 +848,29 @@ def test_non_overlapping_windows_keep_effective_n_equal_to_raw_n(db_session):
     assert stats.effective_sample_size == pytest.approx(2.0)
 
 
+def test_distinct_tickers_identical_windows_keep_effective_n_equal_to_raw_n(db_session):
+    for index, ticker in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"], start=1):
+        _add_observation(
+            db_session,
+            f"distinct-identical-{ticker}",
+            status=STATUS_COMPUTED,
+            forward_return=0.10 * index,
+            ticker=ticker,
+            mfe=0.30,
+            mae=-0.10,
+            entry_session_date="2026-06-02",
+            exit_session_date="2026-06-23",
+        )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 5
+    assert stats.distinct_tickers == 5
+    assert stats.overlapping_window_firings == 0
+    assert stats.max_concurrent_same_ticker == 1
+    assert stats.effective_sample_size == pytest.approx(5.0)
+
+
 def test_same_ticker_consecutive_windows_surface_overlap_and_reduced_effective_n(db_session):
     _add_observation(
         db_session,
@@ -1532,7 +1555,7 @@ def test_success_output_surfaces_excursion_denominators_and_anomaly(
 
     assert rc == 0
     assert "  graded_missing_excursion: 1\n" in captured.out
-    assert "  Total firings:         2\n" in captured.out
+    assert "  Graded firings:        2\n" in captured.out
     assert "  Distinct tickers:      1\n" in captured.out
     assert "  Overlap firings:       2\n" in captured.out
     assert "  Max same-ticker conc:  2\n" in captured.out
