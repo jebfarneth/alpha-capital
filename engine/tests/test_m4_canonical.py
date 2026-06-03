@@ -1646,6 +1646,19 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
             },
         )
 
+    def fake_m1(**kwargs):
+        calls.append(("m1", kwargs))
+        return run_m4_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={
+                "market_factor_symbol": "SPY",
+                "assembly": {"assembled_count": 2},
+                "orchestration": {"total_signals_persisted": 1},
+            },
+        )
+
     class FakeSession:
         def close(self):
             calls.append(("session_close", {}))
@@ -1667,6 +1680,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
             },
             "universe": {},
             "m4_assembly": {},
+            "m1_assembly": {},
             "m4_signals": {},
             "data_quality": {},
             "forward_return_guard": {},
@@ -1680,6 +1694,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
 
     monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
     monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_m4_canonical, "_run_m1", fake_m1)
     monkeypatch.setattr(run_m4_canonical, "_report_session", fake_report_session)
     monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fake_build_report)
     monkeypatch.setattr(run_m4_canonical, "_app_commit_sha", lambda: "deadbeef")
@@ -1698,6 +1713,8 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
     assert build_kwargs["universe_run_id"] == "universe-run"
     assert build_kwargs["primary_m4_run_id"] == "m4-primary"
     assert build_kwargs["rerun_m4_run_id"] == "m4-rerun"
+    assert build_kwargs["m1_run_id"] == "m1-run"
+    assert build_kwargs["m1_metrics"]["market_factor_symbol"] == "SPY"
     assert build_kwargs["m4_metrics"]["signal_context"]["context_enriched_count"] == 1
     assert build_kwargs["rerun_m4_metrics"]["signal_context"]["context_reused_from_persistence_count"] == 1
     assert output.exists()
@@ -1725,6 +1742,15 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
             run_id="m4-primary",
             run_status="finished",
             metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_m1(**kwargs):
+        calls.append(("m1", kwargs))
+        return run_m4_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={"market_factor_symbol": "SPY"},
         )
 
     def fake_forward_context(**kwargs):
@@ -1756,6 +1782,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
             "run_metadata": {},
             "universe": {},
             "m4_assembly": {},
+            "m1_assembly": {},
             "m4_signals": {},
             "data_quality": {},
             "forward_return_guard": {},
@@ -1770,6 +1797,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     monkeypatch.setattr(run_m4_canonical, "_run_universe", fake_universe)
     monkeypatch.setattr(run_m4_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_m4_canonical, "_run_m1", fake_m1)
     monkeypatch.setattr(run_m4_canonical, "_run_forward_context", fake_forward_context)
     monkeypatch.setattr(run_m4_canonical, "_report_session", fake_report_session)
     monkeypatch.setattr(run_m4_canonical, "build_m4_health_report", fake_build_report)
@@ -1785,9 +1813,12 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
     assert [name for name, _payload in calls] == [
         "universe",
         "m4",
+        "m1",
         "forward_context",
         "build_report",
     ]
+    m1_kwargs = [payload for name, payload in calls if name == "m1"][0]
+    assert m1_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
     forward_kwargs = [payload for name, payload in calls if name == "forward_context"][0]
     assert forward_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
 

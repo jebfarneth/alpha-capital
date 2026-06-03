@@ -471,6 +471,97 @@ class SecurityIdentitySnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# m1_earnings_events
+# ---------------------------------------------------------------------------
+class M1EarningsEvent(Base):
+    """PIT M1 earnings event and Foster SUE computation evidence."""
+
+    __tablename__ = "m1_earnings_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_id",
+            "ticker",
+            "earnings_event_id",
+            name="ux_m1_earnings_events_scan_ticker_event",
+        ),
+        Index("ix_m1_earnings_events_scan_status", "scan_id", "status"),
+        Index("ix_m1_earnings_events_ticker_announcement", "ticker", "announcement_date"),
+    )
+
+    m1_earnings_event_id = Column(String, primary_key=True, default=_uuid)
+    scan_id = Column(String, ForeignKey("universe_scans.scan_id"), nullable=True)
+    universe_snapshot_id = Column(
+        String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    earnings_event_id = Column(String, nullable=False)
+    announcement_date = Column(String, nullable=True)
+    effective_announcement_session = Column(String, nullable=True)
+    announcement_time = Column(String, nullable=True)
+    fiscal_period_end = Column(String, nullable=True)
+    fiscal_year = Column(Integer, nullable=True)
+    fiscal_quarter = Column(Integer, nullable=True)
+    actual_eps = Column(Float, nullable=True)
+    estimated_eps = Column(Float, nullable=True)
+    expected_eps = Column(Float, nullable=True)
+    sigma_delta_eps = Column(Float, nullable=True)
+    sue_foster = Column(Float, nullable=True)
+    rho1 = Column(Float, nullable=True)
+    sue_sign_current = Column(Integer, nullable=True)
+    sue_sign_prior = Column(Integer, nullable=True)
+    sue_streak_length = Column(Integer, nullable=True)
+    foster_history_quarters_used = Column(Integer, nullable=False, default=0)
+    split_adjustment_continuity_check = Column(String, nullable=True)
+    restatement_exposure = Column(Boolean, nullable=False, default=False)
+    status = Column(String, nullable=False)
+    diagnostic_json = Column(Text, nullable=True)
+    sue_series_json = Column(Text, nullable=True)
+    data_lineage_ids = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# m1_friction_snapshots
+# ---------------------------------------------------------------------------
+class M1FrictionSnapshot(Base):
+    """M1-local D1 and sigma_epsilon values ranked over the operating universe."""
+
+    __tablename__ = "m1_friction_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_id",
+            "ticker",
+            name="ux_m1_friction_snapshots_scan_ticker",
+        ),
+        Index("ix_m1_friction_snapshots_scan_status", "scan_id", "status"),
+        Index("ix_m1_friction_snapshots_d1_decile", "scan_id", "d1_decile"),
+    )
+
+    m1_friction_snapshot_id = Column(String, primary_key=True, default=_uuid)
+    scan_id = Column(String, ForeignKey("universe_scans.scan_id"), nullable=True)
+    universe_snapshot_id = Column(
+        String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    market_factor_symbol = Column(String, nullable=False, default="SPY")
+    d1 = Column(Float, nullable=True)
+    d1_decile = Column(Integer, nullable=True)
+    sigma_epsilon = Column(Float, nullable=True)
+    sigma_epsilon_percentile = Column(Float, nullable=True)
+    weekly_return_count = Column(Integer, nullable=False, default=0)
+    status = Column(String, nullable=False)
+    diagnostic_json = Column(Text, nullable=True)
+    data_lineage_ids = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # data_lineage
 # ---------------------------------------------------------------------------
 class DataLineage(Base):

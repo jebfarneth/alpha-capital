@@ -578,6 +578,8 @@ class TestSchemaCompleteness:
             "forward_return_path_rows",
             "forward_context_path_rows",
             "forward_return_observation_events",
+            "m1_earnings_events",
+            "m1_friction_snapshots",
             "trade_candidates",
             "optimizer_runs",
             "order_events",

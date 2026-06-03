@@ -1189,6 +1189,84 @@ class TestFmpAdapter:
         assert resp.ok
         assert resp.data == []
 
+    def test_get_earnings_calendar_ok(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "FIRE",
+                "date": "2026-05-20",
+                "epsActual": 1.23,
+                "epsEstimated": 0.98,
+                "time": "bmo",
+                "fiscalDateEnding": "2026-03-31",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+        asof = datetime(2026, 5, 20, 21, 0, tzinfo=timezone.utc)
+
+        resp = adapter.get_earnings_calendar(
+            from_date=date(2026, 5, 1),
+            to_date=date(2026, 5, 20),
+            asof=asof,
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        event = resp.data[0]
+        assert event.symbol == "FIRE"
+        assert event.actual_eps == 1.23
+        assert event.estimated_eps == 0.98
+        assert event.announcement_time == "bmo"
+        assert event.fiscal_year == 2026
+        assert event.fiscal_quarter == 1
+        assert resp.lineage.endpoint == "/stable/earnings-calendar"
+        assert resp.lineage.asof_timestamp == asof
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/earnings-calendar",
+            params={"from": "2026-05-01", "to": "2026-05-20"},
+            timeout=30,
+        )
+
+    def test_get_earnings_history_ok(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "FIRE",
+                "date": "2026-03-31",
+                "eps": 1.23,
+                "fiscalYear": "2026",
+                "period": "Q1",
+            },
+            {
+                "symbol": "FIRE",
+                "date": "2025-12-31",
+                "eps": 0.88,
+                "fiscalYear": "2025",
+                "period": "Q4",
+            },
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings_history("FIRE", limit=20)
+
+        assert resp.ok
+        assert len(resp.data) == 2
+        assert resp.data[0].eps == 1.23
+        assert resp.data[0].fiscal_date_ending == "2026-03-31"
+        assert resp.data[0].fiscal_year == 2026
+        assert resp.data[0].fiscal_quarter == 1
+        assert resp.data[1].eps == 0.88
+        assert resp.lineage.endpoint == "/stable/income-statement"
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/income-statement",
+            params={"symbol": "FIRE", "period": "quarter", "limit": 20},
+            timeout=30,
+        )
+
     def test_get_stock_screener_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}

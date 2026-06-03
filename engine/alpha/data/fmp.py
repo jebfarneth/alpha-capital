@@ -35,6 +35,8 @@ HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT = (
     "/stable/historical-price-eod/dividend-adjusted"
 )
 DELISTED_COMPANIES_ENDPOINT = "/stable/delisted-companies"
+EARNINGS_CALENDAR_ENDPOINT = "/stable/earnings-calendar"
+EARNINGS_HISTORY_ENDPOINT = "/stable/income-statement"
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -144,6 +146,34 @@ class FmpDelistedCompany:
     exchange: Optional[str] = None
     ipo_date: Optional[str] = None
     delisted_date: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class FmpEarningsCalendarEvent:
+    """Normalized earnings-calendar row for PIT announcement detection."""
+
+    symbol: str
+    date: str
+    actual_eps: Optional[float] = None
+    estimated_eps: Optional[float] = None
+    announcement_time: Optional[str] = None
+    fiscal_date_ending: Optional[str] = None
+    fiscal_year: Optional[int] = None
+    fiscal_quarter: Optional[int] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class FmpEpsRecord:
+    """Normalized quarterly EPS-history row."""
+
+    symbol: str
+    date: Optional[str] = None
+    eps: Optional[float] = None
+    fiscal_date_ending: Optional[str] = None
+    fiscal_year: Optional[int] = None
+    fiscal_quarter: Optional[int] = None
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -548,6 +578,72 @@ class FmpAdapter:
         ]
         return AdapterResponse(data=delisted, lineage=resp.lineage)
 
+    # --- Earnings ---
+
+    def get_earnings_calendar(
+        self,
+        *,
+        from_date: date,
+        to_date: date,
+        asof: Optional[datetime] = None,
+        symbol: Optional[str] = None,
+    ) -> AdapterResponse[List[FmpEarningsCalendarEvent]]:
+        """Fetch earnings calendar rows in a date range."""
+
+        params: Dict[str, Any] = {
+            "from": from_date.isoformat(),
+            "to": to_date.isoformat(),
+        }
+        if symbol:
+            params["symbol"] = symbol
+        resp = self._request(EARNINGS_CALENDAR_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        rows = resp.data if isinstance(resp.data, list) else []
+        events = [
+            _parse_earnings_calendar_event(row)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return AdapterResponse(data=events, lineage=resp.lineage)
+
+    def get_earnings_history(
+        self,
+        ticker: str,
+        *,
+        limit: int = 40,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[FmpEpsRecord]]:
+        """Fetch quarterly EPS history for one symbol."""
+
+        params: Dict[str, Any] = {
+            "symbol": ticker,
+            "period": "quarter",
+            "limit": limit,
+        }
+        resp = self._request(EARNINGS_HISTORY_ENDPOINT, params=params, asof=asof)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        rows = resp.data
+        if isinstance(rows, dict):
+            rows = rows.get("historical") or rows.get("data") or []
+        if not isinstance(rows, list):
+            rows = []
+        records = [
+            _parse_eps_record(row, ticker=ticker)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        if not records:
+            return self._no_data_response(
+                endpoint=EARNINGS_HISTORY_ENDPOINT,
+                lineage=resp.lineage,
+                message=f"No EPS history found for {ticker}",
+            )  # type: ignore[return-value]
+        return AdapterResponse(data=records, lineage=resp.lineage)
+
     # --- SEC filings ---
 
     def get_sec_filings(
@@ -604,6 +700,144 @@ def _parse_fmp_bar(
         split_adjusted_close=split_adjusted_close,
         adj_close=adj_close,
     )
+
+
+def _parse_earnings_calendar_event(row: Dict[str, Any]) -> FmpEarningsCalendarEvent:
+    symbol = str(_first_present(row, "symbol", "ticker", default="") or "")
+    fiscal_year, fiscal_quarter = _parse_fiscal_year_quarter(row)
+    return FmpEarningsCalendarEvent(
+        symbol=symbol,
+        date=str(_first_present(row, "date", "announcementDate", default="") or ""),
+        actual_eps=_float_or_none(_first_present(
+            row,
+            "epsActual",
+            "actualEps",
+            "actualEPS",
+            "reportedEPS",
+            "reportedEps",
+            "eps",
+        )),
+        estimated_eps=_float_or_none(_first_present(
+            row,
+            "epsEstimated",
+            "estimatedEps",
+            "estimatedEPS",
+            "epsEstimate",
+            "estimate",
+        )),
+        announcement_time=_string_or_none(_first_present(
+            row,
+            "time",
+            "announcementTime",
+            "timeOfDay",
+            "when",
+        )),
+        fiscal_date_ending=_string_or_none(_first_present(
+            row,
+            "fiscalDateEnding",
+            "fiscalDate",
+            "periodEnding",
+            "periodEndDate",
+        )),
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        raw=dict(row),
+    )
+
+
+def _parse_eps_record(row: Dict[str, Any], *, ticker: str) -> FmpEpsRecord:
+    fiscal_year, fiscal_quarter = _parse_fiscal_year_quarter(row)
+    return FmpEpsRecord(
+        symbol=str(_first_present(row, "symbol", "ticker", default=ticker) or ticker),
+        date=_string_or_none(_first_present(row, "date", "reportedDate", "filingDate")),
+        eps=_float_or_none(_first_present(
+            row,
+            "eps",
+            "reportedEPS",
+            "reportedEps",
+            "epsActual",
+            "actualEps",
+            "netIncomePerShare",
+        )),
+        fiscal_date_ending=_string_or_none(_first_present(
+            row,
+            "fiscalDateEnding",
+            "fiscalDate",
+            "periodEnding",
+            "periodEndDate",
+            "date",
+        )),
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        raw=dict(row),
+    )
+
+
+def _parse_fiscal_year_quarter(row: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    fiscal_year = _int_or_none(_first_present(row, "fiscalYear", "year"))
+    fiscal_quarter = _quarter_or_none(_first_present(
+        row,
+        "fiscalQuarter",
+        "quarter",
+        "period",
+    ))
+    fiscal_date = _string_or_none(_first_present(
+        row,
+        "fiscalDateEnding",
+        "fiscalDate",
+        "periodEnding",
+        "periodEndDate",
+    ))
+    if fiscal_date:
+        try:
+            parsed = date.fromisoformat(fiscal_date[:10])
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            fiscal_year = fiscal_year or parsed.year
+            fiscal_quarter = fiscal_quarter or ((parsed.month - 1) // 3 + 1)
+    return fiscal_year, fiscal_quarter
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _quarter_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip().upper()
+        if cleaned.startswith("Q"):
+            cleaned = cleaned[1:]
+        value = cleaned
+    parsed = _int_or_none(value)
+    if parsed is None or not 1 <= parsed <= 4:
+        return None
+    return parsed
+
+
+def _string_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _first_present(row: Dict[str, Any], *keys: str, default: Any = None) -> Any:

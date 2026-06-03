@@ -50,7 +50,7 @@ from alpha.db.models import (
     UniverseScan,
     UniverseSnapshot,
 )
-from alpha.jobs import run_forward_context, run_m4_daily, run_universe
+from alpha.jobs import run_forward_context, run_m1_daily, run_m4_daily, run_universe
 from alpha.market_calendar import (
     is_us_equity_session,
     resolve_us_equity_session,
@@ -824,6 +824,8 @@ def build_m4_health_report(
     rerun_m4_run_id: Optional[str] = None,
     rerun_m4_metrics: Optional[Dict[str, Any]] = None,
     universe_run_id: Optional[str] = None,
+    m1_run_id: Optional[str] = None,
+    m1_metrics: Optional[Dict[str, Any]] = None,
     forward_context_run_id: Optional[str] = None,
     forward_context_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -841,6 +843,7 @@ def build_m4_health_report(
         if m4_metrics is not None
         else _latest_m4_run_metrics(session, decision_date)
     )
+    m1_metrics = dict(m1_metrics or {})
     explicit_m4_run_ids = [
         run_id for run_id in (primary_m4_run_id, rerun_m4_run_id) if run_id
     ]
@@ -1080,6 +1083,26 @@ def build_m4_health_report(
             "fetch_error_count": m4_metrics.get("fetch_error_count"),
             "m4_feature_snapshots": len(features),
         },
+        "m1_assembly": {
+            "m1_run_id": m1_run_id,
+            "no_op_reason": m1_metrics.get("no_op_reason"),
+            "included_universe_size": m1_metrics.get("included_universe_size"),
+            "announcing_universe_event_count": m1_metrics.get(
+                "announcing_universe_event_count"
+            ),
+            "foster_computed_count": m1_metrics.get("foster_computed_count"),
+            "foster_insufficient_history_count": m1_metrics.get(
+                "foster_insufficient_history_count"
+            ),
+            "foster_eligible_fraction": m1_metrics.get("foster_eligible_fraction"),
+            "friction_computed_count": m1_metrics.get("friction_computed_count"),
+            "friction_population_count": m1_metrics.get("friction_population_count"),
+            "market_factor_symbol": m1_metrics.get("market_factor_symbol"),
+            "assembled_count": (m1_metrics.get("assembly") or {}).get("assembled_count"),
+            "m1_signals_persisted": (
+                m1_metrics.get("orchestration") or {}
+            ).get("total_signals_persisted"),
+        },
         "m4_signals": {
             "signal_count": signal_count,
             "duplicate_signal_count": duplicate_signal_count,
@@ -1208,6 +1231,7 @@ def _print_report(report: Dict[str, Any]) -> None:
         "run_metadata",
         "universe",
         "m4_assembly",
+        "m1_assembly",
         "m4_signals",
         "data_quality",
         "forward_return_guard",
@@ -1291,6 +1315,33 @@ def _run_m4(
         url=os.environ.get("DATABASE_URL", ""),
         schema=schema,
         job_name="m4_daily_feature_assembly",
+        decision_date=decision_date,
+        exit_code=exit_code,
+    )
+
+
+def _run_m1(
+    *,
+    schema: Optional[str],
+    run_timestamp: str,
+    decision_date: str,
+    args: argparse.Namespace,
+) -> RunInvocation:
+    argv = [
+        "--live",
+        "--run-timestamp", run_timestamp,
+        "--earnings-window-sessions", str(args.m1_earnings_window_sessions),
+        "--next-earnings-calendar-days", str(args.m1_next_earnings_calendar_days),
+        "--price-lookback-calendar-days", str(args.m1_price_lookback_calendar_days),
+    ]
+    if schema:
+        argv += ["--schema", schema, "--create-tables"]
+    print("\n== M1 daily ==")
+    exit_code = run_m1_daily.main(argv)
+    return _recover_invocation(
+        url=os.environ.get("DATABASE_URL", ""),
+        schema=schema,
+        job_name="m1_daily_feature_assembly",
         decision_date=decision_date,
         exit_code=exit_code,
     )
@@ -1384,12 +1435,17 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help="Skip Polygon identity enrichment in the universe build.")
     parser.add_argument("--skip-rerun", action="store_true",
                         help="Skip the idempotency freeze/reuse rerun.")
+    parser.add_argument("--skip-m1", action="store_true",
+                        help="Skip the M1 PEAD signal-only assembly step.")
     parser.add_argument("--skip-forward-context", action="store_true",
                         help="Skip the post-M4 forward-context panel collector.")
     parser.add_argument("--signal-context-breakout-buffer", type=float, default=0.02)
     parser.add_argument("--retry-backoff-seconds", type=float, default=0.25)
     parser.add_argument("--profile-max-workers", type=int, default=20)
     parser.add_argument("--profile-rate-limit-per-minute", type=int, default=2000)
+    parser.add_argument("--m1-earnings-window-sessions", type=int, default=15)
+    parser.add_argument("--m1-next-earnings-calendar-days", type=int, default=140)
+    parser.add_argument("--m1-price-lookback-calendar-days", type=int, default=430)
     return parser.parse_args(argv)
 
 
@@ -1451,7 +1507,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         print("\nDry run: no database writes and no provider API calls performed.")
         print(
-            "Planned steps: universe build -> M4 daily -> "
+            "Planned steps: universe build -> M4 daily -> M1 daily -> "
             "forward context panel -> health report."
         )
         return 0
@@ -1526,6 +1582,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("ERROR: M4 idempotency rerun returned exit 0 without a finished job run")
             return 1
 
+    m1_invocation = RunInvocation(
+        exit_code=0,
+        run_status="finished",
+        metrics={"no_op_reason": "skipped_by_cli"},
+    )
+    if args.skip_m1:
+        print("\nM1 daily skipped by --skip-m1.")
+    else:
+        reset_globals()
+        m1_invocation = _coerce_invocation(_run_m1(
+            schema=schema,
+            run_timestamp=effective_run_timestamp,
+            decision_date=decision_date,
+            args=args,
+        ))
+        if m1_invocation.exit_code != 0:
+            print(f"ERROR: M1 daily failed with exit {m1_invocation.exit_code}")
+            return m1_invocation.exit_code
+        if (
+            not m1_invocation.run_id
+            or m1_invocation.run_status not in SUCCESS_RUN_STATUSES
+        ):
+            print("ERROR: M1 daily returned exit 0 without a finished job run")
+            return 1
+
     forward_context_invocation = RunInvocation(
         exit_code=0,
         run_status="finished",
@@ -1582,6 +1663,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             run_timestamp=effective_run_timestamp,
             universe_metrics=universe_invocation.metrics,
             universe_run_id=universe_invocation.run_id,
+            m1_run_id=m1_invocation.run_id,
+            m1_metrics=m1_invocation.metrics,
             m4_metrics=primary_m4_invocation.metrics,
             primary_m4_run_id=primary_m4_invocation.run_id,
             rerun_m4_run_id=rerun_m4_invocation.run_id,
