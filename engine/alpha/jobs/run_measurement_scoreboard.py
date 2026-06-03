@@ -25,6 +25,7 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardPoolingError,
     ScoreboardResult,
     ScoreboardSignalIntegrityError,
+    ScoreboardWindowIntegrityError,
     build_measurement_scoreboard,
 )
 from alpha.jobs.forward_return import REQUIRED_FORWARD_RETURN_STATUSES
@@ -66,6 +67,7 @@ def _run_live(args: argparse.Namespace) -> int:
         ScoreboardDirectionError,
         ScoreboardSignalIntegrityError,
         ScoreboardPatternIntegrityError,
+        ScoreboardWindowIntegrityError,
         ScoreboardPoolingError,
         ValueError,
     ) as exc:
@@ -121,6 +123,11 @@ def _print_scoreboard(result: ScoreboardResult, *, schema: str) -> None:
         return
     print("Graded stats:")
     print(f"  N:                     {stats.n}")
+    print(f"  Total firings:         {stats.total_firings}")
+    print(f"  Distinct tickers:      {stats.distinct_tickers}")
+    print(f"  Overlap firings:       {stats.overlapping_window_firings}")
+    print(f"  Max same-ticker conc:  {stats.max_concurrent_same_ticker}")
+    print(f"  Effective sample size: {_format_optional(stats.effective_sample_size)}")
     print(f"  Expectancy:            {_format_optional(stats.expectancy)}")
     print(f"  Median:                {_format_optional(stats.median)}")
     print(f"  Best:                  {_format_optional(stats.best)}")
@@ -164,6 +171,10 @@ def _print_error(exc: Exception) -> None:
         print("Pattern mismatches:")
         for mismatch in exc.mismatches[:20]:
             print(f"  {json.dumps(mismatch, sort_keys=True)}")
+    if isinstance(exc, ScoreboardWindowIntegrityError):
+        print("Window integrity errors:")
+        for error in exc.window_errors[:20]:
+            print(f"  {json.dumps(error, sort_keys=True)}")
 
 
 def _error_payload(exc: Exception) -> Dict[str, object]:
@@ -182,6 +193,8 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
         payload["orphans"] = exc.orphans
     if isinstance(exc, ScoreboardPatternIntegrityError):
         payload["mismatches"] = exc.mismatches
+    if isinstance(exc, ScoreboardWindowIntegrityError):
+        payload["window_errors"] = exc.window_errors
     if isinstance(exc, ScoreboardPoolingError):
         payload["pattern_counts"] = exc.pattern_counts
         payload["pattern_horizons"] = exc.pattern_horizons

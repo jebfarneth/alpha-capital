@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -28,6 +28,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from alpha.db.models import ForwardReturnObservation, SignalRegistry
+from alpha.market_calendar import is_us_equity_session, next_us_equity_session
 from alpha.jobs.forward_return import (
     REQUIRED_FORWARD_RETURN_STATUSES,
     RETRYABLE_FORWARD_RETURN_STATUSES,
@@ -169,6 +170,19 @@ class ScoreboardPatternIntegrityError(RuntimeError):
         self.mismatches = mismatches or []
 
 
+class ScoreboardWindowIntegrityError(RuntimeError):
+    """Raised when a graded observation lacks a valid persisted forward window."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        window_errors: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.window_errors = window_errors or []
+
+
 @dataclass(frozen=True)
 class AnomalySummary:
     computed_missing_forward_return: int
@@ -191,7 +205,12 @@ class AnomalySummary:
 @dataclass(frozen=True)
 class ComputedStats:
     n: int
+    total_firings: int
     no_graded_firings: bool
+    distinct_tickers: int
+    overlapping_window_firings: int
+    max_concurrent_same_ticker: int
+    effective_sample_size: Optional[float]
     expectancy: Optional[float]
     median: Optional[float]
     best: Optional[float]
@@ -621,7 +640,12 @@ def _computed_stats(
     if not returns:
         return ComputedStats(
             n=0,
+            total_firings=0,
             no_graded_firings=True,
+            distinct_tickers=0,
+            overlapping_window_firings=0,
+            max_concurrent_same_ticker=0,
+            effective_sample_size=None,
             expectancy=None,
             median=None,
             best=None,
@@ -665,6 +689,7 @@ def _computed_stats(
         else None
     )
     n = len(rows)
+    window_stats = _window_overlap_stats(rows)
     hit_t1_count = _truthy_count(row["hit_t1_intraday"] for row in rows)
     hit_t2_count = _truthy_count(row["hit_t2_intraday"] for row in rows)
     hit_t3_count = _truthy_count(row["hit_t3_intraday"] for row in rows)
@@ -685,7 +710,12 @@ def _computed_stats(
 
     return ComputedStats(
         n=n,
+        total_firings=n,
         no_graded_firings=False,
+        distinct_tickers=window_stats["distinct_tickers"],
+        overlapping_window_firings=window_stats["overlapping_window_firings"],
+        max_concurrent_same_ticker=window_stats["max_concurrent_same_ticker"],
+        effective_sample_size=window_stats["effective_sample_size"],
         expectancy=mean(returns),
         median=median(returns),
         best=max(returns),
@@ -720,6 +750,114 @@ def _computed_stats(
             if tail_event_denominator else None
         ),
     )
+
+
+def _window_overlap_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    windows = _forward_windows(rows)
+    if not windows:
+        return {
+            "distinct_tickers": 0,
+            "overlapping_window_firings": 0,
+            "max_concurrent_same_ticker": 0,
+            "effective_sample_size": None,
+        }
+
+    distinct_tickers = len({window["ticker"] for window in windows})
+    same_ticker_concurrency: Dict[Tuple[str, date], int] = {}
+    session_concurrency: Dict[date, int] = {}
+    for window in windows:
+        ticker = window["ticker"]
+        for session_date in window["sessions"]:
+            same_key = (ticker, session_date)
+            same_ticker_concurrency[same_key] = same_ticker_concurrency.get(same_key, 0) + 1
+            session_concurrency[session_date] = session_concurrency.get(session_date, 0) + 1
+
+    overlapping_window_firings = sum(
+        1
+        for window in windows
+        if any(
+            same_ticker_concurrency[(window["ticker"], session_date)] > 1
+            for session_date in window["sessions"]
+        )
+    )
+    effective_sample_size = sum(
+        mean(1 / session_concurrency[session_date] for session_date in window["sessions"])
+        for window in windows
+    )
+
+    return {
+        "distinct_tickers": distinct_tickers,
+        "overlapping_window_firings": overlapping_window_firings,
+        "max_concurrent_same_ticker": max(same_ticker_concurrency.values()),
+        "effective_sample_size": effective_sample_size,
+    }
+
+
+def _forward_windows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    windows: List[Dict[str, Any]] = []
+    window_errors: List[Dict[str, Any]] = []
+    for row in rows:
+        entry_raw = row.get("entry_session_date")
+        exit_raw = row.get("exit_session_date")
+        entry = _parse_persisted_session_date(entry_raw)
+        exit = _parse_persisted_session_date(exit_raw)
+        error: Optional[str] = None
+        if entry is None or exit is None:
+            error = "missing_entry_or_exit_session"
+        elif entry > exit:
+            error = "entry_after_exit_session"
+        elif not is_us_equity_session(entry):
+            error = "entry_session_date_is_not_trading_session"
+        elif not is_us_equity_session(exit):
+            error = "exit_session_date_is_not_trading_session"
+
+        if error is not None:
+            window_errors.append({
+                "signal_id": row["signal_id"],
+                "observation_id": row["forward_return_observation_id"],
+                "ticker": row["ticker"],
+                "entry_session_date": entry_raw,
+                "exit_session_date": exit_raw,
+                "error": error,
+            })
+            continue
+
+        windows.append({
+            "observation_id": row["forward_return_observation_id"],
+            "ticker": str(row["ticker"]),
+            "sessions": _trading_sessions_inclusive(entry, exit),
+        })
+
+    if window_errors:
+        raise ScoreboardWindowIntegrityError(
+            "graded observations lack valid persisted forward windows",
+            window_errors=window_errors,
+        )
+    return windows
+
+
+def _parse_persisted_session_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _trading_sessions_inclusive(entry: date, exit: date) -> Tuple[date, ...]:
+    sessions: List[date] = []
+    cursor = entry
+    while cursor <= exit:
+        sessions.append(cursor)
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return tuple(sessions)
 
 
 def _float_values(values: Iterable[Any]) -> List[float]:

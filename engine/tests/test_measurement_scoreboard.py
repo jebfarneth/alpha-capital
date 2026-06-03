@@ -50,6 +50,7 @@ from alpha.jobs.measurement_scoreboard import (
     ScoreboardPartitionError,
     ScoreboardPoolingError,
     ScoreboardSignalIntegrityError,
+    ScoreboardWindowIntegrityError,
     _canonical_observation_rows,
     build_measurement_scoreboard,
     validate_status_partition,
@@ -142,6 +143,8 @@ def _add_observation(
     updated_at: Optional[datetime] = None,
     signal_timestamp: datetime = SIGNAL_TS,
     signal_horizon: str = "15d",
+    entry_session_date: Optional[str] = "2026-06-02",
+    exit_session_date: Optional[str] = "2026-06-23",
     direction: Optional[str] = "long",
 ) -> ForwardReturnObservation:
     observation_pattern_id = pattern_id
@@ -165,8 +168,8 @@ def _add_observation(
         signal_timestamp=signal_timestamp,
         signal_horizon=signal_horizon,
         next_execution_session="2026-06-02",
-        entry_session_date="2026-06-02",
-        exit_session_date="2026-06-23",
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
         forward_return=forward_return,
         max_favorable_excursion=mfe,
         max_adverse_excursion=mae,
@@ -790,6 +793,207 @@ def test_tail_counter_threshold_is_inclusive(db_session):
     assert stats.tail_event_fraction == pytest.approx(2 / 3)
 
 
+def test_single_graded_window_has_full_effective_sample_size(db_session):
+    _add_observation(
+        db_session,
+        "single-window",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        ticker="SOLO",
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-23",
+    )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 1
+    assert stats.distinct_tickers == 1
+    assert stats.overlapping_window_firings == 0
+    assert stats.max_concurrent_same_ticker == 1
+    assert stats.effective_sample_size == pytest.approx(1.0)
+
+
+def test_non_overlapping_windows_keep_effective_n_equal_to_raw_n(db_session):
+    _add_observation(
+        db_session,
+        "first-window",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        ticker="ACME",
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-03",
+    )
+    _add_observation(
+        db_session,
+        "second-window",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        ticker="ACME",
+        mfe=0.20,
+        mae=-0.20,
+        entry_session_date="2026-06-04",
+        exit_session_date="2026-06-05",
+    )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 2
+    assert stats.distinct_tickers == 1
+    assert stats.overlapping_window_firings == 0
+    assert stats.max_concurrent_same_ticker == 1
+    assert stats.effective_sample_size == pytest.approx(2.0)
+
+
+def test_same_ticker_consecutive_windows_surface_overlap_and_reduced_effective_n(db_session):
+    _add_observation(
+        db_session,
+        "day-one",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        ticker="ACME",
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-23",
+    )
+    _add_observation(
+        db_session,
+        "day-two",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        ticker="ACME",
+        mfe=0.20,
+        mae=-0.20,
+        entry_session_date="2026-06-03",
+        exit_session_date="2026-06-24",
+    )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 2
+    assert stats.distinct_tickers == 1
+    assert stats.overlapping_window_firings == 2
+    assert stats.max_concurrent_same_ticker == 2
+    assert stats.effective_sample_size < 2
+
+
+def test_three_same_ticker_windows_track_max_concurrency_and_uniqueness(db_session):
+    _add_observation(
+        db_session,
+        "window-a",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        ticker="ACME",
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-04",
+    )
+    _add_observation(
+        db_session,
+        "window-b",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        ticker="ACME",
+        mfe=0.20,
+        mae=-0.20,
+        entry_session_date="2026-06-03",
+        exit_session_date="2026-06-05",
+    )
+    _add_observation(
+        db_session,
+        "window-c",
+        status=STATUS_COMPUTED,
+        forward_return=0.30,
+        ticker="ACME",
+        mfe=0.40,
+        mae=-0.30,
+        entry_session_date="2026-06-04",
+        exit_session_date="2026-06-08",
+    )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 3
+    assert stats.distinct_tickers == 1
+    assert stats.overlapping_window_firings == 3
+    assert stats.max_concurrent_same_ticker == 3
+    assert stats.effective_sample_size == pytest.approx(5 / 3)
+
+
+def test_distinct_tickers_marks_repeated_ticker_in_graded_population(db_session):
+    _add_observation(
+        db_session,
+        "acme-a",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        ticker="ACME",
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date="2026-06-02",
+        exit_session_date="2026-06-04",
+    )
+    _add_observation(
+        db_session,
+        "acme-b",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        ticker="ACME",
+        mfe=0.20,
+        mae=-0.20,
+        entry_session_date="2026-06-05",
+        exit_session_date="2026-06-08",
+    )
+    _add_observation(
+        db_session,
+        "bravo",
+        status=STATUS_COMPUTED,
+        forward_return=0.30,
+        ticker="BRAVO",
+        mfe=0.40,
+        mae=-0.30,
+        entry_session_date="2026-06-09",
+        exit_session_date="2026-06-10",
+    )
+
+    stats = build_measurement_scoreboard(db_session).computed_stats
+
+    assert stats.total_firings == 3
+    assert stats.distinct_tickers == 2
+    assert stats.distinct_tickers < stats.total_firings
+    assert stats.overlapping_window_firings == 0
+    assert stats.effective_sample_size == pytest.approx(3.0)
+
+
+def test_missing_persisted_forward_window_fails_loud(db_session):
+    _add_observation(
+        db_session,
+        "missing-window",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        mfe=0.30,
+        mae=-0.10,
+        entry_session_date=None,
+        exit_session_date="2026-06-23",
+    )
+
+    with pytest.raises(ScoreboardWindowIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session)
+
+    assert exc_info.value.window_errors == [{
+        "signal_id": "signal-missing-window",
+        "observation_id": "missing-window",
+        "ticker": "ACME",
+        "entry_session_date": None,
+        "exit_session_date": "2026-06-23",
+        "error": "missing_entry_or_exit_session",
+    }]
+
+
 def test_missing_mfe_surfaces_excursion_gap_and_uses_finite_tail_denominator(db_session):
     _add_observation(
         db_session,
@@ -1013,6 +1217,11 @@ def test_zero_graded_is_explicit_and_has_no_nan(db_session):
     stats = build_measurement_scoreboard(db_session).computed_stats
 
     assert stats.n == 0
+    assert stats.total_firings == 0
+    assert stats.distinct_tickers == 0
+    assert stats.overlapping_window_firings == 0
+    assert stats.max_concurrent_same_ticker == 0
+    assert stats.effective_sample_size is None
     assert stats.no_graded_firings is True
     assert stats.expectancy is None
     assert stats.tail_event_fraction is None
@@ -1306,6 +1515,11 @@ def test_success_output_surfaces_excursion_denominators_and_anomaly(
     assert rc == 0
     payload = json.loads(captured.out)
     assert payload["computed_stats"]["n"] == 2
+    assert payload["computed_stats"]["total_firings"] == 2
+    assert payload["computed_stats"]["distinct_tickers"] == 1
+    assert payload["computed_stats"]["overlapping_window_firings"] == 2
+    assert payload["computed_stats"]["max_concurrent_same_ticker"] == 2
+    assert payload["computed_stats"]["effective_sample_size"] == pytest.approx(1.0)
     assert payload["computed_stats"]["mfe_finite_count"] == 1
     assert payload["computed_stats"]["mae_finite_count"] == 2
     assert payload["computed_stats"]["tail_event_denominator"] == 1
@@ -1318,6 +1532,11 @@ def test_success_output_surfaces_excursion_denominators_and_anomaly(
 
     assert rc == 0
     assert "  graded_missing_excursion: 1\n" in captured.out
+    assert "  Total firings:         2\n" in captured.out
+    assert "  Distinct tickers:      1\n" in captured.out
+    assert "  Overlap firings:       2\n" in captured.out
+    assert "  Max same-ticker conc:  2\n" in captured.out
+    assert "  Effective sample size: 1\n" in captured.out
     assert "  Finite MFE / MAE N:    1 / 2\n" in captured.out
     assert "  Tail denominator:      1\n" in captured.out
     assert "  Tail events:           1 (1)\n" in captured.out
