@@ -46,6 +46,7 @@ from alpha.jobs.measurement_scoreboard import (
     BUCKET_TERMINAL_UNAVAILABLE,
     ROLLUP_STATUS_BUCKETS,
     ScoreboardDirectionError,
+    ScoreboardHorizonIntegrityError,
     ScoreboardPatternIntegrityError,
     ScoreboardPartitionError,
     ScoreboardPoolingError,
@@ -1529,6 +1530,92 @@ def test_by_horizon_scoreboard_returns_m1_variable_horizon_groups(db_session):
     assert thirteen.tail_event_fraction == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("bad_horizon", [None, "", "   ", "15"])
+def test_graded_missing_or_noncanonical_signal_horizon_fails_closed(
+    db_session,
+    bad_horizon,
+):
+    _add_observation(
+        db_session,
+        "bad-horizon",
+        status=STATUS_COMPUTED,
+        forward_return=0.12,
+        pattern_id="M4",
+        signal_horizon=bad_horizon,
+        mfe=0.30,
+        mae=-0.02,
+    )
+
+    with pytest.raises(ScoreboardHorizonIntegrityError) as unfiltered:
+        build_measurement_scoreboard(db_session, pattern_id="M4")
+
+    assert unfiltered.value.horizon_errors == [{
+        "signal_id": "signal-bad-horizon",
+        "observation_id": "bad-horizon",
+        "pattern_id": "M4",
+        "signal_horizon": bad_horizon,
+        "status": STATUS_COMPUTED,
+    }]
+
+    with pytest.raises(ScoreboardHorizonIntegrityError) as filtered:
+        build_measurement_scoreboard(
+            db_session,
+            pattern_id="M4",
+            signal_horizon="15d",
+        )
+
+    assert filtered.value.horizon_errors == unfiltered.value.horizon_errors
+
+
+def test_pending_missing_signal_horizon_does_not_trip_horizon_integrity(db_session):
+    _add_observation(
+        db_session,
+        "pending-bad-horizon",
+        status=STATUS_PENDING,
+        pattern_id="M4",
+        signal_horizon=None,
+    )
+
+    result = build_measurement_scoreboard(db_session, pattern_id="M4")
+
+    assert result.total_observations == 1
+    assert result.computed_stats.no_graded_firings is True
+
+
+def test_signal_horizon_variants_canonicalize_to_one_group(db_session):
+    for obs_id, horizon, expected_return in (
+        ("leading-space", " 15d", 0.10),
+        ("uppercase", "15D", 0.20),
+        ("canonical", "15d", 0.30),
+    ):
+        _add_observation(
+            db_session,
+            obs_id,
+            status=STATUS_COMPUTED,
+            forward_return=expected_return,
+            pattern_id="M4",
+            ticker=obs_id.upper(),
+            signal_horizon=horizon,
+            mfe=0.30,
+            mae=-0.02,
+        )
+
+    filtered = build_measurement_scoreboard(
+        db_session,
+        pattern_id="M4",
+        signal_horizon="15d",
+    )
+
+    assert filtered.total_observations == 3
+    assert filtered.computed_stats.n == 3
+    assert filtered.computed_stats.expectancy == pytest.approx(0.20)
+
+    grouped = build_measurement_scoreboard_by_horizon(db_session, pattern_id="M4")
+
+    assert set(grouped.computed_stats_by_horizon) == {"15d"}
+    assert grouped.computed_stats_by_horizon["15d"].n == 3
+
+
 def test_pooling_guard_ignores_non_graded_patterns(db_session):
     _add_observation(
         db_session,
@@ -1939,6 +2026,76 @@ def test_json_and_human_error_paths_surface_signal_integrity_guard(
     assert "Orphan observations:" in captured.out
     assert '"observation_id": "orphan-cli"' in captured.out
     assert '"signal_id": "missing-cli"' in captured.out
+
+
+def test_json_and_human_error_paths_surface_horizon_integrity_guard(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    path = tmp_path / "horizon-integrity.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        _add_observation(
+            session,
+            "blank-horizon",
+            status=STATUS_COMPUTED,
+            forward_return=0.10,
+            pattern_id="M4",
+            signal_horizon="",
+            mfe=0.30,
+            mae=-0.02,
+        )
+        session.commit()
+    finally:
+        session.close()
+        engine.dispose()
+
+    expected = [{
+        "signal_id": "signal-blank-horizon",
+        "observation_id": "blank-horizon",
+        "pattern_id": "M4",
+        "signal_horizon": "",
+        "status": STATUS_COMPUTED,
+    }]
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        url,
+        "--pattern-id",
+        "M4",
+        "--signal-horizon",
+        "15d",
+        "--json",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["error_type"] == "ScoreboardHorizonIntegrityError"
+    assert payload["horizon_errors"] == expected
+
+    rc = run_measurement_scoreboard.main([
+        "--live",
+        "--database-url",
+        url,
+        "--pattern-id",
+        "M4",
+        "--signal-horizon",
+        "15d",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Horizon integrity errors:" in captured.out
+    assert '"observation_id": "blank-horizon"' in captured.out
+    assert '"signal_horizon": ""' in captured.out
 
 
 def test_cli_rejects_empty_pattern_id(tmp_path, monkeypatch, capsys):

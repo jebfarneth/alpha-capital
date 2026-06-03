@@ -19,6 +19,7 @@ the required global orphan sentinel.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from statistics import mean, median
@@ -49,6 +50,7 @@ from alpha.jobs.forward_return import (
 )
 
 DEFAULT_MFE_TAIL_THRESHOLD = 0.25
+CANONICAL_SIGNAL_HORIZON_RE = re.compile(r"^[1-9][0-9]*d$")
 
 # forward_return is a raw price return with no direction term, so the
 # win/loss, expectancy, and tail math is only correct for long positions.
@@ -172,6 +174,19 @@ class ScoreboardPatternIntegrityError(RuntimeError):
     ):
         super().__init__(message)
         self.mismatches = mismatches or []
+
+
+class ScoreboardHorizonIntegrityError(RuntimeError):
+    """Raised when a graded observation lacks a canonical signal horizon."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        horizon_errors: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.horizon_errors = horizon_errors or []
 
 
 class ScoreboardWindowIntegrityError(RuntimeError):
@@ -343,17 +358,15 @@ def build_measurement_scoreboard(
         not isinstance(pattern_id, str) or pattern_id.strip() == ""
     ):
         raise ValueError("pattern_id must be a non-empty string")
-    if signal_horizon is not None and (
-        not isinstance(signal_horizon, str) or signal_horizon.strip() == ""
-    ):
-        raise ValueError("signal_horizon must be a non-empty string")
+    canonical_signal_horizon = _validate_signal_horizon_filter(signal_horizon)
 
     fold = _fold_scoreboard_rows(
         session,
         pattern_id=pattern_id,
-        signal_horizon=signal_horizon,
+        signal_horizon=canonical_signal_horizon,
     )
     _assert_pattern_integrity(fold.computed_rows)
+    _assert_horizon_integrity(fold.computed_rows)
     _assert_single_graded_pattern(fold.computed_rows)
     if signal_horizon is None:
         _assert_single_graded_horizon(fold.computed_rows)
@@ -408,6 +421,7 @@ def build_measurement_scoreboard_by_horizon(
         signal_horizon=None,
     )
     _assert_pattern_integrity(fold.computed_rows)
+    _assert_horizon_integrity(fold.computed_rows)
     _assert_single_graded_pattern(fold.computed_rows)
 
     grouped: Dict[str, List[Mapping[str, Any]]] = {}
@@ -435,8 +449,9 @@ def _fold_scoreboard_rows(
     raw_rows = _load_observation_rows(
         session,
         pattern_id=pattern_id,
-        signal_horizon=signal_horizon,
+        signal_horizon=None,
     )
+    raw_rows = _filter_rows_for_signal_horizon(raw_rows, signal_horizon)
     # Guard order is load-bearing: orphan integrity gates the denominator before
     # status/direction classification; a row missing its parent must fail loud,
     # never be classified or folded.
@@ -606,6 +621,30 @@ def _assert_pattern_integrity(rows: Sequence[Mapping[str, Any]]) -> None:
         )
 
 
+def _assert_horizon_integrity(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Fail if a graded observation cannot be assigned one canonical horizon."""
+
+    horizon_errors: List[Dict[str, Any]] = []
+    for row in rows:
+        raw_horizon = row.get("signal_horizon")
+        if _canonical_signal_horizon(raw_horizon) is not None:
+            continue
+        horizon_errors.append({
+            "signal_id": row["signal_id"],
+            "observation_id": row["forward_return_observation_id"],
+            "pattern_id": row["signal_pattern_id"],
+            "signal_horizon": raw_horizon,
+            "status": row["status"],
+        })
+
+    if horizon_errors:
+        raise ScoreboardHorizonIntegrityError(
+            "graded forward-return observations carry missing or "
+            "non-canonical signal_horizon values",
+            horizon_errors=horizon_errors,
+        )
+
+
 def _assert_single_graded_pattern(rows: Sequence[Mapping[str, Any]]) -> None:
     """Fail loud before reducing multiple pattern distributions into one stat block."""
 
@@ -614,9 +653,9 @@ def _assert_single_graded_pattern(rows: Sequence[Mapping[str, Any]]) -> None:
     for row in rows:
         pattern = str(row["signal_pattern_id"])
         pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
-        horizon = row.get("signal_horizon")
+        horizon = _canonical_signal_horizon(row.get("signal_horizon"))
         if horizon is not None:
-            pattern_horizons.setdefault(pattern, str(horizon))
+            pattern_horizons.setdefault(pattern, horizon)
 
     if len(pattern_counts) > 1:
         raise ScoreboardPoolingError(
@@ -657,8 +696,53 @@ def _assert_single_graded_horizon(rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _horizon_key(row: Mapping[str, Any]) -> str:
-    horizon = row.get("signal_horizon")
-    return "null" if horizon is None else str(horizon)
+    horizon = _canonical_signal_horizon(row.get("signal_horizon"))
+    return "invalid" if horizon is None else horizon
+
+
+def _validate_signal_horizon_filter(signal_horizon: Optional[str]) -> Optional[str]:
+    if signal_horizon is None:
+        return None
+    if not isinstance(signal_horizon, str):
+        raise ValueError("signal_horizon must be a canonical Nd string, such as 15d")
+    canonical = _canonical_signal_horizon(signal_horizon)
+    if canonical is None:
+        raise ValueError("signal_horizon must be a canonical Nd string, such as 15d")
+    return canonical
+
+
+def _canonical_signal_horizon(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if not CANONICAL_SIGNAL_HORIZON_RE.fullmatch(text):
+        return None
+    return text
+
+
+def _filter_rows_for_signal_horizon(
+    rows: Sequence[Mapping[str, Any]],
+    signal_horizon: Optional[str],
+) -> List[Mapping[str, Any]]:
+    if signal_horizon is None:
+        return list(rows)
+
+    filtered: List[Mapping[str, Any]] = []
+    for row in rows:
+        canonical_horizon = _canonical_signal_horizon(row.get("signal_horizon"))
+        if canonical_horizon == signal_horizon:
+            filtered.append(row)
+            continue
+        # A bad finite-computed horizon must fail closed even for a filtered
+        # run; otherwise --signal-horizon 15d could hide exactly the rows that
+        # would have polluted the unfiltered truth summary.
+        if (
+            canonical_horizon is None
+            and row["status"] == STATUS_COMPUTED
+            and _is_finite_number(row["forward_return"])
+        ):
+            filtered.append(row)
+    return filtered
 
 
 def _load_observation_rows(
@@ -706,13 +790,6 @@ def _load_observation_rows(
             or_(
                 ForwardReturnObservation.pattern_id == pattern_id,
                 SignalRegistry.pattern_id == pattern_id,
-            )
-        )
-    if signal_horizon is not None:
-        statement = statement.where(
-            or_(
-                ForwardReturnObservation.signal_horizon == signal_horizon,
-                SignalRegistry.signal_horizon == signal_horizon,
             )
         )
     with session.no_autoflush:

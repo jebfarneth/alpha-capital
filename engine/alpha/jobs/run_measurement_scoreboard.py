@@ -20,6 +20,7 @@ from alpha.jobs.measurement_scoreboard import (
     DEFAULT_MFE_TAIL_THRESHOLD,
     ROLLUP_STATUS_BUCKETS,
     ScoreboardDirectionError,
+    ScoreboardHorizonIntegrityError,
     ScoreboardPatternIntegrityError,
     ScoreboardPartitionError,
     ScoreboardPoolingError,
@@ -78,6 +79,7 @@ def _run_live(args: argparse.Namespace) -> int:
         ScoreboardDirectionError,
         ScoreboardSignalIntegrityError,
         ScoreboardPatternIntegrityError,
+        ScoreboardHorizonIntegrityError,
         ScoreboardWindowIntegrityError,
         ScoreboardPoolingError,
         ValueError,
@@ -211,6 +213,10 @@ def _print_error(exc: Exception) -> None:
         print("Pattern mismatches:")
         for mismatch in exc.mismatches[:20]:
             print(f"  {json.dumps(mismatch, sort_keys=True)}")
+    if isinstance(exc, ScoreboardHorizonIntegrityError):
+        print("Horizon integrity errors:")
+        for error in exc.horizon_errors[:20]:
+            print(f"  {json.dumps(error, sort_keys=True)}")
     if isinstance(exc, ScoreboardWindowIntegrityError):
         print("Window integrity errors:")
         for error in exc.window_errors[:20]:
@@ -233,6 +239,8 @@ def _error_payload(exc: Exception) -> Dict[str, object]:
         payload["orphans"] = exc.orphans
     if isinstance(exc, ScoreboardPatternIntegrityError):
         payload["mismatches"] = exc.mismatches
+    if isinstance(exc, ScoreboardHorizonIntegrityError):
+        payload["horizon_errors"] = exc.horizon_errors
     if isinstance(exc, ScoreboardWindowIntegrityError):
         payload["window_errors"] = exc.window_errors
     if isinstance(exc, ScoreboardPoolingError):
