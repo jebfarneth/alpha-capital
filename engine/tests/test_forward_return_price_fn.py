@@ -610,6 +610,8 @@ def _make_signal(
     db_session,
     ticker="ACME",
     *,
+    pattern_id="M4",
+    signal_horizon="15d",
     next_execution_session="2026-05-26",
     trading_date="2026-05-26",
     signal_timestamp=SIGNAL_TS,
@@ -622,7 +624,7 @@ def _make_signal(
         features["security_identity"] = dict(security_identity)
     feat = record_feature_snapshot(
         db_session,
-        pattern_id="M4",
+        pattern_id=pattern_id,
         ticker=ticker,
         asof_timestamp=signal_timestamp,
         features=features,
@@ -630,15 +632,15 @@ def _make_signal(
     )
     sig = record_signal(
         db_session,
-        pattern_id="M4",
+        pattern_id=pattern_id,
         ticker=ticker,
         direction="long",
         signal_timestamp=signal_timestamp,
         raw_signal_strength=0.9,
         raw_expected_edge=0.01,
         feature_snapshot_id=feat.feature_snapshot_id,
-        signal_horizon="15d",
-        signal_identity_hash=f"m4-{ticker}",
+        signal_horizon=signal_horizon,
+        signal_identity_hash=f"{pattern_id.lower()}-{ticker}",
         trading_date=trading_date,
         next_execution_session=next_execution_session,
     )
@@ -650,6 +652,7 @@ def _run_job(
     db_session,
     adapter,
     *,
+    pattern_id="M4",
     run_ts=MATURE_RUN_TS,
     max_attempts=3,
     finality_lag_sessions=1,
@@ -665,6 +668,7 @@ def _run_job(
         ForwardReturnJob(
             session=db_session,
             adapter=adapter,
+            pattern_id=pattern_id,
             survivorship_adapters=survivorship_adapters,
             listing_authority_adapter=listing_authority_adapter,
             run_timestamp=run_ts,
@@ -714,6 +718,45 @@ def test_m4_entry_exit_calculation_counts_entry_as_day_one():
     assert plan.exit_session_date == EXIT_DATE
     assert plan.mature is True
     assert plan.entry_resolution_reason is None
+
+
+def test_forward_return_prices_m1_variable_horizon_signal(db_session):
+    _make_signal(
+        db_session,
+        ticker="FIRE",
+        pattern_id="M1",
+        signal_horizon="9d",
+        next_execution_session="2026-05-26",
+        trading_date="2026-05-20",
+        signal_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
+    )
+    adapter = FakeHistoricalAdapter({
+        "FIRE": [
+            _bar(date(2026, 5, 26), 10.0, high=10.0, low=10.0, close=10.0),
+            _bar(date(2026, 6, 1), 10.5, high=10.8, low=10.2, close=10.6),
+            _bar(date(2026, 6, 5), 11.0, high=11.0, low=11.0, close=11.0),
+        ]
+    })
+
+    result = _run_job(
+        db_session,
+        adapter,
+        pattern_id="M1",
+        run_ts=datetime(2026, 6, 8, 21, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["total_eligible"] == 1
+    assert result.metrics["computed"] == 1
+    obs = _obs(db_session)
+    assert obs.pattern_id == "M1"
+    assert obs.signal_horizon == "9d"
+    assert obs.next_execution_session == "2026-05-26"
+    assert obs.entry_session_date == "2026-05-26"
+    assert obs.exit_session_date == "2026-06-05"
+    assert obs.forward_return == pytest.approx(0.10)
+    assert obs.hit_t1_intraday is False
+    assert obs.hit_stop_intraday is False
 
 
 def test_live_future_timestamp_guard_rejects_future_time():

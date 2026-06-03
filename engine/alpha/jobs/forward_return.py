@@ -1,7 +1,7 @@
 """All-firings forward-return population.
 
-The production path prices durable M4 signal_registry rows from intended
-entry open to the 15-session time barrier open, records a self-auditing
+The production path prices durable signal_registry rows from intended entry
+open to their pattern-specific time barrier open, records a self-auditing
 forward_return_observations row, and keeps signal_registry as the summary
 surface. The injected price_fn mode is retained for existing measurement
 spine tests and simple non-production fixtures.
@@ -216,6 +216,16 @@ M4_EXIT_GEOMETRY = M4ExitGeometry(
     time_barrier_sessions=15,
     source_contract="Engineering/Patterns/M4-52WeekHigh/SPEC.md",
 )
+NO_BARRIER_EXIT_GEOMETRY = M4ExitGeometry(
+    pattern_id="generic",
+    t1_return=math.inf,
+    t2_return=math.inf,
+    t3_return=math.inf,
+    hard_stop_return=-math.inf,
+    hard_stop_pct=math.inf,
+    time_barrier_sessions=0,
+    source_contract="pattern_time_barrier_only",
+)
 RETURN_COMPARISON_EPSILON = 1e-12
 
 
@@ -366,12 +376,39 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(str(value))
 
 
+def _signal_horizon_sessions(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text.endswith("d"):
+        return None
+    try:
+        sessions = int(text[:-1])
+    except ValueError:
+        return None
+    if sessions < 1:
+        return None
+    return sessions
+
+
+def _telemetry_geometry_for_signal(sig: SignalRegistry) -> M4ExitGeometry:
+    horizon_sessions = _signal_horizon_sessions(sig.signal_horizon) or 0
+    if sig.pattern_id == M4_PATTERN_ID and sig.signal_horizon == M4_SIGNAL_HORIZON:
+        return M4_EXIT_GEOMETRY
+    return replace(
+        NO_BARRIER_EXIT_GEOMETRY,
+        pattern_id=str(sig.pattern_id),
+        time_barrier_sessions=horizon_sessions,
+    )
+
+
 def m4_entry_exit_plan(
     *,
     decision_date: date,
     next_execution_session: Optional[date] = None,
     current_evidence_session_date: date,
     run_timestamp: Optional[datetime] = None,
+    time_barrier_sessions: int = M4_EXIT_GEOMETRY.time_barrier_sessions,
 ) -> M4ForwardReturnPlan:
     """Resolve M4 all-firings entry/exit sessions.
 
@@ -387,7 +424,7 @@ def m4_entry_exit_plan(
         entry_session = next_execution_session
     exit_session = nth_us_equity_session(
         entry_session,
-        M4_EXIT_GEOMETRY.time_barrier_sessions,
+        time_barrier_sessions,
     )
     mature = current_evidence_session_date >= exit_session
     pending_reason = None
@@ -556,7 +593,7 @@ class ForwardReturnJob(BaseJob):
         return self._run_production_m4(ctx)
 
     # ------------------------------------------------------------------
-    # Production M4 path
+    # Production forward-return path
     # ------------------------------------------------------------------
     def _run_production_m4(self, ctx: JobContext) -> JobResult:
         run_timestamp, timestamp_error = _resolve_run_timestamp(
@@ -696,7 +733,7 @@ class ForwardReturnJob(BaseJob):
         return JobResult(
             status="finished",
             metrics={
-                "mode": "production_m4",
+                "mode": "production_forward_return",
                 "pattern_id": self._pattern_id,
                 "decision_evidence_session_date": (
                     session_resolution.evidence_session_date
@@ -794,13 +831,10 @@ class ForwardReturnJob(BaseJob):
         )
 
     def _production_signal_query(self):
-        if self._pattern_id != M4_PATTERN_ID:
-            return self._session.query(SignalRegistry).filter(False)
         return (
             self._session.query(SignalRegistry)
             .filter(
-                SignalRegistry.pattern_id == M4_PATTERN_ID,
-                SignalRegistry.signal_horizon == M4_SIGNAL_HORIZON,
+                SignalRegistry.pattern_id == self._pattern_id,
                 or_(
                     SignalRegistry.forward_return_status.in_(
                         PRODUCTION_RETRYABLE_STATUSES
@@ -812,13 +846,10 @@ class ForwardReturnJob(BaseJob):
         )
 
     def _computed_observation_query(self):
-        if self._pattern_id != M4_PATTERN_ID:
-            return self._session.query(ForwardReturnObservation).filter(False)
         return (
             self._session.query(ForwardReturnObservation)
             .filter(
-                ForwardReturnObservation.pattern_id == M4_PATTERN_ID,
-                ForwardReturnObservation.signal_horizon == M4_SIGNAL_HORIZON,
+                ForwardReturnObservation.pattern_id == self._pattern_id,
                 ForwardReturnObservation.status == STATUS_COMPUTED,
                 ForwardReturnObservation.forward_return.isnot(None),
                 ForwardReturnObservation.entry_price_source == M4_PRICE_SOURCE,
@@ -1053,6 +1084,9 @@ class ForwardReturnJob(BaseJob):
             decision_date = _parse_date(sig.trading_date)
         except ValueError:
             return None, "invalid_decision_date"
+        horizon_sessions = _signal_horizon_sessions(sig.signal_horizon)
+        if horizon_sessions is None:
+            return None, "invalid_signal_horizon"
         next_execution_session = None
         if sig.next_execution_session:
             try:
@@ -1066,6 +1100,7 @@ class ForwardReturnJob(BaseJob):
                     next_execution_session=next_execution_session,
                     current_evidence_session_date=current_evidence_date,
                     run_timestamp=run_timestamp,
+                    time_barrier_sessions=horizon_sessions,
                 ),
                 None,
             )
@@ -1243,7 +1278,7 @@ class ForwardReturnJob(BaseJob):
             entry_price=entry_price,
             entry_session_date=plan.entry_session_date,
             exit_session_date=plan.exit_session_date,
-            geometry=M4_EXIT_GEOMETRY,
+            geometry=_telemetry_geometry_for_signal(sig),
         )
         path_points = _forward_path_points(
             bars,

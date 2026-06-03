@@ -18,15 +18,32 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _migration_url():
+    env_url = os.environ.get("DATABASE_URL")
+    url = env_url or config.get_main_option("sqlalchemy.url")
+    allow_sqlite = os.environ.get("ALPHA_ALLOW_SQLITE_ALEMBIC") == "1"
+    if not env_url and not allow_sqlite:
+        raise RuntimeError(
+            "DATABASE_URL is required for Alembic migrations; set "
+            "ALPHA_ALLOW_SQLITE_ALEMBIC=1 only for local SQLite test runs"
+        )
+    if url.startswith("sqlite") and not allow_sqlite:
+        raise RuntimeError(
+            "Alembic migrations refuse SQLite unless "
+            "ALPHA_ALLOW_SQLITE_ALEMBIC=1 is set for a local test run"
+        )
+    return url
+
+
 def run_migrations_offline():
-    url = config.get_main_option("sqlalchemy.url")
+    url = _migration_url()
     context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online():
-    url = os.environ.get("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
+    url = _migration_url()
     schema = os.environ.get("ALPHA_DB_SCHEMA")
     connectable = create_engine(url, **schema_connect_args(url, schema))
     with connectable.connect() as connection:

@@ -597,6 +597,7 @@ class TestSchemaCompleteness:
     def test_alembic_upgrade_creates_all_18_tables(self, tmp_path, monkeypatch):
         db_path = tmp_path / "migration-smoke.db"
         monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+        monkeypatch.setenv("ALPHA_ALLOW_SQLITE_ALEMBIC", "1")
         monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
 
         cfg = Config(str(Path("alembic.ini")))

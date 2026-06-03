@@ -8,7 +8,7 @@ persists M1 signal firings through detector orchestration.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +25,7 @@ from alpha.assembly.m1_daily import (
     rank_friction_metrics,
     trading_session_distance,
 )
+from alpha.data.contracts import stable_hash
 from alpha.data.fmp import (
     EARNINGS_CALENDAR_ENDPOINT,
     EARNINGS_HISTORY_ENDPOINT,
@@ -48,6 +49,24 @@ from alpha.market_calendar import (
     us_equity_session_close_timestamp,
 )
 from alpha.patterns.m1 import M1Detector
+
+
+@dataclass
+class CalendarPageFetch:
+    request_date: date
+    response: Any
+
+
+@dataclass
+class CalendarWindowFetch:
+    events: List[FmpEarningsCalendarEvent]
+    pages: List[CalendarPageFetch]
+    coverage: Dict[str, Any]
+    errors: List[Dict[str, Any]]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors and bool(self.coverage.get("covers_requested_window"))
 
 
 class M1DailyAssemblyJob(BaseJob):
@@ -127,23 +146,19 @@ class M1DailyAssemblyJob(BaseJob):
             )
         snapshot_by_ticker = {snapshot.ticker.upper(): snapshot for snapshot in snapshots}
 
-        trailing_resp = self._adapter.get_earnings_calendar(
+        trailing_fetch = _fetch_earnings_calendar_window(
+            self._adapter,
             from_date=earnings_from,
             to_date=evidence_day,
             asof=cutoff_timestamp,
         )
-        trailing_lineage = _record_response_lineage(
+        trailing_lineages = _record_calendar_page_lineages(
             self._session,
-            trailing_resp,
+            trailing_fetch,
             job_run_id=ctx.job_run_id,
-            raw_payload={
-                "endpoint": EARNINGS_CALENDAR_ENDPOINT,
-                "from": earnings_from.isoformat(),
-                "to": evidence_session_date,
-                "rows": _jsonable(trailing_resp.data),
-            },
+            coverage_kind="trailing",
         )
-        if not trailing_resp.ok:
+        if not trailing_fetch.ok:
             return JobResult(
                 status="failed",
                 metrics=_base_metrics(
@@ -153,27 +168,31 @@ class M1DailyAssemblyJob(BaseJob):
                     earnings_from=earnings_from,
                     earnings_to=evidence_day,
                     price_from=price_from,
-                ),
-                errors=[{"stage": "earnings_calendar", **_provider_error(trailing_resp.error)}],
+                ) | {"earnings_calendar_coverage": trailing_fetch.coverage},
+                errors=[
+                    {"stage": "earnings_calendar", **err}
+                    for err in trailing_fetch.errors
+                ] or [{
+                    "stage": "earnings_calendar",
+                    "message": "earnings calendar coverage incomplete",
+                    "coverage": trailing_fetch.coverage,
+                }],
             )
 
-        forward_resp = self._adapter.get_earnings_calendar(
-            from_date=next_us_equity_session(evidence_day + timedelta(days=1)),
+        forward_from = next_us_equity_session(evidence_day + timedelta(days=1))
+        forward_fetch = _fetch_earnings_calendar_window(
+            self._adapter,
+            from_date=forward_from,
             to_date=forward_to,
             asof=cutoff_timestamp,
         )
-        forward_lineage = _record_response_lineage(
+        forward_lineages = _record_calendar_page_lineages(
             self._session,
-            forward_resp,
+            forward_fetch,
             job_run_id=ctx.job_run_id,
-            raw_payload={
-                "endpoint": EARNINGS_CALENDAR_ENDPOINT,
-                "from": next_us_equity_session(evidence_day + timedelta(days=1)).isoformat(),
-                "to": forward_to.isoformat(),
-                "rows": _jsonable(forward_resp.data),
-            },
+            coverage_kind="forward",
         )
-        if not forward_resp.ok:
+        if not forward_fetch.ok:
             return JobResult(
                 status="failed",
                 metrics=_base_metrics(
@@ -183,29 +202,40 @@ class M1DailyAssemblyJob(BaseJob):
                     earnings_from=earnings_from,
                     earnings_to=evidence_day,
                     price_from=price_from,
-                ),
-                errors=[{"stage": "forward_earnings_calendar", **_provider_error(forward_resp.error)}],
+                ) | {"forward_earnings_calendar_coverage": forward_fetch.coverage},
+                errors=[
+                    {"stage": "forward_earnings_calendar", **err}
+                    for err in forward_fetch.errors
+                ] or [{
+                    "stage": "forward_earnings_calendar",
+                    "message": "forward earnings calendar coverage incomplete",
+                    "coverage": forward_fetch.coverage,
+                }],
             )
 
         trailing_events = _select_trailing_announcements(
-            trailing_resp.data or [],
+            trailing_fetch.events,
             snapshot_by_ticker=snapshot_by_ticker,
             evidence_day=evidence_day,
             window_start=earnings_from,
         )
         next_earnings_by_ticker = _next_earnings_distance(
-            forward_resp.data or [],
+            forward_fetch.events,
             evidence_day=evidence_day,
             snapshot_by_ticker=snapshot_by_ticker,
         )
+        trailing_lineage_ids = [lineage.data_lineage_id for lineage in trailing_lineages]
+        trailing_lineage_hashes = [
+            page.response.lineage.raw_payload_hash for page in trailing_fetch.pages
+        ]
 
         eps_fetch_errors: List[Dict[str, Any]] = []
         foster_by_ticker: Dict[str, FosterComputation] = {}
         lineage_ids_by_ticker: Dict[str, List[str]] = {}
         lineage_hashes_by_ticker: Dict[str, List[str]] = {}
         for ticker, event in trailing_events.items():
-            lineage_ids_by_ticker.setdefault(ticker, []).append(trailing_lineage.data_lineage_id)
-            lineage_hashes_by_ticker.setdefault(ticker, []).append(trailing_resp.lineage.raw_payload_hash)
+            lineage_ids_by_ticker.setdefault(ticker, []).extend(trailing_lineage_ids)
+            lineage_hashes_by_ticker.setdefault(ticker, []).extend(trailing_lineage_hashes)
             eps_resp = self._adapter.get_earnings_history(
                 ticker,
                 limit=40,
@@ -237,6 +267,7 @@ class M1DailyAssemblyJob(BaseJob):
                     event=event,
                     eps_history=eps_resp.data or [],
                     effective_session=effective_announcement_session(event),
+                    asof_timestamp=cutoff_timestamp,
                 )
             foster_by_ticker[ticker] = computation
             _persist_m1_earnings_event(
@@ -347,7 +378,7 @@ class M1DailyAssemblyJob(BaseJob):
             evidence_session_date=evidence_session_date,
             next_execution_session=session_resolution.next_execution_session,
             source_provider="FMP",
-            source_lineage_hash=trailing_resp.lineage.raw_payload_hash,
+            source_lineage_hash=stable_hash(trailing_lineage_hashes),
             lineage_ids_by_ticker=lineage_ids_by_ticker,
             lineage_hashes_by_ticker=lineage_hashes_by_ticker,
         )
@@ -372,9 +403,9 @@ class M1DailyAssemblyJob(BaseJob):
         insufficient_foster = sum(1 for item in foster_by_ticker.values() if not item.computed)
         computed_friction = sum(1 for item in friction_by_ticker.values() if item.computed)
         metrics.update({
-            "trailing_earnings_event_count": len(trailing_resp.data or []),
+            "trailing_earnings_event_count": len(trailing_fetch.events),
             "announcing_universe_event_count": len(trailing_events),
-            "forward_earnings_event_count": len(forward_resp.data or []),
+            "forward_earnings_event_count": len(forward_fetch.events),
             "next_earnings_distance_count": len(next_earnings_by_ticker),
             "eps_history_fetch_error_count": len(eps_fetch_errors),
             "price_fetch_error_count": len(price_fetch_errors),
@@ -387,8 +418,12 @@ class M1DailyAssemblyJob(BaseJob):
             "friction_population_count": len(friction_by_ticker),
             "market_factor_symbol": MARKET_FACTOR_SYMBOL,
             "market_factor_lineage_id": market_lineage.data_lineage_id,
-            "earnings_calendar_lineage_id": trailing_lineage.data_lineage_id,
-            "forward_earnings_calendar_lineage_id": forward_lineage.data_lineage_id,
+            "earnings_calendar_lineage_ids": trailing_lineage_ids,
+            "forward_earnings_calendar_lineage_ids": [
+                lineage.data_lineage_id for lineage in forward_lineages
+            ],
+            "earnings_calendar_coverage": trailing_fetch.coverage,
+            "forward_earnings_calendar_coverage": forward_fetch.coverage,
             "assembly": _assembly_metrics(assembly),
             "orchestration": orchestration_result.metrics,
         })
@@ -499,6 +534,120 @@ def _next_earnings_distance(
         if ticker not in distances or distance < distances[ticker]:
             distances[ticker] = distance
     return distances
+
+
+def _fetch_earnings_calendar_window(
+    adapter: Any,
+    *,
+    from_date: date,
+    to_date: date,
+    asof: datetime,
+) -> CalendarWindowFetch:
+    pages: List[CalendarPageFetch] = []
+    events: List[FmpEarningsCalendarEvent] = []
+    errors: List[Dict[str, Any]] = []
+    returned_dates: List[date] = []
+    max_page_rows = 0
+    capped_page_dates: List[str] = []
+    day_count = 0
+
+    cursor = from_date
+    while cursor <= to_date:
+        day_count += 1
+        resp = adapter.get_earnings_calendar(
+            from_date=cursor,
+            to_date=cursor,
+            asof=asof,
+        )
+        pages.append(CalendarPageFetch(request_date=cursor, response=resp))
+        if not resp.ok:
+            errors.append({
+                "request_date": cursor.isoformat(),
+                **_provider_error(resp.error),
+            })
+            cursor += timedelta(days=1)
+            continue
+        rows = list(resp.data or [])
+        max_page_rows = max(max_page_rows, len(rows))
+        if len(rows) >= 4000:
+            capped_page_dates.append(cursor.isoformat())
+        for event in rows:
+            event_day = _event_calendar_date(event)
+            if event_day is None:
+                errors.append({
+                    "request_date": cursor.isoformat(),
+                    "message": "earnings calendar row missing event date",
+                })
+                continue
+            if from_date <= event_day <= to_date:
+                returned_dates.append(event_day)
+                events.append(event)
+        cursor += timedelta(days=1)
+
+    coverage = {
+        "fetch_strategy": "per_day",
+        "requested_from": from_date.isoformat(),
+        "requested_to": to_date.isoformat(),
+        "requested_calendar_days": day_count,
+        "successful_calendar_days": day_count - len({
+            error.get("request_date") for error in errors if error.get("request_date")
+        }),
+        "error_count": len(errors),
+        "returned_event_count": len(events),
+        "returned_min_date": min(returned_dates).isoformat() if returned_dates else None,
+        "returned_max_date": max(returned_dates).isoformat() if returned_dates else None,
+        "max_page_row_count": max_page_rows,
+        "capped_page_dates": capped_page_dates,
+    }
+    coverage["covers_requested_window"] = (
+        not errors
+        and not capped_page_dates
+        and len(pages) == day_count
+    )
+    if capped_page_dates:
+        errors.append({
+            "message": "earnings calendar page hit provider row cap",
+            "capped_page_dates": capped_page_dates,
+        })
+    return CalendarWindowFetch(
+        events=events,
+        pages=pages,
+        coverage=coverage,
+        errors=errors,
+    )
+
+
+def _record_calendar_page_lineages(
+    session: Session,
+    fetch: CalendarWindowFetch,
+    *,
+    job_run_id: str,
+    coverage_kind: str,
+) -> List[Any]:
+    lineages: List[Any] = []
+    for page in fetch.pages:
+        resp = page.response
+        lineages.append(_record_response_lineage(
+            session,
+            resp,
+            job_run_id=job_run_id,
+            raw_payload={
+                "endpoint": EARNINGS_CALENDAR_ENDPOINT,
+                "coverage_kind": coverage_kind,
+                "from": page.request_date.isoformat(),
+                "to": page.request_date.isoformat(),
+                "coverage": fetch.coverage,
+                "rows": _jsonable(resp.data),
+            },
+        ))
+    return lineages
+
+
+def _event_calendar_date(event: FmpEarningsCalendarEvent) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(event.date)[:10])
+    except (TypeError, ValueError):
+        return None
 
 
 def _session_window_start(evidence_day: date, sessions: int) -> date:

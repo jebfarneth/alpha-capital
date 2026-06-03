@@ -1436,8 +1436,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help="Skip Polygon identity enrichment in the universe build.")
     parser.add_argument("--skip-rerun", action="store_true",
                         help="Skip the idempotency freeze/reuse rerun.")
+    parser.add_argument("--enable-m1", action="store_true",
+                        help="Enable the M1 PEAD signal-only assembly step.")
     parser.add_argument("--skip-m1", action="store_true",
-                        help="Skip the M1 PEAD signal-only assembly step.")
+                        help="Keep the M1 PEAD signal-only assembly step disabled.")
     parser.add_argument("--skip-forward-context", action="store_true",
                         help="Skip the post-M4 forward-context panel collector.")
     parser.add_argument("--signal-context-breakout-buffer", type=float, default=0.02)
@@ -1456,6 +1458,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.database_url:
         os.environ["DATABASE_URL"] = args.database_url
     url = os.environ.get("DATABASE_URL", "")
+
+    if args.enable_m1 and args.skip_m1:
+        print("ERROR: --enable-m1 and --skip-m1 cannot be combined")
+        return 1
 
     try:
         run_ts = _parse_timestamp(args.run_timestamp)
@@ -1507,8 +1513,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dry_run:
         print("\nDry run: no database writes and no provider API calls performed.")
+        m1_step = "M1 daily" if args.enable_m1 and not args.skip_m1 else "M1 daily skipped"
         print(
-            "Planned steps: universe build -> M4 daily -> M1 daily -> "
+            "Planned steps: universe build -> M4 daily -> "
+            f"{m1_step} -> "
             "forward context panel -> health report."
         )
         return 0
@@ -1586,10 +1594,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     m1_invocation = RunInvocation(
         exit_code=0,
         run_status="finished",
-        metrics={"no_op_reason": "skipped_by_cli"},
+        metrics={"no_op_reason": "skipped_default_off"},
     )
     if args.skip_m1:
+        m1_invocation = RunInvocation(
+            exit_code=0,
+            run_status="finished",
+            metrics={"no_op_reason": "skipped_by_cli"},
+        )
         print("\nM1 daily skipped by --skip-m1.")
+    elif not args.enable_m1:
+        print("\nM1 daily skipped; pass --enable-m1 after re-audit to run it.")
     else:
         reset_globals()
         m1_invocation = _coerce_invocation(_run_m1(

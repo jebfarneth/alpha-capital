@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+import math
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -161,6 +162,7 @@ class FmpEarningsCalendarEvent:
     fiscal_date_ending: Optional[str] = None
     fiscal_year: Optional[int] = None
     fiscal_quarter: Optional[int] = None
+    diagnostics: tuple[str, ...] = ()
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -174,6 +176,9 @@ class FmpEpsRecord:
     fiscal_date_ending: Optional[str] = None
     fiscal_year: Optional[int] = None
     fiscal_quarter: Optional[int] = None
+    filing_date: Optional[str] = None
+    accepted_date: Optional[str] = None
+    diagnostics: tuple[str, ...] = ()
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -606,6 +611,9 @@ class FmpAdapter:
             for row in rows
             if isinstance(row, dict)
         ]
+        if symbol:
+            wanted = symbol.upper()
+            events = [event for event in events if event.symbol.upper() == wanted]
         return AdapterResponse(data=events, lineage=resp.lineage)
 
     def get_earnings_history(
@@ -705,33 +713,45 @@ def _parse_fmp_bar(
 def _parse_earnings_calendar_event(row: Dict[str, Any]) -> FmpEarningsCalendarEvent:
     symbol = str(_first_present(row, "symbol", "ticker", default="") or "")
     fiscal_year, fiscal_quarter = _parse_fiscal_year_quarter(row)
+    diagnostics: List[str] = []
+    actual_raw = _first_present(
+        row,
+        "epsActual",
+        "actualEps",
+        "actualEPS",
+        "reportedEPS",
+        "reportedEps",
+        "eps",
+    )
+    actual_eps = _float_or_none(actual_raw)
+    if actual_raw not in (None, "") and actual_eps is None:
+        diagnostics.append("invalid_actual_eps")
+    estimated_raw = _first_present(
+        row,
+        "epsEstimated",
+        "estimatedEps",
+        "estimatedEPS",
+        "epsEstimate",
+        "estimate",
+    )
+    estimated_eps = _float_or_none(estimated_raw)
+    if estimated_raw not in (None, "") and estimated_eps is None:
+        diagnostics.append("invalid_estimated_eps")
+    announcement_time = _string_or_none(_first_present(
+        row,
+        "time",
+        "announcementTime",
+        "timeOfDay",
+        "when",
+    ))
+    if announcement_time is None:
+        diagnostics.append("announcement_time_missing_conservative_next_session")
     return FmpEarningsCalendarEvent(
         symbol=symbol,
         date=str(_first_present(row, "date", "announcementDate", default="") or ""),
-        actual_eps=_float_or_none(_first_present(
-            row,
-            "epsActual",
-            "actualEps",
-            "actualEPS",
-            "reportedEPS",
-            "reportedEps",
-            "eps",
-        )),
-        estimated_eps=_float_or_none(_first_present(
-            row,
-            "epsEstimated",
-            "estimatedEps",
-            "estimatedEPS",
-            "epsEstimate",
-            "estimate",
-        )),
-        announcement_time=_string_or_none(_first_present(
-            row,
-            "time",
-            "announcementTime",
-            "timeOfDay",
-            "when",
-        )),
+        actual_eps=actual_eps,
+        estimated_eps=estimated_eps,
+        announcement_time=announcement_time,
         fiscal_date_ending=_string_or_none(_first_present(
             row,
             "fiscalDateEnding",
@@ -741,24 +761,39 @@ def _parse_earnings_calendar_event(row: Dict[str, Any]) -> FmpEarningsCalendarEv
         )),
         fiscal_year=fiscal_year,
         fiscal_quarter=fiscal_quarter,
+        diagnostics=tuple(diagnostics),
         raw=dict(row),
     )
 
 
 def _parse_eps_record(row: Dict[str, Any], *, ticker: str) -> FmpEpsRecord:
     fiscal_year, fiscal_quarter = _parse_fiscal_year_quarter(row)
+    diagnostics: List[str] = []
+    eps_raw = _first_present(
+        row,
+        "eps",
+        "reportedEPS",
+        "reportedEps",
+        "epsActual",
+        "actualEps",
+        "netIncomePerShare",
+    )
+    eps = _float_or_none(eps_raw)
+    if eps_raw not in (None, "") and eps is None:
+        diagnostics.append("invalid_eps")
+    accepted_date = _string_or_none(_first_present(
+        row,
+        "acceptedDate",
+        "accepted_date",
+        "acceptedDatetime",
+        "acceptedDateTime",
+    ))
+    if accepted_date is None:
+        diagnostics.append("missing_accepted_date")
     return FmpEpsRecord(
         symbol=str(_first_present(row, "symbol", "ticker", default=ticker) or ticker),
         date=_string_or_none(_first_present(row, "date", "reportedDate", "filingDate")),
-        eps=_float_or_none(_first_present(
-            row,
-            "eps",
-            "reportedEPS",
-            "reportedEps",
-            "epsActual",
-            "actualEps",
-            "netIncomePerShare",
-        )),
+        eps=eps,
         fiscal_date_ending=_string_or_none(_first_present(
             row,
             "fiscalDateEnding",
@@ -769,6 +804,14 @@ def _parse_eps_record(row: Dict[str, Any], *, ticker: str) -> FmpEpsRecord:
         )),
         fiscal_year=fiscal_year,
         fiscal_quarter=fiscal_quarter,
+        filing_date=_string_or_none(_first_present(
+            row,
+            "filingDate",
+            "filedDate",
+            "reportedDate",
+        )),
+        accepted_date=accepted_date,
+        diagnostics=tuple(diagnostics),
         raw=dict(row),
     )
 
@@ -805,6 +848,8 @@ def _float_or_none(value: Any) -> Optional[float]:
     try:
         result = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
         return None
     return result
 

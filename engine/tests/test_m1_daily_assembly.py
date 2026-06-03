@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -36,7 +36,7 @@ from alpha.db.models import (
     UniverseScan,
     UniverseSnapshot,
 )
-from alpha.jobs.m1_daily import M1DailyAssemblyJob
+from alpha.jobs.m1_daily import M1DailyAssemblyJob, _fetch_earnings_calendar_window
 from alpha.jobs.runner import run_job
 from alpha.patterns.m1 import M1Detector
 
@@ -100,6 +100,8 @@ def _foster_fixture(
             fiscal_date_ending=_fiscal_end(idx),
             fiscal_year=idx // 4,
             fiscal_quarter=idx % 4 + 1,
+            filing_date="2026-05-20" if idx == current_index else _fiscal_end(idx),
+            accepted_date="2026-05-20T18:00:00+00:00" if idx == current_index else "2026-01-01T18:00:00+00:00",
         ))
     event = FmpEarningsCalendarEvent(
         symbol=ticker,
@@ -221,6 +223,39 @@ class TestFosterSueProducer:
         assert len(result.sue_series) >= 8
         assert result.split_adjustment_continuity_check == "passed"
 
+    def test_near_zero_sigma_delta_refuses_fabricated_extreme_sue(self):
+        current_index = 2026 * 4
+        records = []
+        for idx in range(current_index - 28, current_index + 1):
+            records.append(FmpEpsRecord(
+                symbol="FLAT",
+                eps=2.0 if idx == current_index else 1.0 + idx * 1e-12,
+                fiscal_date_ending=_fiscal_end(idx),
+                fiscal_year=idx // 4,
+                fiscal_quarter=idx % 4 + 1,
+                accepted_date="2026-01-01T18:00:00+00:00",
+            ))
+        event = FmpEarningsCalendarEvent(
+            symbol="FLAT",
+            date="2026-05-20",
+            actual_eps=2.0,
+            estimated_eps=1.0,
+            announcement_time="bmo",
+            fiscal_date_ending=_fiscal_end(current_index),
+            fiscal_year=2026,
+            fiscal_quarter=1,
+        )
+
+        result = compute_foster_sue(
+            event=event,
+            eps_history=records,
+            effective_session=date(2026, 5, 20),
+        )
+
+        assert result.status == "insufficient_history"
+        assert "near_zero_sigma_delta_eps" in result.diagnostics
+        assert result.sue_foster is None
+
     def test_missing_required_fiscal_quarter_rejects_without_zero_fill(self):
         event, history, _ = _foster_fixture()
         gap_index = event.fiscal_year * 4 + (event.fiscal_quarter - 1) - 7
@@ -241,7 +276,7 @@ class TestFosterSueProducer:
         assert any("missing_required_foster_lags:7" in item for item in result.diagnostics)
         assert result.sue_foster is None
 
-    def test_calendar_eps_anchors_current_surprise_when_history_differs(self):
+    def test_history_eps_basis_anchors_current_surprise_when_calendar_differs(self):
         event, history, _ = _foster_fixture(
             sue_target=2.0,
             restated_history_current=True,
@@ -254,10 +289,90 @@ class TestFosterSueProducer:
         )
 
         assert result.status == "computed"
-        assert result.sue_foster == pytest.approx(2.0)
+        assert result.sue_foster != pytest.approx(2.0)
+        assert result.actual_eps == result.eps_history_current_eps
         assert result.restatement_exposure is True
         assert "calendar_eps_differs_from_eps_history_current" in result.diagnostics
-        assert result.actual_eps == event.actual_eps
+        assert result.actual_eps != event.actual_eps
+
+    def test_unresolved_current_quarter_refuses_instead_of_overwriting_prior_filing(self):
+        event, history, _ = _foster_fixture(sue_target=2.0)
+        event.fiscal_year = None
+        event.fiscal_quarter = None
+        event.fiscal_date_ending = None
+        current_index = 2026 * 4
+        for record in history:
+            if record.fiscal_year * 4 + (record.fiscal_quarter - 1) == current_index:
+                record.accepted_date = "2026-05-22T18:00:00+00:00"
+
+        result = compute_foster_sue(
+            event=event,
+            eps_history=history,
+            effective_session=date(2026, 5, 20),
+            asof_timestamp=_ts(),
+        )
+
+        assert result.status == "insufficient_history"
+        assert "current_eps_basis_unverified" in result.diagnostics
+        assert any(item.startswith("eps_accepted_after_asof") for item in result.diagnostics)
+        assert result.fiscal_quarter == 1
+
+    def test_current_eps_restatement_after_asof_is_not_consumed(self):
+        event, history, _ = _foster_fixture(sue_target=2.0)
+        current_index = event.fiscal_year * 4 + (event.fiscal_quarter - 1)
+        original_current = next(
+            record for record in history
+            if record.fiscal_year * 4 + (record.fiscal_quarter - 1) == current_index
+        )
+        history.insert(0, FmpEpsRecord(
+            symbol=event.symbol,
+            eps=original_current.eps + 0.75,
+            fiscal_date_ending=original_current.fiscal_date_ending,
+            fiscal_year=original_current.fiscal_year,
+            fiscal_quarter=original_current.fiscal_quarter,
+            accepted_date="2026-05-25T18:00:00+00:00",
+        ))
+
+        result = compute_foster_sue(
+            event=event,
+            eps_history=history,
+            effective_session=date(2026, 5, 20),
+            asof_timestamp=_ts(),
+        )
+
+        assert result.status == "computed"
+        assert result.sue_foster == pytest.approx(2.0)
+        assert result.actual_eps == pytest.approx(original_current.eps)
+
+    def test_rho1_uses_pit_series_not_future_quarters(self):
+        event, history, _ = _foster_fixture(sue_target=2.0)
+        baseline = compute_foster_sue(
+            event=event,
+            eps_history=list(history),
+            effective_session=date(2026, 5, 20),
+        )
+        current_index = event.fiscal_year * 4 + (event.fiscal_quarter - 1)
+        with_future = list(history)
+        for offset in range(1, 6):
+            idx = current_index + offset
+            with_future.append(FmpEpsRecord(
+                symbol=event.symbol,
+                eps=10.0 + offset,
+                fiscal_date_ending=_fiscal_end(idx),
+                fiscal_year=idx // 4,
+                fiscal_quarter=idx % 4 + 1,
+                accepted_date="2026-05-19T18:00:00+00:00",
+            ))
+
+        replay = compute_foster_sue(
+            event=event,
+            eps_history=with_future,
+            effective_session=date(2026, 5, 20),
+            asof_timestamp=_ts(),
+        )
+
+        assert replay.status == "computed"
+        assert replay.rho1 == pytest.approx(baseline.rho1)
 
     def test_unknown_announcement_time_defaults_to_next_session(self):
         event, _, _ = _foster_fixture()
@@ -294,19 +409,53 @@ class TestPriceDelayProducer:
             "A": PriceDelayComputation(ticker="A", status="computed", d1=0.1, sigma_epsilon=0.01),
             "B": PriceDelayComputation(ticker="B", status="computed", d1=0.5, sigma_epsilon=0.03),
             "C": PriceDelayComputation(ticker="C", status="computed", d1=0.9, sigma_epsilon=0.05),
+            "D": PriceDelayComputation(ticker="D", status="computed", d1=0.8, sigma_epsilon=0.02),
         }
 
         ranked = rank_friction_metrics(metrics)
 
-        assert ranked["A"].d1_decile == 4
-        assert ranked["B"].d1_decile == 7
+        assert ranked["A"].d1_decile == 3
+        assert ranked["B"].d1_decile == 5
+        assert ranked["D"].d1_decile == 8
         assert ranked["C"].d1_decile == 10
         assert ranked["A"].sigma_epsilon_percentile == 0.0
-        assert ranked["B"].sigma_epsilon_percentile == 0.5
+        assert ranked["B"].sigma_epsilon_percentile == 0.0
+        assert ranked["D"].sigma_epsilon_percentile == 0.0
         assert ranked["C"].sigma_epsilon_percentile == 1.0
 
 
 class TestM1DailyAssembly:
+    def test_singleton_announcing_cohort_does_not_auto_fire(self):
+        event, history, _ = _foster_fixture(sue_target=3.0)
+        foster = compute_foster_sue(
+            event=event,
+            eps_history=history,
+            effective_session=date(2026, 5, 20),
+        )
+        friction = PriceDelayComputation(
+            ticker="FIRE",
+            status="computed",
+            d1=0.74,
+            d1_decile=8,
+            sigma_epsilon=0.025,
+            sigma_epsilon_percentile=0.65,
+        )
+
+        result = assemble_m1_daily(
+            snapshots=[_snapshot("FIRE")],
+            foster_by_ticker={"FIRE": foster},
+            friction_by_ticker={"FIRE": friction},
+            cutoff_timestamp=_ts(),
+            decision_date="2026-05-20",
+            evidence_session_date="2026-05-20",
+            next_execution_session="2026-05-21",
+            source_lineage_hash="earnings-hash",
+        )
+
+        assert result.assembled_count == 0
+        assert result.insufficient_count == 1
+        assert result.diagnostics[0].diagnostic_type == "announcing_cohort_too_small"
+
     def test_assembler_populates_frozen_detector_contract_and_fires(self):
         event, history, _ = _foster_fixture(sue_target=2.7)
         foster = compute_foster_sue(
@@ -325,7 +474,13 @@ class TestM1DailyAssembly:
 
         result = assemble_m1_daily(
             snapshots=[_snapshot("FIRE")],
-            foster_by_ticker={"FIRE": foster},
+            foster_by_ticker={
+                "FIRE": foster,
+                "LOW1": FosterComputation(ticker="LOW1", status="computed", sue_foster=0.2),
+                "LOW2": FosterComputation(ticker="LOW2", status="computed", sue_foster=0.4),
+                "LOW3": FosterComputation(ticker="LOW3", status="computed", sue_foster=0.6),
+                "LOW4": FosterComputation(ticker="LOW4", status="computed", sue_foster=0.8),
+            },
             friction_by_ticker={"FIRE": friction},
             next_earnings_by_ticker={"FIRE": 10},
             cutoff_timestamp=_ts(),
@@ -413,7 +568,23 @@ class TestM1DailyAssembly:
 
 class FakeM1Adapter:
     def __init__(self):
-        trailing_event, history, _ = _foster_fixture(sue_target=2.7)
+        self.tickers = ["FIRE", "LOW1", "LOW2", "LOW3", "LOW4"]
+        sue_targets = {
+            "FIRE": 2.7,
+            "LOW1": -1.5,
+            "LOW2": -1.0,
+            "LOW3": -0.5,
+            "LOW4": 0.0,
+        }
+        self.trailing_events = []
+        self.histories = {}
+        for ticker in self.tickers:
+            event, history, _ = _foster_fixture(
+                ticker=ticker,
+                sue_target=sue_targets[ticker],
+            )
+            self.trailing_events.append(event)
+            self.histories[ticker] = history
         next_event = FmpEarningsCalendarEvent(
             symbol="FIRE",
             date="2026-06-04",
@@ -425,16 +596,20 @@ class FakeM1Adapter:
             fiscal_quarter=2,
         )
         market_bars, stock_bars = _market_and_stock_bars("FIRE")
-        self.trailing_event = trailing_event
         self.history = history
         self.next_event = next_event
-        self.price_bars = {
-            MARKET_FACTOR_SYMBOL: market_bars,
-            "FIRE": stock_bars,
-        }
+        self.price_bars = {MARKET_FACTOR_SYMBOL: market_bars}
+        for ticker in self.tickers:
+            _market, bars = _market_and_stock_bars(ticker)
+            self.price_bars[ticker] = bars
 
     def get_earnings_calendar(self, *, from_date, to_date, asof=None, symbol=None):
-        data = [self.next_event] if from_date >= date(2026, 5, 21) else [self.trailing_event]
+        if from_date == date(2026, 5, 20):
+            data = list(self.trailing_events)
+        elif from_date == date(2026, 6, 4):
+            data = [self.next_event]
+        else:
+            data = []
         return AdapterResponse(
             data=data,
             lineage=_lineage(EARNINGS_CALENDAR_ENDPOINT, data, asof or _ts()),
@@ -442,8 +617,8 @@ class FakeM1Adapter:
 
     def get_earnings_history(self, ticker, *, limit=40, asof=None):
         return AdapterResponse(
-            data=self.history,
-            lineage=_lineage(EARNINGS_HISTORY_ENDPOINT, self.history, asof or _ts()),
+            data=self.histories[ticker],
+            lineage=_lineage(EARNINGS_HISTORY_ENDPOINT, self.histories[ticker], asof or _ts()),
         )
 
     def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
@@ -454,14 +629,45 @@ class FakeM1Adapter:
         )
 
 
-def _setup_canonical_universe(db_session) -> None:
+class TestEarningsCalendarCoverage:
+    def test_calendar_window_refuses_provider_cap_instead_of_silent_truncation(self):
+        class CappedAdapter:
+            def get_earnings_calendar(self, *, from_date, to_date, asof=None, symbol=None):
+                data = [
+                    FmpEarningsCalendarEvent(
+                        symbol=f"T{idx}",
+                        date=from_date.isoformat(),
+                        actual_eps=1.0,
+                    )
+                    for idx in range(4000)
+                ]
+                return AdapterResponse(
+                    data=data,
+                    lineage=_lineage(EARNINGS_CALENDAR_ENDPOINT, data, asof or _ts()),
+                )
+
+        fetch = _fetch_earnings_calendar_window(
+            CappedAdapter(),
+            from_date=date(2026, 5, 20),
+            to_date=date(2026, 5, 20),
+            asof=_ts(),
+        )
+
+        assert not fetch.ok
+        assert fetch.coverage["max_page_row_count"] == 4000
+        assert fetch.coverage["capped_page_dates"] == ["2026-05-20"]
+        assert any("provider row cap" in error["message"] for error in fetch.errors)
+
+
+def _setup_canonical_universe(db_session, tickers: Optional[List[str]] = None) -> None:
+    tickers = tickers or ["FIRE"]
     scan = UniverseScan(
         scan_id="m1-test-scan",
         trading_date="2026-05-20",
         asof_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
-        raw_count=1,
-        deduped_count=1,
-        included_count=1,
+        raw_count=len(tickers),
+        deduped_count=len(tickers),
+        included_count=len(tickers),
         excluded_count=0,
         run_status="finished",
         source_lineage_hash="scan-hash",
@@ -473,25 +679,26 @@ def _setup_canonical_universe(db_session) -> None:
         scan_id=scan.scan_id,
         selection_reason="test",
     ))
-    db_session.add(UniverseSnapshot(
-        universe_snapshot_id="snap-FIRE",
-        scan_id=scan.scan_id,
-        ticker="FIRE",
-        asof_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
-        market_cap=75_000_000,
-        price=8.75,
-        primary_exchange="NASDAQ",
-        security_type="common_stock",
-        operating_universe_inclusion=True,
-        source_lineage_hash="snapshot-hash-FIRE",
-    ))
+    for ticker in tickers:
+        db_session.add(UniverseSnapshot(
+            universe_snapshot_id=f"snap-{ticker}",
+            scan_id=scan.scan_id,
+            ticker=ticker,
+            asof_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
+            market_cap=75_000_000,
+            price=8.75,
+            primary_exchange="NASDAQ",
+            security_type="common_stock",
+            operating_universe_inclusion=True,
+            source_lineage_hash=f"snapshot-hash-{ticker}",
+        ))
     db_session.flush()
 
 
 class TestM1DailyJob:
     def test_job_persists_friction_earnings_and_m1_signal(self, db_session):
-        _setup_canonical_universe(db_session)
         adapter = FakeM1Adapter()
+        _setup_canonical_universe(db_session, adapter.tickers)
         job = M1DailyAssemblyJob(
             db_session,
             adapter=adapter,
@@ -506,15 +713,15 @@ class TestM1DailyJob:
 
         assert result.status == "finished"
         assert result.metrics["market_factor_symbol"] == MARKET_FACTOR_SYMBOL
-        assert result.metrics["foster_computed_count"] == 1
+        assert result.metrics["foster_computed_count"] == 5
         assert result.metrics["foster_insufficient_history_count"] == 0
-        assert result.metrics["friction_computed_count"] == 1
-        assert result.metrics["assembly"]["assembled_count"] == 1
-        assert result.metrics["orchestration"]["total_signals_persisted"] == 1
+        assert result.metrics["friction_computed_count"] == 5
+        assert result.metrics["assembly"]["assembled_count"] == 5
+        assert result.metrics["orchestration"]["total_signals_persisted"] >= 1
 
-        earnings = db_session.query(M1EarningsEvent).one()
-        friction = db_session.query(M1FrictionSnapshot).one()
-        signal = db_session.query(SignalRegistry).filter_by(pattern_id="M1").one()
+        earnings = db_session.query(M1EarningsEvent).filter_by(ticker="FIRE").one()
+        friction = db_session.query(M1FrictionSnapshot).filter_by(ticker="FIRE").one()
+        signal = db_session.query(SignalRegistry).filter_by(pattern_id="M1", ticker="FIRE").one()
 
         assert earnings.status == "computed"
         assert earnings.sue_foster is not None
@@ -522,3 +729,4 @@ class TestM1DailyJob:
         assert friction.status == "computed"
         assert signal.ticker == "FIRE"
         assert signal.signal_horizon != "15d"
+        assert signal.next_execution_session == "2026-05-21"

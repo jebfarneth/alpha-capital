@@ -1705,6 +1705,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
         "--schema", "scratch_schema",
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--decision-date", "2026-05-26",
+        "--enable-m1",
         "--json-output", str(output),
     ])
 
@@ -1745,13 +1746,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
         )
 
     def fake_m1(**kwargs):
-        calls.append(("m1", kwargs))
-        return run_nightly_canonical.RunInvocation(
-            exit_code=0,
-            run_id="m1-run",
-            run_status="finished",
-            metrics={"market_factor_symbol": "SPY"},
-        )
+        raise AssertionError("M1 must be default-off until explicitly enabled")
 
     def fake_forward_context(**kwargs):
         calls.append(("forward_context", kwargs))
@@ -1813,14 +1808,103 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
     assert [name for name, _payload in calls] == [
         "universe",
         "m4",
-        "m1",
         "forward_context",
+        "build_report",
+    ]
+    build_kwargs = [payload for name, payload in calls if name == "build_report"][0]
+    assert build_kwargs["m1_run_id"] is None
+    assert build_kwargs["m1_metrics"]["no_op_reason"] == "skipped_default_off"
+    forward_kwargs = [payload for name, payload in calls if name == "forward_context"][0]
+    assert forward_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
+
+
+def test_main_runs_m1_only_when_enabled(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    calls = []
+
+    def fake_universe(**kwargs):
+        calls.append(("universe", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="universe-run",
+            run_status="finished",
+            metrics={"included": 3},
+        )
+
+    def fake_m4(**kwargs):
+        calls.append(("m4", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m4-primary",
+            run_status="finished",
+            metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_m1(**kwargs):
+        calls.append(("m1", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={"market_factor_symbol": "SPY"},
+        )
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def fake_report_session(url, schema):
+        return FakeEngine(), FakeSession()
+
+    def fake_build_report(session, **kwargs):
+        calls.append(("build_report", kwargs))
+        return {
+            "health": True,
+            "run_metadata": {},
+            "universe": {},
+            "m4_assembly": {},
+            "m1_assembly": {},
+            "m4_signals": {},
+            "data_quality": {},
+            "forward_return_guard": {},
+            "forward_context_panel": {},
+            "source_attempts": {},
+            "freeze_reuse": {},
+            "idempotency_rerun": {},
+            "run_diagnostics": {},
+            "fired_signal_table": [],
+            "health_verdict": {"failing_checks": []},
+        }
+
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
+
+    rc = run_nightly_canonical.main([
+        "--scratch",
+        "--schema", "scratch_schema",
+        "--run-timestamp", "2026-05-29T20:00:00-04:00",
+        "--skip-rerun",
+        "--skip-forward-context",
+        "--enable-m1",
+    ])
+
+    assert rc == 0
+    assert [name for name, _payload in calls] == [
+        "universe",
+        "m4",
+        "m1",
         "build_report",
     ]
     m1_kwargs = [payload for name, payload in calls if name == "m1"][0]
     assert m1_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
-    forward_kwargs = [payload for name, payload in calls if name == "forward_context"][0]
-    assert forward_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
 
 
 def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):

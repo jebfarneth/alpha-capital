@@ -30,7 +30,11 @@ PATTERN_ID = PatternId.M1
 MARKET_FACTOR_SYMBOL = "SPY"
 FOSTER_REQUIRED_LAGS = tuple(range(4, 20))
 FOSTER_DIFF_LAGS = tuple(range(4, 16))
+FOSTER_SIGMA_DELTA_EPSILON = 1e-6
+MAX_ABS_FOSTER_SUE = 25.0
 MIN_PRICE_DELAY_OBSERVATIONS = 20
+MIN_ANNOUNCING_COHORT_SIZE = 5
+SUE_TIE_EPSILON = 1e-12
 
 
 @dataclass
@@ -97,11 +101,12 @@ def compute_foster_sue(
     event: FmpEarningsCalendarEvent,
     eps_history: Sequence[FmpEpsRecord],
     effective_session: Optional[date] = None,
+    asof_timestamp: Optional[datetime] = None,
 ) -> FosterComputation:
     """Compute Foster TS-RW SUE from a PIT calendar event and EPS history."""
 
     ticker = event.symbol.upper()
-    diagnostics: List[str] = []
+    diagnostics: List[str] = list(getattr(event, "diagnostics", ()) or ())
     announcement_date = event.date or None
     event_id = stable_hash({
         "provider": "FMP",
@@ -133,7 +138,11 @@ def compute_foster_sue(
         diagnostics.append("actual_eps_missing")
         return base
 
-    current_index, fiscal_period_end = _resolve_current_fiscal_index(event, eps_history)
+    current_index, fiscal_period_end = _resolve_current_fiscal_index(
+        event,
+        eps_history,
+        asof_timestamp=asof_timestamp,
+    )
     if current_index is None:
         diagnostics.append("fiscal_quarter_unresolved")
         return base
@@ -144,20 +153,35 @@ def compute_foster_sue(
     if fiscal_period_end is not None:
         base.fiscal_period_end = fiscal_period_end
 
-    eps_by_index: Dict[int, float] = {}
+    needed_indices = [current_index]
+    needed_indices.extend(current_index - lag for lag in FOSTER_REQUIRED_LAGS)
+    all_history_indices = set(needed_indices)
     for record in eps_history:
         record_index = _record_fiscal_index(record)
-        if record_index is None or record.eps is None or not _is_finite(record.eps):
-            continue
-        eps_by_index[record_index] = float(record.eps)
+        if record_index is not None and record_index <= current_index:
+            all_history_indices.add(record_index)
+    selected_records, record_diagnostics = _select_pit_eps_records(
+        eps_history,
+        indices=sorted(all_history_indices),
+        diagnostic_indices=set(needed_indices),
+        asof_timestamp=asof_timestamp,
+    )
+    diagnostics.extend(record_diagnostics)
+    eps_by_index = {
+        index: float(record.eps)
+        for index, record in selected_records.items()
+        if record.eps is not None and _is_finite(record.eps)
+    }
 
     history_current = eps_by_index.get(current_index)
-    if history_current is not None:
-        base.eps_history_current_eps = history_current
-        if not math.isclose(history_current, float(event.actual_eps), rel_tol=1e-9, abs_tol=1e-9):
-            base.restatement_exposure = True
-            diagnostics.append("calendar_eps_differs_from_eps_history_current")
-    eps_by_index[current_index] = float(event.actual_eps)
+    if history_current is None:
+        diagnostics.append("current_eps_basis_unverified")
+        return base
+    base.actual_eps = history_current
+    base.eps_history_current_eps = history_current
+    if not math.isclose(history_current, float(event.actual_eps), rel_tol=1e-9, abs_tol=1e-9):
+        base.restatement_exposure = True
+        diagnostics.append("calendar_eps_differs_from_eps_history_current")
 
     missing_lags = [
         lag for lag in FOSTER_REQUIRED_LAGS
@@ -177,13 +201,16 @@ def compute_foster_sue(
         diagnostics.append("non_finite_seasonal_difference")
         return base
     sigma_delta = _sample_std(seasonal_diffs)
-    if sigma_delta is None or sigma_delta <= 0:
-        diagnostics.append("zero_or_invalid_sigma_delta_eps")
+    if sigma_delta is None or sigma_delta < FOSTER_SIGMA_DELTA_EPSILON:
+        diagnostics.append("near_zero_sigma_delta_eps")
         return base
 
     delta = sum(seasonal_diffs) / len(seasonal_diffs)
     expected_eps = eps_by_index[current_index - 4] + delta
-    sue = (float(event.actual_eps) - expected_eps) / sigma_delta
+    sue = (history_current - expected_eps) / sigma_delta
+    if not _is_finite(sue) or abs(sue) > MAX_ABS_FOSTER_SUE:
+        diagnostics.append("sue_out_of_domain_bounds")
+        return base
     series = _compute_sue_series(eps_by_index)
     current_series = [row for row in series if row["fiscal_index"] == current_index]
     if not current_series:
@@ -215,7 +242,11 @@ def compute_foster_sue(
     base.expected_eps = expected_eps
     base.sigma_delta_eps = sigma_delta
     base.sue_foster = sue
-    base.rho1 = _lag1_autocorr([row["sue"] for row in series[-8:]])
+    pit_series = [
+        row for row in sorted(series, key=lambda row: row["fiscal_index"])
+        if row["fiscal_index"] <= current_index
+    ]
+    base.rho1 = _lag1_autocorr([row["sue"] for row in pit_series[-8:]])
     base.sue_sign_current = current_sign
     base.sue_sign_prior = prior_sign
     base.sue_streak_length = _streak_length(signs)
@@ -339,19 +370,35 @@ def rank_friction_metrics(
 
     computed = [m for m in metrics.values() if m.status == "computed"]
     d1_values = sorted((m.d1, m.ticker) for m in computed if m.d1 is not None)
-    sigma_values = sorted(
-        (m.sigma_epsilon, m.ticker)
-        for m in computed
-        if m.sigma_epsilon is not None
-    )
     d1_rank = {ticker: idx + 1 for idx, (_, ticker) in enumerate(d1_values)}
-    sigma_rank = {ticker: idx for idx, (_, ticker) in enumerate(sigma_values)}
     n_d1 = len(d1_values)
-    n_sigma = len(sigma_values)
     for ticker, metric in metrics.items():
         if metric.status != "computed":
             continue
         metric.d1_decile = max(1, min(10, math.ceil(d1_rank[ticker] * 10.0 / n_d1)))
+
+    high_d1_sigma_values = sorted(
+        (m.sigma_epsilon, m.ticker)
+        for m in computed
+        if (
+            m.sigma_epsilon is not None
+            and m.d1_decile is not None
+            and m.d1_decile >= 8
+        )
+    )
+    sigma_rank = {ticker: idx for idx, (_, ticker) in enumerate(high_d1_sigma_values)}
+    n_sigma = len(high_d1_sigma_values)
+    for ticker, metric in metrics.items():
+        if metric.status != "computed":
+            continue
+        if (
+            metric.d1_decile is None
+            or metric.d1_decile < 8
+            or metric.sigma_epsilon is None
+            or ticker not in sigma_rank
+        ):
+            metric.sigma_epsilon_percentile = 0.0
+            continue
         metric.sigma_epsilon_percentile = (
             1.0 if n_sigma == 1 else sigma_rank[ticker] / (n_sigma - 1)
         )
@@ -381,7 +428,9 @@ def assemble_m1_daily(
     lineage_ids_by_ticker = lineage_ids_by_ticker or {}
     lineage_hashes_by_ticker = lineage_hashes_by_ticker or {}
     resolved_universe_cutoff = universe_cutoff_timestamp or cutoff_timestamp
-    sue_percentiles = _signed_sue_percentiles(foster_by_ticker.values())
+    sue_percentiles, sue_percentile_diagnostic = _signed_sue_percentiles(
+        foster_by_ticker.values()
+    )
 
     for snap in snapshots:
         ticker = str(_snap_attr(snap, "ticker") or "").upper()
@@ -415,6 +464,17 @@ def assemble_m1_daily(
                 pattern_id=PATTERN_ID,
                 diagnostic_type="insufficient_friction",
                 detail=detail,
+            ))
+            continue
+        if ticker not in sue_percentiles:
+            result.insufficient_count += 1
+            result.diagnostics.append(AssemblyDiagnostic(
+                ticker=ticker,
+                pattern_id=PATTERN_ID,
+                diagnostic_type=(
+                    sue_percentile_diagnostic
+                    or "announcing_cohort_percentile_unavailable"
+                ),
             ))
             continue
         if foster.effective_announcement_session is None:
@@ -526,7 +586,7 @@ def assemble_m1_daily(
 
 def _signed_sue_percentiles(
     computations: Iterable[FosterComputation],
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], Optional[str]]:
     computed = [
         (item.ticker, float(item.sue_foster))
         for item in computations
@@ -534,10 +594,14 @@ def _signed_sue_percentiles(
     ]
     values = [sue for _, sue in computed]
     n = len(values)
+    if n < MIN_ANNOUNCING_COHORT_SIZE:
+        return {}, "announcing_cohort_too_small"
+    if max(values) - min(values) <= SUE_TIE_EPSILON:
+        return {}, "announcing_cohort_all_equal_sue"
     percentiles: Dict[str, float] = {}
     for ticker, sue in computed:
         percentiles[ticker] = sum(1 for value in values if value <= sue) / n
-    return percentiles
+    return percentiles, None
 
 
 def _compute_sue_series(eps_by_index: Dict[int, float]) -> List[Dict[str, Any]]:
@@ -550,10 +614,12 @@ def _compute_sue_series(eps_by_index: Dict[int, float]) -> List[Dict[str, Any]]:
             for lag in FOSTER_DIFF_LAGS
         ]
         sigma = _sample_std(diffs)
-        if sigma is None or sigma <= 0:
+        if sigma is None or sigma < FOSTER_SIGMA_DELTA_EPSILON:
             continue
         expected = eps_by_index[index - 4] + sum(diffs) / len(diffs)
         sue = (eps_by_index[index] - expected) / sigma
+        if not _is_finite(sue) or abs(sue) > MAX_ABS_FOSTER_SUE:
+            continue
         series.append({
             "fiscal_index": index,
             "fiscal_year": index // 4,
@@ -566,6 +632,8 @@ def _compute_sue_series(eps_by_index: Dict[int, float]) -> List[Dict[str, Any]]:
 def _resolve_current_fiscal_index(
     event: FmpEarningsCalendarEvent,
     eps_history: Sequence[FmpEpsRecord],
+    *,
+    asof_timestamp: Optional[datetime] = None,
 ) -> tuple[Optional[int], Optional[str]]:
     if event.fiscal_year is not None and event.fiscal_quarter is not None:
         return event.fiscal_year * 4 + (event.fiscal_quarter - 1), event.fiscal_date_ending
@@ -573,17 +641,107 @@ def _resolve_current_fiscal_index(
     if fiscal_date is not None:
         return fiscal_date.year * 4 + ((fiscal_date.month - 1) // 3), fiscal_date.isoformat()
     event_date = _parse_date(event.date)
-    candidates = []
+    if event_date is None:
+        return None, None
+    normalized_asof = _ensure_aware(asof_timestamp) if asof_timestamp is not None else None
+    current_matches: List[Tuple[int, Optional[str]]] = []
+    if event.actual_eps is not None and _is_finite(event.actual_eps):
+        for record in eps_history:
+            idx = _record_fiscal_index(record)
+            if idx is None or record.eps is None or not _is_finite(record.eps):
+                continue
+            if not math.isclose(
+                float(record.eps),
+                float(event.actual_eps),
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                continue
+            accepted_at = _accepted_at(record)
+            if normalized_asof is not None:
+                if accepted_at is None or accepted_at > normalized_asof:
+                    continue
+            accepted_day = accepted_at.date() if accepted_at is not None else _parse_date(record.date)
+            period_end = _parse_date(record.fiscal_date_ending)
+            if accepted_day is None or accepted_day < event_date:
+                continue
+            if period_end is not None and period_end > event_date:
+                continue
+            current_matches.append((idx, record.fiscal_date_ending))
+    if current_matches:
+        distinct = {idx for idx, _period_end in current_matches}
+        if len(distinct) == 1:
+            return current_matches[0]
+        return None, None
+    candidates: List[Tuple[int, Optional[str]]] = []
     for record in eps_history:
         idx = _record_fiscal_index(record)
         if idx is None:
             continue
-        rec_date = _parse_date(record.fiscal_date_ending) or _parse_date(record.date)
-        if event_date is None or rec_date is None or rec_date <= event_date:
+        accepted_at = _accepted_at(record)
+        if asof_timestamp is not None:
+            if accepted_at is None or accepted_at > normalized_asof:
+                continue
+        accepted_day = accepted_at.date() if accepted_at is not None else _parse_date(record.date)
+        if accepted_day is not None and accepted_day <= event_date:
             candidates.append((idx, record.fiscal_date_ending))
     if not candidates:
         return None, None
-    return max(candidates, key=lambda item: item[0])
+    prior_index, _prior_period_end = max(candidates, key=lambda item: item[0])
+    current_index = prior_index + 1
+    return current_index, None
+
+
+def _select_pit_eps_records(
+    eps_history: Sequence[FmpEpsRecord],
+    *,
+    indices: Sequence[int],
+    diagnostic_indices: set[int],
+    asof_timestamp: Optional[datetime],
+) -> Tuple[Dict[int, FmpEpsRecord], List[str]]:
+    by_index: Dict[int, List[FmpEpsRecord]] = {}
+    diagnostics: List[str] = []
+    for record in eps_history:
+        index = _record_fiscal_index(record)
+        if index is None:
+            continue
+        by_index.setdefault(index, []).append(record)
+
+    selected: Dict[int, FmpEpsRecord] = {}
+    normalized_asof = _ensure_aware(asof_timestamp) if asof_timestamp is not None else None
+    for index in indices:
+        records = by_index.get(index, [])
+        finite_records = [
+            record for record in records
+            if record.eps is not None and _is_finite(record.eps)
+        ]
+        if not finite_records:
+            if index in diagnostic_indices:
+                diagnostics.append(f"eps_missing_or_invalid:{index}")
+            continue
+        if normalized_asof is None:
+            selected[index] = finite_records[0]
+            continue
+        accepted_rows = [
+            (_accepted_at(record), record)
+            for record in finite_records
+            if _accepted_at(record) is not None
+        ]
+        if not accepted_rows:
+            if index in diagnostic_indices:
+                diagnostics.append(f"eps_missing_accepted_date:{index}")
+            continue
+        eligible = [
+            (accepted_at, record)
+            for accepted_at, record in accepted_rows
+            if accepted_at is not None and accepted_at <= normalized_asof
+        ]
+        if not eligible:
+            if index in diagnostic_indices:
+                diagnostics.append(f"eps_accepted_after_asof:{index}")
+            continue
+        selected[index] = max(eligible, key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc))[1]
+    return selected, diagnostics
 
 
 def _record_fiscal_index(record: FmpEpsRecord) -> Optional[int]:
@@ -751,6 +909,24 @@ def _parse_date(value: Any) -> Optional[date]:
         return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
+
+
+def _accepted_at(record: FmpEpsRecord) -> Optional[datetime]:
+    raw = getattr(record, "accepted_date", None)
+    if raw is None:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed_date = date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+        return datetime(parsed_date.year, parsed_date.month, parsed_date.day, tzinfo=timezone.utc)
+    return _ensure_aware(parsed)
 
 
 def _is_finite(value: Any) -> bool:

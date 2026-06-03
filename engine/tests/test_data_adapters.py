@@ -1229,6 +1229,57 @@ class TestFmpAdapter:
             timeout=30,
         )
 
+    def test_get_earnings_calendar_filters_symbol_client_side(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {"symbol": "FIRE", "date": "2026-05-20", "epsActual": 1.23},
+            {"symbol": "LEAK", "date": "2026-05-20", "epsActual": 9.99},
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings_calendar(
+            from_date=date(2026, 5, 20),
+            to_date=date(2026, 5, 20),
+            symbol="FIRE",
+        )
+
+        assert resp.ok
+        assert [event.symbol for event in resp.data] == ["FIRE"]
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/earnings-calendar",
+            params={"from": "2026-05-20", "to": "2026-05-20", "symbol": "FIRE"},
+            timeout=30,
+        )
+
+    def test_get_earnings_calendar_marks_malformed_eps(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "FIRE",
+                "date": "2026-05-20",
+                "epsActual": "nan",
+                "epsEstimated": "bad",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings_calendar(
+            from_date=date(2026, 5, 20),
+            to_date=date(2026, 5, 20),
+        )
+
+        assert resp.ok
+        event = resp.data[0]
+        assert event.actual_eps is None
+        assert event.estimated_eps is None
+        assert "invalid_actual_eps" in event.diagnostics
+        assert "invalid_estimated_eps" in event.diagnostics
+        assert "announcement_time_missing_conservative_next_session" in event.diagnostics
+
     def test_get_earnings_history_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -1259,6 +1310,7 @@ class TestFmpAdapter:
         assert resp.data[0].fiscal_date_ending == "2026-03-31"
         assert resp.data[0].fiscal_year == 2026
         assert resp.data[0].fiscal_quarter == 1
+        assert "missing_accepted_date" in resp.data[0].diagnostics
         assert resp.data[1].eps == 0.88
         assert resp.lineage.endpoint == "/stable/income-statement"
         session.get.assert_called_with(
@@ -1266,6 +1318,29 @@ class TestFmpAdapter:
             params={"symbol": "FIRE", "period": "quarter", "limit": 20},
             timeout=30,
         )
+
+    def test_get_earnings_history_marks_malformed_eps_and_accepted_date(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        json_data = [
+            {
+                "symbol": "FIRE",
+                "date": "2026-03-31",
+                "eps": "nan",
+                "fiscalYear": "2026",
+                "period": "Q1",
+            }
+        ]
+        session.get.return_value = _mock_response(200, json_data)
+        adapter = self._adapter(session)
+
+        resp = adapter.get_earnings_history("FIRE", limit=20)
+
+        assert resp.ok
+        record = resp.data[0]
+        assert record.eps is None
+        assert "invalid_eps" in record.diagnostics
+        assert "missing_accepted_date" in record.diagnostics
 
     def test_get_stock_screener_ok(self):
         session = MagicMock(spec=requests.Session)
