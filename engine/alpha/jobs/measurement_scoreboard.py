@@ -11,6 +11,9 @@ primary key. That recency choice is corpus-load-bearing, so timestamps are
 compared as aware UTC datetimes rather than strings; missing timestamps sort
 oldest. Pattern-filtered runs are scoped reporting, not a global drift sentinel;
 only an unfiltered run fails loud on a globally unknown status.
+The same scoping applies to the orphan-integrity guard: a ``--pattern-id`` run
+only sees observations claiming that pattern, so the unfiltered nightly run is
+the required global orphan sentinel.
 """
 
 from __future__ import annotations
@@ -392,7 +395,7 @@ def _assert_no_orphan_signals(rows: Sequence[Mapping[str, Any]]) -> None:
 
     orphans: List[Dict[str, Any]] = []
     for row in rows:
-        if row["signal_pattern_id"] is not None:
+        if row["parent_signal_id"] is not None:
             continue
         orphans.append({
             "observation_id": row["forward_return_observation_id"],
@@ -512,6 +515,7 @@ def _load_observation_rows(
         ForwardReturnObservation.hit_stop_intraday,
         ForwardReturnObservation.same_day_barrier_ambiguity,
         ForwardReturnObservation.pattern_id,
+        SignalRegistry.signal_id.label("parent_signal_id"),
         SignalRegistry.pattern_id.label("signal_pattern_id"),
         ForwardReturnObservation.ticker,
         ForwardReturnObservation.direction,

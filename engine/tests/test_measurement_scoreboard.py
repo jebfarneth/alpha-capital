@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytest
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from alpha.db.models import (
@@ -227,6 +227,17 @@ def _add_orphan_observation(
     return obs
 
 
+def _relax_signal_registry_pattern_id(db_session) -> None:
+    db_session.execute(text("DROP TABLE signal_registry"))
+    db_session.execute(text(
+        "CREATE TABLE signal_registry ("
+        "signal_id VARCHAR PRIMARY KEY, "
+        "pattern_id VARCHAR"
+        ")"
+    ))
+    db_session.flush()
+
+
 def test_status_partition_is_exhaustive_and_disjoint():
     validate_status_partition()
     bucket_members = [status for statuses in ROLLUP_STATUS_BUCKETS.values() for status in statuses]
@@ -300,6 +311,35 @@ def test_orphan_signal_integrity_error_fails_loud(db_session_without_fk):
         "status": STATUS_COMPUTED,
         "direction": "long",
         "pattern_id": "M4",
+    }]
+
+
+def test_null_pattern_parent_is_not_misclassified_as_orphan(db_session_without_fk):
+    _relax_signal_registry_pattern_id(db_session_without_fk)
+    db_session_without_fk.execute(
+        text(
+            "INSERT INTO signal_registry (signal_id, pattern_id) "
+            "VALUES (:signal_id, NULL)"
+        ),
+        {"signal_id": "null-pattern-parent"},
+    )
+    _add_orphan_observation(
+        db_session_without_fk,
+        "parented-null-pattern",
+        signal_id="null-pattern-parent",
+        pattern_id="M4",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+    )
+
+    with pytest.raises(ScoreboardPatternIntegrityError) as exc_info:
+        build_measurement_scoreboard(db_session_without_fk)
+
+    assert exc_info.value.mismatches == [{
+        "signal_id": "null-pattern-parent",
+        "observation_id": "parented-null-pattern",
+        "observation_pattern_id": "M4",
+        "signal_pattern_id": None,
     }]
 
 
@@ -1546,6 +1586,7 @@ def _scoreboard_row(
         "hit_stop_intraday": None,
         "same_day_barrier_ambiguity": None,
         "pattern_id": "M4",
+        "parent_signal_id": "same-signal",
         "signal_pattern_id": "M4",
         "ticker": "ACME",
         "direction": "long",
