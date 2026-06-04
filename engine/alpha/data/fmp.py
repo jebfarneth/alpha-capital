@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 import math
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -38,6 +39,9 @@ HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT = (
 DELISTED_COMPANIES_ENDPOINT = "/stable/delisted-companies"
 EARNINGS_CALENDAR_ENDPOINT = "/stable/earnings-calendar"
 EARNINGS_HISTORY_ENDPOINT = "/stable/income-statement"
+INSIDER_TRADING_SEARCH_ENDPOINT = "/stable/insider-trading/search"
+_ACCESSION_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
+_ACCESSION_DIGITS_RE = re.compile(r"\b(\d{18})\b")
 
 
 def _bool_or_raw(value: Any) -> Any:
@@ -179,6 +183,33 @@ class FmpEpsRecord:
     filing_date: Optional[str] = None
     accepted_date: Optional[str] = None
     diagnostics: tuple[str, ...] = ()
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class FmpInsiderTrade:
+    """Normalized FMP insider-trading enrichment row.
+
+    FMP is not the source of truth for M2 firings. These rows can enrich SEC
+    Form 4 transactions, but the assembler still requires accession proof.
+    """
+
+    symbol: str
+    filing_date: Optional[str] = None
+    transaction_date: Optional[str] = None
+    reporting_name: Optional[str] = None
+    reporting_cik: Optional[str] = None
+    company_cik: Optional[str] = None
+    transaction_type: Optional[str] = None
+    transaction_code: Optional[str] = None
+    acquisition_or_disposition: Optional[str] = None
+    securities_transacted: Optional[float] = None
+    price: Optional[float] = None
+    security_name: Optional[str] = None
+    ownership_type: Optional[str] = None
+    link: Optional[str] = None
+    final_link: Optional[str] = None
+    accession_number: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -652,6 +683,48 @@ class FmpAdapter:
             )  # type: ignore[return-value]
         return AdapterResponse(data=records, lineage=resp.lineage)
 
+    # --- Insider trades ---
+
+    def get_insider_trades(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        page: int = 0,
+        limit: int = 100,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[FmpInsiderTrade]]:
+        """Fetch FMP insider-trading rows for enrichment/backfill.
+
+        The stable endpoint is paginated. Callers that need complete windows
+        must page until an empty page or their own PIT/date bound is reached.
+        """
+
+        params: Dict[str, Any] = {"page": page, "limit": limit}
+        if symbol:
+            params["symbol"] = symbol.upper()
+        resp = self._request(
+            INSIDER_TRADING_SEARCH_ENDPOINT,
+            params=params,
+            asof=asof,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+
+        rows = resp.data
+        if isinstance(rows, dict):
+            rows = rows.get("data") or rows.get("results") or rows.get("insiderTrades")
+        if not isinstance(rows, list):
+            rows = []
+        trades = [
+            _parse_insider_trade(row, symbol=symbol)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        if symbol:
+            wanted = symbol.upper()
+            trades = [trade for trade in trades if trade.symbol.upper() == wanted]
+        return AdapterResponse(data=trades, lineage=resp.lineage)
+
     # --- SEC filings ---
 
     def get_sec_filings(
@@ -816,6 +889,109 @@ def _parse_eps_record(row: Dict[str, Any], *, ticker: str) -> FmpEpsRecord:
     )
 
 
+def _parse_insider_trade(
+    row: Dict[str, Any],
+    *,
+    symbol: Optional[str],
+) -> FmpInsiderTrade:
+    link = _string_or_none(_first_present(row, "link", "url"))
+    final_link = _string_or_none(_first_present(row, "finalLink", "final_link"))
+    accession = _string_or_none(_first_present(
+        row,
+        "accessionNumber",
+        "accession_number",
+        "accessionNo",
+        "accession",
+    ))
+    accession = _normalize_accession(accession) or _accession_from_link(final_link or link)
+    return FmpInsiderTrade(
+        symbol=str(_first_present(row, "symbol", "ticker", default=symbol or "") or ""),
+        filing_date=_string_or_none(_first_present(
+            row,
+            "filingDate",
+            "fillingDate",
+            "filedDate",
+            "filing_date",
+        )),
+        transaction_date=_string_or_none(_first_present(
+            row,
+            "transactionDate",
+            "transaction_date",
+            "date",
+        )),
+        reporting_name=_string_or_none(_first_present(
+            row,
+            "reportingName",
+            "reportingOwnerName",
+            "ownerName",
+            "name",
+        )),
+        reporting_cik=_normalize_cik(_first_present(
+            row,
+            "reportingCik",
+            "reportingCIK",
+            "ownerCik",
+            "ownerCikNumber",
+            "insiderCik",
+        )),
+        company_cik=_normalize_cik(_first_present(
+            row,
+            "companyCik",
+            "issuerCik",
+            "issuerCIK",
+            "cik",
+        )),
+        transaction_type=_string_or_none(_first_present(
+            row,
+            "transactionType",
+            "type",
+            "transaction",
+        )),
+        transaction_code=_string_or_none(_first_present(
+            row,
+            "transactionCode",
+            "code",
+            "codingCode",
+        )),
+        acquisition_or_disposition=_string_or_none(_first_present(
+            row,
+            "acquisitionOrDisposition",
+            "acquistionOrDisposition",
+            "acquiredDisposedCode",
+            "acquiredOrDisposed",
+        )),
+        securities_transacted=_float_or_none(_first_present(
+            row,
+            "securitiesTransacted",
+            "shares",
+            "transactionShares",
+            "securitiesTransactedAmount",
+        )),
+        price=_float_or_none(_first_present(
+            row,
+            "price",
+            "transactionPrice",
+            "pricePerShare",
+        )),
+        security_name=_string_or_none(_first_present(
+            row,
+            "securityName",
+            "securityTitle",
+            "security",
+        )),
+        ownership_type=_string_or_none(_first_present(
+            row,
+            "typeOfOwner",
+            "ownershipType",
+            "directOrIndirectOwnership",
+        )),
+        link=link,
+        final_link=final_link,
+        accession_number=accession,
+        raw=dict(row),
+    )
+
+
 def _parse_fiscal_year_quarter(row: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
     fiscal_year = _int_or_none(_first_present(row, "fiscalYear", "year"))
     fiscal_quarter = _quarter_or_none(_first_present(
@@ -876,6 +1052,41 @@ def _quarter_or_none(value: Any) -> Optional[int]:
     if parsed is None or not 1 <= parsed <= 4:
         return None
     return parsed
+
+
+def _normalize_cik(value: Any) -> Optional[str]:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return None
+    return digits[-10:].zfill(10)
+
+
+def _normalize_accession(value: Any) -> Optional[str]:
+    text = _string_or_none(value)
+    if not text:
+        return None
+    match = _ACCESSION_RE.search(text)
+    if match:
+        return match.group(0)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 18:
+        tail = digits[-18:]
+        return f"{tail[:10]}-{tail[10:12]}-{tail[12:]}"
+    return None
+
+
+def _accession_from_link(value: Any) -> Optional[str]:
+    text = _string_or_none(value)
+    if not text:
+        return None
+    match = _ACCESSION_RE.search(text)
+    if match:
+        return match.group(0)
+    match = _ACCESSION_DIGITS_RE.search(text)
+    if match:
+        digits = match.group(1)
+        return f"{digits[:10]}-{digits[10:12]}-{digits[12:]}"
+    return None
 
 
 def _string_or_none(value: Any) -> Optional[str]:

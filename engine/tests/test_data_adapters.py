@@ -977,6 +977,86 @@ class TestSecEdgarAdapter:
         assert resp.lineage.data_quality_flags["ticker_resolved"] is True
         assert resp.lineage.data_quality_flags["truncated"] is True
 
+    def test_get_form4_transactions_fetches_primary_document_and_parses_owner_rows(self):
+        xml = """<?xml version="1.0"?>
+<ownershipDocument>
+  <issuer>
+    <issuerCik>0000001234</issuerCik>
+    <issuerName>Acme Microcap Inc</issuerName>
+    <issuerTradingSymbol>ACME</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerCik>0000007777</rptOwnerCik>
+      <rptOwnerName>Jane Doe</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerAddress><rptOwnerState>CA</rptOwnerState></reportingOwnerAddress>
+    <reportingOwnerRelationship>
+      <isDirector>1</isDirector>
+      <isOfficer>0</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+      <isOther>0</isOther>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-06-03</value></transactionDate>
+      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>10000</value></transactionShares>
+        <transactionPricePerShare><value>2.50</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <ownershipNature><directOrIndirectOwnership><value>D</value></directOrIndirectOwnership></ownershipNature>
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+</ownershipDocument>"""
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": ["0000001234-26-000001"],
+                            "form": ["4"],
+                            "filingDate": ["2026-06-03"],
+                            "reportDate": ["2026-06-03"],
+                            "acceptanceDateTime": ["2026-06-03T18:00:00Z"],
+                            "primaryDocument": ["form4.xml"],
+                        }
+                    }
+                },
+            ),
+            _mock_response(200, text=xml),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_form4_transactions(
+            "0000001234",
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 4),
+            asof=datetime(2026, 6, 4, 2, 30, tzinfo=timezone.utc),
+        )
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        row = resp.data[0]
+        assert row.accession_number == "0000001234-26-000001"
+        assert row.ticker == "ACME"
+        assert row.insider_cik == "0000007777"
+        assert row.transaction_code == "P"
+        assert row.acquired_disposed_code == "A"
+        assert row.shares == 10000
+        assert row.price_per_share == 2.5
+        assert row.insider_roles["is_director"] is True
+        assert resp.lineage.endpoint == "sec_edgar_form4_transactions"
+        assert resp.lineage.data_quality_flags["transaction_count"] == 1
+        assert session.get.call_args_list[1].args[0] == (
+            "https://www.sec.gov/Archives/edgar/data/1234/000000123426000001/form4.xml"
+        )
+
 
 # ---------------------------------------------------------------------------
 # FMP adapter
@@ -1049,6 +1129,49 @@ class TestFmpAdapter:
         assert resp.ok
         assert resp.data.price is None
         assert resp.data.volume == 100000
+
+    def test_get_insider_trades_parses_accession_and_owner_fields(self):
+        session = MagicMock(spec=requests.Session)
+        session.params = {}
+        session.get.return_value = _mock_response(
+            200,
+            [
+                {
+                    "symbol": "ACME",
+                    "filingDate": "2026-06-03",
+                    "transactionDate": "2026-06-02",
+                    "reportingName": "Jane Doe",
+                    "reportingCik": "7777",
+                    "companyCik": "1234",
+                    "transactionType": "P-Purchase",
+                    "acquistionOrDisposition": "A",
+                    "securitiesTransacted": "10000",
+                    "price": "2.50",
+                    "securityName": "Common Stock",
+                    "finalLink": "https://www.sec.gov/Archives/edgar/data/1234/000000123426000001/form4.xml",
+                }
+            ],
+        )
+        adapter = self._adapter(session)
+        asof = datetime(2026, 6, 4, 2, 30, tzinfo=timezone.utc)
+
+        resp = adapter.get_insider_trades(symbol="ACME", page=0, limit=50, asof=asof)
+
+        assert resp.ok
+        assert len(resp.data) == 1
+        row = resp.data[0]
+        assert row.symbol == "ACME"
+        assert row.reporting_cik == "0000007777"
+        assert row.company_cik == "0000001234"
+        assert row.accession_number == "0000001234-26-000001"
+        assert row.securities_transacted == 10000
+        assert row.price == 2.5
+        assert resp.lineage.endpoint == "/stable/insider-trading/search"
+        session.get.assert_called_with(
+            "https://financialmodelingprep.com/stable/insider-trading/search",
+            params={"page": 0, "limit": 50, "symbol": "ACME"},
+            timeout=30,
+        )
 
     def test_get_historical_price_ok(self):
         session = MagicMock(spec=requests.Session)

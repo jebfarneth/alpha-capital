@@ -562,6 +562,135 @@ class M1FrictionSnapshot(Base):
 
 
 # ---------------------------------------------------------------------------
+# m2_insider_transactions
+# ---------------------------------------------------------------------------
+class M2InsiderTransaction(Base):
+    """Full Form 4 transaction stream used by M2 classification and clustering."""
+
+    __tablename__ = "m2_insider_transactions"
+    __table_args__ = (
+        Index("ix_m2_transactions_ticker_tradable", "ticker", "first_tradable_session"),
+        Index("ix_m2_transactions_insider_year", "insider_id", "transaction_date"),
+        Index("ix_m2_transactions_accession", "filing_accession_number"),
+        Index("ix_m2_transactions_source", "source_authority"),
+    )
+
+    transaction_id = Column(String, primary_key=True)
+    scan_id = Column(String, ForeignKey("universe_scans.scan_id"), nullable=True)
+    universe_snapshot_id = Column(
+        String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    source_authority = Column(String, nullable=False)
+    enrichment_sources = Column(Text, nullable=True)
+    ticker = Column(String, nullable=False)
+    issuer_cik = Column(String, nullable=True)
+    issuer_name = Column(Text, nullable=True)
+    insider_id = Column(String, nullable=False)
+    insider_cik = Column(String, nullable=True)
+    insider_name = Column(Text, nullable=True)
+    issuer_state = Column(String, nullable=True)
+    insider_state = Column(String, nullable=True)
+    identity_resolution_method = Column(String, nullable=False)
+    identity_resolution_confidence = Column(Float, nullable=False)
+    filing_accession_number = Column(String, nullable=True)
+    filing_form = Column(String, nullable=True)
+    filing_date = Column(String, nullable=True)
+    filing_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    filing_detected_at = Column(DateTime(timezone=True), nullable=True)
+    first_tradable_session = Column(String, nullable=True)
+    clock_quality = Column(String, nullable=False)
+    transaction_date = Column(String, nullable=True)
+    transaction_code = Column(String, nullable=True)
+    transaction_code_description = Column(Text, nullable=True)
+    acquired_disposed_code = Column(String, nullable=True)
+    transaction_shares = Column(Float, nullable=True)
+    transaction_price_per_share = Column(Float, nullable=True)
+    transaction_notional_usd = Column(Float, nullable=True)
+    purchase_notional_usd = Column(Float, nullable=True)
+    market_cap_usd = Column(Float, nullable=True)
+    ownership_type = Column(String, nullable=True)
+    insider_roles_json = Column(Text, nullable=True)
+    is_open_market_purchase = Column(Boolean, nullable=False, default=False)
+    is_buy = Column(Boolean, nullable=False, default=False)
+    is_sell = Column(Boolean, nullable=False, default=False)
+    is_10b5_1 = Column(Boolean, nullable=True)
+    sec_fmp_mismatch = Column(Boolean, nullable=False, default=False)
+    data_lineage_ids = Column(Text, nullable=True)
+    raw_json = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# m2_insider_classifications
+# ---------------------------------------------------------------------------
+class M2InsiderClassification(Base):
+    """Annual CMP routine/opportunistic/unclassifiable classification."""
+
+    __tablename__ = "m2_insider_classifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "insider_id",
+            "calendar_year",
+            name="ux_m2_classifications_insider_year",
+        ),
+        Index("ix_m2_classifications_year_class", "calendar_year", "classification"),
+    )
+
+    m2_insider_classification_id = Column(String, primary_key=True, default=_uuid)
+    insider_id = Column(String, nullable=False)
+    insider_cik = Column(String, nullable=True)
+    insider_name = Column(Text, nullable=True)
+    calendar_year = Column(Integer, nullable=False)
+    classification = Column(String, nullable=False)
+    routine_month = Column(Integer, nullable=True)
+    prior_year_count = Column(Integer, nullable=False, default=0)
+    data_cutoff_at = Column(DateTime(timezone=True), nullable=False)
+    basis_json = Column(Text, nullable=True)
+    computed_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# m2_cluster_members
+# ---------------------------------------------------------------------------
+class M2ClusterMember(Base):
+    """Join table from M2/M2U cluster ids back to accession-level transactions."""
+
+    __tablename__ = "m2_cluster_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "pattern_id",
+            "m2_cluster_id",
+            "transaction_id",
+            name="ux_m2_cluster_members_pattern_cluster_transaction",
+        ),
+        Index("ix_m2_cluster_members_cluster", "pattern_id", "m2_cluster_id"),
+        Index("ix_m2_cluster_members_accession", "filing_accession_number"),
+    )
+
+    m2_cluster_member_id = Column(String, primary_key=True, default=_uuid)
+    pattern_id = Column(String, nullable=False)
+    m2_cluster_id = Column(String, nullable=False)
+    m2_cluster_signature_hash = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    transaction_id = Column(
+        String, ForeignKey("m2_insider_transactions.transaction_id"), nullable=False
+    )
+    filing_accession_number = Column(String, nullable=True)
+    insider_id = Column(String, nullable=False)
+    insider_cik = Column(String, nullable=True)
+    classification = Column(String, nullable=False)
+    first_tradable_session = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # data_lineage
 # ---------------------------------------------------------------------------
 class DataLineage(Base):

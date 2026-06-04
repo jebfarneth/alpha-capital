@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import requests
@@ -35,7 +36,9 @@ SOURCE_AUTHORITY = "SEC_EDGAR"
 COMPANY_TICKERS_EXCHANGE_ENDPOINT = "/files/company_tickers_exchange.json"
 SUBMISSIONS_ENDPOINT_TEMPLATE = "/submissions/CIK{cik}.json"
 SURVIVORSHIP_EVENTS_ENDPOINT = "sec_edgar_survivorship_events"
+FORM4_TRANSACTIONS_ENDPOINT = "sec_edgar_form4_transactions"
 FORM_25_FORMS = ("25", "25-NSE")
+FORM_4_FORMS = ("4", "4/A")
 SEC_MAX_REQUESTS_PER_SECOND = 10
 MAX_SUBMISSIONS_OVERFLOW_PAGES = 20
 EDGAR_ACCEPTANCE_TIMEZONE = ZoneInfo("America/New_York")
@@ -72,6 +75,33 @@ class SecEdgarFiling:
     size: Optional[int] = None
     is_xbrl: Optional[bool] = None
     is_inline_xbrl: Optional[bool] = None
+    raw: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class SecForm4Transaction:
+    """One parsed owner/transaction row from a SEC Form 4 filing."""
+
+    transaction_id: str
+    accession_number: str
+    filing_form: str
+    filing_date: Optional[date]
+    filing_accepted_at: Optional[datetime]
+    issuer_cik: Optional[str]
+    issuer_name: Optional[str]
+    ticker: Optional[str]
+    insider_cik: Optional[str]
+    insider_name: Optional[str]
+    insider_state: Optional[str]
+    insider_roles: Dict[str, Any]
+    transaction_date: Optional[date]
+    transaction_code: Optional[str]
+    acquired_disposed_code: Optional[str]
+    security_title: Optional[str]
+    shares: Optional[float]
+    price_per_share: Optional[float]
+    ownership_type: Optional[str]
+    is_10b5_1: Optional[bool]
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -268,6 +298,141 @@ class SecEdgarAdapter:
 
         return AdapterResponse(data=data, lineage=lineage)
 
+    def _request_text(
+        self,
+        endpoint: str,
+        *,
+        base_url: Optional[str] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[str]:
+        request_base_url = base_url or self._config.sec_base_url
+        url = f"{request_base_url}{endpoint}"
+        quality_flags = _request_data_quality_flags(url)
+        request_ts = utcnow()
+        asof_ts = aware_utc_or_none(asof) if asof is not None else request_ts
+        if asof_ts is None:
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    request_timestamp=request_ts,
+                    asof_timestamp=request_ts,
+                    raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                    data_quality_flags=quality_flags,
+                ),
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=None,
+                    error_type="validation",
+                    message="SEC EDGAR adapter asof timestamp must be timezone-aware datetime",
+                    retryable=False,
+                ),
+            )
+        try:
+            self._rate_gate()
+            resp = self._session.get(
+                url,
+                params={},
+                headers=self._headers,
+                timeout=30,
+            )
+        except requests.exceptions.Timeout:
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    request_timestamp=request_ts,
+                    asof_timestamp=asof_ts,
+                    raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                    data_quality_flags=quality_flags,
+                ),
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=None,
+                    error_type="timeout",
+                    message="Request timed out",
+                    retryable=True,
+                ),
+            )
+        except requests.exceptions.RequestException as exc:
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    request_timestamp=request_ts,
+                    asof_timestamp=asof_ts,
+                    raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                    data_quality_flags=quality_flags,
+                ),
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=None,
+                    error_type="http",
+                    message=f"SEC EDGAR request failed: {exc.__class__.__name__}",
+                    retryable=True,
+                ),
+            )
+
+        lineage = LineageMeta(
+            provider=PROVIDER,
+            endpoint=endpoint,
+            request_timestamp=request_ts,
+            asof_timestamp=asof_ts,
+            raw_payload_hash=stable_hash(resp.text),
+            freshness_seconds=(utcnow() - request_ts).total_seconds(),
+            source_authority=SOURCE_AUTHORITY,
+            data_quality_flags=quality_flags,
+        )
+        if resp.status_code == 429:
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=429,
+                    error_type="rate_limit",
+                    message="SEC EDGAR rate limit exceeded",
+                    retryable=True,
+                ),
+            )
+        if resp.status_code in (401, 403):
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=resp.status_code,
+                    error_type="auth",
+                    message=f"SEC EDGAR auth/fair-access error: {resp.status_code}",
+                    retryable=False,
+                ),
+            )
+        if resp.status_code != 200:
+            return AdapterResponse(
+                data=None,
+                lineage=lineage,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=resp.status_code,
+                    error_type="http",
+                    message=f"SEC EDGAR HTTP {resp.status_code}",
+                    retryable=resp.status_code >= 500,
+                ),
+            )
+        return AdapterResponse(data=resp.text, lineage=lineage)
+
     def _rate_gate(self) -> None:
         interval = 1.0 / SEC_MAX_REQUESTS_PER_SECOND
         now = time.monotonic()
@@ -459,6 +624,148 @@ class SecEdgarAdapter:
         )
         return AdapterResponse(data=filtered, lineage=lineage)
 
+    def get_form4_filings(
+        self,
+        cik: Any,
+        *,
+        from_date: Optional[Any] = None,
+        to_date: Optional[Any] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[SecEdgarFiling]]:
+        """Fetch PIT-filtered Form 4 / 4-A filing metadata for one issuer CIK."""
+
+        return self.get_filings(
+            cik,
+            forms=FORM_4_FORMS,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+        )
+
+    def get_filing_document(
+        self,
+        filing: SecEdgarFiling,
+        *,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[str]:
+        """Fetch the primary document bytes for a filing accession."""
+
+        if not filing.primary_document:
+            request_ts = utcnow()
+            asof_ts = aware_utc_or_none(asof) if asof is not None else request_ts
+            if asof_ts is None:
+                asof_ts = request_ts
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider=PROVIDER,
+                    endpoint="sec_edgar_filing_document",
+                    request_timestamp=request_ts,
+                    asof_timestamp=asof_ts,
+                    raw_payload_hash="",
+                    source_authority=SOURCE_AUTHORITY,
+                ),
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint="sec_edgar_filing_document",
+                    status_code=None,
+                    error_type="validation",
+                    message="filing primary_document is required",
+                    retryable=False,
+                ),
+            )
+        accession_dir = filing.accession_number.replace("-", "")
+        try:
+            cik_int = str(int(filing.cik))
+        except (TypeError, ValueError):
+            cik_int = str(filing.cik).lstrip("0") or "0"
+        document = str(filing.primary_document).lstrip("/")
+        endpoint = f"/Archives/edgar/data/{cik_int}/{accession_dir}/{document}"
+        return self._request_text(endpoint, base_url=self._config.sec_base_url, asof=asof)
+
+    def get_form4_transactions(
+        self,
+        cik: Any,
+        *,
+        from_date: Optional[Any] = None,
+        to_date: Optional[Any] = None,
+        asof: Optional[datetime] = None,
+    ) -> AdapterResponse[List[SecForm4Transaction]]:
+        """Fetch and parse SEC Form 4 owner/transaction rows for one issuer."""
+
+        filings_resp = self.get_form4_filings(
+            cik,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+        )
+        if not filings_resp.ok:
+            return AdapterResponse(
+                data=None,
+                lineage=filings_resp.lineage,
+                error=filings_resp.error,
+            )
+        transactions: List[SecForm4Transaction] = []
+        document_hashes: List[str] = []
+        document_count = 0
+        for filing in filings_resp.data or []:
+            doc_resp = self.get_filing_document(filing, asof=asof)
+            if not doc_resp.ok:
+                return AdapterResponse(
+                    data=None,
+                    lineage=replace(
+                        filings_resp.lineage,
+                        endpoint=FORM4_TRANSACTIONS_ENDPOINT,
+                        data_quality_flags={
+                            **(filings_resp.lineage.data_quality_flags or {}),
+                            "document_fetch_error_accession": filing.accession_number,
+                        },
+                    ),
+                    error=doc_resp.error,
+                )
+            document_count += 1
+            document_hashes.append(doc_resp.lineage.raw_payload_hash)
+            parsed, parse_error = _parse_form4_transactions_xml(
+                doc_resp.data or "",
+                filing=filing,
+            )
+            if parse_error is not None:
+                return AdapterResponse(
+                    data=None,
+                    lineage=replace(
+                        filings_resp.lineage,
+                        endpoint=FORM4_TRANSACTIONS_ENDPOINT,
+                        data_quality_flags={
+                            **(filings_resp.lineage.data_quality_flags or {}),
+                            "parse_error_accession": filing.accession_number,
+                        },
+                    ),
+                    error=ProviderError(
+                        provider=PROVIDER,
+                        endpoint=FORM4_TRANSACTIONS_ENDPOINT,
+                        status_code=200,
+                        error_type="parse",
+                        message=parse_error,
+                        retryable=False,
+                    ),
+                )
+            transactions.extend(parsed)
+        lineage = replace(
+            filings_resp.lineage,
+            endpoint=FORM4_TRANSACTIONS_ENDPOINT,
+            raw_payload_hash=stable_hash({
+                "filing_hash": filings_resp.lineage.raw_payload_hash,
+                "document_hashes": document_hashes,
+                "transaction_ids": [row.transaction_id for row in transactions],
+            }),
+            data_quality_flags={
+                **(filings_resp.lineage.data_quality_flags or {}),
+                "document_count": document_count,
+                "transaction_count": len(transactions),
+            },
+        )
+        return AdapterResponse(data=transactions, lineage=lineage)
+
     def _get_overflow_filings(
         self,
         cik: str,
@@ -645,6 +952,202 @@ class SecEdgarAdapter:
             },
         )
         return AdapterResponse(data=events, lineage=lineage)
+
+
+def _parse_form4_transactions_xml(
+    text: str,
+    *,
+    filing: SecEdgarFiling,
+) -> Tuple[List[SecForm4Transaction], Optional[str]]:
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return [], f"Form 4 XML parse error: {exc}"
+
+    issuer = _first_child(root, "issuer")
+    issuer_cik = _cik10(_first_text(issuer, "issuerCik") if issuer is not None else None)
+    issuer_name = _first_text(issuer, "issuerName") if issuer is not None else None
+    ticker = _first_text(issuer, "issuerTradingSymbol") if issuer is not None else None
+    owners = _reporting_owners(root)
+    if not owners:
+        owners = [{
+            "insider_cik": None,
+            "insider_name": None,
+            "insider_state": None,
+            "roles": {},
+        }]
+    remarks = (_first_text(root, "remarks") or "").lower()
+    document_10b5_1 = "10b5-1" in remarks or "10b5" in remarks
+
+    transaction_nodes = _descendants(root, "nonDerivativeTransaction")
+    transaction_nodes.extend(_descendants(root, "derivativeTransaction"))
+    rows: List[SecForm4Transaction] = []
+    for tx_index, tx_node in enumerate(transaction_nodes):
+        transaction_date = _coerce_date(_nested_text(tx_node, "transactionDate", "value"))
+        transaction_code = _nested_text(tx_node, "transactionCoding", "transactionCode")
+        acquired_disposed = _nested_text(
+            tx_node,
+            "transactionAmounts",
+            "transactionAcquiredDisposedCode",
+            "value",
+        )
+        shares = _optional_float(_nested_text(
+            tx_node,
+            "transactionAmounts",
+            "transactionShares",
+            "value",
+        ))
+        price = _optional_float(_nested_text(
+            tx_node,
+            "transactionAmounts",
+            "transactionPricePerShare",
+            "value",
+        ))
+        security_title = _nested_text(tx_node, "securityTitle", "value")
+        ownership_type = _nested_text(
+            tx_node,
+            "ownershipNature",
+            "directOrIndirectOwnership",
+            "value",
+        )
+        tx_raw = {
+            "security_title": security_title,
+            "transaction_date": transaction_date.isoformat() if transaction_date else None,
+            "transaction_code": transaction_code,
+            "acquired_disposed_code": acquired_disposed,
+            "shares": shares,
+            "price_per_share": price,
+            "ownership_type": ownership_type,
+        }
+        for owner in owners:
+            owner_cik = _cik10(owner.get("insider_cik"))
+            owner_name = owner.get("insider_name")
+            transaction_id = stable_hash({
+                "accession_number": filing.accession_number,
+                "transaction_index": tx_index,
+                "owner_cik": owner_cik,
+                "owner_name": owner_name,
+                "transaction_date": transaction_date,
+                "transaction_code": transaction_code,
+                "acquired_disposed_code": acquired_disposed,
+                "shares": shares,
+                "price_per_share": price,
+                "security_title": security_title,
+            })
+            rows.append(SecForm4Transaction(
+                transaction_id=transaction_id,
+                accession_number=filing.accession_number,
+                filing_form=filing.form,
+                filing_date=filing.filing_date,
+                filing_accepted_at=filing.acceptance_datetime,
+                issuer_cik=issuer_cik or _cik10(filing.cik),
+                issuer_name=issuer_name,
+                ticker=ticker,
+                insider_cik=owner_cik,
+                insider_name=owner_name,
+                insider_state=owner.get("insider_state"),
+                insider_roles=dict(owner.get("roles") or {}),
+                transaction_date=transaction_date,
+                transaction_code=_clean_string(transaction_code),
+                acquired_disposed_code=_clean_string(acquired_disposed),
+                security_title=_clean_string(security_title),
+                shares=shares,
+                price_per_share=price,
+                ownership_type=_clean_string(ownership_type),
+                is_10b5_1=document_10b5_1 or _transaction_mentions_10b5(tx_node),
+                raw={
+                    "owner": owner,
+                    "transaction": tx_raw,
+                    "accession_number": filing.accession_number,
+                },
+            ))
+    return rows, None
+
+
+def _reporting_owners(root: ET.Element) -> List[Dict[str, Any]]:
+    owners: List[Dict[str, Any]] = []
+    for owner_node in _descendants(root, "reportingOwner"):
+        owner_id = _first_child(owner_node, "reportingOwnerId")
+        address = _first_child(owner_node, "reportingOwnerAddress")
+        relationship = _first_child(owner_node, "reportingOwnerRelationship")
+        officer_title = _first_text(relationship, "officerTitle") if relationship is not None else None
+        roles = {
+            "is_director": _xml_bool(_first_text(relationship, "isDirector") if relationship is not None else None),
+            "is_officer": _xml_bool(_first_text(relationship, "isOfficer") if relationship is not None else None),
+            "is_ten_percent_owner": _xml_bool(_first_text(relationship, "isTenPercentOwner") if relationship is not None else None),
+            "is_other": _xml_bool(_first_text(relationship, "isOther") if relationship is not None else None),
+            "officer_title": officer_title,
+        }
+        owners.append({
+            "insider_cik": _first_text(owner_id, "rptOwnerCik") if owner_id is not None else None,
+            "insider_name": _first_text(owner_id, "rptOwnerName") if owner_id is not None else None,
+            "insider_state": _first_text(address, "rptOwnerState") if address is not None else None,
+            "roles": roles,
+        })
+    return owners
+
+
+def _transaction_mentions_10b5(node: ET.Element) -> Optional[bool]:
+    text = " ".join(
+        item.text or ""
+        for item in node.iter()
+        if item.text
+    ).lower()
+    if not text:
+        return None
+    return "10b5-1" in text or "10b5" in text
+
+
+def _nested_text(node: Optional[ET.Element], *path: str) -> Optional[str]:
+    current = node
+    for name in path:
+        current = _first_child(current, name)
+        if current is None:
+            return None
+    return _clean_string(current.text)
+
+
+def _first_text(node: Optional[ET.Element], name: str) -> Optional[str]:
+    child = _first_child(node, name)
+    return _clean_string(child.text) if child is not None else None
+
+
+def _first_child(node: Optional[ET.Element], name: str) -> Optional[ET.Element]:
+    if node is None:
+        return None
+    wanted = name.lower()
+    for child in node:
+        if _local_name(child.tag).lower() == wanted:
+            return child
+    for child in node.iter():
+        if child is not node and _local_name(child.tag).lower() == wanted:
+            return child
+    return None
+
+
+def _descendants(node: ET.Element, name: str) -> List[ET.Element]:
+    wanted = name.lower()
+    return [
+        item
+        for item in node.iter()
+        if _local_name(item.tag).lower() == wanted
+    ]
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _xml_bool(value: Any) -> Optional[bool]:
+    text = _clean_string(value)
+    if text is None:
+        return None
+    lowered = text.lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    return None
 
 
 def _asof_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -940,6 +1443,15 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
