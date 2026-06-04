@@ -16,7 +16,7 @@ from alpha.assembly.m2_daily import (
 )
 from alpha.db.models import M2InsiderTransaction
 from alpha.jobs.detector_orchestration import _input_asof_ceiling
-from alpha.jobs.m2_daily import _persist_transaction
+from alpha.jobs.m2_daily import _live_detected_at_for_sec_row, _persist_transaction
 
 
 def _ts(day: int = 3, hour: int = 22) -> datetime:
@@ -135,6 +135,106 @@ def test_live_detection_timestamp_controls_clock_after_preopen_acceptance():
     assert evidence.first_tradable_session == "2026-06-04"
 
 
+def test_live_detection_selector_uses_acceptance_for_historical_context():
+    sec_row = SimpleNamespace(
+        filing_accepted_at=datetime(2022, 5, 20, 22, 0, tzinfo=timezone.utc),
+        filing_date=date(2022, 5, 20),
+    )
+    detected_at = _live_detected_at_for_sec_row(
+        sec_row,
+        run_timestamp=datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc),
+        live_detection_window_start=datetime(2026, 6, 3, 4, 0, tzinfo=timezone.utc),
+    )
+
+    evidence = transaction_evidence_from_sec(
+        SimpleNamespace(
+            transaction_id="tx-old",
+            ticker="ACME",
+            insider_cik="0000000001",
+            insider_name="Owner One",
+            accession_number="0000000001-22-000001",
+            filing_form="4",
+            filing_date=date(2022, 5, 20),
+            filing_accepted_at=sec_row.filing_accepted_at,
+            transaction_date=date(2022, 5, 20),
+            transaction_code="P",
+            acquired_disposed_code="A",
+            shares=10_000,
+            price_per_share=2.0,
+            issuer_cik="0000009999",
+            issuer_name="Acme",
+            insider_state="CA",
+            insider_roles={},
+            ownership_type="D",
+            is_10b5_1=False,
+            raw={},
+        ),
+        detected_at=detected_at,
+        market_cap_usd=75_000_000,
+        ticker="ACME",
+    )
+
+    assert detected_at == sec_row.filing_accepted_at
+    assert evidence.filing_detected_at == sec_row.filing_accepted_at
+    assert evidence.first_tradable_session == "2022-05-23"
+
+
+def test_live_detection_selector_uses_run_timestamp_for_watch_window_rows():
+    sec_row = SimpleNamespace(
+        filing_accepted_at=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
+    )
+
+    detected_at = _live_detected_at_for_sec_row(
+        sec_row,
+        run_timestamp=datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc),
+        live_detection_window_start=datetime(2026, 6, 3, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert detected_at == datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc)
+
+
+def test_live_detection_selector_filing_date_only_emits_no_fake_time():
+    sec_row = SimpleNamespace(
+        transaction_id="tx-filing-date-only",
+        ticker="ACME",
+        insider_cik="0000000001",
+        insider_name="Owner One",
+        accession_number="0000000001-26-000001",
+        filing_form="4",
+        filing_date=date(2026, 6, 3),
+        filing_accepted_at=None,
+        transaction_date=date(2026, 6, 3),
+        transaction_code="P",
+        acquired_disposed_code="A",
+        shares=10_000,
+        price_per_share=2.0,
+        issuer_cik="0000009999",
+        issuer_name="Acme",
+        insider_state="CA",
+        insider_roles={},
+        ownership_type="D",
+        is_10b5_1=False,
+        raw={},
+    )
+
+    detected_at = _live_detected_at_for_sec_row(
+        sec_row,
+        run_timestamp=datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc),
+        live_detection_window_start=datetime(2026, 6, 3, 4, 0, tzinfo=timezone.utc),
+    )
+    evidence = transaction_evidence_from_sec(
+        sec_row,
+        detected_at=detected_at,
+        market_cap_usd=75_000_000,
+        ticker="ACME",
+    )
+
+    assert detected_at is None
+    assert evidence.filing_detected_at is None
+    assert evidence.clock_quality == "filing_date_only"
+    assert evidence.first_tradable_session == "2026-06-04"
+
+
 def test_reingestion_preserves_earliest_filing_detected_at(db_session):
     first = _tx(
         "0000000001",
@@ -172,6 +272,45 @@ def test_reingestion_preserves_earliest_filing_detected_at(db_session):
     row = db_session.get(M2InsiderTransaction, first.transaction_id)
     assert row.filing_detected_at == datetime(2026, 6, 3, 22, 15)
     assert row.first_tradable_session == "2026-06-04"
+
+
+def test_reingestion_does_not_move_filing_detected_at_backward(db_session):
+    first = _tx(
+        "0000000001",
+        tx_date="2026-06-03",
+        accepted_at=datetime(2026, 6, 3, 12, tzinfo=timezone.utc),
+        first_tradable="2026-06-05",
+        accession="0000000001-26-000001",
+    )
+    first.filing_detected_at = datetime(2026, 6, 4, 22, 15, tzinfo=timezone.utc)
+    second = _tx(
+        "0000000001",
+        tx_date="2026-06-03",
+        accepted_at=datetime(2026, 6, 3, 12, tzinfo=timezone.utc),
+        first_tradable="2026-06-04",
+        accession="0000000001-26-000001",
+    )
+    second.filing_detected_at = datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc)
+    snapshot = SimpleNamespace(universe_snapshot_id=None)
+
+    _persist_transaction(
+        db_session,
+        first,
+        scan_id=None,
+        snapshot=snapshot,
+        job_run_id=None,
+    )
+    _persist_transaction(
+        db_session,
+        second,
+        scan_id=None,
+        snapshot=snapshot,
+        job_run_id=None,
+    )
+
+    row = db_session.get(M2InsiderTransaction, first.transaction_id)
+    assert row.filing_detected_at == datetime(2026, 6, 4, 22, 15)
+    assert row.first_tradable_session == "2026-06-05"
 
 
 def test_identity_resolver_collapses_name_variants_when_sec_cik_matches():

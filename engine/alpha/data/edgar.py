@@ -966,6 +966,13 @@ def _parse_form4_transactions_xml(
     except ET.ParseError as exc:
         return [], f"Form 4 XML parse error: {exc}"
 
+    root_name = _local_name(root.tag)
+    if root_name != "ownershipDocument":
+        return [], (
+            "Form 4 XML root validation error: expected ownershipDocument, "
+            f"got {root_name}"
+        )
+
     issuer = _first_child(root, "issuer")
     issuer_cik = _cik10(_first_text(issuer, "issuerCik") if issuer is not None else None)
     issuer_name = _first_text(issuer, "issuerName") if issuer is not None else None

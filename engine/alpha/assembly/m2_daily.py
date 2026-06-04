@@ -964,7 +964,7 @@ def transaction_evidence_from_fmp(
     trade: Any,
     *,
     accession_owner_cik: Optional[str],
-    detected_at: datetime,
+    detected_at: Optional[datetime],
     market_cap_usd: Optional[float],
     issuer_state: Optional[str] = None,
     lineage_ids: Optional[List[str]] = None,

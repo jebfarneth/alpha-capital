@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, is_dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -23,6 +23,7 @@ from alpha.data.edgar import FORM4_TRANSACTIONS_ENDPOINT
 from alpha.data.fmp import INSIDER_TRADING_SEARCH_ENDPOINT
 from alpha.db.models import (
     CanonicalUniverseScan,
+    EvidenceJobRun,
     M2ClusterMember,
     M2InsiderClassification,
     M2InsiderTransaction,
@@ -33,7 +34,7 @@ from alpha.db.models import (
 from alpha.evidence.writer import record_data_lineage
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
-from alpha.market_calendar import resolve_us_equity_session
+from alpha.market_calendar import EASTERN_TZ, resolve_us_equity_session
 from alpha.patterns.m2 import M2Detector
 
 
@@ -117,6 +118,13 @@ class M2DailyAssemblyJob(BaseJob):
         sec_transaction_count = 0
         fmp_enrichment_count = 0
         unresolved_cik_count = 0
+        live_detection_window_start = _live_detection_window_start(
+            self._session,
+            job_id=ctx.job_id,
+            current_job_run_id=ctx.job_run_id,
+            current_started_at=ctx.started_at,
+            evidence_session_date=evidence_session_date,
+        )
 
         for snapshot in snapshots:
             ticker = snapshot.ticker.upper()
@@ -178,7 +186,11 @@ class M2DailyAssemblyJob(BaseJob):
             sec_evidence = [
                 transaction_evidence_from_sec(
                     row,
-                    detected_at=run_timestamp,
+                    detected_at=_live_detected_at_for_sec_row(
+                        row,
+                        run_timestamp=run_timestamp,
+                        live_detection_window_start=live_detection_window_start,
+                    ),
                     market_cap_usd=snapshot.market_cap,
                     ticker=ticker,
                     lineage_ids=[sec_lineage.data_lineage_id],
@@ -233,7 +245,7 @@ class M2DailyAssemblyJob(BaseJob):
                 evidence = transaction_evidence_from_fmp(
                     trade,
                     accession_owner_cik=accession_owner_ciks.get(accession),
-                    detected_at=run_timestamp,
+                    detected_at=None,
                     market_cap_usd=snapshot.market_cap,
                     lineage_ids=[fmp_lineage.data_lineage_id, sec_lineage.data_lineage_id],
                     lineage_hashes=[
@@ -390,6 +402,48 @@ def _load_identity_ciks(session: Session, scan_id: str) -> Dict[str, str]:
     }
 
 
+def _live_detection_window_start(
+    session: Session,
+    *,
+    job_id: str,
+    current_job_run_id: str,
+    current_started_at: datetime,
+    evidence_session_date: str,
+) -> datetime:
+    previous_run = (
+        session.query(EvidenceJobRun)
+        .filter(
+            EvidenceJobRun.job_id == job_id,
+            EvidenceJobRun.job_run_id != current_job_run_id,
+            EvidenceJobRun.started_at.isnot(None),
+            EvidenceJobRun.started_at < current_started_at,
+            EvidenceJobRun.ended_at.isnot(None),
+        )
+        .order_by(EvidenceJobRun.started_at.desc())
+        .first()
+    )
+    if previous_run is not None:
+        previous_started_at = _ensure_aware(previous_run.started_at)
+        if previous_started_at is not None:
+            return previous_started_at
+    evidence_day = date.fromisoformat(evidence_session_date)
+    return datetime.combine(evidence_day, time.min, EASTERN_TZ).astimezone(timezone.utc)
+
+
+def _live_detected_at_for_sec_row(
+    row: Any,
+    *,
+    run_timestamp: datetime,
+    live_detection_window_start: datetime,
+) -> Optional[datetime]:
+    accepted_at = _ensure_aware(getattr(row, "filing_accepted_at", None))
+    if accepted_at is None:
+        return None
+    if live_detection_window_start <= accepted_at <= run_timestamp:
+        return run_timestamp
+    return accepted_at
+
+
 def _persist_transaction(
     session: Session,
     evidence: Any,
@@ -399,17 +453,11 @@ def _persist_transaction(
     job_run_id: Optional[str],
 ) -> None:
     existing = session.get(M2InsiderTransaction, evidence.transaction_id)
-    earliest_detected_at = evidence.filing_detected_at
+    persisted_detected_at = evidence.filing_detected_at
     if existing is not None and existing.filing_detected_at is not None:
-        existing_detected_at = _ensure_aware(existing.filing_detected_at)
-        incoming_detected_at = _ensure_aware(evidence.filing_detected_at)
-        if incoming_detected_at is None or (
-            existing_detected_at is not None
-            and existing_detected_at <= incoming_detected_at
-        ):
-            earliest_detected_at = existing_detected_at
-    if earliest_detected_at != evidence.filing_detected_at:
-        evidence = _with_detection_clock(evidence, earliest_detected_at)
+        persisted_detected_at = _ensure_aware(existing.filing_detected_at)
+    if persisted_detected_at != evidence.filing_detected_at:
+        evidence = _with_detection_clock(evidence, persisted_detected_at)
     if existing is not None:
         session.delete(existing)
         session.flush()
@@ -434,7 +482,7 @@ def _persist_transaction(
         filing_form=evidence.filing_form,
         filing_date=evidence.filing_date,
         filing_accepted_at=evidence.filing_accepted_at,
-        filing_detected_at=earliest_detected_at,
+        filing_detected_at=persisted_detected_at,
         first_tradable_session=evidence.first_tradable_session,
         clock_quality=evidence.clock_quality,
         transaction_date=evidence.transaction_date,

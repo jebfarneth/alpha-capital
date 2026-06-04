@@ -1057,6 +1057,43 @@ class TestSecEdgarAdapter:
             "https://www.sec.gov/Archives/edgar/data/1234/000000123426000001/ownership.xml"
         )
 
+    def test_get_form4_transactions_rejects_non_ownership_xml(self):
+        session = MagicMock(spec=requests.Session)
+        session.get.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": ["0000001234-26-000001"],
+                            "form": ["4"],
+                            "filingDate": ["2026-06-03"],
+                            "reportDate": ["2026-06-03"],
+                            "acceptanceDateTime": ["2026-06-03T18:00:00Z"],
+                            "primaryDocument": ["xslF345X06/ownership.xml"],
+                        }
+                    }
+                },
+            ),
+            _mock_response(200, text="<html><body>not ownership XML</body></html>"),
+        ]
+        adapter = self._adapter(session)
+
+        resp = adapter.get_form4_transactions(
+            "0000001234",
+            from_date=date(2026, 6, 1),
+            to_date=date(2026, 6, 4),
+            asof=datetime(2026, 6, 4, 2, 30, tzinfo=timezone.utc),
+        )
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error.error_type == "parse"
+        assert "expected ownershipDocument" in resp.error.message
+        assert resp.lineage.data_quality_flags["parse_error_accession"] == (
+            "0000001234-26-000001"
+        )
+
     @pytest.mark.parametrize(
         ("primary_document", "expected_document"),
         [
