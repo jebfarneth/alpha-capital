@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from alpha.assembly.m1_daily import assemble_m1_daily
+from alpha.assembly.m2_daily import assemble_m2_daily
 from alpha.patterns.contracts import PatternId, PatternInput
 
 
@@ -44,7 +45,7 @@ class AssemblyRegistry:
         assemblers: Optional[Dict[str, Callable[..., Any]]] = None,
         disabled: Optional[set] = None,
     ):
-        self._assemblers = {"M1": assemble_m1_daily}
+        self._assemblers = {"M1": assemble_m1_daily, "M2": assemble_m2_daily}
         self._assemblers.update(assemblers or {})
         self._disabled = disabled or set()
         self._entries: Dict[str, AssemblerRegistryEntry] = {}

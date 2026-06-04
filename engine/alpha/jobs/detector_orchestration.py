@@ -210,6 +210,23 @@ def _input_asof_ceiling(
     scan_asof_timestamp: Optional[datetime],
     trading_date: str,
 ) -> Tuple[Optional[datetime], str]:
+    explicit_ceiling = inp.market_data.get("asof_ceiling_timestamp")
+    if isinstance(explicit_ceiling, str) and explicit_ceiling.strip():
+        try:
+            parsed = datetime.fromisoformat(explicit_ceiling.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid_asof_ceiling_timestamp:{explicit_ceiling}"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(
+                f"invalid_asof_ceiling_timestamp_naive:{explicit_ceiling}"
+            )
+        if _market_date(parsed) > date.fromisoformat(trading_date):
+            raise ValueError(
+                f"future_asof_ceiling_timestamp:{explicit_ceiling}>{trading_date}"
+            )
+        return parsed.astimezone(timezone.utc), "input asof ceiling"
     evidence_session_date = inp.market_data.get("evidence_session_date")
     if isinstance(evidence_session_date, str) and evidence_session_date:
         evidence_day = date.fromisoformat(evidence_session_date)

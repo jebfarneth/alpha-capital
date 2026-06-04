@@ -247,8 +247,8 @@ class TestAssemblyRegistry:
         registry = AssemblyRegistry()
         # M1 has a production assembler by default; remaining detector
         # patterns without assemblers stay detector_only.
-        implemented_patterns = {"M1"}
-        detector_patterns = {"M2", "M3", "M4", "M5", "M6", "M7", "I1", "I8"}
+        implemented_patterns = {"M1", "M2"}
+        detector_patterns = {"M3", "M4", "M5", "M6", "M7", "I1", "I8"}
         reserved_patterns = set(PatternId.ALL) - detector_patterns
         reserved_patterns -= implemented_patterns
 
@@ -274,7 +274,7 @@ class TestAssemblyRegistry:
 
     def test_implemented_ids_returns_only_implemented(self):
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
-        assert registry.implemented_ids() == ["M1", "M4"]
+        assert registry.implemented_ids() == ["M1", "M2", "M4"]
 
     def test_diagnostics_returns_full_status_map(self):
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
@@ -1426,7 +1426,7 @@ class TestRegistryDiagnostics:
     def test_detector_only_pattern_reports_diagnostic(self):
         """Patterns with detectors but no assembler produce explicit diagnostic."""
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
-        entry = registry.get("M2")
+        entry = registry.get("M3")
         assert entry.status == AssemblerStatus.DETECTOR_ONLY
         assert entry.assembler is None
 
@@ -1443,7 +1443,7 @@ class TestRegistryDiagnostics:
         diag = registry.diagnostics()
         assert diag == {
             "M1": "implemented",
-            "M2": "detector_only",
+            "M2": "implemented",
             "M3": "detector_only",
             "M4": "implemented",
             "M5": "detector_only",
