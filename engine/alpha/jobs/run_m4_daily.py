@@ -18,7 +18,13 @@ from alpha.data.benzinga import BenzingaAdapter
 from alpha.data.config import BenzingaConfig, ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter
 from alpha.data.polygon import PolygonAdapter
-from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
+from alpha.db.engine import (
+    SchemaTargetError,
+    create_all_tables,
+    get_session,
+    prepare_writable_schema_target,
+    reset_globals,
+)
 from alpha.jobs.m4_daily import M4DailyAssemblyJob
 from alpha.jobs.runner import run_job
 from alpha.runtime_env import load_runtime_env
@@ -38,13 +44,22 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
+    target_schema = args.schema
+    if target_schema is not None:
+        try:
+            prepare_writable_schema_target(
+                schema=target_schema,
+                create_tables=args.create_tables,
+            )
+        except (SchemaTargetError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
     if not os.environ.get("FMP_API_KEY"):
         print("ERROR: FMP_API_KEY not set")
         return 1
 
     session = get_session()
-    if args.create_tables:
-        create_schema_if_missing(schema=args.schema)
+    if args.create_tables and not target_schema:
         create_all_tables()
 
     try:

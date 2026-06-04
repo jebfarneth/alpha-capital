@@ -21,8 +21,7 @@ from typing import Any, Dict, Iterable, Optional
 from sqlalchemy import create_engine, text
 
 from alpha.db.engine import (
-    create_all_tables,
-    create_schema_if_missing,
+    prepare_writable_schema_target,
     reset_globals,
     schema_connect_args,
 )
@@ -120,12 +119,15 @@ def _preflight_network(url: str) -> None:
 
 
 def _preflight_database(url: str, schema: str) -> None:
+    prepare_writable_schema_target(
+        url=url,
+        schema=schema,
+        create_tables=True,
+    )
     engine = create_engine(url, **schema_connect_args(url, schema))
     try:
-        create_schema_if_missing(engine=engine, schema=schema)
-        create_all_tables(engine=engine)
         with engine.begin() as conn:
-            conn.execute(text(f'SET search_path TO "{schema}", public'))
+            conn.execute(text(f'SET search_path TO "{schema}"'))
             current_schema = conn.execute(text("SELECT current_schema()")).scalar()
             database = conn.execute(text("SELECT current_database()")).scalar()
             conn.execute(text(

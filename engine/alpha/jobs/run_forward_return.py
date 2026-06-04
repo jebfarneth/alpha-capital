@@ -19,7 +19,13 @@ from alpha.data.config import BenzingaConfig, FmpConfig, SecEdgarConfig
 from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.fmp import FmpAdapter
 from alpha.data.nasdaq import NasdaqTraderListingAdapter
-from alpha.db.engine import create_all_tables, create_schema_if_missing, get_session, reset_globals
+from alpha.db.engine import (
+    SchemaTargetError,
+    create_all_tables,
+    get_session,
+    prepare_writable_schema_target,
+    reset_globals,
+)
 from alpha.jobs.forward_return import (
     DEFAULT_FINALITY_LAG_SESSIONS,
     DEFAULT_REVISION_WINDOW_SESSIONS,
@@ -82,17 +88,26 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
+    target_schema = args.schema
     timestamp_error = _live_timestamp_error(args.run_timestamp)
     if timestamp_error:
         print(f"ERROR: {timestamp_error}")
         return 1
+    if target_schema is not None:
+        try:
+            prepare_writable_schema_target(
+                schema=target_schema,
+                create_tables=args.create_tables,
+            )
+        except (SchemaTargetError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
     if not os.environ.get("FMP_API_KEY"):
         print("ERROR: FMP_API_KEY not set")
         return 1
 
     session = get_session()
-    if args.create_tables:
-        create_schema_if_missing(schema=args.schema)
+    if args.create_tables and not target_schema:
         create_all_tables()
 
     try:

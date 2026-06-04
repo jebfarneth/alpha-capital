@@ -18,9 +18,10 @@ from alpha.data.benzinga import BenzingaAdapter
 from alpha.data.config import BenzingaConfig, ConfigError, PolygonConfig
 from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
+    SchemaTargetError,
     create_all_tables,
-    create_schema_if_missing,
     get_session,
+    prepare_writable_schema_target,
     reset_globals,
 )
 from alpha.jobs.forward_context import ForwardContextCollectorJob
@@ -42,6 +43,16 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
+    target_schema = args.schema
+    if target_schema is not None:
+        try:
+            prepare_writable_schema_target(
+                schema=target_schema,
+                create_tables=args.create_tables,
+            )
+        except (SchemaTargetError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
 
     try:
         polygon_adapter = _required_polygon_adapter()
@@ -51,8 +62,7 @@ def _run_live(args: argparse.Namespace) -> int:
         return 1
 
     session = get_session()
-    if args.create_tables:
-        create_schema_if_missing(schema=args.schema)
+    if args.create_tables and not target_schema:
         create_all_tables()
 
     try:

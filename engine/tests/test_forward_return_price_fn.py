@@ -4001,7 +4001,7 @@ def test_postgres_schema_connect_args_sets_scratch_search_path():
     assert kwargs == {
         "connect_args": {
             "options": (
-                "-csearch_path=scratch_codex_m4_pricefn_audit_test,public"
+                "-csearch_path=scratch_codex_m4_pricefn_audit_test"
             )
         }
     }
