@@ -1024,7 +1024,7 @@ class TestSecEdgarAdapter:
                             "filingDate": ["2026-06-03"],
                             "reportDate": ["2026-06-03"],
                             "acceptanceDateTime": ["2026-06-03T18:00:00Z"],
-                            "primaryDocument": ["form4.xml"],
+                            "primaryDocument": ["xslF345X06/ownership.xml"],
                         }
                     }
                 },
@@ -1054,7 +1054,50 @@ class TestSecEdgarAdapter:
         assert resp.lineage.endpoint == "sec_edgar_form4_transactions"
         assert resp.lineage.data_quality_flags["transaction_count"] == 1
         assert session.get.call_args_list[1].args[0] == (
-            "https://www.sec.gov/Archives/edgar/data/1234/000000123426000001/form4.xml"
+            "https://www.sec.gov/Archives/edgar/data/1234/000000123426000001/ownership.xml"
+        )
+
+    @pytest.mark.parametrize(
+        ("primary_document", "expected_document"),
+        [
+            ("xslF345X05/ownership.xml", "ownership.xml"),
+            ("xslF345X06/ownership.xml", "ownership.xml"),
+            ("xslF345X06/primary_doc.xml", "primary_doc.xml"),
+            ("ownership.xml", "ownership.xml"),
+        ],
+    )
+    def test_get_filing_document_strips_form4_xsl_viewer_prefix(
+        self,
+        primary_document,
+        expected_document,
+    ):
+        session = MagicMock(spec=requests.Session)
+        session.get.return_value = _mock_response(
+            200,
+            text="<?xml version='1.0'?><ownershipDocument/>",
+        )
+        adapter = self._adapter(session)
+        # Avoid a second mocked submissions shape; only the document path is
+        # under test here.
+        from alpha.data.edgar import SecEdgarFiling
+
+        doc_resp = adapter.get_filing_document(
+            SecEdgarFiling(
+                cik="0000001234",
+                accession_number="0000001234-26-000001",
+                form="4",
+                filing_date=date(2026, 6, 3),
+                report_date=date(2026, 6, 3),
+                acceptance_datetime=datetime(2026, 6, 3, 22, tzinfo=timezone.utc),
+                primary_document=primary_document,
+            ),
+            asof=datetime(2026, 6, 4, tzinfo=timezone.utc),
+        )
+
+        assert doc_resp.ok
+        assert session.get.call_args.args[0] == (
+            "https://www.sec.gov/Archives/edgar/data/1234/"
+            f"000000123426000001/{expected_document}"
         )
 
 

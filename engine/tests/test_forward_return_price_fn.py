@@ -759,6 +759,51 @@ def test_forward_return_prices_m1_variable_horizon_signal(db_session):
     assert obs.hit_stop_intraday is False
 
 
+def test_forward_return_records_m2_no_barrier_horizon_metadata(db_session):
+    _make_signal(
+        db_session,
+        ticker="FIRE",
+        pattern_id="M2",
+        signal_horizon="20d",
+        next_execution_session=ENTRY_DATE.isoformat(),
+        trading_date="2026-05-20",
+        signal_timestamp=datetime(2026, 5, 20, 20, 0, tzinfo=timezone.utc),
+    )
+    plan = m4_entry_exit_plan(
+        decision_date=date(2026, 5, 20),
+        next_execution_session=ENTRY_DATE,
+        current_evidence_session_date=date(2026, 6, 30),
+        time_barrier_sessions=20,
+    )
+    adapter = FakeHistoricalAdapter({
+        "FIRE": [
+            _bar(ENTRY_DATE, 10.0, high=10.0, low=10.0, close=10.0),
+            _bar(plan.exit_session_date, 11.0, high=11.0, low=11.0, close=11.0),
+        ]
+    })
+
+    result = _run_job(
+        db_session,
+        adapter,
+        pattern_id="M2",
+        run_ts=datetime(2026, 6, 30, 21, 0, tzinfo=timezone.utc),
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["computed"] == 1
+    obs = _obs(db_session)
+    provider_request = json.loads(obs.provider_request_json)
+    reconstruction = provider_request["price_request"]["forward_return_reconstruction"]
+    assert obs.pattern_id == "M2"
+    assert obs.signal_horizon == "20d"
+    assert obs.exit_session_date == plan.exit_session_date.isoformat()
+    assert reconstruction["pattern_id"] == "M2"
+    assert reconstruction["signal_horizon"] == "20d"
+    assert reconstruction["horizon_sessions"] == 20
+    assert reconstruction["exit_geometry_source"] == "pattern_time_barrier_only"
+    assert reconstruction["exit_geometry_source"] != M4_EXIT_GEOMETRY.source_contract
+
+
 def test_live_future_timestamp_guard_rejects_future_time():
     now = datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
 

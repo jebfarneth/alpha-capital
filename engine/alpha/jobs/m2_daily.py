@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +14,7 @@ from alpha.assembly.m2_daily import (
     assemble_m2_daily,
     classify_cmp_insider,
     cluster_member_rows,
+    first_tradable_session_after_publication,
     transaction_evidence_from_fmp,
     transaction_evidence_from_sec,
 )
@@ -177,7 +178,7 @@ class M2DailyAssemblyJob(BaseJob):
             sec_evidence = [
                 transaction_evidence_from_sec(
                     row,
-                    detected_at=getattr(row, "filing_accepted_at", None),
+                    detected_at=run_timestamp,
                     market_cap_usd=snapshot.market_cap,
                     ticker=ticker,
                     lineage_ids=[sec_lineage.data_lineage_id],
@@ -395,9 +396,20 @@ def _persist_transaction(
     *,
     scan_id: Optional[str],
     snapshot: UniverseSnapshot,
-    job_run_id: str,
+    job_run_id: Optional[str],
 ) -> None:
     existing = session.get(M2InsiderTransaction, evidence.transaction_id)
+    earliest_detected_at = evidence.filing_detected_at
+    if existing is not None and existing.filing_detected_at is not None:
+        existing_detected_at = _ensure_aware(existing.filing_detected_at)
+        incoming_detected_at = _ensure_aware(evidence.filing_detected_at)
+        if incoming_detected_at is None or (
+            existing_detected_at is not None
+            and existing_detected_at <= incoming_detected_at
+        ):
+            earliest_detected_at = existing_detected_at
+    if earliest_detected_at != evidence.filing_detected_at:
+        evidence = _with_detection_clock(evidence, earliest_detected_at)
     if existing is not None:
         session.delete(existing)
         session.flush()
@@ -422,7 +434,7 @@ def _persist_transaction(
         filing_form=evidence.filing_form,
         filing_date=evidence.filing_date,
         filing_accepted_at=evidence.filing_accepted_at,
-        filing_detected_at=evidence.filing_detected_at,
+        filing_detected_at=earliest_detected_at,
         first_tradable_session=evidence.first_tradable_session,
         clock_quality=evidence.clock_quality,
         transaction_date=evidence.transaction_date,
@@ -465,6 +477,26 @@ def _load_transactions(
             M2InsiderTransaction.transaction_date >= from_date.isoformat(),
         )
         .all()
+    )
+
+
+def _with_detection_clock(evidence: Any, detected_at: Optional[datetime]) -> Any:
+    filing_day = None
+    if evidence.filing_date:
+        try:
+            filing_day = date.fromisoformat(str(evidence.filing_date)[:10])
+        except ValueError:
+            filing_day = None
+    clock = first_tradable_session_after_publication(
+        filing_accepted_at=evidence.filing_accepted_at,
+        filing_detected_at=detected_at,
+        filing_date=filing_day,
+    )
+    return replace(
+        evidence,
+        filing_detected_at=detected_at,
+        first_tradable_session=clock.first_tradable_session.isoformat(),
+        clock_quality=clock.clock_quality,
     )
 
 

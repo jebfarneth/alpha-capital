@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 from alpha.assembly.m2_daily import (
     CLASSIFICATION_OPPORTUNISTIC,
@@ -11,8 +12,11 @@ from alpha.assembly.m2_daily import (
     first_tradable_session_after_publication,
     resolve_insider_identity,
     trade_size_weights,
+    transaction_evidence_from_sec,
 )
+from alpha.db.models import M2InsiderTransaction
 from alpha.jobs.detector_orchestration import _input_asof_ceiling
+from alpha.jobs.m2_daily import _persist_transaction
 
 
 def _ts(day: int = 3, hour: int = 22) -> datetime:
@@ -94,6 +98,80 @@ def test_after_close_form4_anchors_to_next_regular_open():
 
     assert clock.first_tradable_session == date(2026, 6, 4)
     assert clock.clock_quality == "accepted_detected"
+
+
+def test_live_detection_timestamp_controls_clock_after_preopen_acceptance():
+    sec_row = SimpleNamespace(
+        transaction_id="tx-live-detect",
+        ticker="ACME",
+        insider_cik="0000000001",
+        insider_name="Owner One",
+        accession_number="0000000001-26-000001",
+        filing_form="4",
+        filing_date=date(2026, 6, 3),
+        filing_accepted_at=datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc),
+        transaction_date=date(2026, 6, 3),
+        transaction_code="P",
+        acquired_disposed_code="A",
+        shares=10_000,
+        price_per_share=2.0,
+        issuer_cik="0000009999",
+        issuer_name="Acme",
+        insider_state="CA",
+        insider_roles={},
+        ownership_type="D",
+        is_10b5_1=False,
+        raw={},
+    )
+
+    evidence = transaction_evidence_from_sec(
+        sec_row,
+        detected_at=datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc),
+        market_cap_usd=75_000_000,
+        ticker="ACME",
+    )
+
+    assert evidence.filing_detected_at == datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc)
+    assert evidence.first_tradable_session == "2026-06-04"
+
+
+def test_reingestion_preserves_earliest_filing_detected_at(db_session):
+    first = _tx(
+        "0000000001",
+        tx_date="2026-06-03",
+        accepted_at=datetime(2026, 6, 3, 12, tzinfo=timezone.utc),
+        first_tradable="2026-06-04",
+        accession="0000000001-26-000001",
+    )
+    first.filing_detected_at = datetime(2026, 6, 3, 22, 15, tzinfo=timezone.utc)
+    second = _tx(
+        "0000000001",
+        tx_date="2026-06-03",
+        accepted_at=datetime(2026, 6, 3, 12, tzinfo=timezone.utc),
+        first_tradable="2026-06-05",
+        accession="0000000001-26-000001",
+    )
+    second.filing_detected_at = datetime(2026, 6, 4, 22, 15, tzinfo=timezone.utc)
+    snapshot = SimpleNamespace(universe_snapshot_id=None)
+
+    _persist_transaction(
+        db_session,
+        first,
+        scan_id=None,
+        snapshot=snapshot,
+        job_run_id=None,
+    )
+    _persist_transaction(
+        db_session,
+        second,
+        scan_id=None,
+        snapshot=snapshot,
+        job_run_id=None,
+    )
+
+    row = db_session.get(M2InsiderTransaction, first.transaction_id)
+    assert row.filing_detected_at == datetime(2026, 6, 3, 22, 15)
+    assert row.first_tradable_session == "2026-06-04"
 
 
 def test_identity_resolver_collapses_name_variants_when_sec_cik_matches():
@@ -179,6 +257,36 @@ def test_assemble_m2_cluster_uses_accessions_cik_count_and_next_open_age_zero():
         "0000000002-26-000001",
     ]
     assert len(payload["m2_cluster_members"]) == 2
+
+
+def test_multi_owner_same_accession_counts_as_two_cik_backed_buyers():
+    transactions = []
+    shared_accession = "0000009999-26-000001"
+    for insider in ("0000000001", "0000000002"):
+        transactions.extend(_history(insider))
+        transactions.append(_tx(
+            insider,
+            tx_date="2026-06-03",
+            accepted_at=datetime(2026, 6, 3, 22, tzinfo=timezone.utc),
+            first_tradable="2026-06-04",
+            accession=shared_accession,
+        ))
+
+    assembly = assemble_m2_daily(
+        snapshots=[_snapshot()],
+        transactions=transactions,
+        cutoff_timestamp=_ts(),
+        universe_cutoff_timestamp=datetime(2026, 6, 3, 20, 0, tzinfo=timezone.utc),
+        decision_date="2026-06-03",
+        evidence_session_date="2026-06-03",
+        next_execution_session="2026-06-04",
+    )
+
+    assert assembly["M2"].assembled_count == 1
+    payload = assembly["M2"].inputs[0].market_data
+    assert payload["n_distinct_opp_buyers_30d"] == 2
+    assert payload["sec_accession_numbers"] == [shared_accession]
+    assert payload["m2_cluster_signature_hash"] == payload["m2_cluster_id"]
 
 
 def test_assemble_m2u_shadow_uses_own_pattern_id_for_unclassifiable_cluster():

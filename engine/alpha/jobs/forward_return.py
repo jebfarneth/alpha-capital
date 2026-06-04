@@ -495,6 +495,7 @@ def m4_forward_return_outcome_hash(
 
 
 def _input_payload(sig: SignalRegistry, plan: M4ForwardReturnPlan) -> Dict[str, Any]:
+    geometry = _telemetry_geometry_for_signal(sig)
     return {
         "layer": "price_fn_forward_return",
         "pattern_id": sig.pattern_id,
@@ -510,13 +511,13 @@ def _input_payload(sig: SignalRegistry, plan: M4ForwardReturnPlan) -> Dict[str, 
         "entry_resolution_reason": plan.entry_resolution_reason,
         "entry_session_date": plan.entry_session_date.isoformat(),
         "exit_session_date": plan.exit_session_date.isoformat(),
-        "horizon_sessions": M4_EXIT_GEOMETRY.time_barrier_sessions,
+        "horizon_sessions": geometry.time_barrier_sessions,
         "finality_lag_sessions": plan.finality_lag_sessions,
         "finality_session_date": (
             plan.finality_session_date.isoformat()
             if plan.finality_session_date is not None else None
         ),
-        "exit_geometry_source": M4_EXIT_GEOMETRY.source_contract,
+        "exit_geometry_source": geometry.source_contract,
         "entry_price_source": M4_PRICE_SOURCE,
         "exit_price_source": M4_PRICE_SOURCE,
         "endpoint": HISTORICAL_PRICE_FULL_ENDPOINT,
@@ -1126,6 +1127,7 @@ class ForwardReturnJob(BaseJob):
             ticker=sig.ticker,
             from_date=plan.entry_session_date,
             to_date=plan.exit_session_date,
+            reconstruction_metadata=_input_payload(sig, plan),
         )
         resp = self._adapter.get_historical_price(
             sig.ticker,
@@ -4087,8 +4089,9 @@ def _provider_request_payload(
     ticker: str,
     from_date: date,
     to_date: date,
+    reconstruction_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "symbol": ticker,
         "from": from_date.isoformat(),
         "to": to_date.isoformat(),
@@ -4096,6 +4099,9 @@ def _provider_request_payload(
         "basis": "split_adjusted_ohlcv_full_endpoint",
         "price_field": "open",
     }
+    if reconstruction_metadata is not None:
+        payload["forward_return_reconstruction"] = dict(reconstruction_metadata)
+    return payload
 
 
 def _split_adjusted_open_basis_proof(bar: FmpBar) -> Optional[str]:

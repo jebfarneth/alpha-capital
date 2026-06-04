@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
+import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -39,6 +40,7 @@ SURVIVORSHIP_EVENTS_ENDPOINT = "sec_edgar_survivorship_events"
 FORM4_TRANSACTIONS_ENDPOINT = "sec_edgar_form4_transactions"
 FORM_25_FORMS = ("25", "25-NSE")
 FORM_4_FORMS = ("4", "4/A")
+FORM4_XSL_VIEWER_RE = re.compile(r"^xslF345X\d+/", re.IGNORECASE)
 SEC_MAX_REQUESTS_PER_SECOND = 10
 MAX_SUBMISSIONS_OVERFLOW_PAGES = 20
 EDGAR_ACCEPTANCE_TIMEZONE = ZoneInfo("America/New_York")
@@ -679,7 +681,7 @@ class SecEdgarAdapter:
             cik_int = str(int(filing.cik))
         except (TypeError, ValueError):
             cik_int = str(filing.cik).lstrip("0") or "0"
-        document = str(filing.primary_document).lstrip("/")
+        document = _raw_form4_document_path(filing.primary_document)
         endpoint = f"/Archives/edgar/data/{cik_int}/{accession_dir}/{document}"
         return self._request_text(endpoint, base_url=self._config.sec_base_url, asof=asof)
 
@@ -1062,6 +1064,11 @@ def _parse_form4_transactions_xml(
                 },
             ))
     return rows, None
+
+
+def _raw_form4_document_path(value: Any) -> str:
+    document = str(value or "").lstrip("/")
+    return FORM4_XSL_VIEWER_RE.sub("", document, count=1)
 
 
 def _reporting_owners(root: ET.Element) -> List[Dict[str, Any]]:

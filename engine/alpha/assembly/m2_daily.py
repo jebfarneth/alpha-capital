@@ -530,7 +530,10 @@ def _append_cluster_input(
         for tx in rows
         if str(_tx_attr(tx, "filing_accession_number") or "").strip()
     })
-    if len(accessions) < len(rows):
+    if any(
+        not str(_tx_attr(tx, "filing_accession_number") or "").strip()
+        for tx in rows
+    ):
         result.rejected_count += 1
         result.diagnostics.append(AssemblyDiagnostic(
             ticker=ticker,
