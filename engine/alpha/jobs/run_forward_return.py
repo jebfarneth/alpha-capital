@@ -88,7 +88,7 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
-    target_schema = args.schema
+    target_schema = args.schema or os.environ.get("ALPHA_DB_SCHEMA")
     timestamp_error = _live_timestamp_error(args.run_timestamp)
     if timestamp_error:
         print(f"ERROR: {timestamp_error}")
@@ -269,10 +269,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for forward-return population and reconciliation."""
 
-    args = _parse_args(argv or sys.argv[1:])
-    if args.live:
-        return _run_live(args)
-    return 1
+    previous_env = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "ALPHA_DB_SCHEMA": os.environ.get("ALPHA_DB_SCHEMA"),
+    }
+    try:
+        args = _parse_args(argv or sys.argv[1:])
+        if args.live:
+            return _run_live(args)
+        return 1
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reset_globals()
 
 
 if __name__ == "__main__":

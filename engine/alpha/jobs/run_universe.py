@@ -158,7 +158,7 @@ def _run_live(args) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
-    target_schema = args.schema
+    target_schema = args.schema or os.environ.get("ALPHA_DB_SCHEMA")
     if target_schema is not None:
         try:
             prepare_writable_schema_target(
@@ -495,10 +495,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for universe construction and security-type enrichment."""
 
-    args = _parse_args(argv or sys.argv[1:])
-    if args.live:
-        return _run_live(args)
-    return _run_mock(args)
+    previous_env = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "ALPHA_DB_SCHEMA": os.environ.get("ALPHA_DB_SCHEMA"),
+    }
+    try:
+        args = _parse_args(argv or sys.argv[1:])
+        if args.live:
+            return _run_live(args)
+        return _run_mock(args)
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reset_globals()
 
 
 def _csv_arg(value: str) -> list[str]:

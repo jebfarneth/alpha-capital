@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, text
 # Make alpha package importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from alpha.db.engine import schema_connect_args
+from alpha.db.engine import _validate_schema_name, schema_connect_args
 from alpha.db.models import Base
 
 config = context.config
@@ -45,12 +45,18 @@ def run_migrations_offline():
 def run_migrations_online():
     url = _migration_url()
     schema = os.environ.get("ALPHA_DB_SCHEMA")
+    if schema:
+        schema = _validate_schema_name(schema)
+        admin = create_engine(url)
+        try:
+            with admin.begin() as connection:
+                connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        finally:
+            admin.dispose()
     connectable = create_engine(url, **schema_connect_args(url, schema))
     with connectable.connect() as connection:
         if schema:
-            connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-            connection.commit()
-            connection.exec_driver_sql(f'SET search_path TO "{schema}", public')
+            connection.exec_driver_sql(f'SET search_path TO "{schema}"')
             connection.commit()
         context.configure(
             connection=connection,

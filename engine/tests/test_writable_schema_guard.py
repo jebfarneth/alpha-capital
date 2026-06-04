@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from alpha.db import engine as db_engine
-from alpha.db.engine import SchemaTargetError, prepare_writable_schema_target
+from alpha.db.engine import (
+    SchemaTargetError,
+    _validate_schema_name,
+    prepare_writable_schema_target,
+    schema_connect_args,
+)
 from alpha.jobs import (
     run_forward_context,
     run_forward_return,
@@ -53,6 +60,44 @@ def test_prepare_writable_schema_target_refuses_public_schema():
             schema="public",
             create_tables=False,
         )
+    with pytest.raises(SchemaTargetError, match="must not be public"):
+        prepare_writable_schema_target(
+            url="postgresql+psycopg://user:pass@example.com/db",
+            schema="PUBLIC",
+            create_tables=True,
+        )
+
+
+@pytest.mark.parametrize("schema", ["PUBLIC", "Public", "Scratch_Audit"])
+def test_validate_schema_name_rejects_non_lowercase(schema):
+    with pytest.raises(ValueError, match="lowercase"):
+        _validate_schema_name(schema)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    ["public", "pg_catalog", "information_schema", "pg_temp_audit"],
+)
+def test_validate_schema_name_rejects_reserved_names(schema):
+    with pytest.raises(ValueError, match="Reserved"):
+        _validate_schema_name(schema)
+
+
+def test_schema_connect_args_rejects_folded_public_variants():
+    with pytest.raises(ValueError, match="lowercase"):
+        schema_connect_args(
+            "postgresql+psycopg://user:pass@example.com/db",
+            "PUBLIC",
+        )
+
+
+def test_alembic_env_validates_schema_and_removes_public_fallback():
+    env_py = Path("migrations/env.py").read_text()
+
+    assert "_validate_schema_name(schema)" in env_py
+    assert "schema_connect_args(url, schema)" in env_py
+    assert 'SET search_path TO "{schema}", public' not in env_py
+    assert 'SET search_path TO "{schema}"' in env_py
 
 
 def test_prepare_writable_schema_target_refuses_incomplete_schema(monkeypatch):
@@ -210,3 +255,85 @@ def test_writable_schema_entrypoints_preflight_before_session(
 
     assert rc == 1
     assert "schema 'scratch_missing' does not exist" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("module", "argv"),
+    [
+        (
+            run_forward_return,
+            [
+                "--live",
+                "--run-timestamp",
+                "2026-06-03T21:00:00+00:00",
+            ],
+        ),
+        (
+            run_m4_daily,
+            [
+                "--live",
+                "--run-timestamp",
+                "2026-06-03T21:00:00+00:00",
+            ],
+        ),
+        (
+            run_m1_daily,
+            [
+                "--live",
+                "--run-timestamp",
+                "2026-06-03T21:00:00+00:00",
+            ],
+        ),
+        (
+            run_forward_context,
+            [
+                "--live",
+                "--run-timestamp",
+                "2026-06-03T21:00:00+00:00",
+            ],
+        ),
+        (
+            run_universe,
+            [
+                "--live",
+                "--trading-date",
+                "2026-06-03",
+            ],
+        ),
+        (
+            run_nasdaq_archive,
+            [
+                "--live",
+                "--run-timestamp",
+                "2026-06-03T21:00:00+00:00",
+            ],
+        ),
+    ],
+)
+def test_writable_schema_entrypoints_preflight_env_only_schema_before_session(
+    module,
+    argv,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp")
+    monkeypatch.setenv("ALPHA_DB_SCHEMA", "scratch_env_missing")
+    monkeypatch.setattr(module, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "prepare_writable_schema_target",
+        lambda **kwargs: (_ for _ in ()).throw(
+            SchemaTargetError("schema 'scratch_env_missing' does not exist")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "get_session",
+        lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+    )
+
+    rc = module.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "schema 'scratch_env_missing' does not exist" in captured.out

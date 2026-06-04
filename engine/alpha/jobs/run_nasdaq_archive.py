@@ -290,7 +290,7 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
-    target_schema = args.schema
+    target_schema = args.schema or os.environ.get("ALPHA_DB_SCHEMA")
     if target_schema is not None:
         try:
             prepare_writable_schema_target(
@@ -386,10 +386,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
-    if args.live:
-        return _run_live(args)
-    return 1
+    previous_env = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "ALPHA_DB_SCHEMA": os.environ.get("ALPHA_DB_SCHEMA"),
+    }
+    try:
+        args = _parse_args(argv if argv is not None else sys.argv[1:])
+        if args.live:
+            return _run_live(args)
+        return 1
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reset_globals()
 
 
 if __name__ == "__main__":

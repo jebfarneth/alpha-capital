@@ -14,6 +14,7 @@ from alpha.db.models import Base
 _engine = None
 _SessionLocal = None
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_SCHEMAS = frozenset({"public", "pg_catalog", "information_schema"})
 
 
 class SchemaTargetError(RuntimeError):
@@ -23,6 +24,12 @@ class SchemaTargetError(RuntimeError):
 def _validate_schema_name(schema: str) -> str:
     if not _SCHEMA_RE.match(schema):
         raise ValueError(f"Invalid database schema name: {schema!r}")
+    if schema != schema.lower():
+        raise ValueError(
+            f"Invalid database schema name: {schema!r}; schema names must be lowercase"
+        )
+    if schema in _RESERVED_SCHEMAS or schema.startswith("pg_"):
+        raise ValueError(f"Reserved database schema name: {schema!r}")
     return schema
 
 
@@ -117,12 +124,12 @@ def prepare_writable_schema_target(
     schema = schema or os.environ.get("ALPHA_DB_SCHEMA")
     if not schema:
         return
-    schema = _validate_schema_name(schema)
-    if schema == "public":
+    if schema.strip().casefold() == "public":
         raise SchemaTargetError(
             "writable --schema targets must not be public; omit --schema for "
             "canonical writes"
         )
+    schema = _validate_schema_name(schema)
     url = url or os.environ.get("DATABASE_URL", "sqlite:///alpha_capital.db")
     if not url.startswith("postgresql"):
         raise SchemaTargetError("scratch schema writes require a PostgreSQL DATABASE_URL")

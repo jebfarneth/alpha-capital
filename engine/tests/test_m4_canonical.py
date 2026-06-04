@@ -193,6 +193,10 @@ def test_scratch_requires_schema():
 def test_scratch_refuses_public_schema():
     with pytest.raises(CanonicalRunError, match="public"):
         require_scratch_schema("public", "postgresql+psycopg://u:p@host/db")
+    with pytest.raises(CanonicalRunError, match="public"):
+        require_scratch_schema("PUBLIC", "postgresql+psycopg://u:p@host/db")
+    with pytest.raises(CanonicalRunError, match="public"):
+        require_scratch_schema("Public", "postgresql+psycopg://u:p@host/db")
 
 
 def test_scratch_cli_without_schema_is_refused(monkeypatch, capsys):

@@ -240,7 +240,7 @@ def require_canonical_target(url: str) -> None:
 def require_scratch_schema(schema: Optional[str], url: str) -> None:
     if not schema:
         raise CanonicalRunError("--scratch requires --schema")
-    if schema == "public":
+    if schema.strip().casefold() == "public":
         raise CanonicalRunError("--scratch refuses the public schema")
     if url and url.startswith("sqlite"):
         raise CanonicalRunError("--scratch requires a PostgreSQL DATABASE_URL")
@@ -1453,6 +1453,22 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    previous_env = {
+        "DATABASE_URL": os.environ.get("DATABASE_URL"),
+        "ALPHA_DB_SCHEMA": os.environ.get("ALPHA_DB_SCHEMA"),
+    }
+    try:
+        return _main_impl(argv)
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reset_globals()
+
+
+def _main_impl(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     load_runtime_env()
     if args.database_url:
