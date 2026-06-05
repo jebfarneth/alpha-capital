@@ -1543,6 +1543,27 @@ def test_report_metrics_populated_after_orchestration(db_session):
     assert report["freeze_reuse"]["context_enriched_count"] is not None
 
 
+def test_health_report_surfaces_m2_fatal_fetch_error_count(db_session):
+    _add_feature(db_session, "feature-m2-metric", "M2M")
+    _add_signal(db_session, "signal-m2-metric", "feature-m2-metric", "M2M")
+
+    report = build_m4_health_report(
+        db_session,
+        mode="scratch",
+        schema="m4_live_scratch_test",
+        host_class="postgres_other",
+        app_commit_sha="deadbeef",
+        decision_date="2026-05-26",
+        evidence_session_date="2026-05-22",
+        next_execution_session="2026-05-26",
+        run_timestamp="2026-05-26T08:00:00+00:00",
+        m2_metrics={"fatal_fetch_error_count": 3},
+    )
+
+    assert report["m2_assembly"]["fatal_fetch_error_count"] == 3
+    assert "fatal_fetch_error_count" not in report["health_verdict"]["checks"]
+
+
 def test_explicit_empty_m4_metrics_do_not_fallback_to_db_metrics(db_session):
     run_id = _ensure_test_m4_run(
         db_session,
@@ -1909,6 +1930,184 @@ def test_main_runs_m1_only_when_enabled(monkeypatch):
     ]
     m1_kwargs = [payload for name, payload in calls if name == "m1"][0]
     assert m1_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
+
+
+def test_main_enable_m2_tolerated_fetch_errors_reaches_healthy_report(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    calls = []
+
+    def fake_universe(**kwargs):
+        calls.append(("universe", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="universe-run",
+            run_status="finished",
+            metrics={"included": 3},
+        )
+
+    def fake_m4(**kwargs):
+        calls.append(("m4", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m4-primary",
+            run_status="finished",
+            metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_m1(**kwargs):
+        calls.append(("m1", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={"assembly": {"assembled_count": 1}},
+        )
+
+    def fake_m2(**kwargs):
+        calls.append(("m2", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m2-run",
+            run_status="finished",
+            metrics={
+                "fetch_error_count": 1,
+                "fatal_fetch_error_count": 0,
+                "tolerated_fetch_error_count": 1,
+            },
+        )
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def fake_report_session(url, schema):
+        return FakeEngine(), FakeSession()
+
+    def fake_build_report(session, **kwargs):
+        calls.append(("build_report", kwargs))
+        assert kwargs["m2_run_id"] == "m2-run"
+        assert kwargs["m2_metrics"]["fatal_fetch_error_count"] == 0
+        return {
+            "health": True,
+            "run_metadata": {},
+            "universe": {},
+            "m4_assembly": {},
+            "m1_assembly": {},
+            "m2_assembly": {"fatal_fetch_error_count": 0},
+            "m4_signals": {},
+            "data_quality": {},
+            "forward_return_guard": {},
+            "forward_context_panel": {},
+            "source_attempts": {},
+            "freeze_reuse": {},
+            "idempotency_rerun": {},
+            "run_diagnostics": {},
+            "fired_signal_table": [],
+            "health_verdict": {"checks": {}, "failing_checks": []},
+        }
+
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m2", fake_m2)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
+    monkeypatch.setattr(run_nightly_canonical, "_app_commit_sha", lambda: "deadbeef")
+
+    output = tmp_path / "report.json"
+    rc = run_nightly_canonical.main([
+        "--scratch",
+        "--schema", "scratch_schema",
+        "--run-timestamp", "2026-05-29T20:00:00-04:00",
+        "--skip-rerun",
+        "--skip-forward-context",
+        "--enable-m1",
+        "--enable-m2",
+        "--json-output", str(output),
+    ])
+
+    assert rc == 0
+    assert [name for name, _payload in calls] == [
+        "universe",
+        "m4",
+        "m1",
+        "m2",
+        "build_report",
+    ]
+    report = json.loads(output.read_text())
+    assert report["health"] is True
+    assert report["m2_assembly"]["fatal_fetch_error_count"] == 0
+
+
+def test_main_enable_m2_fatal_fetch_error_aborts_before_health_report(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+
+    def fake_universe(**kwargs):
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="universe-run",
+            run_status="finished",
+            metrics={"included": 3},
+        )
+
+    def fake_m4(**kwargs):
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m4-primary",
+            run_status="finished",
+            metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_m1(**kwargs):
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={},
+        )
+
+    def fake_m2(**kwargs):
+        return run_nightly_canonical.RunInvocation(
+            exit_code=1,
+            run_id="m2-run",
+            run_status="partial_failed",
+            metrics={"fatal_fetch_error_count": 1},
+        )
+
+    def fail_report(*_args, **_kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("health report must not build after fatal M2")
+
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m2", fake_m2)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fail_report)
+    monkeypatch.setattr(run_nightly_canonical, "_app_commit_sha", lambda: "deadbeef")
+
+    rc = run_nightly_canonical.main([
+        "--scratch",
+        "--schema", "scratch_schema",
+        "--run-timestamp", "2026-05-29T20:00:00-04:00",
+        "--skip-rerun",
+        "--skip-forward-context",
+        "--enable-m1",
+        "--enable-m2",
+    ])
+
+    assert rc == 1
+    assert "M2 daily failed with exit 1" in capsys.readouterr().out
 
 
 def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):

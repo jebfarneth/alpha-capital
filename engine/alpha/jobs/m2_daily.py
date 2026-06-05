@@ -28,6 +28,7 @@ from alpha.db.models import (
     M2InsiderClassification,
     M2InsiderTransaction,
     SecurityIdentitySnapshot,
+    SignalRegistry,
     UniverseScan,
     UniverseSnapshot,
 )
@@ -346,9 +347,26 @@ class M2DailyAssemblyJob(BaseJob):
         })
         errors = list(orchestration_result.errors or [])
         errors.extend(fetch_errors)
+        fired_tickers = _fired_m2_tickers(
+            self._session,
+            job_run_id=ctx.job_run_id,
+        )
+        fatal_fetch_errors, tolerated_fetch_errors = _partition_fetch_errors(
+            fetch_errors,
+            fired_tickers=fired_tickers,
+        )
+        metrics.update({
+            "fatal_fetch_error_count": len(fatal_fetch_errors),
+            "tolerated_fetch_error_count": len(tolerated_fetch_errors),
+            "fatal_fetch_errors": _fetch_error_summaries(fatal_fetch_errors),
+        })
+        # A fetch error that prevents a would-be M2/M2U fire from entering the
+        # fired set is tolerated by design. This mirrors canonical source gating:
+        # non-fired source attempts do not fail the run, while a fire certified
+        # from incomplete source evidence is fatal.
         status = (
             "partial_failed"
-            if orchestration_result.status == "partial_failed" or fetch_errors
+            if orchestration_result.status == "partial_failed" or fatal_fetch_errors
             else "finished"
         )
         return JobResult(
@@ -680,6 +698,50 @@ def _persist_cluster_members(
                 continue
             session.add(M2ClusterMember(**payload))
     session.flush()
+
+
+def _fired_m2_tickers(session: Session, *, job_run_id: str) -> set[str]:
+    rows = (
+        session.query(SignalRegistry.ticker)
+        .filter(
+            SignalRegistry.job_run_id == job_run_id,
+            SignalRegistry.pattern_id.in_(("M2", "M2U")),
+        )
+        .distinct()
+        .all()
+    )
+    return {str(row[0]).strip().upper() for row in rows if str(row[0] or "").strip()}
+
+
+def _partition_fetch_errors(
+    fetch_errors: List[Dict[str, Any]],
+    *,
+    fired_tickers: set[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    fatal: List[Dict[str, Any]] = []
+    tolerated: List[Dict[str, Any]] = []
+    normalized_fired = {str(ticker).strip().upper() for ticker in fired_tickers}
+    for error in fetch_errors:
+        ticker = str(error.get("ticker") or "").strip().upper()
+        if ticker and ticker in normalized_fired:
+            fatal.append(error)
+        else:
+            tolerated.append(error)
+    return fatal, tolerated
+
+
+def _fetch_error_summaries(
+    fetch_errors: List[Dict[str, Any]],
+    *,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "ticker": str(error.get("ticker") or "").strip().upper() or None,
+            "stage": error.get("stage"),
+        }
+        for error in fetch_errors[:limit]
+    ]
 
 
 def _record_response_lineage(

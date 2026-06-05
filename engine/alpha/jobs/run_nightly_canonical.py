@@ -1115,6 +1115,7 @@ def build_m4_health_report(
             "fmp_enrichment_count": m2_metrics.get("fmp_enrichment_count"),
             "unresolved_cik_count": m2_metrics.get("unresolved_cik_count"),
             "fetch_error_count": m2_metrics.get("fetch_error_count"),
+            "fatal_fetch_error_count": m2_metrics.get("fatal_fetch_error_count"),
             "m2_assembled_count": (
                 (m2_metrics.get("assembly") or {}).get("M2") or {}
             ).get("assembled_count"),
