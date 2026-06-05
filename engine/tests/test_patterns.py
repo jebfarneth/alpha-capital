@@ -511,3 +511,5 @@ class TestPatternIdRoster:
             "M1", "M2", "M3", "M4", "M5", "M6", "M7",
             "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10",
         }
+        assert PatternId.SHADOW_ALL == ["M3S"]
+        assert PatternId.ALL_WITH_SHADOWS == PatternId.ALL + PatternId.SHADOW_ALL

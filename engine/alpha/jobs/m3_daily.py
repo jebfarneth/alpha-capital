@@ -262,12 +262,10 @@ class M3DailyAssemblyJob(BaseJob):
             delisted_dates_by_ticker=delisted_dates,
             delisting_reasons_by_ticker=delisting_reasons,
         )
-        coverage_years = _min_coverage_years(current_assignments.values())
         sector_returns = compute_sector_return_snapshots(
             components=components,
             asof_date=evidence_day,
             formation_date=formation_date,
-            sector_history_coverage_years=coverage_years,
         )
         _persist_sector_returns(self._session, sector_returns)
         sector_returns_by_sector = {row.sector: row for row in sector_returns}
@@ -618,12 +616,3 @@ def _persist_sector_returns(
             for key, value in payload.items():
                 setattr(existing, key, value)
     session.flush()
-
-
-def _min_coverage_years(assignments: Sequence[Any]) -> Optional[float]:
-    values = [
-        assignment.sector_history_coverage_years
-        for assignment in assignments
-        if assignment.sector_history_coverage_years is not None
-    ]
-    return min(values) if values else None

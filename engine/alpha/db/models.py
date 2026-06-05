@@ -18,6 +18,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    DDL,
     Float,
     ForeignKey,
     Index,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -729,6 +731,23 @@ class FirmSectorAssignmentHistory(Base):
     )
 
 
+event.listen(
+    FirmSectorAssignmentHistory.__table__,
+    "after_create",
+    DDL("CREATE EXTENSION IF NOT EXISTS btree_gist").execute_if(dialect="postgresql"),
+)
+event.listen(
+    FirmSectorAssignmentHistory.__table__,
+    "after_create",
+    DDL(
+        "ALTER TABLE %(table)s "
+        "ADD CONSTRAINT ex_firm_sector_history_no_overlap "
+        "EXCLUDE USING gist "
+        "(ticker WITH =, daterange(valid_from, valid_to, '[)') WITH &&)"
+    ).execute_if(dialect="postgresql"),
+)
+
+
 class FirmSectorAssignment(Base):
     """Current/open M3 sector assignment snapshot."""
 
@@ -787,10 +806,10 @@ class SectorReturnDaily(Base):
     sic_to_sector_map_version = Column(String, nullable=False)
     formation_date = Column(Date, nullable=False)
     point_in_time_passed = Column(
-        Boolean, nullable=False, default=True, server_default=text("true")
+        Boolean, nullable=False, default=False, server_default=text("false")
     )
     formation_cohort_passed = Column(
-        Boolean, nullable=False, default=True, server_default=text("true")
+        Boolean, nullable=False, default=False, server_default=text("false")
     )
     sector_history_coverage_years = Column(Float, nullable=True)
     created_at = Column(

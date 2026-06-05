@@ -52,6 +52,14 @@ def upgrade() -> None:
         "firm_sector_assignments_history",
         ["source"],
     )
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
+        op.execute(
+            "ALTER TABLE firm_sector_assignments_history "
+            "ADD CONSTRAINT ex_firm_sector_history_no_overlap "
+            "EXCLUDE USING gist "
+            "(ticker WITH =, daterange(valid_from, valid_to, '[)') WITH &&)"
+        )
 
     op.create_table(
         "firm_sector_assignments",
@@ -105,13 +113,13 @@ def upgrade() -> None:
         sa.Column(
             "point_in_time_passed",
             sa.Boolean(),
-            server_default=sa.text("true"),
+            server_default=sa.text("false"),
             nullable=False,
         ),
         sa.Column(
             "formation_cohort_passed",
             sa.Boolean(),
-            server_default=sa.text("true"),
+            server_default=sa.text("false"),
             nullable=False,
         ),
         sa.Column("sector_history_coverage_years", sa.Float(), nullable=True),
@@ -415,6 +423,11 @@ def downgrade() -> None:
         "ix_firm_sector_history_source",
         table_name="firm_sector_assignments_history",
     )
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute(
+            "ALTER TABLE firm_sector_assignments_history "
+            "DROP CONSTRAINT IF EXISTS ex_firm_sector_history_no_overlap"
+        )
     op.drop_index(
         "ix_firm_sector_history_sector_interval",
         table_name="firm_sector_assignments_history",

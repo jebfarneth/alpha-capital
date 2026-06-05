@@ -59,6 +59,7 @@ class SectorReturnComponent:
     return_3mo: Optional[float] = None
     return_1mo: Optional[float] = None
     delisting_adjustment_applied: bool = False
+    sector_history_coverage_years: Optional[float] = None
 
 
 @dataclass
@@ -195,7 +196,18 @@ def _is_acquisition_delisting(reason: Optional[str]) -> bool:
     if not reason:
         return False
     text = reason.casefold()
-    markers = (
+    failure_markers = (
+        "bankrupt",
+        "deficien",
+        "failed",
+        "failure",
+        "insolv",
+        "liquidat",
+        "receivership",
+    )
+    if any(marker in text for marker in failure_markers):
+        return False
+    acquisition_markers = (
         "acquisition",
         "acquired",
         "merger",
@@ -204,7 +216,7 @@ def _is_acquisition_delisting(reason: Optional[str]) -> bool:
         "cash merger",
         "m&a",
     )
-    return any(marker in text for marker in markers)
+    return any(marker in text for marker in acquisition_markers)
 
 
 def _component_return(
@@ -306,6 +318,7 @@ def build_sector_return_components(
                 else None
             ),
             delisting_adjustment_applied=delisting_applied,
+            sector_history_coverage_years=assignment.sector_history_coverage_years,
         ))
     return components, diagnostics
 
@@ -315,7 +328,6 @@ def compute_sector_return_snapshots(
     components: Sequence[SectorReturnComponent],
     asof_date: date,
     formation_date: date,
-    sector_history_coverage_years: Optional[float] = None,
 ) -> List[SectorReturnSnapshot]:
     """Aggregate firm components into ranked sector returns."""
 
@@ -332,6 +344,15 @@ def compute_sector_return_snapshots(
         ew = sum(row.return_6mo for row in rows) / len(rows)
         one_month_values = [row.return_1mo for row in rows if row.return_1mo is not None]
         three_month_values = [row.return_3mo for row in rows if row.return_3mo is not None]
+        component_coverages = [row.sector_history_coverage_years for row in rows]
+        if any(coverage is None for coverage in component_coverages):
+            sector_coverage_years = None
+        else:
+            sector_coverage_years = min(component_coverages)  # type: ignore[arg-type]
+        point_in_time_passed = (
+            sector_coverage_years is not None
+            and sector_coverage_years >= MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS
+        )
         raw_rows.append({
             "sector": sector,
             "return_6mo": vw,
@@ -346,13 +367,11 @@ def compute_sector_return_snapshots(
             ),
             "n_firms_in_sector": len(rows),
             "total_market_cap_in_sector": total_cap,
+            "point_in_time_passed": point_in_time_passed,
+            "sector_history_coverage_years": sector_coverage_years,
         })
     ranked = sorted(raw_rows, key=lambda row: (row["return_6mo"], row["sector"]))
     n = len(ranked)
-    point_in_time_passed = (
-        sector_history_coverage_years is not None
-        and sector_history_coverage_years >= MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS
-    )
     result: List[SectorReturnSnapshot] = []
     for index, row in enumerate(ranked, start=1):
         result.append(SectorReturnSnapshot(
@@ -368,9 +387,9 @@ def compute_sector_return_snapshots(
             n_firms_in_sector=row["n_firms_in_sector"],
             total_market_cap_in_sector=row["total_market_cap_in_sector"],
             formation_date=formation_date,
-            point_in_time_passed=point_in_time_passed,
+            point_in_time_passed=row["point_in_time_passed"],
             formation_cohort_passed=True,
-            sector_history_coverage_years=sector_history_coverage_years,
+            sector_history_coverage_years=row["sector_history_coverage_years"],
         ))
     return result
 
@@ -555,3 +574,11 @@ def assemble_m3_daily(
         result.assembled_count += 1
 
     return result
+
+
+def assemble_m3_shadow_daily(**kwargs: Any) -> PatternAssemblyResult:
+    """Assemble M3 shadow inputs under M3S for sub-3-year PIT coverage."""
+
+    kwargs.setdefault("pattern_id", SHADOW_PATTERN_ID)
+    kwargs.setdefault("allow_undercoverage", True)
+    return assemble_m3_daily(**kwargs)

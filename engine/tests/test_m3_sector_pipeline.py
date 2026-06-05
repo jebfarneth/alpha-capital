@@ -4,11 +4,13 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from alpha.assembly.m3_daily import (
     SHADOW_PATTERN_ID,
     SectorAssignmentSnapshot,
+    SectorReturnComponent,
     SectorReturnSnapshot,
     adjusted_return,
     assemble_m3_daily,
@@ -177,10 +179,37 @@ def test_m3_schema_has_server_defaults(db_session):
     assert defaults["sector_change_log"]["detected_at"] is not None
 
 
+def test_sector_return_pit_booleans_default_false_on_raw_insert(db_session):
+    db_session.execute(text(
+        """
+        INSERT INTO sector_returns_daily (
+            date, sector, return_6mo, sector_rank, sector_rank_normalized,
+            n_sectors, n_firms_in_sector, total_market_cap_in_sector,
+            sic_to_sector_map_version, formation_date
+        )
+        VALUES (
+            '2026-06-04', 'Information Technology', 0.1, 1, 0.5,
+            1, 1, 100000000, :version, '2025-12-04'
+        )
+        """
+    ), {"version": SIC_TO_SECTOR_MAP_VERSION})
+    row = db_session.execute(text(
+        """
+        SELECT point_in_time_passed, formation_cohort_passed
+        FROM sector_returns_daily
+        WHERE date = '2026-06-04' AND sector = 'Information Technology'
+        """
+    )).one()
+
+    assert bool(row.point_in_time_passed) is False
+    assert bool(row.formation_cohort_passed) is False
+
+
 def test_sic_to_sector_map_is_versioned_and_roughly_gics_sized():
-    assert SIC_TO_SECTOR_MAP_VERSION == "POLYGON_SIC_PREFIX_V2_2026_06_05"
+    assert SIC_TO_SECTOR_MAP_VERSION == "POLYGON_SIC_PREFIX_V3_2026_06_05"
     assert len(SECTORS) == 11
     assert set(major_group_map().values()) <= set(SECTORS)
+    assert all(sector_for_sic(f"{major:02d}00") in SECTORS for major in range(1, 100))
     assert sector_for_sic("6022") == "Financials"
     assert sector_for_sic("7372") == "Information Technology"
     assert sector_for_sic("2834") == "Health Care"
@@ -273,6 +302,31 @@ def test_sector_history_out_of_order_write_does_not_overlap(db_session):
     )["BBBY"].sic_code == "5961"
 
 
+def test_sector_history_direct_overlap_insert_blocked_on_postgres(db_session):
+    if db_session.bind.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL exclusion constraint is verified on real PG")
+    db_session.add(FirmSectorAssignmentHistory(
+        ticker="OVLP",
+        sector="Financials",
+        source=SOURCE_POLYGON_SIC,
+        sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
+        valid_from=date(2024, 1, 1),
+        valid_to=date(2026, 1, 1),
+    ))
+    db_session.flush()
+    db_session.add(FirmSectorAssignmentHistory(
+        ticker="OVLP",
+        sector="Financials",
+        source=SOURCE_POLYGON_SIC,
+        sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
+        valid_from=date(2025, 1, 1),
+        valid_to=date(2027, 1, 1),
+    ))
+
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+
 def test_null_sic_uses_fmp_fallback_and_records_source():
     polygon = FakePolygonAdapter({
         ("FRC", "2022-06-01"): SimpleNamespace(
@@ -322,6 +376,19 @@ def test_acquisition_delisting_does_not_apply_shumway_penalty():
 
     assert applied is False
     assert ret == pytest.approx(0.40)
+
+
+def test_ambiguous_failed_acquisition_delisting_applies_shumway():
+    ret, applied = adjusted_return(
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 80.0)],
+        start_date=date(2023, 1, 3),
+        end_date=date(2023, 6, 30),
+        delisted_date=date(2023, 3, 10),
+        delisting_reason="failed acquisition attempt, bankrupt",
+    )
+
+    assert applied is True
+    assert ret == pytest.approx((0.8 * 0.7) - 1.0)
 
 
 def test_polygon_404_delisting_probe_uses_last_available_bar(db_session):
@@ -402,6 +469,46 @@ def test_sector_returns_use_formation_sector_not_current_membership():
     assert by_sector["Energy"].return_6mo == pytest.approx(0.20)
     assert by_sector["Energy"].sector_rank_normalized == pytest.approx(0.75)
     assert by_sector["Information Technology"].sector_rank_normalized == pytest.approx(0.25)
+
+
+def test_sector_return_pit_gate_uses_formation_components_per_sector():
+    formation_day = date(2026, 1, 2)
+    evidence_day = date(2026, 6, 4)
+    components = [
+        SectorReturnComponent(
+            ticker="COVERED",
+            sector="Energy",
+            market_cap=100.0,
+            return_6mo=0.30,
+            sector_history_coverage_years=3.2,
+        ),
+        SectorReturnComponent(
+            ticker="ITGOOD",
+            sector="Information Technology",
+            market_cap=100.0,
+            return_6mo=0.40,
+            sector_history_coverage_years=3.5,
+        ),
+        SectorReturnComponent(
+            ticker="ITBAD",
+            sector="Information Technology",
+            market_cap=100.0,
+            return_6mo=0.50,
+            sector_history_coverage_years=0.9,
+        ),
+    ]
+
+    returns = compute_sector_return_snapshots(
+        components=components,
+        asof_date=evidence_day,
+        formation_date=formation_day,
+    )
+    by_sector = {row.sector: row for row in returns}
+
+    assert by_sector["Energy"].point_in_time_passed is True
+    assert by_sector["Energy"].sector_history_coverage_years == pytest.approx(3.2)
+    assert by_sector["Information Technology"].point_in_time_passed is False
+    assert by_sector["Information Technology"].sector_history_coverage_years == pytest.approx(0.9)
 
 
 def test_assembler_sets_polygon_sic_and_detector_rejects_without_pit_proof():
@@ -554,7 +661,7 @@ def test_m3_daily_job_persists_pit_sector_returns_and_signals(db_session):
             sic_code=sic,
             source=SOURCE_POLYGON_SIC,
             sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
-            valid_from=date(2023, 1, 1),
+            valid_from=date(2022, 1, 1),
             valid_to=date(9999, 12, 31),
         ))
         db_session.add(FirmSectorAssignment(
@@ -640,6 +747,81 @@ def test_m3_daily_job_undercoverage_persists_shadow_only(db_session):
     assert shadow.point_in_time_passed is False
 
 
+def test_m3_daily_job_mixed_formation_undercoverage_shadows_only_that_sector(db_session):
+    evidence_day = date(2026, 6, 4)
+    formation_day = nth_previous_session(evidence_day, 126)
+    current_tickers = {
+        "FIRE": 100_000_000,
+        "ENGY": 90_000_000,
+        "LOW": 80_000_000,
+        "CONS": 70_000_000,
+        "FIN": 60_000_000,
+    }
+    formation_tickers = dict(current_tickers)
+    formation_tickers["ITBAD"] = 100_000_000
+    _canonical_scan(db_session, evidence_day, current_tickers)
+    _canonical_scan(db_session, formation_day, formation_tickers)
+    for ticker, sector, sic, valid_from in (
+        ("FIRE", "Information Technology", "7372", date(2022, 1, 1)),
+        ("ITBAD", "Information Technology", "7372", date(2025, 3, 1)),
+        ("ENGY", "Energy", "1311", date(2022, 1, 1)),
+        ("LOW", "Health Care", "2834", date(2022, 1, 1)),
+        ("CONS", "Consumer Staples", "2000", date(2022, 1, 1)),
+        ("FIN", "Financials", "6022", date(2022, 1, 1)),
+    ):
+        db_session.add(FirmSectorAssignmentHistory(
+            ticker=ticker,
+            sector=sector,
+            sic_code=sic,
+            source=SOURCE_POLYGON_SIC,
+            sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
+            valid_from=valid_from,
+            valid_to=date(9999, 12, 31),
+        ))
+        if ticker in current_tickers:
+            db_session.add(FirmSectorAssignment(
+                ticker=ticker,
+                sector=sector,
+                source=SOURCE_POLYGON_SIC,
+                classification_date=evidence_day,
+                last_verified=evidence_day,
+            ))
+    bars = {
+        "FIRE": [_bar(formation_day, 10.0), _bar(evidence_day, 15.0)],
+        "ITBAD": [_bar(formation_day, 10.0), _bar(evidence_day, 16.0)],
+        "ENGY": [_bar(formation_day, 10.0), _bar(evidence_day, 15.0)],
+        "LOW": [_bar(formation_day, 10.0), _bar(evidence_day, 11.0)],
+        "CONS": [_bar(formation_day, 10.0), _bar(evidence_day, 10.0)],
+        "FIN": [_bar(formation_day, 10.0), _bar(evidence_day, 9.5)],
+    }
+    job = M3DailyAssemblyJob(
+        db_session,
+        polygon_adapter=FakePolygonAdapter({}),
+        fmp_adapter=FakeFmpAdapter(bars=bars),
+        run_timestamp=_ts(),
+        refresh_sector_history=False,
+    )
+
+    result = run_job(db_session, job, params={"run_timestamp": _ts().isoformat()})
+
+    assert result.status == "finished"
+    it_return = db_session.get(
+        SectorReturnDaily,
+        {"date": evidence_day, "sector": "Information Technology"},
+    )
+    energy_return = db_session.get(
+        SectorReturnDaily,
+        {"date": evidence_day, "sector": "Energy"},
+    )
+    assert it_return.n_firms_in_sector == 2
+    assert it_return.point_in_time_passed is False
+    assert it_return.sector_history_coverage_years < 3.0
+    assert energy_return.point_in_time_passed is True
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="M3", ticker="FIRE").count() == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=SHADOW_PATTERN_ID, ticker="FIRE").count() == 1
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="M3", ticker="ENGY").count() == 1
+
+
 def test_m3_current_assignment_staleness_reduces_signal_confidence(db_session):
     evidence_day = date(2026, 6, 4)
     formation_day = nth_previous_session(evidence_day, 126)
@@ -657,7 +839,7 @@ def test_m3_current_assignment_staleness_reduces_signal_confidence(db_session):
             sic_code=sic,
             source=SOURCE_POLYGON_SIC,
             sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
-            valid_from=date(2023, 1, 1),
+            valid_from=date(2022, 1, 1),
             valid_to=date(9999, 12, 31),
         ))
         db_session.add(FirmSectorAssignment(

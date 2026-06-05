@@ -23,6 +23,7 @@ class PatternId:
     M1 = "M1"
     M2 = "M2"
     M3 = "M3"
+    M3S = "M3S"
     M4 = "M4"
     M5 = "M5"
     M6 = "M6"
@@ -42,6 +43,8 @@ class PatternId:
         "M1", "M2", "M3", "M4", "M5", "M6", "M7",
         "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10",
     ]
+    SHADOW_ALL = ["M3S"]
+    ALL_WITH_SHADOWS = ALL + SHADOW_ALL
 
 
 class PatternTrack:

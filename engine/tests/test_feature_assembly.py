@@ -240,8 +240,9 @@ class TestAssemblyRegistry:
     def test_all_17_patterns_represented(self):
         registry = AssemblyRegistry()
         entries = registry.all_entries()
-        assert len(entries) == 17
-        assert {e.pattern_id for e in entries} == set(PatternId.ALL)
+        assert len([e for e in entries if not e.is_shadow]) == 17
+        assert {e.pattern_id for e in entries if not e.is_shadow} == set(PatternId.ALL)
+        assert registry.shadow_ids() == ["M3S"]
 
     def test_default_statuses_correct(self):
         registry = AssemblyRegistry()
@@ -256,6 +257,9 @@ class TestAssemblyRegistry:
             assert registry.status(pid) == AssemblerStatus.DETECTOR_ONLY, pid
         for pid in reserved_patterns:
             assert registry.status(pid) == AssemblerStatus.RESERVED, pid
+        assert registry.status("M3S") == AssemblerStatus.SHADOW
+        assert registry.get("M3S").is_shadow is True
+        assert registry.get("M3S").assembler is not None
 
     def test_m4_implemented_when_assembler_registered(self):
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
@@ -277,10 +281,11 @@ class TestAssemblyRegistry:
     def test_diagnostics_returns_full_status_map(self):
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
         diag = registry.diagnostics()
-        assert len(diag) == 17
+        assert len(diag) == 18
         assert diag["M4"] == AssemblerStatus.IMPLEMENTED
         assert diag["M1"] == AssemblerStatus.IMPLEMENTED
         assert diag["I2"] == AssemblerStatus.RESERVED
+        assert diag["M3S"] == AssemblerStatus.SHADOW
 
     def test_unknown_pattern_id_raises(self):
         registry = AssemblyRegistry()
@@ -1436,7 +1441,7 @@ class TestRegistryDiagnostics:
         assert entry.assembler is None
 
     def test_full_diagnostics_map(self):
-        """The full diagnostics map shows all 17 patterns."""
+        """The full diagnostics map shows all production patterns plus shadows."""
         registry = AssemblyRegistry(assemblers={"M4": assemble_m4_daily})
         diag = registry.diagnostics()
         assert diag == {
@@ -1457,4 +1462,5 @@ class TestRegistryDiagnostics:
             "I8": "detector_only",
             "I9": "reserved",
             "I10": "reserved",
+            "M3S": "shadow",
         }

@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from alpha.assembly.m1_daily import assemble_m1_daily
 from alpha.assembly.m2_daily import assemble_m2_daily
-from alpha.assembly.m3_daily import assemble_m3_daily
+from alpha.assembly.m3_daily import assemble_m3_daily, assemble_m3_shadow_daily
 from alpha.patterns.contracts import PatternId, PatternInput
 
 
@@ -21,6 +21,7 @@ class AssemblerStatus:
     """Lifecycle states for pattern feature assemblers."""
 
     IMPLEMENTED = "implemented"
+    SHADOW = "shadow"
     DETECTOR_ONLY = "detector_only"
     RESERVED = "reserved"
     DISABLED = "disabled"
@@ -33,6 +34,7 @@ class AssemblerRegistryEntry:
     pattern_id: str
     status: str
     assembler: Optional[Callable[..., Any]] = None
+    is_shadow: bool = False
 
 
 class AssemblyRegistry:
@@ -50,6 +52,9 @@ class AssemblyRegistry:
             "M1": assemble_m1_daily,
             "M2": assemble_m2_daily,
             "M3": assemble_m3_daily,
+        }
+        self._shadow_assemblers = {
+            PatternId.M3S: assemble_m3_shadow_daily,
         }
         self._assemblers.update(assemblers or {})
         self._disabled = disabled or set()
@@ -73,6 +78,19 @@ class AssemblyRegistry:
             self._entries[pid] = AssemblerRegistryEntry(
                 pattern_id=pid, status=status, assembler=assembler,
             )
+        for pid in PatternId.SHADOW_ALL:
+            if pid in self._disabled:
+                status = AssemblerStatus.DISABLED
+                assembler = None
+            else:
+                status = AssemblerStatus.SHADOW
+                assembler = self._shadow_assemblers[pid]
+            self._entries[pid] = AssemblerRegistryEntry(
+                pattern_id=pid,
+                status=status,
+                assembler=assembler,
+                is_shadow=True,
+            )
 
     def get(self, pattern_id: str) -> AssemblerRegistryEntry:
         """Return the registry entry for a known pattern id."""
@@ -93,10 +111,15 @@ class AssemblyRegistry:
         return list(self._entries.values())
 
     def implemented_ids(self) -> List[str]:
-        """Return pattern ids with production assemblers available."""
+        """Return canonical production pattern ids with production assemblers."""
 
         return [e.pattern_id for e in self._entries.values()
                 if e.status == AssemblerStatus.IMPLEMENTED]
+
+    def shadow_ids(self) -> List[str]:
+        """Return explicit shadow pattern ids handled outside production dispatch."""
+
+        return [e.pattern_id for e in self._entries.values() if e.is_shadow]
 
     def diagnostics(self) -> Dict[str, str]:
         """Return a status map for all 17 patterns."""

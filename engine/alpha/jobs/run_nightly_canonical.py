@@ -1824,12 +1824,25 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
         print("\nM3 daily skipped; pass --enable-m3 after PIT sector-history audit to run it.")
     else:
         reset_globals()
-        m3_invocation = _coerce_invocation(_run_m3(
-            schema=schema,
-            run_timestamp=effective_run_timestamp,
-            decision_date=decision_date,
-            args=args,
-        ))
+        try:
+            m3_invocation = _coerce_invocation(_run_m3(
+                schema=schema,
+                run_timestamp=effective_run_timestamp,
+                decision_date=decision_date,
+                args=args,
+            ))
+        except Exception as exc:
+            m3_invocation = RunInvocation(
+                exit_code=1,
+                run_status="failed",
+                metrics={
+                    "errors": [{
+                        "stage": "m3_invocation",
+                        "message": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }],
+                },
+            )
         m3_metrics = dict(m3_invocation.metrics or {})
         m3_metrics["exit_code"] = m3_invocation.exit_code
         m3_metrics["run_status"] = m3_invocation.run_status

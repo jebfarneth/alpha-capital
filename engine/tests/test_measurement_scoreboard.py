@@ -1280,6 +1280,34 @@ def test_pattern_filter_limits_rows_without_cross_tabs(db_session):
     assert result.computed_stats.expectancy == pytest.approx(0.10)
 
 
+def test_m3s_shadow_scoreboard_isolated_from_production_patterns(db_session):
+    _add_observation(
+        db_session,
+        "m3-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.20,
+        pattern_id="M3",
+        signal_horizon="15d",
+    )
+    _add_observation(
+        db_session,
+        "m3s-computed",
+        status=STATUS_COMPUTED,
+        forward_return=0.10,
+        pattern_id="M3S",
+        signal_horizon="15d",
+    )
+
+    shadow = build_measurement_scoreboard(db_session, pattern_id="M3S")
+
+    assert shadow.pattern_id == "M3S"
+    assert shadow.total_observations == 1
+    assert shadow.computed_stats.expectancy == pytest.approx(0.10)
+    with pytest.raises(ScoreboardPoolingError) as exc_info:
+        build_measurement_scoreboard(db_session)
+    assert exc_info.value.pattern_counts == {"M3": 1, "M3S": 1}
+
+
 @pytest.mark.parametrize("pattern_id", ["", "   "])
 def test_pattern_filter_rejects_empty_or_whitespace_pattern_id(db_session, pattern_id):
     with pytest.raises(ValueError, match="pattern_id must be a non-empty string"):

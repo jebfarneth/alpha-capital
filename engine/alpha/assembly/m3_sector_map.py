@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 
-SIC_TO_SECTOR_MAP_VERSION = "POLYGON_SIC_PREFIX_V2_2026_06_05"
+SIC_TO_SECTOR_MAP_VERSION = "POLYGON_SIC_PREFIX_V3_2026_06_05"
 
 SECTORS = (
     "Communication Services",
@@ -34,14 +34,15 @@ _MAJOR_GROUP_TO_SECTOR: Dict[int, str] = {
     # Agriculture, forestry, fishing.
     **{major: "Consumer Staples" for major in range(1, 10)},
     # Mining, oil/gas extraction, petroleum refining.
-    **{major: "Energy" for major in (10, 12, 13, 14, 29)},
+    **{major: "Energy" for major in (10, 11, 12, 13, 14, 29)},
     # Construction and broad industrial production/distribution.
-    **{major: "Industrials" for major in (15, 16, 17, 24, 25, 32, 33, 34)},
+    **{major: "Industrials" for major in (15, 16, 17, 18, 19, 24, 25, 32, 33, 34)},
     # Food, tobacco, grocery.
     **{major: "Consumer Staples" for major in (20, 21, 54)},
     # Textiles, apparel, retail, lodging, leisure, personal services.
     **{major: "Consumer Discretionary" for major in (
-        22, 23, 31, 39, 52, 53, 55, 56, 57, 58, 59, 70, 72, 75, 76, 78, 79, 82,
+        22, 23, 31, 39, 52, 53, 55, 56, 57, 58, 59, 70, 71, 72, 75, 76, 77, 78, 79,
+        82, 88,
     )},
     # Paper, printing, rubber/plastics, primary materials.
     **{major: "Materials" for major in (26, 27, 30)},
@@ -57,15 +58,20 @@ _MAJOR_GROUP_TO_SECTOR: Dict[int, str] = {
     **{major: "Information Technology" for major in (36, 73)},
     # Transportation, wholesale, professional and repair services.
     **{major: "Industrials" for major in (
-        37, 40, 41, 42, 44, 45, 46, 47, 50, 51, 74, 81, 86, 87, 89,
+        37, 40, 41, 42, 43, 44, 45, 46, 47, 50, 51, 74, 81, 86, 87, 89,
     )},
     # Telecommunications and media.
     48: "Communication Services",
     # Electric/gas/sanitary utilities.
     49: "Utilities",
     # Finance/insurance and real-estate split.
-    **{major: "Financials" for major in (60, 61, 62, 63, 64, 67)},
-    65: "Real Estate",
+    **{major: "Financials" for major in (60, 61, 62, 63, 64, 67, 69)},
+    **{major: "Real Estate" for major in (65, 66, 68)},
+    # Public-administration and nonclassifiable ranges are rare in the operating
+    # universe; map them to Industrials so a syntactically valid Polygon SIC
+    # never silently falls out of the PIT taxonomy.
+    **{major: "Industrials" for major in range(90, 100)},
+    85: "Health Care",
 }
 
 
