@@ -9,6 +9,7 @@ formation cohort, and detector proof flags are set only from that path.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,8 +37,8 @@ SHUMWAY_PERFORMANCE_DELISTING_RETURN = -0.30
 DELISTING_REASON_SOURCE_PROVIDER = "provider_reason"
 DELISTING_REASON_SOURCE_UNKNOWN_REVIEW = "unknown_review"
 DELISTING_TREATMENT_SHUMWAY_FAILURE = "shumway_failure"
+DELISTING_TREATMENT_SHUMWAY_UNKNOWN_DEFAULT = "shumway_unknown_default"
 DELISTING_TREATMENT_ACQUISITION_PAYOFF = "acquisition_realized_payoff"
-DELISTING_TREATMENT_UNKNOWN_REVIEW = "neutral_last_observable_review"
 
 
 @dataclass
@@ -176,10 +177,9 @@ def adjusted_return(
 
     If a firm delisted inside the window and the end-date price is absent, use
     the last available adjusted close before delisting. Apply Shumway's
-    performance-delisting adjustment only when the delisting reason is positively
-    classified as failure/performance-related. Unknown reasons route to
-    corporate-action review via neutral last-observable-price treatment rather
-    than fabricating a terminal loss.
+    performance-delisting adjustment unless the delisting reason is positively
+    classified as an acquisition/merger payoff. Unknown reasons take the
+    survivorship-conservative Shumway default and remain stamped for review.
     """
 
     prices: Dict[date, float] = {}
@@ -203,7 +203,7 @@ def adjusted_return(
     last_price = prices[max(candidate_days)]
     partial = (last_price / start_price) - 1.0
     reason_class = _classify_delisting_reason(delisting_reason)
-    if reason_class != "failure":
+    if reason_class == "acquisition":
         return partial, False
     adjusted = (1.0 + partial) * (1.0 + shumway_return) - 1.0
     return adjusted, True
@@ -219,28 +219,37 @@ def _classify_delisting_reason(reason: Optional[str]) -> str:
     text = reason.casefold()
     failure_markers = (
         "bankrupt",
+        "chapter 7",
+        "chapter 11",
         "deficien",
+        "delinquent",
         "distress",
         "exchange-mandated",
         "failed",
         "failure",
+        "going concern",
         "insolv",
+        "listing deficien",
         "liquidat",
+        "minimum equity",
         "noncompliance",
         "receivership",
+        "reorganization",
+        "suspended",
     )
     if any(marker in text for marker in failure_markers):
         return "failure"
-    acquisition_markers = (
-        "acquisition",
-        "acquired",
-        "merger",
-        "takeover",
-        "buyout",
-        "cash merger",
-        "m&a",
+    acquisition_patterns = (
+        r"\bcash\s+merger\b",
+        r"\bmerger\b",
+        r"\bacquisition\b",
+        r"\btakeover\b",
+        r"\bbuyout\b",
+        r"\bm\s*&\s*a\b",
+        r"\b(?:to be|being|was|were|is|has been|will be)\s+acquired\b",
+        r"\bacquired\s+(?:by|for|in|via|through)\b",
     )
-    if any(marker in text for marker in acquisition_markers):
+    if any(re.search(pattern, text) for pattern in acquisition_patterns):
         return "acquisition"
     return "unknown_review"
 
@@ -264,14 +273,18 @@ def _delisting_adjustment_metadata(
         else DELISTING_REASON_SOURCE_UNKNOWN_REVIEW
     )
     if shumway_applied:
-        treatment = DELISTING_TREATMENT_SHUMWAY_FAILURE
+        treatment = (
+            DELISTING_TREATMENT_SHUMWAY_UNKNOWN_DEFAULT
+            if reason_class == "unknown_review"
+            else DELISTING_TREATMENT_SHUMWAY_FAILURE
+        )
         suppressed_reason = None
     elif reason_class == "acquisition":
         treatment = DELISTING_TREATMENT_ACQUISITION_PAYOFF
         suppressed_reason = "acquisition_or_merger"
     else:
-        treatment = DELISTING_TREATMENT_UNKNOWN_REVIEW
-        suppressed_reason = "unknown_missing_delisting_reason"
+        treatment = None
+        suppressed_reason = None
     return {
         "delisting_reason_source": reason_source,
         "delisting_adjustment_treatment": treatment,

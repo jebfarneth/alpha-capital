@@ -370,17 +370,17 @@ def test_shumway_delisting_adjustment_when_end_price_missing():
     assert ret == pytest.approx((0.8 * 0.7) - 1.0)
 
 
-def test_unknown_delisting_reason_routes_to_review_without_shumway():
+def test_unknown_delisting_reason_defaults_to_shumway():
     ret, applied = adjusted_return(
-        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 140.0)],
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 60.0)],
         start_date=date(2023, 1, 3),
         end_date=date(2023, 6, 30),
         delisted_date=date(2023, 3, 10),
         delisting_reason=None,
     )
 
-    assert applied is False
-    assert ret == pytest.approx(0.40)
+    assert applied is True
+    assert ret == pytest.approx((0.60 * 0.70) - 1.0)
 
 
 def test_acquisition_delisting_does_not_apply_shumway_penalty():
@@ -396,6 +396,19 @@ def test_acquisition_delisting_does_not_apply_shumway_penalty():
     assert ret == pytest.approx(0.40)
 
 
+def test_unrelated_acquired_phrase_does_not_suppress_shumway():
+    ret, applied = adjusted_return(
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 60.0)],
+        start_date=date(2023, 1, 3),
+        end_date=date(2023, 6, 30),
+        delisted_date=date(2023, 3, 10),
+        delisting_reason="acquired taste unrelated note",
+    )
+
+    assert applied is True
+    assert ret == pytest.approx((0.60 * 0.70) - 1.0)
+
+
 def test_ambiguous_failed_acquisition_delisting_applies_shumway():
     ret, applied = adjusted_return(
         [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 80.0)],
@@ -403,6 +416,19 @@ def test_ambiguous_failed_acquisition_delisting_applies_shumway():
         end_date=date(2023, 6, 30),
         delisted_date=date(2023, 3, 10),
         delisting_reason="failed acquisition attempt, bankrupt",
+    )
+
+    assert applied is True
+    assert ret == pytest.approx((0.8 * 0.7) - 1.0)
+
+
+def test_chapter_11_delisting_applies_shumway():
+    ret, applied = adjusted_return(
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 80.0)],
+        start_date=date(2023, 1, 3),
+        end_date=date(2023, 6, 30),
+        delisted_date=date(2023, 3, 10),
+        delisting_reason="Chapter 11 reorganization",
     )
 
     assert applied is True
@@ -439,7 +465,7 @@ def test_polygon_404_delisting_probe_uses_last_available_bar(db_session):
     assert resolved == {"SIVB": date(2023, 3, 10)}
 
 
-def test_unknown_delisting_reason_is_stamped_on_sector_return_component():
+def test_unknown_delisting_reason_is_stamped_as_shumway_default():
     evidence_day = date(2023, 12, 29)
     formation_day = date(2023, 1, 3)
     components, diagnostics = build_sector_return_components(
@@ -465,20 +491,21 @@ def test_unknown_delisting_reason_is_stamped_on_sector_return_component():
 
     assert diagnostics == []
     component = components[0]
-    assert component.delisting_adjustment_applied is False
+    assert component.delisting_adjustment_applied is True
     assert component.delisting_reason_source == "unknown_review"
-    assert component.delisting_adjustment_treatment == "neutral_last_observable_review"
-    assert component.shumway_suppressed_reason == "unknown_missing_delisting_reason"
+    assert component.delisting_adjustment_treatment == "shumway_unknown_default"
+    assert component.shumway_suppressed_reason is None
     rows = compute_sector_return_snapshots(
         components=components,
         asof_date=evidence_day,
         formation_date=formation_day,
     )
     assert rows[0].delisting_unknown_review_count == 1
-    assert rows[0].delisting_shumway_adjustment_count == 0
+    assert rows[0].delisting_shumway_adjustment_count == 1
     audit = rows[0].delisting_adjustment_audit
     assert audit["components"][0]["ticker"] == "ATVI"
     assert audit["components"][0]["delisting_reason_source"] == "unknown_review"
+    assert audit["components"][0]["delisting_adjustment_treatment"] == "shumway_unknown_default"
 
 
 def test_sector_returns_use_formation_sector_not_current_membership():
