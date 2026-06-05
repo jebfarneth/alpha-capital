@@ -373,17 +373,14 @@ def assemble_m2_daily(
         str(_snap_attr(snap, "ticker") or "").upper(): snap
         for snap in snapshots
     }
+    transactions_by_insider = _transactions_by_insider(transactions)
     classifications = {
         (insider_id, signal_year): classify_cmp_insider(
-            transactions,
+            insider_transactions,
             insider_id=insider_id,
             calendar_year=signal_year,
         )
-        for insider_id in sorted({
-            str(_tx_attr(tx, "insider_id") or "")
-            for tx in transactions
-            if _tx_attr(tx, "insider_id")
-        })
+        for insider_id, insider_transactions in sorted(transactions_by_insider.items())
     }
     results = {
         PATTERN_ID: PatternAssemblyResult(pattern_id=PATTERN_ID),
@@ -707,6 +704,16 @@ def _recent_cluster_candidates(
             continue
         by_ticker.setdefault(ticker, []).append(tx)
     return by_ticker
+
+
+def _transactions_by_insider(transactions: Sequence[Any]) -> Dict[str, List[Any]]:
+    by_insider: Dict[str, List[Any]] = {}
+    for tx in transactions:
+        insider_id = str(_tx_attr(tx, "insider_id") or "")
+        if not insider_id:
+            continue
+        by_insider.setdefault(insider_id, []).append(tx)
+    return by_insider
 
 
 def _distinct_cik_backed_buyers(rows: Sequence[Any]) -> set[str]:

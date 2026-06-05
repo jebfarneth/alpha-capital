@@ -7,6 +7,7 @@ from alpha.assembly.m2_daily import (
     CLASSIFICATION_OPPORTUNISTIC,
     CLASSIFICATION_UNCLASSIFIABLE,
     M2TransactionEvidence,
+    _transactions_by_insider,
     assemble_m2_daily,
     classify_cmp_insider,
     first_tradable_session_after_publication,
@@ -342,6 +343,48 @@ def test_cmp_classifier_uses_jan1_pit_cutoff_not_same_year_acceptance():
     assert classification.classification == CLASSIFICATION_OPPORTUNISTIC
     assert "2025" in classification.basis["months_by_year"]
     assert 12 not in classification.basis["months_by_year"]["2025"]
+
+
+def test_grouped_cmp_classification_matches_full_transaction_scan():
+    transactions = []
+    for insider in ("0000000001", "0000000002", "0000000003"):
+        transactions.extend(_history(insider))
+        transactions.append(_tx(
+            insider,
+            tx_date="2026-06-03",
+            accepted_at=datetime(2026, 6, 3, 22, tzinfo=timezone.utc),
+            first_tradable="2026-06-04",
+            accession=f"{insider}-26-000001",
+        ))
+    transactions.append(_tx(
+        "0000000002",
+        tx_date="2025-12-29",
+        accepted_at=datetime(2026, 1, 3, 15, tzinfo=timezone.utc),
+        first_tradable="2026-01-05",
+        accession="late-filed-no-lookahead",
+        open_purchase=False,
+        code="S",
+    ))
+
+    grouped = _transactions_by_insider(transactions)
+    full_scan = {
+        insider: classify_cmp_insider(
+            transactions,
+            insider_id=insider,
+            calendar_year=2026,
+        )
+        for insider in sorted(grouped)
+    }
+    grouped_scan = {
+        insider: classify_cmp_insider(
+            grouped[insider],
+            insider_id=insider,
+            calendar_year=2026,
+        )
+        for insider in sorted(grouped)
+    }
+
+    assert grouped_scan == full_scan
 
 
 def test_market_cap_relative_size_weight_preserves_microcap_scale():

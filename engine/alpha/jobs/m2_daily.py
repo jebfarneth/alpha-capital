@@ -79,7 +79,7 @@ class M2DailyAssemblyJob(BaseJob):
         decision_date = session_resolution.decision_date
         evidence_session_date = session_resolution.evidence_session_date
         decision_day = date.fromisoformat(decision_date)
-        from_date = decision_day - timedelta(days=self._form4_lookback_calendar_days)
+        history_from_date = decision_day - timedelta(days=self._form4_lookback_calendar_days)
 
         requested_trading_date = ctx.params.get("trading_date")
         if requested_trading_date and requested_trading_date != decision_date:
@@ -105,7 +105,7 @@ class M2DailyAssemblyJob(BaseJob):
                     session_resolution,
                     scan_id=scan_id,
                     included_universe_size=0,
-                    from_date=from_date,
+                    from_date=history_from_date,
                     to_date=decision_day,
                 ),
                 errors=[{"stage": "canonical_universe", "message": canonical_error}],
@@ -118,16 +118,35 @@ class M2DailyAssemblyJob(BaseJob):
         sec_transaction_count = 0
         fmp_enrichment_count = 0
         unresolved_cik_count = 0
-        live_detection_window_start = _live_detection_window_start(
+        live_detection_window_start, has_prior_detection_window = _live_detection_window_start(
             self._session,
             job_id=ctx.job_id,
             current_job_run_id=ctx.job_run_id,
             current_started_at=ctx.started_at,
             evidence_session_date=evidence_session_date,
         )
+        sec_fetch_from_date = _sec_form4_fetch_from_date(
+            history_from_date=history_from_date,
+            live_detection_window_start=live_detection_window_start,
+            has_prior_detection_window=has_prior_detection_window,
+        )
+        tickers = [snapshot.ticker.upper() for snapshot in snapshots]
+        tickers_with_history = _tickers_with_transaction_history(
+            self._session,
+            tickers=tickers,
+            from_date=history_from_date,
+        )
+        full_history_fetch_tickers: List[str] = []
 
         for snapshot in snapshots:
             ticker = snapshot.ticker.upper()
+            ticker_fetch_from_date = (
+                sec_fetch_from_date
+                if ticker in tickers_with_history
+                else history_from_date
+            )
+            if ticker_fetch_from_date == history_from_date:
+                full_history_fetch_tickers.append(ticker)
             issuer_cik = identity_by_ticker.get(ticker)
             if not issuer_cik:
                 ticker_resp = self._sec_adapter.get_company_ticker(
@@ -158,7 +177,7 @@ class M2DailyAssemblyJob(BaseJob):
 
             sec_resp = self._sec_adapter.get_form4_transactions(
                 issuer_cik,
-                from_date=from_date,
+                from_date=ticker_fetch_from_date,
                 to_date=decision_day,
                 asof=run_timestamp,
             )
@@ -170,7 +189,7 @@ class M2DailyAssemblyJob(BaseJob):
                     "endpoint": FORM4_TRANSACTIONS_ENDPOINT,
                     "ticker": ticker,
                     "issuer_cik": issuer_cik,
-                    "from": from_date.isoformat(),
+                    "from": ticker_fetch_from_date.isoformat(),
                     "to": decision_day.isoformat(),
                     "transaction_ids": [
                         getattr(row, "transaction_id", None)
@@ -264,11 +283,10 @@ class M2DailyAssemblyJob(BaseJob):
                 )
                 fmp_enrichment_count += 1
 
-        tickers = [snapshot.ticker.upper() for snapshot in snapshots]
         transactions = _load_transactions(
             self._session,
             tickers=tickers,
-            from_date=from_date,
+            from_date=history_from_date,
         )
         _persist_classifications(
             self._session,
@@ -308,10 +326,14 @@ class M2DailyAssemblyJob(BaseJob):
             session_resolution,
             scan_id=scan_id,
             included_universe_size=len(snapshots),
-            from_date=from_date,
+            from_date=history_from_date,
             to_date=decision_day,
         )
         metrics.update({
+            "sec_form4_fetch_from_date": sec_fetch_from_date.isoformat(),
+            "prior_detection_window_start": live_detection_window_start.isoformat(),
+            "prior_detection_window_found": has_prior_detection_window,
+            "full_history_fetch_ticker_count": len(full_history_fetch_tickers),
             "sec_transaction_count": sec_transaction_count,
             "fmp_enrichment_count": fmp_enrichment_count,
             "unresolved_cik_count": unresolved_cik_count,
@@ -335,7 +357,8 @@ class M2DailyAssemblyJob(BaseJob):
             input_hashes={
                 "scan_id": scan_id,
                 "decision_date": decision_date,
-                "from_date": from_date.isoformat(),
+                "from_date": history_from_date.isoformat(),
+                "sec_fetch_from_date": sec_fetch_from_date.isoformat(),
                 "to_date": decision_day.isoformat(),
             },
             output_hashes={
@@ -409,12 +432,13 @@ def _live_detection_window_start(
     current_job_run_id: str,
     current_started_at: datetime,
     evidence_session_date: str,
-) -> datetime:
+) -> Tuple[datetime, bool]:
     previous_run = (
         session.query(EvidenceJobRun)
         .filter(
             EvidenceJobRun.job_id == job_id,
             EvidenceJobRun.job_run_id != current_job_run_id,
+            EvidenceJobRun.run_status == "finished",
             EvidenceJobRun.started_at.isnot(None),
             EvidenceJobRun.started_at < current_started_at,
             EvidenceJobRun.ended_at.isnot(None),
@@ -425,9 +449,24 @@ def _live_detection_window_start(
     if previous_run is not None:
         previous_started_at = _ensure_aware(previous_run.started_at)
         if previous_started_at is not None:
-            return previous_started_at
+            return previous_started_at, True
     evidence_day = date.fromisoformat(evidence_session_date)
-    return datetime.combine(evidence_day, time.min, EASTERN_TZ).astimezone(timezone.utc)
+    return (
+        datetime.combine(evidence_day, time.min, EASTERN_TZ).astimezone(timezone.utc),
+        False,
+    )
+
+
+def _sec_form4_fetch_from_date(
+    *,
+    history_from_date: date,
+    live_detection_window_start: datetime,
+    has_prior_detection_window: bool,
+) -> date:
+    if not has_prior_detection_window:
+        return history_from_date
+    incremental_start = live_detection_window_start.astimezone(EASTERN_TZ).date()
+    return max(history_from_date, incremental_start)
 
 
 def _live_detected_at_for_sec_row(
@@ -528,6 +567,26 @@ def _load_transactions(
     )
 
 
+def _tickers_with_transaction_history(
+    session: Session,
+    *,
+    tickers: List[str],
+    from_date: date,
+) -> set[str]:
+    if not tickers:
+        return set()
+    rows = (
+        session.query(M2InsiderTransaction.ticker)
+        .filter(
+            M2InsiderTransaction.ticker.in_(tickers),
+            M2InsiderTransaction.transaction_date >= from_date.isoformat(),
+        )
+        .distinct()
+        .all()
+    )
+    return {str(row[0]).upper() for row in rows if row[0]}
+
+
 def _with_detection_clock(evidence: Any, detected_at: Optional[datetime]) -> Any:
     filing_day = None
     if evidence.filing_date:
@@ -554,10 +613,10 @@ def _persist_classifications(
     *,
     calendar_year: int,
 ) -> None:
-    insider_ids = sorted({row.insider_id for row in transactions if row.insider_id})
-    for insider_id in insider_ids:
+    transactions_by_insider = _transactions_by_insider(transactions)
+    for insider_id, insider_transactions in sorted(transactions_by_insider.items()):
         classification = classify_cmp_insider(
-            transactions,
+            insider_transactions,
             insider_id=insider_id,
             calendar_year=calendar_year,
         )
@@ -572,7 +631,7 @@ def _persist_classifications(
         if existing is not None:
             session.delete(existing)
             session.flush()
-        sample = next((row for row in transactions if row.insider_id == insider_id), None)
+        sample = insider_transactions[0] if insider_transactions else None
         session.add(M2InsiderClassification(
             insider_id=insider_id,
             insider_cik=getattr(sample, "insider_cik", None),
@@ -585,6 +644,17 @@ def _persist_classifications(
             basis_json=json.dumps(classification.basis, default=str),
         ))
     session.flush()
+
+
+def _transactions_by_insider(
+    transactions: List[M2InsiderTransaction],
+) -> Dict[str, List[M2InsiderTransaction]]:
+    by_insider: Dict[str, List[M2InsiderTransaction]] = {}
+    for row in transactions:
+        if not row.insider_id:
+            continue
+        by_insider.setdefault(row.insider_id, []).append(row)
+    return by_insider
 
 
 def _persist_cluster_members(
