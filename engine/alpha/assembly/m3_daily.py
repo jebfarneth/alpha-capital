@@ -27,9 +27,11 @@ from alpha.patterns.contracts import PatternId
 
 
 PATTERN_ID = PatternId.M3
+SHADOW_PATTERN_ID = "M3S"
 PRODUCTION_TAXONOMY_SOURCE = "POLYGON_SIC"
 OPEN_INTERVAL_END = date(9999, 12, 31)
 SECTOR_RETURN_LOOKBACK_SESSIONS = 126
+MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS = 3.0
 SHUMWAY_PERFORMANCE_DELISTING_RETURN = -0.30
 
 
@@ -45,6 +47,7 @@ class SectorAssignmentSnapshot:
     industry: Optional[str] = None
     sic_to_sector_map_version: str = SIC_TO_SECTOR_MAP_VERSION
     sector_history_coverage_years: Optional[float] = None
+    last_verified: Optional[date] = None
 
 
 @dataclass
@@ -74,7 +77,7 @@ class SectorReturnSnapshot:
     formation_date: date
     source: str = PRODUCTION_TAXONOMY_SOURCE
     sic_to_sector_map_version: str = SIC_TO_SECTOR_MAP_VERSION
-    point_in_time_passed: bool = True
+    point_in_time_passed: bool = False
     formation_cohort_passed: bool = True
     sector_history_coverage_years: Optional[float] = None
 
@@ -152,6 +155,7 @@ def adjusted_return(
     start_date: date,
     end_date: date,
     delisted_date: Optional[date] = None,
+    delisting_reason: Optional[str] = None,
     shumway_return: float = SHUMWAY_PERFORMANCE_DELISTING_RETURN,
 ) -> Tuple[Optional[float], bool]:
     """Compute adjusted return over [start_date, end_date].
@@ -181,8 +185,26 @@ def adjusted_return(
         return None, False
     last_price = prices[max(candidate_days)]
     partial = (last_price / start_price) - 1.0
+    if _is_acquisition_delisting(delisting_reason):
+        return partial, False
     adjusted = (1.0 + partial) * (1.0 + shumway_return) - 1.0
     return adjusted, True
+
+
+def _is_acquisition_delisting(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+    text = reason.casefold()
+    markers = (
+        "acquisition",
+        "acquired",
+        "merger",
+        "takeover",
+        "buyout",
+        "cash merger",
+        "m&a",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _component_return(
@@ -191,12 +213,14 @@ def _component_return(
     start_date: date,
     end_date: date,
     delisted_date: Optional[date],
+    delisting_reason: Optional[str] = None,
 ) -> Optional[float]:
     value, _ = adjusted_return(
         bars,
         start_date=start_date,
         end_date=end_date,
         delisted_date=delisted_date,
+        delisting_reason=delisting_reason,
     )
     return value
 
@@ -211,12 +235,14 @@ def build_sector_return_components(
     one_month_date: Optional[date] = None,
     three_month_date: Optional[date] = None,
     delisted_dates_by_ticker: Optional[Dict[str, date]] = None,
+    delisting_reasons_by_ticker: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[SectorReturnComponent], List[AssemblyDiagnostic]]:
     """Build firm-level return components from the formation-date cohort."""
 
     components: List[SectorReturnComponent] = []
     diagnostics: List[AssemblyDiagnostic] = []
     delisted_dates_by_ticker = delisted_dates_by_ticker or {}
+    delisting_reasons_by_ticker = delisting_reasons_by_ticker or {}
     for snap in formation_snapshots:
         ticker = str(_snap_attr(snap, "ticker") or "").upper()
         assignment = assignments_by_ticker.get(ticker)
@@ -237,11 +263,13 @@ def build_sector_return_components(
             continue
         bars = bars_by_ticker.get(ticker, ())
         delisted_date = delisted_dates_by_ticker.get(ticker)
+        delisting_reason = delisting_reasons_by_ticker.get(ticker)
         ret_6mo, delisting_applied = adjusted_return(
             bars,
             start_date=formation_date,
             end_date=evidence_date,
             delisted_date=delisted_date,
+            delisting_reason=delisting_reason,
         )
         if ret_6mo is None:
             diagnostics.append(AssemblyDiagnostic(
@@ -261,6 +289,7 @@ def build_sector_return_components(
                     start_date=three_month_date,
                     end_date=evidence_date,
                     delisted_date=delisted_date,
+                    delisting_reason=delisting_reason,
                 )
                 if three_month_date is not None
                 else None
@@ -271,6 +300,7 @@ def build_sector_return_components(
                     start_date=one_month_date,
                     end_date=evidence_date,
                     delisted_date=delisted_date,
+                    delisting_reason=delisting_reason,
                 )
                 if one_month_date is not None
                 else None
@@ -319,6 +349,10 @@ def compute_sector_return_snapshots(
         })
     ranked = sorted(raw_rows, key=lambda row: (row["return_6mo"], row["sector"]))
     n = len(ranked)
+    point_in_time_passed = (
+        sector_history_coverage_years is not None
+        and sector_history_coverage_years >= MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS
+    )
     result: List[SectorReturnSnapshot] = []
     for index, row in enumerate(ranked, start=1):
         result.append(SectorReturnSnapshot(
@@ -334,9 +368,48 @@ def compute_sector_return_snapshots(
             n_firms_in_sector=row["n_firms_in_sector"],
             total_market_cap_in_sector=row["total_market_cap_in_sector"],
             formation_date=formation_date,
+            point_in_time_passed=point_in_time_passed,
+            formation_cohort_passed=True,
             sector_history_coverage_years=sector_history_coverage_years,
         ))
     return result
+
+
+def _current_assignment_field_confidence(
+    assignment: SectorAssignmentSnapshot,
+    *,
+    evidence_date: date,
+    min_coverage_years: float,
+) -> Dict[str, float]:
+    """Confidence multipliers for current assignment freshness only.
+
+    Formation-date interval lookups remain exact-as-of and are not discounted
+    here. The coverage multiplier reflects the DATA.md shadow-only mandate for
+    the current taxonomy history feeding production M3.
+    """
+
+    coverage = assignment.sector_history_coverage_years
+    coverage_confidence = (
+        min(max(coverage / min_coverage_years, 0.0), 1.0)
+        if coverage is not None and min_coverage_years > 0
+        else 0.0
+    )
+    if assignment.last_verified is None:
+        freshness_confidence = 0.5
+    else:
+        age_days = max(0, (evidence_date - assignment.last_verified).days)
+        if age_days <= 7:
+            freshness_confidence = 1.0
+        elif age_days <= 30:
+            freshness_confidence = 0.9
+        elif age_days <= 90:
+            freshness_confidence = 0.75
+        else:
+            freshness_confidence = 0.5
+    return {
+        "current_sector_assignment_coverage": round(coverage_confidence, 4),
+        "current_sector_assignment_freshness": round(freshness_confidence, 4),
+    }
 
 
 def assemble_m3_daily(
@@ -353,10 +426,13 @@ def assemble_m3_daily(
     source_lineage_hash: Optional[str] = None,
     lineage_ids_by_ticker: Optional[Dict[str, List[str]]] = None,
     lineage_hashes_by_ticker: Optional[Dict[str, List[str]]] = None,
+    pattern_id: str = PATTERN_ID,
+    allow_undercoverage: bool = False,
+    min_coverage_years: float = MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS,
 ) -> PatternAssemblyResult:
     """Assemble M3 PatternInput objects from PIT sector history and returns."""
 
-    result = PatternAssemblyResult(pattern_id=PATTERN_ID)
+    result = PatternAssemblyResult(pattern_id=pattern_id)
     lineage_ids_by_ticker = lineage_ids_by_ticker or {}
     lineage_hashes_by_ticker = lineage_hashes_by_ticker or {}
     resolved_universe_cutoff = universe_cutoff_timestamp or cutoff_timestamp
@@ -370,7 +446,7 @@ def assemble_m3_daily(
             result.insufficient_count += 1
             result.diagnostics.append(AssemblyDiagnostic(
                 ticker=ticker,
-                pattern_id=PATTERN_ID,
+                pattern_id=pattern_id,
                 diagnostic_type="sector_unknown",
             ))
             continue
@@ -379,16 +455,34 @@ def assemble_m3_daily(
             result.insufficient_count += 1
             result.diagnostics.append(AssemblyDiagnostic(
                 ticker=ticker,
-                pattern_id=PATTERN_ID,
+                pattern_id=pattern_id,
                 diagnostic_type="sector_return_missing",
                 detail=assignment.sector,
             ))
             continue
+        if not allow_undercoverage and (
+            sector_return.sector_history_coverage_years is None
+            or sector_return.sector_history_coverage_years < min_coverage_years
+            or sector_return.point_in_time_passed is not True
+        ):
+            result.insufficient_count += 1
+            result.diagnostics.append(AssemblyDiagnostic(
+                ticker=ticker,
+                pattern_id=pattern_id,
+                diagnostic_type="sector_history_coverage_below_minimum",
+                detail=str(sector_return.sector_history_coverage_years),
+            ))
+            continue
+        field_confidence = _current_assignment_field_confidence(
+            assignment,
+            evidence_date=date.fromisoformat(evidence_session_date),
+            min_coverage_years=min_coverage_years,
+        )
 
         fields = [
             _field("sector", assignment.sector, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("industry", assignment.industry, cutoff_timestamp, source_provider, source_lineage_hash),
-            _field("sector_taxonomy_source", PRODUCTION_TAXONOMY_SOURCE, cutoff_timestamp, source_provider, source_lineage_hash),
+            _field("sector_taxonomy_source", assignment.source, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_assignment_source", assignment.source, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sic_code", assignment.sic_code, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sic_description", assignment.sic_description, cutoff_timestamp, source_provider, source_lineage_hash),
@@ -404,6 +498,7 @@ def assemble_m3_daily(
             _field("n_sectors_in_universe", sector_return.n_sectors, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_rank_normalized", sector_return.sector_rank_normalized, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_return_formation_date", sector_return.formation_date.isoformat(), cutoff_timestamp, source_provider, source_lineage_hash),
+            _field("field_confidence", field_confidence, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("price", _snap_attr(snap, "price"), resolved_universe_cutoff, "universe", snap_lineage),
             _field("market_cap", _snap_attr(snap, "market_cap"), resolved_universe_cutoff, "universe", snap_lineage),
             _field("market_cap_usd", _snap_attr(snap, "market_cap"), resolved_universe_cutoff, "universe", snap_lineage),
@@ -435,7 +530,7 @@ def assemble_m3_daily(
             result.rejected_count += 1
             result.diagnostics.append(AssemblyDiagnostic(
                 ticker=ticker,
-                pattern_id=PATTERN_ID,
+                pattern_id=pattern_id,
                 diagnostic_type="missing_m3_fields",
                 detail=",".join(missing),
             ))
@@ -449,7 +544,7 @@ def assemble_m3_daily(
             lineage_hashes.append(source_lineage_hash)
         inp = build_pattern_input(
             ticker=ticker,
-            pattern_id=PATTERN_ID,
+            pattern_id=pattern_id,
             asof_timestamp=cutoff_timestamp,
             validated_fields=validated,
             lineage_ids=lineage_ids,

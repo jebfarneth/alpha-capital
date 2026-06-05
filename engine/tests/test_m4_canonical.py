@@ -2110,6 +2110,155 @@ def test_main_enable_m2_fatal_fetch_error_aborts_before_health_report(
     assert "M2 daily failed with exit 1" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "m3_invocation",
+    [
+        run_nightly_canonical.RunInvocation(
+            exit_code=9,
+            run_id="m3-run",
+            run_status="failed",
+            metrics={"errors": [{"stage": "injected", "message": "exit 9"}]},
+        ),
+        run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m3-run",
+            run_status="partial_failed",
+            metrics={"orchestration": {"total_signals_persisted": 0}},
+        ),
+        run_nightly_canonical.RunInvocation(
+            exit_code=1,
+            run_id="m3-run",
+            run_status="failed",
+            metrics={"errors": [{"stage": "formation_universe", "message": "missing"}]},
+        ),
+    ],
+)
+def test_main_enable_m3_errors_are_observability_only(
+    monkeypatch,
+    tmp_path,
+    m3_invocation,
+):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    calls = []
+
+    def fake_universe(**kwargs):
+        calls.append(("universe", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="universe-run",
+            run_status="finished",
+            metrics={"included": 3},
+        )
+
+    def fake_m4(**kwargs):
+        calls.append(("m4", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m4-primary",
+            run_status="finished",
+            metrics={"decision_date": "2026-05-29"},
+        )
+
+    def fake_m1(**kwargs):
+        calls.append(("m1", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m1-run",
+            run_status="finished",
+            metrics={"assembly": {"assembled_count": 1}},
+        )
+
+    def fake_m2(**kwargs):
+        calls.append(("m2", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="m2-run",
+            run_status="finished",
+            metrics={"fatal_fetch_error_count": 0},
+        )
+
+    def fake_m3(**kwargs):
+        calls.append(("m3", kwargs))
+        return m3_invocation
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def fake_report_session(url, schema):
+        return FakeEngine(), FakeSession()
+
+    def fake_build_report(session, **kwargs):
+        calls.append(("build_report", kwargs))
+        assert kwargs["m1_run_id"] == "m1-run"
+        assert kwargs["m2_run_id"] == "m2-run"
+        assert kwargs["m3_run_id"] == "m3-run"
+        assert kwargs["m3_metrics"]["exit_code"] == m3_invocation.exit_code
+        assert kwargs["m3_metrics"]["run_status"] == m3_invocation.run_status
+        return {
+            "health": True,
+            "run_metadata": {},
+            "universe": {},
+            "m4_assembly": {},
+            "m1_assembly": {},
+            "m2_assembly": {},
+            "m3_assembly": {
+                "exit_code": m3_invocation.exit_code,
+                "run_status": m3_invocation.run_status,
+            },
+            "m4_signals": {},
+            "data_quality": {},
+            "forward_return_guard": {},
+            "forward_context_panel": {},
+            "source_attempts": {},
+            "freeze_reuse": {},
+            "idempotency_rerun": {},
+            "run_diagnostics": {},
+            "fired_signal_table": [],
+            "health_verdict": {"checks": {}, "failing_checks": []},
+        }
+
+    monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m2", fake_m2)
+    monkeypatch.setattr(run_nightly_canonical, "_run_m3", fake_m3)
+    monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
+    monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
+    monkeypatch.setattr(run_nightly_canonical, "_app_commit_sha", lambda: "deadbeef")
+
+    output = tmp_path / "report.json"
+    rc = run_nightly_canonical.main([
+        "--scratch",
+        "--schema", "scratch_schema",
+        "--run-timestamp", "2026-05-29T20:00:00-04:00",
+        "--skip-rerun",
+        "--skip-forward-context",
+        "--enable-m1",
+        "--enable-m2",
+        "--enable-m3",
+        "--json-output", str(output),
+    ])
+
+    assert rc == 0
+    assert [name for name, _payload in calls] == [
+        "universe",
+        "m4",
+        "m1",
+        "m2",
+        "m3",
+        "build_report",
+    ]
+    report = json.loads(output.read_text())
+    assert report["health"] is True
+    assert report["m3_assembly"]["exit_code"] == m3_invocation.exit_code
+
+
 def test_main_aborts_on_zero_exit_with_failed_run_status(monkeypatch, capsys):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
     monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)

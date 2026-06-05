@@ -716,10 +716,17 @@ class FirmSectorAssignmentHistory(Base):
     sic_code = Column(String, nullable=True)
     sic_description = Column(Text, nullable=True)
     industry = Column(String, nullable=True)
-    source = Column(String, nullable=False, default="POLYGON_SIC")
+    source = Column(
+        String, nullable=False, default="POLYGON_SIC", server_default="POLYGON_SIC"
+    )
     sic_to_sector_map_version = Column(String, nullable=False)
     valid_to = Column(Date, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
 
 
 class FirmSectorAssignment(Base):
@@ -734,12 +741,23 @@ class FirmSectorAssignment(Base):
     ticker = Column(String, primary_key=True)
     sector = Column(String, nullable=False)
     industry = Column(String, nullable=True)
-    source = Column(String, nullable=False, default="POLYGON_SIC")
+    source = Column(
+        String, nullable=False, default="POLYGON_SIC", server_default="POLYGON_SIC"
+    )
     classification_date = Column(Date, nullable=False)
     last_verified = Column(Date, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
     updated_at = Column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+        DateTime(timezone=True),
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
     )
 
 
@@ -763,15 +781,30 @@ class SectorReturnDaily(Base):
     n_sectors = Column(Integer, nullable=False)
     n_firms_in_sector = Column(Integer, nullable=False)
     total_market_cap_in_sector = Column(Float, nullable=False)
-    source = Column(String, nullable=False, default="POLYGON_SIC")
+    source = Column(
+        String, nullable=False, default="POLYGON_SIC", server_default="POLYGON_SIC"
+    )
     sic_to_sector_map_version = Column(String, nullable=False)
     formation_date = Column(Date, nullable=False)
-    point_in_time_passed = Column(Boolean, nullable=False, default=True)
-    formation_cohort_passed = Column(Boolean, nullable=False, default=True)
+    point_in_time_passed = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    formation_cohort_passed = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
     sector_history_coverage_years = Column(Float, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
     updated_at = Column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+        DateTime(timezone=True),
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
     )
 
 
@@ -794,7 +827,12 @@ class SectorChangeLog(Base):
     new_source = Column(String, nullable=False)
     sic_to_sector_map_version = Column(String, nullable=False)
     change_date = Column(Date, nullable=False)
-    detected_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    detected_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
     job_run_id = Column(
         String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
     )
@@ -979,7 +1017,12 @@ class M3ValidationMetadata(Base):
     sigma_epsilon_contribution = Column(Float, nullable=True)
     residual_m3_alpha = Column(Float, nullable=True)
     override_affected = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
 
 
 class M3TrancheFill(Base):
@@ -1058,7 +1101,12 @@ class M3OcoLegState(Base):
     intended_price = Column(Float, nullable=False)
     actual_price = Column(Float, nullable=True)
     last_broker_update = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
 
 
 # ---------------------------------------------------------------------------

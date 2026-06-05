@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from alpha.assembly.m3_daily import (
     PATTERN_ID,
+    SHADOW_PATTERN_ID,
     SECTOR_RETURN_LOOKBACK_SESSIONS,
     SectorReturnSnapshot,
     assemble_m3_daily,
@@ -39,7 +41,48 @@ from alpha.market_calendar import (
     resolve_us_equity_session,
     us_equity_session_close_timestamp,
 )
+from alpha.patterns.contracts import PatternDetectionResult, PatternInput
 from alpha.patterns.m3 import M3Detector
+
+
+class M3ShadowDetector(M3Detector):
+    """Shadow-only M3 detector for sub-3-year PIT taxonomy history."""
+
+    pattern_id = SHADOW_PATTERN_ID
+    version = "1.0-shadow"
+    allow_shadow_point_in_time_failure = True
+
+    def detect(self, inp: PatternInput) -> PatternDetectionResult:
+        original_market_data = dict(inp.market_data)
+        shadow_market_data = deepcopy(original_market_data)
+        shadow_market_data["sector_return_point_in_time_passed"] = True
+        shadow_market_data["sector_return_formation_cohort_passed"] = True
+        shadow_input = PatternInput(
+            ticker=inp.ticker,
+            asof_timestamp=inp.asof_timestamp,
+            market_data=shadow_market_data,
+            fundamental_data=dict(inp.fundamental_data),
+            event_data=dict(inp.event_data),
+            lineage_ids=list(inp.lineage_ids),
+            lineage_hashes=list(inp.lineage_hashes),
+            universe_snapshot_id=inp.universe_snapshot_id,
+            job_run_id=inp.job_run_id,
+            code_commit_sha=inp.code_commit_sha,
+        )
+        result = super().detect(shadow_input)
+        result.pattern_id = self.pattern_id
+        result.quality_flags["point_in_time_passed"] = False
+        result.warnings.append("M3 shadow-only: sector history coverage below 3 years")
+        if result.features is not None:
+            result.features.point_in_time_passed = False
+            result.features.features["sector_return_point_in_time_passed"] = (
+                original_market_data.get("sector_return_point_in_time_passed")
+            )
+            result.features.features["shadow_pattern_id"] = self.pattern_id
+            result.features.features["shadow_reason"] = "sector_history_coverage_below_3yr"
+        for signal in result.signals:
+            signal.signal_status = "shadow"
+        return result
 
 
 class M3DailyAssemblyJob(BaseJob):
@@ -199,7 +242,7 @@ class M3DailyAssemblyJob(BaseJob):
         for ticker, lineages in price_lineages.items():
             lineage_ids_by_ticker.setdefault(ticker, []).extend(lineages["ids"])
             lineage_hashes_by_ticker.setdefault(ticker, []).extend(lineages["hashes"])
-        delisted_dates = _resolve_delisted_dates_for_missing_end_prices(
+        delisted_dates, delisting_reasons = _resolve_delisting_metadata_for_missing_end_prices(
             self._session,
             self._polygon_adapter,
             tickers=formation_tickers,
@@ -217,6 +260,7 @@ class M3DailyAssemblyJob(BaseJob):
             one_month_date=one_month_date,
             three_month_date=three_month_date,
             delisted_dates_by_ticker=delisted_dates,
+            delisting_reasons_by_ticker=delisting_reasons,
         )
         coverage_years = _min_coverage_years(current_assignments.values())
         sector_returns = compute_sector_return_snapshots(
@@ -228,7 +272,7 @@ class M3DailyAssemblyJob(BaseJob):
         _persist_sector_returns(self._session, sector_returns)
         sector_returns_by_sector = {row.sector: row for row in sector_returns}
 
-        assembly = assemble_m3_daily(
+        production_assembly = assemble_m3_daily(
             snapshots=snapshots,
             assignments_by_ticker=current_assignments,
             sector_returns_by_sector=sector_returns_by_sector,
@@ -248,11 +292,41 @@ class M3DailyAssemblyJob(BaseJob):
             lineage_ids_by_ticker=lineage_ids_by_ticker,
             lineage_hashes_by_ticker=lineage_hashes_by_ticker,
         )
+        shadow_sector_returns_by_sector = {
+            sector: row
+            for sector, row in sector_returns_by_sector.items()
+            if row.point_in_time_passed is not True
+        }
+        shadow_assembly = assemble_m3_daily(
+            snapshots=snapshots,
+            assignments_by_ticker=current_assignments,
+            sector_returns_by_sector=shadow_sector_returns_by_sector,
+            cutoff_timestamp=cutoff_timestamp,
+            universe_cutoff_timestamp=scan_asof_timestamp,
+            decision_date=decision_date,
+            evidence_session_date=evidence_session_date,
+            next_execution_session=session_resolution.next_execution_session,
+            source_lineage_hash=stable_hash({
+                "pattern_id": SHADOW_PATTERN_ID,
+                "scan_id": scan_id,
+                "formation_scan_id": formation_scan_id,
+                "formation_date": formation_date.isoformat(),
+                "sector_return_count": len(sector_returns),
+                "sic_to_sector_map_version": SIC_TO_SECTOR_MAP_VERSION,
+            }),
+            lineage_ids_by_ticker=lineage_ids_by_ticker,
+            lineage_hashes_by_ticker=lineage_hashes_by_ticker,
+            pattern_id=SHADOW_PATTERN_ID,
+            allow_undercoverage=True,
+        )
         orchestration = DetectorOrchestrationJob(
             self._session,
-            detectors=[M3Detector()],
+            detectors=[M3Detector(), M3ShadowDetector()],
             trading_date=decision_date,
-            assembled_inputs={"M3": assembly.inputs},
+            assembled_inputs={
+                "M3": production_assembly.inputs,
+                SHADOW_PATTERN_ID: shadow_assembly.inputs,
+            },
         )
         orchestration_result = orchestration.run(ctx)
 
@@ -271,7 +345,8 @@ class M3DailyAssemblyJob(BaseJob):
             "price_fetch_error_count": len(price_fetch_errors),
             "sector_history_refresh": refresh_counts,
             "sic_to_sector_map_version": SIC_TO_SECTOR_MAP_VERSION,
-            "assembly": _assembly_metrics(assembly),
+            "assembly": _assembly_metrics(production_assembly),
+            "shadow_assembly": _assembly_metrics(shadow_assembly),
             "orchestration": orchestration_result.metrics,
         })
         errors = list(refresh_errors)
@@ -398,7 +473,30 @@ def _resolve_delisted_dates_for_missing_end_prices(
     asof: datetime,
     job_run_id: str,
 ) -> Dict[str, date]:
+    dates, _ = _resolve_delisting_metadata_for_missing_end_prices(
+        session,
+        polygon_adapter,
+        tickers=tickers,
+        bars_by_ticker=bars_by_ticker,
+        evidence_day=evidence_day,
+        asof=asof,
+        job_run_id=job_run_id,
+    )
+    return dates
+
+
+def _resolve_delisting_metadata_for_missing_end_prices(
+    session: Session,
+    polygon_adapter: Any,
+    *,
+    tickers: Sequence[str],
+    bars_by_ticker: Dict[str, Sequence[Any]],
+    evidence_day: date,
+    asof: datetime,
+    job_run_id: str,
+) -> Tuple[Dict[str, date], Dict[str, str]]:
     out: Dict[str, date] = {}
+    reasons: Dict[str, str] = {}
     for ticker in tickers:
         bars = bars_by_ticker.get(ticker, ())
         if _has_bar_on_date(bars, evidence_day):
@@ -423,12 +521,15 @@ def _resolve_delisted_dates_for_missing_end_prices(
             delisted = _parse_delisted_date(getattr(resp.data, "delisted_utc", None))
             if delisted is not None:
                 out[ticker] = delisted
+                reason = _delisting_reason(resp.data)
+                if reason:
+                    reasons[ticker] = reason
         elif not resp.ok:
             if _provider_error(resp.error).get("status_code") == 404:
                 last_bar_date = _last_bar_date(bars)
                 if last_bar_date is not None and last_bar_date <= evidence_day:
                     out[ticker] = last_bar_date
-    return out
+    return out, reasons
 
 
 def _has_bar_on_date(bars: Sequence[Any], day: date) -> bool:
@@ -463,6 +564,29 @@ def _parse_delisted_date(value: Any) -> Optional[date]:
         return date.fromisoformat(text[:10])
     except ValueError:
         return None
+
+
+def _delisting_reason(detail: Any) -> Optional[str]:
+    raw = getattr(detail, "raw", None)
+    candidates = [
+        getattr(detail, "delisting_reason", None),
+        getattr(detail, "delisting_event_type", None),
+    ]
+    if isinstance(raw, dict):
+        candidates.extend(
+            raw.get(key)
+            for key in (
+                "delisting_reason",
+                "delisting_event_type",
+                "delisting_event",
+                "delisting_description",
+                "corporate_action_type",
+            )
+        )
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _persist_sector_returns(

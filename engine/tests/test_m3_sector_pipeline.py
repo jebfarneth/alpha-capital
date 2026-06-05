@@ -4,8 +4,10 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import inspect
 
 from alpha.assembly.m3_daily import (
+    SHADOW_PATTERN_ID,
     SectorAssignmentSnapshot,
     SectorReturnSnapshot,
     adjusted_return,
@@ -17,6 +19,7 @@ from alpha.assembly.m3_daily import (
 from alpha.assembly.m3_sector_map import (
     SECTORS,
     SIC_TO_SECTOR_MAP_VERSION,
+    canonical_sector_from_fmp,
     major_group_map,
     sector_for_sic,
 )
@@ -146,16 +149,49 @@ def _bar(day: date, adj_close: float):
     return SimpleNamespace(date=day.isoformat(), adj_close=adj_close, close=adj_close)
 
 
+def test_m3_schema_has_server_defaults(db_session):
+    inspector = inspect(db_session.bind)
+    defaults = {
+        table: {
+            column["name"]: column.get("default")
+            for column in inspector.get_columns(table)
+        }
+        for table in (
+            "firm_sector_assignments_history",
+            "firm_sector_assignments",
+            "sector_returns_daily",
+            "sector_change_log",
+        )
+    }
+
+    assert defaults["firm_sector_assignments_history"]["source"] is not None
+    assert defaults["firm_sector_assignments_history"]["created_at"] is not None
+    assert defaults["firm_sector_assignments"]["source"] is not None
+    assert defaults["firm_sector_assignments"]["created_at"] is not None
+    assert defaults["firm_sector_assignments"]["updated_at"] is not None
+    assert defaults["sector_returns_daily"]["source"] is not None
+    assert defaults["sector_returns_daily"]["point_in_time_passed"] is not None
+    assert defaults["sector_returns_daily"]["formation_cohort_passed"] is not None
+    assert defaults["sector_returns_daily"]["created_at"] is not None
+    assert defaults["sector_returns_daily"]["updated_at"] is not None
+    assert defaults["sector_change_log"]["detected_at"] is not None
+
+
 def test_sic_to_sector_map_is_versioned_and_roughly_gics_sized():
-    assert SIC_TO_SECTOR_MAP_VERSION == "POLYGON_SIC_2DIGIT_V1_2026_06_05"
+    assert SIC_TO_SECTOR_MAP_VERSION == "POLYGON_SIC_PREFIX_V2_2026_06_05"
     assert len(SECTORS) == 11
     assert set(major_group_map().values()) <= set(SECTORS)
     assert sector_for_sic("6022") == "Financials"
     assert sector_for_sic("7372") == "Information Technology"
     assert sector_for_sic("2834") == "Health Care"
+    assert sector_for_sic("2812") == "Materials"
+    assert sector_for_sic("3531") == "Industrials"
+    assert sector_for_sic("3571") == "Information Technology"
     assert sector_for_sic("1311") == "Energy"
     assert sector_for_sic("6500") == "Real Estate"
     assert sector_for_sic(None) is None
+    assert canonical_sector_from_fmp("Financial Services") == "Financials"
+    assert canonical_sector_from_fmp("Consumer Cyclical") == "Consumer Discretionary"
 
 
 def test_sector_history_intervals_are_point_in_time(db_session):
@@ -194,6 +230,49 @@ def test_sector_history_intervals_are_point_in_time(db_session):
     assert current.sector == "Financials"
 
 
+def test_sector_history_out_of_order_write_does_not_overlap(db_session):
+    current = ResolvedSectorAssignment(
+        ticker="BBBY",
+        asof_date=date(2026, 6, 1),
+        sector="Consumer Discretionary",
+        source=SOURCE_POLYGON_SIC,
+        sic_code="5961",
+        diagnostics=[],
+        lineage_ids=[],
+        lineage_hashes=[],
+    )
+    older = ResolvedSectorAssignment(
+        ticker="BBBY",
+        asof_date=date(2022, 6, 1),
+        sector="Consumer Discretionary",
+        source=SOURCE_POLYGON_SIC,
+        sic_code="5700",
+        diagnostics=[],
+        lineage_ids=[],
+        lineage_hashes=[],
+    )
+
+    assert write_sector_assignment_interval(db_session, current)
+    assert write_sector_assignment_interval(db_session, older)
+
+    rows = (
+        db_session.query(FirmSectorAssignmentHistory)
+        .filter_by(ticker="BBBY")
+        .order_by(FirmSectorAssignmentHistory.valid_from.asc())
+        .all()
+    )
+    assert [(row.valid_from, row.valid_to) for row in rows] == [
+        (date(2022, 6, 1), date(2026, 6, 1)),
+        (date(2026, 6, 1), date(9999, 12, 31)),
+    ]
+    assert load_sector_assignments_at(
+        db_session, tickers=["BBBY"], asof_date=date(2023, 1, 1)
+    )["BBBY"].sic_code == "5700"
+    assert load_sector_assignments_at(
+        db_session, tickers=["BBBY"], asof_date=date(2026, 6, 2)
+    )["BBBY"].sic_code == "5961"
+
+
 def test_null_sic_uses_fmp_fallback_and_records_source():
     polygon = FakePolygonAdapter({
         ("FRC", "2022-06-01"): SimpleNamespace(
@@ -216,7 +295,7 @@ def test_null_sic_uses_fmp_fallback_and_records_source():
 
     assert resolved.resolved
     assert resolved.source == SOURCE_FMP_FALLBACK
-    assert resolved.sector == "Financial Services"
+    assert resolved.sector == "Financials"
     assert "polygon_sic_null_or_unmapped" in resolved.diagnostics
 
 
@@ -230,6 +309,19 @@ def test_shumway_delisting_adjustment_when_end_price_missing():
 
     assert applied is True
     assert ret == pytest.approx((0.8 * 0.7) - 1.0)
+
+
+def test_acquisition_delisting_does_not_apply_shumway_penalty():
+    ret, applied = adjusted_return(
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 140.0)],
+        start_date=date(2023, 1, 3),
+        end_date=date(2023, 6, 30),
+        delisted_date=date(2023, 3, 10),
+        delisting_reason="cash merger acquisition",
+    )
+
+    assert applied is False
+    assert ret == pytest.approx(0.40)
 
 
 def test_polygon_404_delisting_probe_uses_last_available_bar(db_session):
@@ -362,6 +454,7 @@ def test_assembler_sets_polygon_sic_and_detector_rejects_without_pit_proof():
         decision_date="2026-06-04",
         evidence_session_date="2026-06-04",
         next_execution_session="2026-06-05",
+        allow_undercoverage=True,
     )
     inp = assembled.inputs[0]
     assert inp.market_data["sector_taxonomy_source"] == "POLYGON_SIC"
@@ -370,6 +463,78 @@ def test_assembler_sets_polygon_sic_and_detector_rejects_without_pit_proof():
     assert not result.has_signal
     assert result.features.features["rejection_reason"] == "sector_return_not_point_in_time"
     assert result.features.point_in_time_passed is False
+
+
+def test_assembler_routes_undercovered_sector_returns_to_shadow_only():
+    snap = SimpleNamespace(
+        ticker="FIRE",
+        universe_snapshot_id="snap-fire",
+        asof_timestamp=_ts(),
+        source_lineage_hash="snap-hash",
+        price=10.0,
+        market_cap=100_000_000,
+        primary_exchange="NASDAQ",
+        security_type="common_stock",
+        operating_universe_inclusion=True,
+        liquidity_score=1.0,
+        hazard_score=10.0,
+    )
+    assignment = SectorAssignmentSnapshot(
+        ticker="FIRE",
+        sector="Information Technology",
+        source=SOURCE_POLYGON_SIC,
+        sic_code="7372",
+        valid_from=date(2024, 6, 1),
+        valid_to=date(9999, 12, 31),
+        sector_history_coverage_years=2.0,
+        last_verified=date(2026, 6, 4),
+    )
+    sector_return = SectorReturnSnapshot(
+        date=date(2026, 6, 4),
+        sector="Information Technology",
+        return_6mo=0.30,
+        return_6mo_ew=0.25,
+        return_1mo=0.02,
+        return_3mo=0.10,
+        sector_rank=3,
+        sector_rank_normalized=0.833333,
+        n_sectors=3,
+        n_firms_in_sector=8,
+        total_market_cap_in_sector=500_000_000,
+        formation_date=date(2025, 12, 4),
+        point_in_time_passed=False,
+        formation_cohort_passed=True,
+        sector_history_coverage_years=2.0,
+    )
+
+    production = assemble_m3_daily(
+        snapshots=[snap],
+        assignments_by_ticker={"FIRE": assignment},
+        sector_returns_by_sector={"Information Technology": sector_return},
+        cutoff_timestamp=_ts(),
+        universe_cutoff_timestamp=_ts(),
+        decision_date="2026-06-04",
+        evidence_session_date="2026-06-04",
+        next_execution_session="2026-06-05",
+    )
+    shadow = assemble_m3_daily(
+        snapshots=[snap],
+        assignments_by_ticker={"FIRE": assignment},
+        sector_returns_by_sector={"Information Technology": sector_return},
+        cutoff_timestamp=_ts(),
+        universe_cutoff_timestamp=_ts(),
+        decision_date="2026-06-04",
+        evidence_session_date="2026-06-04",
+        next_execution_session="2026-06-05",
+        pattern_id=SHADOW_PATTERN_ID,
+        allow_undercoverage=True,
+    )
+
+    assert production.inputs == []
+    assert production.diagnostics[0].diagnostic_type == "sector_history_coverage_below_minimum"
+    assert len(shadow.inputs) == 1
+    assert shadow.inputs[0].market_data["sector_return_point_in_time_passed"] is False
+    assert shadow.inputs[0].market_data["field_confidence"]["current_sector_assignment_coverage"] < 1
 
 
 def test_m3_daily_job_persists_pit_sector_returns_and_signals(db_session):
@@ -391,6 +556,13 @@ def test_m3_daily_job_persists_pit_sector_returns_and_signals(db_session):
             sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
             valid_from=date(2023, 1, 1),
             valid_to=date(9999, 12, 31),
+        ))
+        db_session.add(FirmSectorAssignment(
+            ticker=ticker,
+            sector=sector,
+            source=SOURCE_POLYGON_SIC,
+            classification_date=evidence_day,
+            last_verified=evidence_day,
         ))
     bars = {
         "FIRE": [_bar(formation_day, 10.0), _bar(evidence_day, 13.0)],
@@ -415,3 +587,101 @@ def test_m3_daily_job_persists_pit_sector_returns_and_signals(db_session):
     assert signal.signal_horizon == "15d"
     assert signal.signal_timestamp.isoformat().startswith("2026-06-04T20:00:00")
     assert result.metrics["orchestration"]["total_signals_persisted"] == 1
+
+
+def test_m3_daily_job_undercoverage_persists_shadow_only(db_session):
+    evidence_day = date(2026, 6, 4)
+    formation_day = nth_previous_session(evidence_day, 126)
+    tickers = {"FIRE": 100_000_000, "MID": 90_000_000, "LOW": 80_000_000}
+    _canonical_scan(db_session, evidence_day, tickers)
+    _canonical_scan(db_session, formation_day, tickers)
+    for ticker, sector, sic in (
+        ("FIRE", "Information Technology", "7372"),
+        ("MID", "Energy", "1311"),
+        ("LOW", "Health Care", "2834"),
+    ):
+        db_session.add(FirmSectorAssignmentHistory(
+            ticker=ticker,
+            sector=sector,
+            sic_code=sic,
+            source=SOURCE_POLYGON_SIC,
+            sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
+            valid_from=date(2025, 1, 1),
+            valid_to=date(9999, 12, 31),
+        ))
+        db_session.add(FirmSectorAssignment(
+            ticker=ticker,
+            sector=sector,
+            source=SOURCE_POLYGON_SIC,
+            classification_date=evidence_day,
+            last_verified=evidence_day,
+        ))
+    bars = {
+        "FIRE": [_bar(formation_day, 10.0), _bar(evidence_day, 13.0)],
+        "MID": [_bar(formation_day, 10.0), _bar(evidence_day, 11.0)],
+        "LOW": [_bar(formation_day, 10.0), _bar(evidence_day, 9.0)],
+    }
+    job = M3DailyAssemblyJob(
+        db_session,
+        polygon_adapter=FakePolygonAdapter({}),
+        fmp_adapter=FakeFmpAdapter(bars=bars),
+        run_timestamp=_ts(),
+        refresh_sector_history=False,
+    )
+
+    result = run_job(db_session, job, params={"run_timestamp": _ts().isoformat()})
+
+    assert result.status == "finished"
+    assert result.metrics["assembly"]["assembled_count"] == 0
+    assert result.metrics["shadow_assembly"]["assembled_count"] == 3
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="M3").count() == 0
+    shadow = db_session.query(SignalRegistry).filter_by(pattern_id=SHADOW_PATTERN_ID, ticker="FIRE").one()
+    assert shadow.signal_status == "shadow"
+    assert shadow.point_in_time_passed is False
+
+
+def test_m3_current_assignment_staleness_reduces_signal_confidence(db_session):
+    evidence_day = date(2026, 6, 4)
+    formation_day = nth_previous_session(evidence_day, 126)
+    tickers = {"FIRE": 100_000_000, "MID": 90_000_000, "LOW": 80_000_000}
+    _canonical_scan(db_session, evidence_day, tickers)
+    _canonical_scan(db_session, formation_day, tickers)
+    for ticker, sector, sic in (
+        ("FIRE", "Information Technology", "7372"),
+        ("MID", "Energy", "1311"),
+        ("LOW", "Health Care", "2834"),
+    ):
+        db_session.add(FirmSectorAssignmentHistory(
+            ticker=ticker,
+            sector=sector,
+            sic_code=sic,
+            source=SOURCE_POLYGON_SIC,
+            sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
+            valid_from=date(2023, 1, 1),
+            valid_to=date(9999, 12, 31),
+        ))
+        db_session.add(FirmSectorAssignment(
+            ticker=ticker,
+            sector=sector,
+            source=SOURCE_POLYGON_SIC,
+            classification_date=date(2026, 1, 1),
+            last_verified=date(2026, 1, 1),
+        ))
+    bars = {
+        "FIRE": [_bar(formation_day, 10.0), _bar(evidence_day, 13.0)],
+        "MID": [_bar(formation_day, 10.0), _bar(evidence_day, 11.0)],
+        "LOW": [_bar(formation_day, 10.0), _bar(evidence_day, 9.0)],
+    }
+    job = M3DailyAssemblyJob(
+        db_session,
+        polygon_adapter=FakePolygonAdapter({}),
+        fmp_adapter=FakeFmpAdapter(bars=bars),
+        run_timestamp=_ts(),
+        refresh_sector_history=False,
+    )
+
+    result = run_job(db_session, job, params={"run_timestamp": _ts().isoformat()})
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="M3", ticker="FIRE").one()
+    assert signal.data_confidence < 1.0

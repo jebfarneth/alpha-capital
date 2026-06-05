@@ -238,11 +238,18 @@ def _input_asof_ceiling(
     return scan_asof_timestamp, "canonical scan asof"
 
 
-def _result_guard_passed(result: PatternDetectionResult) -> Tuple[bool, Optional[str]]:
+def _result_guard_passed(
+    result: PatternDetectionResult,
+    *,
+    allow_point_in_time_failure: bool = False,
+) -> Tuple[bool, Optional[str]]:
     """Require detector-emitted guard flags to agree with the orchestration guard."""
     if result.features is None:
         return False, "missing_features"
-    if result.features.point_in_time_passed is not True:
+    if (
+        result.features.point_in_time_passed is not True
+        and not allow_point_in_time_failure
+    ):
         return False, "detector_point_in_time_guard_failed"
     if result.features.lookahead_guard_passed is not True:
         return False, "detector_lookahead_guard_failed"
@@ -661,7 +668,12 @@ class DetectorOrchestrationJob(BaseJob):
                     diag.skipped_count += 1
                 continue
 
-            result_guard_passed, result_guard_reason = _result_guard_passed(result)
+            result_guard_passed, result_guard_reason = _result_guard_passed(
+                result,
+                allow_point_in_time_failure=bool(
+                    getattr(detector, "allow_shadow_point_in_time_failure", False)
+                ),
+            )
             if not result_guard_passed:
                 diag.lookahead_failure_count += 1
                 if result.has_signal:

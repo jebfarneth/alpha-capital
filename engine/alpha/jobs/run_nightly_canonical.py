@@ -1138,6 +1138,8 @@ def build_m4_health_report(
         },
         "m3_assembly": {
             "m3_run_id": m3_run_id,
+            "exit_code": m3_metrics.get("exit_code"),
+            "run_status": m3_metrics.get("run_status"),
             "no_op_reason": m3_metrics.get("no_op_reason"),
             "formation_date": m3_metrics.get("formation_date"),
             "formation_universe_size": m3_metrics.get("formation_universe_size"),
@@ -1153,9 +1155,13 @@ def build_m4_health_report(
             ),
             "price_fetch_error_count": m3_metrics.get("price_fetch_error_count"),
             "assembled_count": (m3_metrics.get("assembly") or {}).get("assembled_count"),
+            "shadow_assembled_count": (
+                m3_metrics.get("shadow_assembly") or {}
+            ).get("assembled_count"),
             "m3_signals_persisted": (
                 m3_metrics.get("orchestration") or {}
             ).get("total_signals_persisted"),
+            "errors": m3_metrics.get("errors"),
         },
         "m4_signals": {
             "signal_count": signal_count,
@@ -1824,15 +1830,28 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
             decision_date=decision_date,
             args=args,
         ))
+        m3_metrics = dict(m3_invocation.metrics or {})
+        m3_metrics["exit_code"] = m3_invocation.exit_code
+        m3_metrics["run_status"] = m3_invocation.run_status
         if m3_invocation.exit_code != 0:
-            print(f"ERROR: M3 daily failed with exit {m3_invocation.exit_code}")
-            return m3_invocation.exit_code
-        if (
+            print(
+                f"WARNING: M3 daily failed with exit {m3_invocation.exit_code}; "
+                "continuing because M3 is shadow/observability-only."
+            )
+        elif (
             not m3_invocation.run_id
             or m3_invocation.run_status not in SUCCESS_RUN_STATUSES
         ):
-            print("ERROR: M3 daily returned exit 0 without a finished job run")
-            return 1
+            print(
+                "WARNING: M3 daily returned without a finished job run; "
+                "continuing because M3 is shadow/observability-only."
+            )
+        m3_invocation = RunInvocation(
+            exit_code=m3_invocation.exit_code,
+            run_id=m3_invocation.run_id,
+            run_status=m3_invocation.run_status,
+            metrics=m3_metrics,
+        )
 
     forward_context_invocation = RunInvocation(
         exit_code=0,

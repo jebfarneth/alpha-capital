@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from alpha.assembly.m3_daily import OPEN_INTERVAL_END, SectorAssignmentSnapshot
 from alpha.assembly.m3_sector_map import (
     SIC_TO_SECTOR_MAP_VERSION,
+    canonical_sector_from_fmp,
     sector_for_sic,
     normalize_sic_code,
 )
@@ -262,7 +263,7 @@ def resolve_sector_assignment(
             lineage_hashes.append(fmp_resp.lineage.raw_payload_hash)
         if fmp_resp.ok and fmp_resp.data is not None:
             profile = fmp_resp.data
-            sector = _clean_sector(getattr(profile, "sector", None))
+            sector = canonical_sector_from_fmp(getattr(profile, "sector", None))
             if sector:
                 return ResolvedSectorAssignment(
                     ticker=ticker,
@@ -274,7 +275,7 @@ def resolve_sector_assignment(
                     lineage_ids=lineage_ids,
                     lineage_hashes=lineage_hashes,
                 )
-            diagnostics.append("fmp_sector_null")
+            diagnostics.append("fmp_sector_null_or_unmapped")
         elif not fmp_resp.ok:
             diagnostics.append(f"fmp_error:{_provider_error(fmp_resp.error).get('message')}")
         else:
@@ -316,6 +317,20 @@ def write_sector_assignment_interval(
     )
     changed = False
     if existing is None:
+        next_interval = (
+            session.query(FirmSectorAssignmentHistory)
+            .filter(
+                FirmSectorAssignmentHistory.ticker == ticker,
+                FirmSectorAssignmentHistory.valid_from > asof_date,
+            )
+            .order_by(FirmSectorAssignmentHistory.valid_from.asc())
+            .first()
+        )
+        new_valid_to = (
+            next_interval.valid_from
+            if next_interval is not None
+            else OPEN_INTERVAL_END
+        )
         session.add(FirmSectorAssignmentHistory(
             ticker=ticker,
             sector=assignment.sector,
@@ -325,7 +340,7 @@ def write_sector_assignment_interval(
             source=assignment.source,
             sic_to_sector_map_version=SIC_TO_SECTOR_MAP_VERSION,
             valid_from=asof_date,
-            valid_to=OPEN_INTERVAL_END,
+            valid_to=new_valid_to,
         ))
         session.add(SectorChangeLog(
             ticker=ticker,
@@ -411,6 +426,7 @@ def write_sector_assignment_interval(
         current.classification_date = asof_date
         current.last_verified = asof_date
     session.flush()
+    assert_no_sector_interval_overlap(session, ticker)
     return changed
 
 
@@ -435,6 +451,14 @@ def load_sector_assignments_at(
         .all()
     )
     coverage = _coverage_years_by_ticker(session, normalized, asof_date)
+    current_rows = {
+        row.ticker.upper(): row.last_verified
+        for row in (
+            session.query(FirmSectorAssignment.ticker, FirmSectorAssignment.last_verified)
+            .filter(FirmSectorAssignment.ticker.in_(normalized))
+            .all()
+        )
+    }
     return {
         row.ticker.upper(): SectorAssignmentSnapshot(
             ticker=row.ticker.upper(),
@@ -447,9 +471,35 @@ def load_sector_assignments_at(
             industry=row.industry,
             sic_to_sector_map_version=row.sic_to_sector_map_version,
             sector_history_coverage_years=coverage.get(row.ticker.upper()),
+            last_verified=current_rows.get(row.ticker.upper()),
         )
         for row in rows
     }
+
+
+def assert_no_sector_interval_overlap(session: Session, ticker: str) -> None:
+    """Fail closed if a ticker's PIT sector intervals overlap or invert."""
+
+    rows = (
+        session.query(FirmSectorAssignmentHistory)
+        .filter(FirmSectorAssignmentHistory.ticker == ticker.upper())
+        .order_by(FirmSectorAssignmentHistory.valid_from.asc())
+        .all()
+    )
+    previous = None
+    for row in rows:
+        if row.valid_to <= row.valid_from:
+            raise ValueError(
+                f"invalid M3 sector interval for {ticker}: "
+                f"{row.valid_from}..{row.valid_to}"
+            )
+        if previous is not None and previous.valid_to > row.valid_from:
+            raise ValueError(
+                f"overlapping M3 sector intervals for {ticker}: "
+                f"{previous.valid_from}..{previous.valid_to} overlaps "
+                f"{row.valid_from}..{row.valid_to}"
+            )
+        previous = row
 
 
 def _same_assignment(
@@ -548,15 +598,6 @@ def _ensure_aware(value: Optional[datetime]) -> Optional[datetime]:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
-
-
-def _clean_sector(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text or text.lower() in {"unknown", "none", "null"}:
-        return None
-    return text
 
 
 def _record_response_lineage(
