@@ -51,7 +51,14 @@ from alpha.db.models import (
     UniverseScan,
     UniverseSnapshot,
 )
-from alpha.jobs import run_forward_context, run_m1_daily, run_m2_daily, run_m4_daily, run_universe
+from alpha.jobs import (
+    run_forward_context,
+    run_m1_daily,
+    run_m2_daily,
+    run_m3_daily,
+    run_m4_daily,
+    run_universe,
+)
 from alpha.market_calendar import (
     is_us_equity_session,
     resolve_us_equity_session,
@@ -829,6 +836,8 @@ def build_m4_health_report(
     m1_metrics: Optional[Dict[str, Any]] = None,
     m2_run_id: Optional[str] = None,
     m2_metrics: Optional[Dict[str, Any]] = None,
+    m3_run_id: Optional[str] = None,
+    m3_metrics: Optional[Dict[str, Any]] = None,
     forward_context_run_id: Optional[str] = None,
     forward_context_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -848,6 +857,7 @@ def build_m4_health_report(
     )
     m1_metrics = dict(m1_metrics or {})
     m2_metrics = dict(m2_metrics or {})
+    m3_metrics = dict(m3_metrics or {})
     explicit_m4_run_ids = [
         run_id for run_id in (primary_m4_run_id, rerun_m4_run_id) if run_id
     ]
@@ -1126,6 +1136,27 @@ def build_m4_health_report(
                 m2_metrics.get("orchestration") or {}
             ).get("total_signals_persisted"),
         },
+        "m3_assembly": {
+            "m3_run_id": m3_run_id,
+            "no_op_reason": m3_metrics.get("no_op_reason"),
+            "formation_date": m3_metrics.get("formation_date"),
+            "formation_universe_size": m3_metrics.get("formation_universe_size"),
+            "current_sector_assignment_count": m3_metrics.get(
+                "current_sector_assignment_count"
+            ),
+            "sector_return_count": m3_metrics.get("sector_return_count"),
+            "sector_return_component_count": m3_metrics.get(
+                "sector_return_component_count"
+            ),
+            "delisted_shumway_adjustment_count": m3_metrics.get(
+                "delisted_shumway_adjustment_count"
+            ),
+            "price_fetch_error_count": m3_metrics.get("price_fetch_error_count"),
+            "assembled_count": (m3_metrics.get("assembly") or {}).get("assembled_count"),
+            "m3_signals_persisted": (
+                m3_metrics.get("orchestration") or {}
+            ).get("total_signals_persisted"),
+        },
         "m4_signals": {
             "signal_count": signal_count,
             "duplicate_signal_count": duplicate_signal_count,
@@ -1256,6 +1287,7 @@ def _print_report(report: Dict[str, Any]) -> None:
         "m4_assembly",
         "m1_assembly",
         "m2_assembly",
+        "m3_assembly",
         "m4_signals",
         "data_quality",
         "forward_return_guard",
@@ -1399,6 +1431,33 @@ def _run_m2(
     )
 
 
+def _run_m3(
+    *,
+    schema: Optional[str],
+    run_timestamp: str,
+    decision_date: str,
+    args: argparse.Namespace,
+) -> RunInvocation:
+    argv = [
+        "--live",
+        "--run-timestamp", run_timestamp,
+        "--sector-lookback-sessions", str(args.m3_sector_lookback_sessions),
+    ]
+    if args.m3_skip_sector_refresh:
+        argv += ["--skip-sector-refresh"]
+    if schema:
+        argv += ["--schema", schema, "--create-tables"]
+    print("\n== M3 daily ==")
+    exit_code = run_m3_daily.main(argv)
+    return _recover_invocation(
+        url=os.environ.get("DATABASE_URL", ""),
+        schema=schema,
+        job_name="m3_daily_feature_assembly",
+        decision_date=decision_date,
+        exit_code=exit_code,
+    )
+
+
 def _run_forward_context(
     *,
     schema: Optional[str],
@@ -1495,6 +1554,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help="Enable the M2 insider-cluster signal-only assembly step.")
     parser.add_argument("--skip-m2", action="store_true",
                         help="Keep the M2 insider-cluster signal-only assembly step disabled.")
+    parser.add_argument("--enable-m3", action="store_true",
+                        help="Enable the M3 sector-rotation signal-only assembly step.")
+    parser.add_argument("--skip-m3", action="store_true",
+                        help="Keep the M3 sector-rotation signal-only assembly step disabled.")
     parser.add_argument("--skip-forward-context", action="store_true",
                         help="Skip the post-M4 forward-context panel collector.")
     parser.add_argument("--signal-context-breakout-buffer", type=float, default=0.02)
@@ -1507,6 +1570,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--m2-form4-lookback-calendar-days", type=int, default=1465)
     parser.add_argument("--m2-fmp-page-limit", type=int, default=100)
     parser.add_argument("--m2-skip-fmp-enrichment", action="store_true")
+    parser.add_argument("--m3-sector-lookback-sessions", type=int, default=126)
+    parser.add_argument("--m3-skip-sector-refresh", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1538,6 +1603,9 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
         return 1
     if args.enable_m2 and args.skip_m2:
         print("ERROR: --enable-m2 and --skip-m2 cannot be combined")
+        return 1
+    if args.enable_m3 and args.skip_m3:
+        print("ERROR: --enable-m3 and --skip-m3 cannot be combined")
         return 1
 
     try:
@@ -1592,9 +1660,10 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
         print("\nDry run: no database writes and no provider API calls performed.")
         m1_step = "M1 daily" if args.enable_m1 and not args.skip_m1 else "M1 daily skipped"
         m2_step = "M2 daily" if args.enable_m2 and not args.skip_m2 else "M2 daily skipped"
+        m3_step = "M3 daily" if args.enable_m3 and not args.skip_m3 else "M3 daily skipped"
         print(
             "Planned steps: universe build -> M4 daily -> "
-            f"{m1_step} -> {m2_step} -> "
+            f"{m1_step} -> {m2_step} -> {m3_step} -> "
             "forward context panel -> health report."
         )
         return 0
@@ -1733,6 +1802,38 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
             print("ERROR: M2 daily returned exit 0 without a finished job run")
             return 1
 
+    m3_invocation = RunInvocation(
+        exit_code=0,
+        run_status="finished",
+        metrics={"no_op_reason": "skipped_default_off"},
+    )
+    if args.skip_m3:
+        m3_invocation = RunInvocation(
+            exit_code=0,
+            run_status="finished",
+            metrics={"no_op_reason": "skipped_by_cli"},
+        )
+        print("\nM3 daily skipped by --skip-m3.")
+    elif not args.enable_m3:
+        print("\nM3 daily skipped; pass --enable-m3 after PIT sector-history audit to run it.")
+    else:
+        reset_globals()
+        m3_invocation = _coerce_invocation(_run_m3(
+            schema=schema,
+            run_timestamp=effective_run_timestamp,
+            decision_date=decision_date,
+            args=args,
+        ))
+        if m3_invocation.exit_code != 0:
+            print(f"ERROR: M3 daily failed with exit {m3_invocation.exit_code}")
+            return m3_invocation.exit_code
+        if (
+            not m3_invocation.run_id
+            or m3_invocation.run_status not in SUCCESS_RUN_STATUSES
+        ):
+            print("ERROR: M3 daily returned exit 0 without a finished job run")
+            return 1
+
     forward_context_invocation = RunInvocation(
         exit_code=0,
         run_status="finished",
@@ -1793,6 +1894,8 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
             m1_metrics=m1_invocation.metrics,
             m2_run_id=m2_invocation.run_id,
             m2_metrics=m2_invocation.metrics,
+            m3_run_id=m3_invocation.run_id,
+            m3_metrics=m3_invocation.metrics,
             m4_metrics=primary_m4_invocation.metrics,
             primary_m4_run_id=primary_m4_invocation.run_id,
             rerun_m4_run_id=rerun_m4_invocation.run_id,

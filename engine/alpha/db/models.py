@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -687,6 +689,375 @@ class M2ClusterMember(Base):
     insider_cik = Column(String, nullable=True)
     classification = Column(String, nullable=False)
     first_tradable_session = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# M3 sector taxonomy and return producer tables
+# ---------------------------------------------------------------------------
+class FirmSectorAssignmentHistory(Base):
+    """Point-in-time SIC-derived sector assignment intervals for M3."""
+
+    __tablename__ = "firm_sector_assignments_history"
+    __table_args__ = (
+        Index(
+            "ix_firm_sector_history_ticker_interval",
+            "ticker",
+            "valid_from",
+            "valid_to",
+        ),
+        Index("ix_firm_sector_history_sector_interval", "sector", "valid_from", "valid_to"),
+        Index("ix_firm_sector_history_source", "source"),
+    )
+
+    ticker = Column(String, primary_key=True)
+    valid_from = Column(Date, primary_key=True)
+    sector = Column(String, nullable=False)
+    sic_code = Column(String, nullable=True)
+    sic_description = Column(Text, nullable=True)
+    industry = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="POLYGON_SIC")
+    sic_to_sector_map_version = Column(String, nullable=False)
+    valid_to = Column(Date, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class FirmSectorAssignment(Base):
+    """Current/open M3 sector assignment snapshot."""
+
+    __tablename__ = "firm_sector_assignments"
+    __table_args__ = (
+        Index("ix_firm_sector_assignments_sector", "sector"),
+        Index("ix_firm_sector_assignments_last_verified", "last_verified"),
+    )
+
+    ticker = Column(String, primary_key=True)
+    sector = Column(String, nullable=False)
+    industry = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="POLYGON_SIC")
+    classification_date = Column(Date, nullable=False)
+    last_verified = Column(Date, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class SectorReturnDaily(Base):
+    """PIT formation-cohort sector return surface consumed by M3."""
+
+    __tablename__ = "sector_returns_daily"
+    __table_args__ = (
+        Index("ix_sector_returns_daily_rank", "date", "sector_rank"),
+        Index("ix_sector_returns_daily_sector", "sector"),
+    )
+
+    date = Column(Date, primary_key=True)
+    sector = Column(String, primary_key=True)
+    return_6mo = Column(Float, nullable=False)
+    return_6mo_ew = Column(Float, nullable=True)
+    return_1mo = Column(Float, nullable=True)
+    return_3mo = Column(Float, nullable=True)
+    sector_rank = Column(Integer, nullable=False)
+    sector_rank_normalized = Column(Float, nullable=False)
+    n_sectors = Column(Integer, nullable=False)
+    n_firms_in_sector = Column(Integer, nullable=False)
+    total_market_cap_in_sector = Column(Float, nullable=False)
+    source = Column(String, nullable=False, default="POLYGON_SIC")
+    sic_to_sector_map_version = Column(String, nullable=False)
+    formation_date = Column(Date, nullable=False)
+    point_in_time_passed = Column(Boolean, nullable=False, default=True)
+    formation_cohort_passed = Column(Boolean, nullable=False, default=True)
+    sector_history_coverage_years = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class SectorChangeLog(Base):
+    """Audit log for detected SIC/sector interval changes."""
+
+    __tablename__ = "sector_change_log"
+    __table_args__ = (
+        Index("ix_sector_change_log_ticker_date", "ticker", "change_date"),
+        Index("ix_sector_change_log_job_run_id", "job_run_id"),
+    )
+
+    sector_change_log_id = Column(String, primary_key=True, default=_uuid)
+    ticker = Column(String, nullable=False)
+    old_sector = Column(String, nullable=True)
+    new_sector = Column(String, nullable=False)
+    old_sic_code = Column(String, nullable=True)
+    new_sic_code = Column(String, nullable=True)
+    old_source = Column(String, nullable=True)
+    new_source = Column(String, nullable=False)
+    sic_to_sector_map_version = Column(String, nullable=False)
+    change_date = Column(Date, nullable=False)
+    detected_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    diagnostic_json = Column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# M3 schema-only STBM/validation parity tables
+# ---------------------------------------------------------------------------
+class M3ValidationMetadata(Base):
+    """Post-exit M3 validation metadata parity table; no execution code writes it yet."""
+
+    __tablename__ = "m3_validation_metadata"
+    __table_args__ = (
+        CheckConstraint(
+            "fill_quality IN (0, 1)",
+            name="ck_m3_validation_metadata_fill_quality",
+        ),
+        CheckConstraint(
+            "thesis_category IN "
+            "('right_tail_convex', 'continuation', 'mean_reversion', 'event_drift')",
+            name="ck_m3_validation_metadata_thesis_category",
+        ),
+        CheckConstraint(
+            "stop_state IN "
+            "('pre_T1', 'post_T1_BE', 'post_T2_floor', 'post_T2_trailing', "
+            "'closed', 'unfilled_expired')",
+            name="ck_m3_validation_metadata_stop_state",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN "
+            "('PRE_ENTRY', 'EXIT_ORDER_SETUP_PENDING', 'ACTIVE_PRE_T1', "
+            "'ACTIVE_POST_T1_BE', 'ACTIVE_POST_T2_FLOOR', 'ACTIVE_POST_T2_TRAILING', "
+            "'NATIVE_STOP_FLATTEN_REQUESTED', 'FRAMEWORK_EXIT_REQUESTED', "
+            "'OCO_CANCEL_PENDING', 'MARKET_FLATTEN_SUBMITTED', "
+            "'BROKER_FLAT_CONFIRMED', 'CLOSE_RECONCILIATION_PENDING', 'CLOSED')",
+            name="ck_m3_validation_metadata_lifecycle_state",
+        ),
+        CheckConstraint(
+            "final_exit_reason IS NULL OR final_exit_reason IN "
+            "('T3_ceiling_hit', 'trailing_stop', 'hard_stop', 'break_even_stop', "
+            "'floor_stop', 'time_barrier', 'setup_failure', 'universe_ejection', "
+            "'circuit_breaker_flatten', 'optimizer_rebalance')",
+            name="ck_m3_validation_metadata_final_exit_reason",
+        ),
+        CheckConstraint(
+            "race_condition_resolution IS NULL OR race_condition_resolution IN "
+            "('T1_T2_simultaneous', 'full_blowoff', 'T1_and_stop_simultaneous', "
+            "'stop_during_replace', 'stop_during_trailing_update', "
+            "'open_gap_through_stop', 'open_gap_through_target', "
+            "'multi_target_gap_up', 'gap_through_stop_down', 'position_divergence', "
+            "'tranche_state_anomaly', 'oco_state_drift', 'stop_invalid_at_submit', "
+            "'websocket_disconnect_reconciled', 'network_failure_escalated', "
+            "'framework_exit_during_native_fill', 't1_fill_stop_adjustment', "
+            "'emergency_flatten_cancel_failure', 'fill_during_temp_stop_race')",
+            name="ck_m3_validation_metadata_race_condition_resolution",
+        ),
+        CheckConstraint(
+            "stbm_saga_state IS NULL OR stbm_saga_state IN "
+            "('FRAMEWORK_EXIT_REQUESTED', 'NATIVE_STOP_FLATTEN_REQUESTED', "
+            "'OCO_CANCEL_PENDING', 'MARKET_FLATTEN_SUBMITTED', "
+            "'BROKER_FLAT_CONFIRMED', 'CLOSED')",
+            name="ck_m3_validation_metadata_stbm_saga_state",
+        ),
+        CheckConstraint(
+            "entry_unfilled_cancel_reason IS NULL OR entry_unfilled_cancel_reason IN "
+            "('close_cutoff_cancel_confirmed', 'close_cutoff_cancel_unconfirmed', "
+            "'intraday_cancel_complete', 'session_close_done_for_day')",
+            name="ck_m3_validation_metadata_entry_unfilled_cancel_reason",
+        ),
+        CheckConstraint(
+            "minimum_size_gate_failure_reason IS NULL OR "
+            "minimum_size_gate_failure_reason IN "
+            "('tranche_notional_below_$1', 'terminal_tranche_below_$5', "
+            "'fractional_below_minimum')",
+            name="ck_m3_validation_metadata_minimum_size_gate_failure_reason",
+        ),
+        CheckConstraint(
+            "universe_ejection_reason IS NULL OR universe_ejection_reason IN "
+            "('liquidity_score_zero', 'market_cap_out_of_band', "
+            "'delisting_announced', 'fractionability_lost', "
+            "'manual_operator_eject', 'corporate_action_ineligible')",
+            name="ck_m3_validation_metadata_universe_ejection_reason",
+        ),
+        UniqueConstraint(
+            "position_id",
+            name="ux_m3_validation_metadata_position_id_fk",
+        ),
+        Index(
+            "idx_m3_validation_metadata_position_id_unique",
+            "position_id",
+            unique=True,
+            sqlite_where=text("position_id IS NOT NULL"),
+            postgresql_where=text("position_id IS NOT NULL"),
+        ),
+    )
+
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), primary_key=True
+    )
+    candidate_id = Column(
+        String, ForeignKey("trade_candidates.candidate_id"), nullable=False
+    )
+    position_id = Column(String, nullable=True)
+    entry_fill_price = Column(Float, nullable=True)
+    entry_filled_qty = Column(Float, nullable=False, default=0)
+    entry_avg_fill_price = Column(Float, nullable=True)
+    entry_fill_timestamp = Column(DateTime(timezone=True), nullable=True)
+    fill_quality = Column(Integer, nullable=False)
+    realized_slippage_bps = Column(Float, nullable=True)
+    position_size_usd = Column(Float, nullable=True)
+    tcb_max_position_pct = Column(Float, nullable=True)
+    optimizer_max_position_pct = Column(Float, nullable=True)
+    thesis_category = Column(String, nullable=False, default="continuation")
+    t1_hit = Column(Boolean, nullable=False, default=False)
+    t1_hit_timestamp = Column(DateTime(timezone=True), nullable=True)
+    t1_hit_price = Column(Float, nullable=True)
+    t2_hit = Column(Boolean, nullable=False, default=False)
+    t2_hit_timestamp = Column(DateTime(timezone=True), nullable=True)
+    t2_hit_price = Column(Float, nullable=True)
+    t3_hit = Column(Boolean, nullable=False, default=False)
+    t3_hit_timestamp = Column(DateTime(timezone=True), nullable=True)
+    t3_hit_price = Column(Float, nullable=True)
+    trailing_stop_active = Column(Boolean, nullable=False, default=False)
+    trailing_stop_triggered = Column(Boolean, nullable=False, default=False)
+    trailing_stop_trigger_price = Column(Float, nullable=True)
+    hard_stop_triggered = Column(Boolean, nullable=False, default=False)
+    time_barrier_triggered = Column(Boolean, nullable=False, default=False)
+    stop_state = Column(String, nullable=False, default="pre_T1")
+    lifecycle_state = Column(String, nullable=False, default="PRE_ENTRY")
+    emergency_flatten_at_close = Column(Boolean, nullable=False, default=False)
+    current_stop_price = Column(Float, nullable=True)
+    t1_stop_adjustment_timestamp = Column(DateTime(timezone=True), nullable=True)
+    t2_stop_adjustment_timestamp = Column(DateTime(timezone=True), nullable=True)
+    order_group_id = Column(String, nullable=True)
+    framework_exit_cleanup_timestamp = Column(DateTime(timezone=True), nullable=True)
+    framework_exit_cleanup_failure_reason = Column(Text, nullable=True)
+    parent_entry_order_id = Column(String, nullable=True)
+    last_order_replace_timestamp = Column(DateTime(timezone=True), nullable=True)
+    race_condition_resolution = Column(String, nullable=True)
+    stbm_saga_state = Column(String, nullable=True)
+    market_flatten_order_id = Column(String, nullable=True)
+    market_flatten_attempts = Column(Integer, nullable=False, default=0)
+    temp_protective_stop_order_id = Column(String, nullable=True)
+    temp_protective_stop_active = Column(Boolean, nullable=False, default=False)
+    temp_protective_stop_cancel_recreate_count = Column(Integer, nullable=False, default=0)
+    temp_protective_stop_filled_during_entry = Column(Boolean, nullable=False, default=False)
+    temp_protective_stop_fill_during_entry_race = Column(Boolean, nullable=False, default=False)
+    pending_temp_stop_update_active = Column(Boolean, nullable=False, default=False)
+    pending_temp_stop_update_target_price = Column(Float, nullable=True)
+    pending_temp_stop_update_target_qty = Column(Float, nullable=True)
+    entry_partial_fill = Column(Boolean, nullable=False, default=False)
+    entry_target_qty = Column(Float, nullable=True)
+    entry_fill_ratio = Column(Float, nullable=True)
+    entry_unfilled_cancel_reason = Column(String, nullable=True)
+    minimum_size_gate_failure = Column(Boolean, nullable=False, default=False)
+    minimum_size_gate_failure_reason = Column(String, nullable=True)
+    failed_tranche_label = Column(String, nullable=True)
+    session_close_state = Column(Text, nullable=True)
+    session_boundary_replays = Column(Integer, nullable=True, default=0)
+    last_session_open_processed_at = Column(DateTime(timezone=True), nullable=True)
+    exit_fill_price = Column(Float, nullable=True)
+    exit_fill_timestamp = Column(DateTime(timezone=True), nullable=True)
+    final_exit_reason = Column(String, nullable=True)
+    universe_ejection_reason = Column(String, nullable=True)
+    hold_duration_trading_days = Column(Integer, nullable=True)
+    realized_return = Column(Float, nullable=True)
+    mae = Column(Float, nullable=True)
+    mfe = Column(Float, nullable=True)
+    realized_mfe_pct = Column(Float, nullable=False, default=0)
+    realized_mfe_timestamp = Column(DateTime(timezone=True), nullable=True)
+    optimizer_rebalance_rejected_convexity_lock = Column(Boolean, nullable=False, default=False)
+    optimizer_rebalance_rejection_count = Column(Integer, nullable=False, default=0)
+    high_since_t2 = Column(Float, nullable=True)
+    n_firms_at_ranking_time = Column(Integer, nullable=True)
+    sparse_sector_excluded = Column(Boolean, nullable=False, default=False)
+    sparse_sector_warning = Column(Boolean, nullable=False, default=False)
+    counterfactual_benchmark_return = Column(Float, nullable=True)
+    counterfactual_sector_etf_return = Column(Float, nullable=True)
+    illiq_premium_contribution = Column(Float, nullable=True)
+    regime_contribution = Column(Float, nullable=True)
+    sigma_epsilon_contribution = Column(Float, nullable=True)
+    residual_m3_alpha = Column(Float, nullable=True)
+    override_affected = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class M3TrancheFill(Base):
+    """M3 tranche-fill audit rows for future STBM parity."""
+
+    __tablename__ = "m3_tranche_fills"
+    __table_args__ = (
+        CheckConstraint(
+            "tranche_label IN "
+            "('T1', 'T2', 'T3', 'hard_stop', 'break_even_stop', 'floor_stop', "
+            "'trailing_stop', 'time_barrier', 'universe_ejection', "
+            "'circuit_breaker_flatten', 'optimizer_rebalance')",
+            name="ck_m3_tranche_fills_tranche_label",
+        ),
+        CheckConstraint(
+            "fill_type IN "
+            "('take_profit', 'protective_stop', 'framework_exit', 'time_barrier_exit')",
+            name="ck_m3_tranche_fills_fill_type",
+        ),
+        Index("ix_m3_tranche_fills_signal_id", "signal_id"),
+        Index("ix_m3_tranche_fills_position_id", "position_id"),
+    )
+
+    fill_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=False)
+    position_id = Column(
+        String, ForeignKey("m3_validation_metadata.position_id"), nullable=False
+    )
+    oco_group_id = Column(String, nullable=False)
+    tranche_label = Column(String, nullable=False)
+    fill_quantity = Column(Float, nullable=False)
+    fill_price = Column(Float, nullable=False)
+    fill_timestamp = Column(DateTime(timezone=True), nullable=False)
+    fill_type = Column(String, nullable=False)
+    current_stop_level = Column(Float, nullable=True)
+
+
+class M3OcoLegState(Base):
+    """Per-leg OCO state table for future M3 STBM reconciliation."""
+
+    __tablename__ = "m3_oco_leg_state"
+    __table_args__ = (
+        CheckConstraint(
+            "tranche_label IN ('T1', 'T2', 'T3')",
+            name="ck_m3_oco_leg_state_tranche_label",
+        ),
+        CheckConstraint(
+            "leg_role IN ('take_profit', 'stop')",
+            name="ck_m3_oco_leg_state_leg_role",
+        ),
+        CheckConstraint(
+            "status IN "
+            "('new', 'accepted', 'partially_filled', 'filled', 'pending_cancel', "
+            "'pending_replace', 'canceled', 'expired', 'replaced', 'rejected', "
+            "'suspended')",
+            name="ck_m3_oco_leg_state_status",
+        ),
+        Index("ix_m3_oco_leg_state_signal_id", "signal_id"),
+        Index("ix_m3_oco_leg_state_position_id", "position_id"),
+        Index("ix_m3_oco_leg_state_broker_order", "broker_order_id"),
+    )
+
+    leg_state_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=False)
+    position_id = Column(
+        String, ForeignKey("m3_validation_metadata.position_id"), nullable=False
+    )
+    oco_group_id = Column(String, nullable=False)
+    tranche_label = Column(String, nullable=False)
+    leg_role = Column(String, nullable=False)
+    broker_order_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    filled_qty = Column(Float, nullable=True, default=0)
+    remaining_qty = Column(Float, nullable=False)
+    avg_fill_price = Column(Float, nullable=True)
+    intended_price = Column(Float, nullable=False)
+    actual_price = Column(Float, nullable=True)
+    last_broker_update = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
