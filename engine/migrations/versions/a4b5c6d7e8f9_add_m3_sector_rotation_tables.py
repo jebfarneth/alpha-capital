@@ -124,6 +124,19 @@ def upgrade() -> None:
         ),
         sa.Column("sector_history_coverage_years", sa.Float(), nullable=True),
         sa.Column(
+            "delisting_shumway_adjustment_count",
+            sa.Integer(),
+            server_default=sa.text("0"),
+            nullable=False,
+        ),
+        sa.Column(
+            "delisting_unknown_review_count",
+            sa.Integer(),
+            server_default=sa.text("0"),
+            nullable=False,
+        ),
+        sa.Column("delisting_adjustment_audit_json", sa.Text(), nullable=True),
+        sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("CURRENT_TIMESTAMP"),

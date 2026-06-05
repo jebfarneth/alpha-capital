@@ -340,6 +340,9 @@ class M3DailyAssemblyJob(BaseJob):
             "delisted_shumway_adjustment_count": sum(
                 1 for component in components if component.delisting_adjustment_applied
             ),
+            "delisted_unknown_review_count": sum(
+                1 for component in components if component.delisting_reason_source == "unknown_review"
+            ),
             "price_fetch_error_count": len(price_fetch_errors),
             "sector_history_refresh": refresh_counts,
             "sic_to_sector_map_version": SIC_TO_SECTOR_MAP_VERSION,
@@ -609,6 +612,13 @@ def _persist_sector_returns(
             "point_in_time_passed": row.point_in_time_passed,
             "formation_cohort_passed": row.formation_cohort_passed,
             "sector_history_coverage_years": row.sector_history_coverage_years,
+            "delisting_shumway_adjustment_count": row.delisting_shumway_adjustment_count,
+            "delisting_unknown_review_count": row.delisting_unknown_review_count,
+            "delisting_adjustment_audit_json": (
+                json.dumps(row.delisting_adjustment_audit, sort_keys=True)
+                if row.delisting_adjustment_audit is not None
+                else None
+            ),
         }
         if existing is None:
             session.add(SectorReturnDaily(date=row.date, sector=row.sector, **payload))

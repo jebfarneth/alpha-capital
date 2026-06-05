@@ -33,6 +33,11 @@ OPEN_INTERVAL_END = date(9999, 12, 31)
 SECTOR_RETURN_LOOKBACK_SESSIONS = 126
 MIN_PRODUCTION_SECTOR_HISTORY_COVERAGE_YEARS = 3.0
 SHUMWAY_PERFORMANCE_DELISTING_RETURN = -0.30
+DELISTING_REASON_SOURCE_PROVIDER = "provider_reason"
+DELISTING_REASON_SOURCE_UNKNOWN_REVIEW = "unknown_review"
+DELISTING_TREATMENT_SHUMWAY_FAILURE = "shumway_failure"
+DELISTING_TREATMENT_ACQUISITION_PAYOFF = "acquisition_realized_payoff"
+DELISTING_TREATMENT_UNKNOWN_REVIEW = "neutral_last_observable_review"
 
 
 @dataclass
@@ -60,6 +65,11 @@ class SectorReturnComponent:
     return_1mo: Optional[float] = None
     delisting_adjustment_applied: bool = False
     sector_history_coverage_years: Optional[float] = None
+    delisted_date: Optional[date] = None
+    delisting_reason: Optional[str] = None
+    delisting_reason_source: Optional[str] = None
+    delisting_adjustment_treatment: Optional[str] = None
+    shumway_suppressed_reason: Optional[str] = None
 
 
 @dataclass
@@ -81,6 +91,9 @@ class SectorReturnSnapshot:
     point_in_time_passed: bool = False
     formation_cohort_passed: bool = True
     sector_history_coverage_years: Optional[float] = None
+    delisting_shumway_adjustment_count: int = 0
+    delisting_unknown_review_count: int = 0
+    delisting_adjustment_audit: Optional[Dict[str, Any]] = None
 
 
 def nth_previous_session(day: date, sessions: int) -> date:
@@ -162,8 +175,11 @@ def adjusted_return(
     """Compute adjusted return over [start_date, end_date].
 
     If a firm delisted inside the window and the end-date price is absent, use
-    the last available adjusted close before delisting and apply Shumway's
-    performance-delisting adjustment.
+    the last available adjusted close before delisting. Apply Shumway's
+    performance-delisting adjustment only when the delisting reason is positively
+    classified as failure/performance-related. Unknown reasons route to
+    corporate-action review via neutral last-observable-price treatment rather
+    than fabricating a terminal loss.
     """
 
     prices: Dict[date, float] = {}
@@ -186,27 +202,35 @@ def adjusted_return(
         return None, False
     last_price = prices[max(candidate_days)]
     partial = (last_price / start_price) - 1.0
-    if _is_acquisition_delisting(delisting_reason):
+    reason_class = _classify_delisting_reason(delisting_reason)
+    if reason_class != "failure":
         return partial, False
     adjusted = (1.0 + partial) * (1.0 + shumway_return) - 1.0
     return adjusted, True
 
 
 def _is_acquisition_delisting(reason: Optional[str]) -> bool:
+    return _classify_delisting_reason(reason) == "acquisition"
+
+
+def _classify_delisting_reason(reason: Optional[str]) -> str:
     if not reason:
-        return False
+        return "unknown_review"
     text = reason.casefold()
     failure_markers = (
         "bankrupt",
         "deficien",
+        "distress",
+        "exchange-mandated",
         "failed",
         "failure",
         "insolv",
         "liquidat",
+        "noncompliance",
         "receivership",
     )
     if any(marker in text for marker in failure_markers):
-        return False
+        return "failure"
     acquisition_markers = (
         "acquisition",
         "acquired",
@@ -216,7 +240,43 @@ def _is_acquisition_delisting(reason: Optional[str]) -> bool:
         "cash merger",
         "m&a",
     )
-    return any(marker in text for marker in acquisition_markers)
+    if any(marker in text for marker in acquisition_markers):
+        return "acquisition"
+    return "unknown_review"
+
+
+def _delisting_adjustment_metadata(
+    *,
+    delisted_date: Optional[date],
+    delisting_reason: Optional[str],
+    shumway_applied: bool,
+) -> Dict[str, Optional[str]]:
+    if delisted_date is None:
+        return {
+            "delisting_reason_source": None,
+            "delisting_adjustment_treatment": None,
+            "shumway_suppressed_reason": None,
+        }
+    reason_class = _classify_delisting_reason(delisting_reason)
+    reason_source = (
+        DELISTING_REASON_SOURCE_PROVIDER
+        if delisting_reason and delisting_reason.strip()
+        else DELISTING_REASON_SOURCE_UNKNOWN_REVIEW
+    )
+    if shumway_applied:
+        treatment = DELISTING_TREATMENT_SHUMWAY_FAILURE
+        suppressed_reason = None
+    elif reason_class == "acquisition":
+        treatment = DELISTING_TREATMENT_ACQUISITION_PAYOFF
+        suppressed_reason = "acquisition_or_merger"
+    else:
+        treatment = DELISTING_TREATMENT_UNKNOWN_REVIEW
+        suppressed_reason = "unknown_missing_delisting_reason"
+    return {
+        "delisting_reason_source": reason_source,
+        "delisting_adjustment_treatment": treatment,
+        "shumway_suppressed_reason": suppressed_reason,
+    }
 
 
 def _component_return(
@@ -290,6 +350,11 @@ def build_sector_return_components(
                 diagnostic_type="return_6mo_unavailable",
             ))
             continue
+        delisting_meta = _delisting_adjustment_metadata(
+            delisted_date=delisted_date,
+            delisting_reason=delisting_reason,
+            shumway_applied=delisting_applied,
+        )
         components.append(SectorReturnComponent(
             ticker=ticker,
             sector=assignment.sector,
@@ -319,6 +384,11 @@ def build_sector_return_components(
             ),
             delisting_adjustment_applied=delisting_applied,
             sector_history_coverage_years=assignment.sector_history_coverage_years,
+            delisted_date=delisted_date,
+            delisting_reason=delisting_reason,
+            delisting_reason_source=delisting_meta["delisting_reason_source"],
+            delisting_adjustment_treatment=delisting_meta["delisting_adjustment_treatment"],
+            shumway_suppressed_reason=delisting_meta["shumway_suppressed_reason"],
         ))
     return components, diagnostics
 
@@ -369,6 +439,15 @@ def compute_sector_return_snapshots(
             "total_market_cap_in_sector": total_cap,
             "point_in_time_passed": point_in_time_passed,
             "sector_history_coverage_years": sector_coverage_years,
+            "delisting_shumway_adjustment_count": sum(
+                1 for row in rows if row.delisting_adjustment_applied
+            ),
+            "delisting_unknown_review_count": sum(
+                1
+                for row in rows
+                if row.delisting_reason_source == DELISTING_REASON_SOURCE_UNKNOWN_REVIEW
+            ),
+            "delisting_adjustment_audit": _sector_delisting_adjustment_audit(rows),
         })
     ranked = sorted(raw_rows, key=lambda row: (row["return_6mo"], row["sector"]))
     n = len(ranked)
@@ -390,8 +469,32 @@ def compute_sector_return_snapshots(
             point_in_time_passed=row["point_in_time_passed"],
             formation_cohort_passed=True,
             sector_history_coverage_years=row["sector_history_coverage_years"],
+            delisting_shumway_adjustment_count=row["delisting_shumway_adjustment_count"],
+            delisting_unknown_review_count=row["delisting_unknown_review_count"],
+            delisting_adjustment_audit=row["delisting_adjustment_audit"],
         ))
     return result
+
+
+def _sector_delisting_adjustment_audit(
+    components: Sequence[SectorReturnComponent],
+) -> Optional[Dict[str, Any]]:
+    rows = []
+    for component in components:
+        if component.delisted_date is None:
+            continue
+        rows.append({
+            "ticker": component.ticker,
+            "delisted_date": component.delisted_date.isoformat(),
+            "delisting_reason": component.delisting_reason,
+            "delisting_reason_source": component.delisting_reason_source,
+            "delisting_adjustment_treatment": component.delisting_adjustment_treatment,
+            "shumway_applied": component.delisting_adjustment_applied,
+            "shumway_suppressed_reason": component.shumway_suppressed_reason,
+        })
+    if not rows:
+        return None
+    return {"components": rows[:50], "component_count": len(rows)}
 
 
 def _current_assignment_field_confidence(
@@ -513,6 +616,9 @@ def assemble_m3_daily(
             _field("sector_return_point_in_time_passed", sector_return.point_in_time_passed, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_return_formation_cohort_passed", sector_return.formation_cohort_passed, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_history_coverage_years", sector_return.sector_history_coverage_years or assignment.sector_history_coverage_years, cutoff_timestamp, source_provider, source_lineage_hash),
+            _field("sector_delisting_shumway_adjustment_count", sector_return.delisting_shumway_adjustment_count, cutoff_timestamp, source_provider, source_lineage_hash),
+            _field("sector_delisting_unknown_review_count", sector_return.delisting_unknown_review_count, cutoff_timestamp, source_provider, source_lineage_hash),
+            _field("sector_delisting_adjustment_audit", sector_return.delisting_adjustment_audit, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_rank", sector_return.sector_rank, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("n_sectors_in_universe", sector_return.n_sectors, cutoff_timestamp, source_provider, source_lineage_hash),
             _field("sector_rank_normalized", sector_return.sector_rank_normalized, cutoff_timestamp, source_provider, source_lineage_hash),

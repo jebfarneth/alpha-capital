@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ from alpha.db.models import (
     CanonicalUniverseScan,
     FirmSectorAssignment,
     FirmSectorAssignmentHistory,
+    FeatureSnapshot,
     SectorReturnDaily,
     SignalRegistry,
     UniverseScan,
@@ -174,6 +176,8 @@ def test_m3_schema_has_server_defaults(db_session):
     assert defaults["sector_returns_daily"]["source"] is not None
     assert defaults["sector_returns_daily"]["point_in_time_passed"] is not None
     assert defaults["sector_returns_daily"]["formation_cohort_passed"] is not None
+    assert defaults["sector_returns_daily"]["delisting_shumway_adjustment_count"] is not None
+    assert defaults["sector_returns_daily"]["delisting_unknown_review_count"] is not None
     assert defaults["sector_returns_daily"]["created_at"] is not None
     assert defaults["sector_returns_daily"]["updated_at"] is not None
     assert defaults["sector_change_log"]["detected_at"] is not None
@@ -359,10 +363,24 @@ def test_shumway_delisting_adjustment_when_end_price_missing():
         start_date=date(2023, 1, 3),
         end_date=date(2023, 6, 30),
         delisted_date=date(2023, 3, 10),
+        delisting_reason="bankruptcy liquidation",
     )
 
     assert applied is True
     assert ret == pytest.approx((0.8 * 0.7) - 1.0)
+
+
+def test_unknown_delisting_reason_routes_to_review_without_shumway():
+    ret, applied = adjusted_return(
+        [_bar(date(2023, 1, 3), 100.0), _bar(date(2023, 3, 10), 140.0)],
+        start_date=date(2023, 1, 3),
+        end_date=date(2023, 6, 30),
+        delisted_date=date(2023, 3, 10),
+        delisting_reason=None,
+    )
+
+    assert applied is False
+    assert ret == pytest.approx(0.40)
 
 
 def test_acquisition_delisting_does_not_apply_shumway_penalty():
@@ -419,6 +437,48 @@ def test_polygon_404_delisting_probe_uses_last_available_bar(db_session):
     )
 
     assert resolved == {"SIVB": date(2023, 3, 10)}
+
+
+def test_unknown_delisting_reason_is_stamped_on_sector_return_component():
+    evidence_day = date(2023, 12, 29)
+    formation_day = date(2023, 1, 3)
+    components, diagnostics = build_sector_return_components(
+        formation_snapshots=[SimpleNamespace(ticker="ATVI", market_cap=100_000_000)],
+        assignments_by_ticker={
+            "ATVI": SectorAssignmentSnapshot(
+                ticker="ATVI",
+                sector="Communication Services",
+                source=SOURCE_POLYGON_SIC,
+                valid_from=date(2020, 1, 1),
+                valid_to=date(9999, 12, 31),
+                sector_history_coverage_years=3.5,
+            )
+        },
+        bars_by_ticker={
+            "ATVI": [_bar(formation_day, 70.0), _bar(date(2023, 10, 12), 95.0)]
+        },
+        evidence_date=evidence_day,
+        formation_date=formation_day,
+        delisted_dates_by_ticker={"ATVI": date(2023, 10, 12)},
+        delisting_reasons_by_ticker={},
+    )
+
+    assert diagnostics == []
+    component = components[0]
+    assert component.delisting_adjustment_applied is False
+    assert component.delisting_reason_source == "unknown_review"
+    assert component.delisting_adjustment_treatment == "neutral_last_observable_review"
+    assert component.shumway_suppressed_reason == "unknown_missing_delisting_reason"
+    rows = compute_sector_return_snapshots(
+        components=components,
+        asof_date=evidence_day,
+        formation_date=formation_day,
+    )
+    assert rows[0].delisting_unknown_review_count == 1
+    assert rows[0].delisting_shumway_adjustment_count == 0
+    audit = rows[0].delisting_adjustment_audit
+    assert audit["components"][0]["ticker"] == "ATVI"
+    assert audit["components"][0]["delisting_reason_source"] == "unknown_review"
 
 
 def test_sector_returns_use_formation_sector_not_current_membership():
@@ -867,3 +927,7 @@ def test_m3_current_assignment_staleness_reduces_signal_confidence(db_session):
     assert result.status == "finished"
     signal = db_session.query(SignalRegistry).filter_by(pattern_id="M3", ticker="FIRE").one()
     assert signal.data_confidence < 1.0
+    feature = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    payload = json.loads(feature.feature_json)
+    assert payload["field_confidence"]["current_sector_assignment_coverage"] == 1.0
+    assert payload["field_confidence"]["current_sector_assignment_freshness"] == 0.5

@@ -108,9 +108,13 @@ def _copy_diagnostic_fields(
         "sector_return_6mo", "sector_return_6mo_ew",
         "sector_return_point_in_time_passed", "sector_return_formation_cohort_passed",
         "sector_history_coverage_years",
+        "sector_delisting_shumway_adjustment_count",
+        "sector_delisting_unknown_review_count",
+        "sector_delisting_adjustment_audit",
         "return_1mo", "return_3mo",
         "sector_rank", "n_sectors_in_universe", "sector_rank_normalized",
         "market_data_status", "halt_status", "corporate_action_filter_passed",
+        "field_confidence",
     )
     for key in market_only_keys:
         val = market_data.get(key)
@@ -345,6 +349,8 @@ class M3Detector(BasePatternDetector):
         require_lineage_hash(inp.lineage_hashes, warnings, quality_flags)
 
         md = inp.market_data
+        if isinstance(md.get("field_confidence"), dict):
+            quality_flags["field_confidence"] = dict(md["field_confidence"])
 
         # Required: sector identity and sector return
         sector = md.get("sector")

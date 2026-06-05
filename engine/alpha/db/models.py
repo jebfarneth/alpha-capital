@@ -812,6 +812,13 @@ class SectorReturnDaily(Base):
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     sector_history_coverage_years = Column(Float, nullable=True)
+    delisting_shumway_adjustment_count = Column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    delisting_unknown_review_count = Column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    delisting_adjustment_audit_json = Column(Text, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         default=_utcnow,
