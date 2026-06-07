@@ -6,13 +6,21 @@ import statistics
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
-from alpha.db.models import MarketPathFeature
+from alpha.db.models import DataLineage, MarketPathFeature
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
+from alpha.jobs.contracts import JobResult
 from alpha.jobs.market_path_features import MarketPathFeatureJob
+from alpha.jobs.market_path_features import _same_day_pattern_strengths_from_cache
+from alpha.jobs.run_market_path_backfill import (
+    BackfillRunConfig,
+    CachedHistoricalPriceFmpAdapter,
+    plan_chunks,
+    run_backfill_chunks,
+)
 from alpha.jobs.runner import run_job
 
 
@@ -737,6 +745,302 @@ def test_market_path_feature_job_is_idempotent(db_session):
     ) == 3
 
 
+def test_market_path_backfill_planner_splits_by_pattern_and_date():
+    chunks = plan_chunks(
+        ["M4", "M1", "M4"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 3),
+        chunk_days=1,
+    )
+
+    assert [
+        (
+            chunk.pattern_id,
+            chunk.signal_start_date.isoformat(),
+            chunk.signal_end_date.isoformat(),
+        )
+        for chunk in chunks
+    ] == [
+        ("M4", "2026-06-01", "2026-06-01"),
+        ("M4", "2026-06-02", "2026-06-02"),
+        ("M4", "2026-06-03", "2026-06-03"),
+        ("M1", "2026-06-01", "2026-06-01"),
+        ("M1", "2026-06-02", "2026-06-02"),
+        ("M1", "2026-06-03", "2026-06-03"),
+    ]
+
+    two_day_chunks = plan_chunks(
+        ["M2"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 5),
+        chunk_days=2,
+    )
+    assert [
+        (chunk.signal_start_date.isoformat(), chunk.signal_end_date.isoformat())
+        for chunk in two_day_chunks
+    ] == [
+        ("2026-06-01", "2026-06-02"),
+        ("2026-06-03", "2026-06-04"),
+        ("2026-06-05", "2026-06-05"),
+    ]
+
+
+class _FakeBackfillSession:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _NoCloseSession:
+    def __init__(self, session):
+        self._session = session
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def close(self):
+        pass
+
+
+def test_market_path_backfill_runner_calls_collector_one_date_windows(tmp_path):
+    chunks = plan_chunks(
+        ["M4", "M1"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 1),
+    )
+    calls = []
+    sessions = []
+
+    class CapturingJob:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    def session_factory():
+        session = _FakeBackfillSession()
+        sessions.append(session)
+        return session
+
+    def fake_runner(session, job, params):
+        return JobResult(
+            status="finished",
+            metrics={"rows_inserted": 1, "rows_updated": 2, "fetch_error_count": 0},
+        )
+
+    summary = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=object(),
+        config=BackfillRunConfig(
+            through_date=date(2026, 6, 5),
+            run_timestamp=RUN_TS,
+            include_signal_session=True,
+        ),
+        artifact_path=tmp_path / "backfill.json",
+        job_factory=CapturingJob,
+        job_runner=fake_runner,
+        print_fn=lambda _: None,
+    )
+
+    assert summary["chunks_finished"] == 2
+    assert [call["pattern_ids"] for call in calls] == [("M4",), ("M1",)]
+    assert [call["signal_start_date"] for call in calls] == [
+        date(2026, 6, 1),
+        date(2026, 6, 1),
+    ]
+    assert [call["signal_end_date"] for call in calls] == [
+        date(2026, 6, 1),
+        date(2026, 6, 1),
+    ]
+    assert all(call["through_date"] == date(2026, 6, 5) for call in calls)
+    assert all(call["include_signal_session"] is True for call in calls)
+    assert all(session.closed for session in sessions)
+    artifact = json.loads((tmp_path / "backfill.json").read_text())
+    assert artifact["summary"]["rows_inserted_total"] == 2
+    assert artifact["summary"]["rows_updated_total"] == 4
+
+
+def test_market_path_backfill_runner_stops_on_failed_chunk(tmp_path):
+    chunks = plan_chunks(
+        ["M4"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 3),
+    )
+    calls = []
+
+    class CapturingJob:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    def fake_runner(session, job, params):
+        if len(calls) == 1:
+            return JobResult(
+                status="finished",
+                metrics={"rows_inserted": 1, "rows_updated": 0, "fetch_error_count": 0},
+            )
+        return JobResult(
+            status="partial_failed",
+            metrics={"rows_inserted": 0, "rows_updated": 0, "fetch_error_count": 1},
+            errors=[{"ticker": "FAIL"}],
+        )
+
+    summary = run_backfill_chunks(
+        chunks,
+        session_factory=_FakeBackfillSession,
+        fmp_adapter=object(),
+        config=BackfillRunConfig(through_date=date(2026, 6, 5)),
+        artifact_path=tmp_path / "backfill_failed.json",
+        job_factory=CapturingJob,
+        job_runner=fake_runner,
+        print_fn=lambda _: None,
+    )
+
+    assert len(calls) == 2
+    assert summary["chunks_finished"] == 1
+    assert summary["chunks_failed"] == 1
+    assert summary["failed_chunk_start"] == "2026-06-02"
+    artifact = json.loads((tmp_path / "backfill_failed.json").read_text())
+    assert artifact["chunks"][1]["status"] == "partial_failed"
+    assert artifact["chunks"][1]["rc"] == 1
+
+
+def test_market_path_backfill_runner_rerun_uses_existing_unique_key(db_session, tmp_path):
+    signal = _add_signal(db_session)
+    adapter = _adapter_with_references({"LCUT": _rich_bars()})
+    chunks = plan_chunks(
+        ["M4"],
+        signal_start_date=date(2026, 6, 2),
+        signal_end_date=date(2026, 6, 2),
+    )
+    config = BackfillRunConfig(
+        through_date=date(2026, 6, 3),
+        run_timestamp=RUN_TS,
+    )
+    session_factory = lambda: _NoCloseSession(db_session)
+
+    first = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=adapter,
+        config=config,
+        artifact_path=tmp_path / "first.json",
+        print_fn=lambda _: None,
+    )
+    second = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=adapter,
+        config=config,
+        artifact_path=tmp_path / "second.json",
+        print_fn=lambda _: None,
+    )
+
+    assert first["rows_inserted_total"] == 1
+    assert second["rows_inserted_total"] == 0
+    assert second["rows_updated_total"] == 1
+    duplicate_groups = db_session.execute(text(
+        "SELECT COUNT(*) FROM ("
+        "SELECT signal_id, feature_session_date, feature_version, COUNT(*) "
+        "FROM market_path_features "
+        "GROUP BY signal_id, feature_session_date, feature_version "
+        "HAVING COUNT(*) > 1"
+        ") d"
+    )).scalar()
+    assert duplicate_groups == 0
+    assert (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id == signal.signal_id)
+        .count()
+    ) == 1
+
+
+def test_market_path_backfill_fmp_cache_reuses_superset_requests():
+    adapter = _adapter_with_references({"LCUT": _rich_bars()})
+    cached = CachedHistoricalPriceFmpAdapter(adapter)
+
+    first = cached.get_historical_price(
+        "LCUT",
+        from_date=date(2025, 4, 1),
+        to_date=date(2026, 6, 5),
+        asof=RUN_TS,
+        adjusted=False,
+    )
+    second = cached.get_historical_price(
+        "LCUT",
+        from_date=date(2026, 6, 1),
+        to_date=date(2026, 6, 3),
+        asof=RUN_TS,
+        adjusted=False,
+    )
+    different_asof = cached.get_historical_price(
+        "LCUT",
+        from_date=date(2026, 6, 1),
+        to_date=date(2026, 6, 3),
+        asof=RUN_TS + timedelta(seconds=1),
+        adjusted=False,
+    )
+
+    assert first.ok
+    assert second.ok
+    assert different_asof.ok
+    assert len(adapter.calls) == 2
+    assert cached.cache_hits == 1
+    assert cached.cache_misses == 2
+    assert [bar.date for bar in second.data] == ["2026-06-01", "2026-06-02", "2026-06-03"]
+    assert second.lineage.data_quality_flags["market_path_backfill_cache_hit"] is True
+    assert second.lineage.raw_payload_hash != first.lineage.raw_payload_hash
+    assert different_asof.lineage.data_quality_flags is None
+
+
+def test_market_path_backfill_persists_cache_hit_lineage_flag(db_session, tmp_path):
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    adapter = CachedHistoricalPriceFmpAdapter(_adapter_with_references({"LCUT": _rich_bars()}))
+    chunks = plan_chunks(
+        ["M4"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 2),
+    )
+    summary = run_backfill_chunks(
+        chunks,
+        session_factory=lambda: _NoCloseSession(db_session),
+        fmp_adapter=adapter,
+        config=BackfillRunConfig(
+            through_date=date(2026, 6, 3),
+            run_timestamp=RUN_TS,
+        ),
+        artifact_path=tmp_path / "cache_lineage.json",
+        print_fn=lambda _: None,
+    )
+
+    assert summary["rows_inserted_total"] == 3
+    cached_row = (
+        db_session.query(MarketPathFeature)
+        .filter(
+            MarketPathFeature.signal_date == "2026-06-02",
+            MarketPathFeature.feature_session_date == "2026-06-03",
+        )
+        .one()
+    )
+    lineage = db_session.get(DataLineage, cached_row.data_lineage_id)
+    flags = json.loads(lineage.data_quality_flags)
+    assert flags["market_path_backfill_cache_hit"] is True
+    assert flags["derived_feature_replay"] is True
+    assert flags["lineage_payload_schema"] == "compact_bar_digest_v1"
+    assert flags["adapter_raw_payload_hash"]
+
+
 def test_market_path_v3_rank_pass_isolates_date_pattern_and_version(db_session):
     m4_a = _add_signal(db_session, ticker="AAAA")
     m4_b = _add_signal(db_session, ticker="BBBB")
@@ -835,6 +1139,174 @@ def test_market_path_v3_rank_pass_isolates_date_pattern_and_version(db_session):
         .one()
         .output_hash
         == v2_hash
+    )
+
+
+def test_market_path_v3_rank_rerun_does_not_rewrite_unchanged_rank_state(db_session):
+    _add_signal(db_session, ticker="AAAA")
+    _add_signal(db_session, ticker="BBBB")
+    adapter = _adapter_with_references({
+        "AAAA": _replace_bar(_rich_bars(), date(2026, 6, 3), close=20.0, volume=1_000_000),
+        "BBBB": _replace_bar(_rich_bars(), date(2026, 6, 3), close=10.0, volume=500_000),
+    })
+    kwargs = dict(
+        session=db_session,
+        fmp_adapter=adapter,
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 2),
+        signal_end_date=date(2026, 6, 2),
+        through_date=date(2026, 6, 3),
+    )
+
+    first = run_job(db_session, MarketPathFeatureJob(**kwargs))
+    assert first.metrics["rows_upserted"] == 2
+    assert first.metrics["rank_rows_updated"] == 2
+    first_hashes = {
+        (row.signal_id, row.feature_session_date): row.output_hash
+        for row in db_session.query(MarketPathFeature).all()
+    }
+
+    second = run_job(db_session, MarketPathFeatureJob(**kwargs))
+    db_session.expire_all()
+    assert second.metrics["rows_upserted"] == 0
+    assert second.metrics["rank_rows_updated"] == 0
+    assert {
+        (row.signal_id, row.feature_session_date): row.output_hash
+        for row in db_session.query(MarketPathFeature).all()
+    } == first_hashes
+    third = run_job(db_session, MarketPathFeatureJob(**kwargs))
+    db_session.expire_all()
+    assert third.metrics["rows_upserted"] == 0
+    assert third.metrics["rank_rows_updated"] == 0
+    assert {
+        (row.signal_id, row.feature_session_date): row.output_hash
+        for row in db_session.query(MarketPathFeature).all()
+    } == first_hashes
+
+
+def test_market_path_chunked_overlap_rank_rerun_counts_only_material_updates(
+    db_session,
+    tmp_path,
+):
+    _add_signal(
+        db_session,
+        ticker="AAAA",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="BBBB",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="CCCC",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    _add_signal(
+        db_session,
+        ticker="DDDD",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    adapter = _adapter_with_references({
+        "AAAA": _replace_bar(_rich_bars(), date(2026, 6, 3), close=40.0, volume=1_000_000),
+        "BBBB": _replace_bar(_rich_bars(), date(2026, 6, 3), close=20.0, volume=500_000),
+        "CCCC": _replace_bar(_rich_bars(), date(2026, 6, 3), close=30.0, volume=800_000),
+        "DDDD": _replace_bar(_rich_bars(), date(2026, 6, 3), close=10.0, volume=300_000),
+    })
+    chunks = plan_chunks(
+        ["M4"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 2),
+    )
+    config = BackfillRunConfig(
+        through_date=date(2026, 6, 3),
+        run_timestamp=RUN_TS,
+        include_signal_session=True,
+    )
+    session_factory = lambda: _NoCloseSession(db_session)
+
+    def chunk_metrics(path):
+        artifact = json.loads(path.read_text())
+        return [chunk["metrics"] for chunk in artifact["chunks"]]
+
+    first_path = tmp_path / "overlap_first.json"
+    first = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=adapter,
+        config=config,
+        artifact_path=first_path,
+        print_fn=lambda _: None,
+    )
+    assert first["chunks_failed"] == 0
+    assert sum(int(metrics["rank_rows_updated"]) for metrics in chunk_metrics(first_path)) > 0
+
+    second_path = tmp_path / "overlap_second.json"
+    second = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=adapter,
+        config=config,
+        artifact_path=second_path,
+        print_fn=lambda _: None,
+    )
+    assert second["chunks_failed"] == 0
+    assert sum(int(metrics["rows_upserted"]) for metrics in chunk_metrics(second_path)) == 0
+    stable_after_second = {
+        (row.signal_id, row.feature_session_date): (
+            row.output_hash,
+            row.feature_json,
+        )
+        for row in db_session.query(MarketPathFeature).all()
+    }
+
+    third_path = tmp_path / "overlap_third.json"
+    third = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=adapter,
+        config=config,
+        artifact_path=third_path,
+        print_fn=lambda _: None,
+    )
+    assert third["chunks_failed"] == 0
+    assert sum(int(metrics["rows_upserted"]) for metrics in chunk_metrics(third_path)) == 0
+    assert sum(int(metrics["rank_rows_updated"]) for metrics in chunk_metrics(third_path)) == 0
+    assert {
+        (row.signal_id, row.feature_session_date): (
+            row.output_hash,
+            row.feature_json,
+        )
+        for row in db_session.query(MarketPathFeature).all()
+    } == stable_after_second
+
+    changed_adapter = _adapter_with_references({
+        "AAAA": _replace_bar(_rich_bars(), date(2026, 6, 3), close=40.0, volume=1_000_000),
+        "BBBB": _replace_bar(_rich_bars(), date(2026, 6, 3), close=90.0, volume=3_000_000),
+        "CCCC": _replace_bar(_rich_bars(), date(2026, 6, 3), close=30.0, volume=800_000),
+        "DDDD": _replace_bar(_rich_bars(), date(2026, 6, 3), close=10.0, volume=300_000),
+    })
+    material_path = tmp_path / "overlap_material.json"
+    material = run_backfill_chunks(
+        chunks,
+        session_factory=session_factory,
+        fmp_adapter=changed_adapter,
+        config=config,
+        artifact_path=material_path,
+        print_fn=lambda _: None,
+    )
+    assert material["chunks_failed"] == 0
+    assert sum(int(metrics["rank_rows_updated"]) for metrics in chunk_metrics(material_path)) > 0
+    assert any(
+        stable_after_second[key][0] != row.output_hash
+        for row in db_session.query(MarketPathFeature).all()
+        if (key := (row.signal_id, row.feature_session_date)) in stable_after_second
     )
 
 
@@ -1159,6 +1631,95 @@ def test_market_path_ml_context_cross_pattern_cofire_uses_signal_registry(db_ses
     payload = json.loads(row.feature_json)
     assert payload["catalyst_context_status"]["signal_registry_context_available"] is True
     assert payload["catalyst_context_status"]["external_catalyst_sources_available"] is False
+
+
+def test_market_path_cofire_prefetch_avoids_per_feature_row_signal_queries(db_session):
+    _add_signal(db_session, ticker="NPLUS", pattern_id="M4")
+    _add_signal(db_session, ticker="NPLUS", pattern_id="M1")
+    adapter = _adapter_with_references({"NPLUS": _rich_bars()})
+    signal_registry_selects = 0
+
+    def count_signal_registry_selects(conn, cursor, statement, parameters, context, executemany):
+        nonlocal signal_registry_selects
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select") and "from signal_registry" in normalized:
+            signal_registry_selects += 1
+
+    event.listen(
+        db_session.get_bind(),
+        "before_cursor_execute",
+        count_signal_registry_selects,
+    )
+    try:
+        result = run_job(
+            db_session,
+            MarketPathFeatureJob(
+                session=db_session,
+                fmp_adapter=adapter,
+                run_timestamp=RUN_TS,
+                pattern_ids=("M4",),
+                signal_start_date=date(2026, 6, 2),
+                signal_end_date=date(2026, 6, 2),
+                through_date=date(2026, 6, 5),
+            ),
+        )
+    finally:
+        event.remove(
+            db_session.get_bind(),
+            "before_cursor_execute",
+            count_signal_registry_selects,
+        )
+
+    assert result.status == "finished"
+    assert result.metrics["rows_inserted"] == 3
+    assert signal_registry_selects == 2
+
+
+def test_market_path_cofire_cache_preserves_same_day_semantics_and_tie_break(db_session):
+    signal = _add_signal(db_session, ticker="COFC", pattern_id="M4")
+    _add_signal(db_session, ticker="COFC", pattern_id="M1")
+    _add_signal(
+        db_session,
+        ticker="COFC",
+        pattern_id="M2",
+        signal_day=date(2026, 6, 3),
+        entry_day=date(2026, 6, 4),
+    )
+    adapter = _adapter_with_references({"COFC": _rich_bars()})
+
+    result = run_job(
+        db_session,
+        MarketPathFeatureJob(
+            session=db_session,
+            fmp_adapter=adapter,
+            run_timestamp=RUN_TS,
+            pattern_ids=("M4",),
+            signal_start_date=date(2026, 6, 2),
+            signal_end_date=date(2026, 6, 2),
+            through_date=date(2026, 6, 4),
+        ),
+    )
+
+    assert result.status == "finished"
+    rows = (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id == signal.signal_id)
+        .order_by(MarketPathFeature.feature_session_date)
+        .all()
+    )
+    assert [row.feature_session_date for row in rows] == ["2026-06-03", "2026-06-04"]
+    for row in rows:
+        assert row.cofire_m1 is True
+        assert row.cofire_m2 is False
+        assert row.cofire_m4 is True
+        assert row.cross_pattern_overlap_count == 2
+        assert row.strongest_overlap_pattern_id == "M1"
+
+    assert _same_day_pattern_strengths_from_cache(
+        {("COFC", date(2026, 6, 2)): {"M4": 1.0}},
+        signal,
+        date(2026, 6, 1),
+    ) == {}
 
 
 def test_market_path_v3_sector_etf_map_and_sector_relative_no_lookahead(db_session):

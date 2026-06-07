@@ -12,16 +12,19 @@ import math
 import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from time import perf_counter
 from typing import Any, Iterable, Sequence
+from uuid import uuid4
 
 from sqlalchemy import inspect, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter, FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
-from alpha.db.models import MarketPathFeature, SignalRegistry
-from alpha.evidence.writer import record_data_lineage
+from alpha.db.models import DataLineage, MarketPathFeature, SignalRegistry
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.market_calendar import (
     next_us_equity_session,
@@ -74,6 +77,7 @@ RANK_INPUT_TO_OUTPUT = {
     ),
     "liquidity_proxy_score": ("liquidity_proxy_rank", "liquidity_proxy_percentile"),
 }
+SameDayPatternStrengthCache = dict[tuple[str, date], dict[str, float]]
 
 ADVANCED_CONTEXT_FIELDS = (
     "universe_pct_above_sma_20d",
@@ -397,6 +401,8 @@ class MarketPathFeatureJob(BaseJob):
         return "feature_enrichment"
 
     def run(self, ctx: JobContext) -> JobResult:
+        job_started = perf_counter()
+        stage_timings: dict[str, float] = {}
         run_ts = _ensure_aware(self._run_timestamp or ctx.started_at)
         session_resolution = resolve_us_equity_session(run_ts)
         through_date = self._through_date or date.fromisoformat(
@@ -422,8 +428,11 @@ class MarketPathFeatureJob(BaseJob):
                 }],
             )
 
+        started = perf_counter()
         signals = self._signals(signal_start, signal_end)
+        _record_timing(stage_timings, "signal_load_seconds", started)
         if not signals:
+            _record_timing(stage_timings, "job_internal_total_seconds", job_started)
             return JobResult(
                 status="finished",
                 metrics={
@@ -436,17 +445,22 @@ class MarketPathFeatureJob(BaseJob):
                     "rows_inserted": 0,
                     "rows_updated": 0,
                     "no_op_reason": "no_matching_signals",
+                    "stage_timing_seconds": stage_timings,
                 },
             )
 
         rows_inserted = 0
         rows_updated = 0
+        rows_unchanged = 0
         rows_skipped = 0
         missing_entry_rows = 0
         fetch_errors: list[dict[str, Any]] = []
         lineages_recorded = 0
         tickers_fetched = 0
+        pending_lineages: list[DataLineage] = []
+        pending_feature_rows: list[dict[str, Any]] = []
         reference_from_date = _fetch_start(signals, self._lookback_calendar_days)
+        started = perf_counter()
         benchmark_series = self._fetch_reference_series(
             BENCHMARK_SYMBOLS,
             from_date=reference_from_date,
@@ -454,13 +468,20 @@ class MarketPathFeatureJob(BaseJob):
             run_ts=run_ts,
             job_run_id=ctx.job_run_id,
             source_role="market_benchmark",
+            pending_lineages=pending_lineages,
         )
+        _record_timing(stage_timings, "benchmark_reference_fetch_seconds", started)
+        started = perf_counter()
         sector_resolver = _SectorResolver(self._session)
+        _record_timing(stage_timings, "sector_resolver_table_check_seconds", started)
+        started = perf_counter()
         needed_sector_etfs = self._needed_sector_etfs(
             signals,
             through_date=through_date,
             sector_resolver=sector_resolver,
         )
+        _record_timing(stage_timings, "sector_etf_resolution_seconds", started)
+        started = perf_counter()
         sector_etf_series = self._fetch_reference_series(
             needed_sector_etfs,
             from_date=reference_from_date,
@@ -468,11 +489,25 @@ class MarketPathFeatureJob(BaseJob):
             run_ts=run_ts,
             job_run_id=ctx.job_run_id,
             source_role="sector_etf",
+            pending_lineages=pending_lineages,
         )
+        _record_timing(stage_timings, "sector_reference_fetch_seconds", started)
 
+        started = perf_counter()
         by_ticker = _group_by_ticker(signals)
+        _record_timing(stage_timings, "signal_grouping_seconds", started)
+        started = perf_counter()
+        same_day_pattern_strengths = _prefetch_same_day_pattern_strengths(
+            self._session,
+            signals,
+        )
+        _record_timing(stage_timings, "cofire_prefetch_seconds", started)
+        started = perf_counter()
+        existing = self._existing_rows(signals)
+        _record_timing(stage_timings, "existing_row_lookup_seconds", started)
         for ticker, ticker_signals in by_ticker.items():
             from_date = _fetch_start(ticker_signals, self._lookback_calendar_days)
+            started = perf_counter()
             resp = self._fmp.get_historical_price(
                 ticker,
                 from_date=from_date,
@@ -480,6 +515,7 @@ class MarketPathFeatureJob(BaseJob):
                 asof=run_ts,
                 adjusted=False,
             )
+            _record_timing(stage_timings, "ticker_fmp_fetch_seconds", started)
             tickers_fetched += 1
             if not resp.ok or resp.data is None:
                 fetch_errors.append({
@@ -489,29 +525,35 @@ class MarketPathFeatureJob(BaseJob):
                     "error_type": getattr(resp.error, "error_type", None),
                 })
                 continue
+            started = perf_counter()
             bars = _clean_bars(resp.data)
-            lineage = record_data_lineage(
-                self._session,
+            _record_timing(stage_timings, "ticker_bar_clean_seconds", started)
+            started = perf_counter()
+            lineage = _build_data_lineage(
                 provider="FMP",
                 endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
                 asof_timestamp=run_ts,
-                raw_payload={
-                    "ticker": ticker,
-                    "from": from_date.isoformat(),
-                    "to": through_date.isoformat(),
-                    "bars": [_bar_payload(bar) for bar in bars],
-                    "feature_version": self._feature_version,
-                    "reconstruction_method": RECONSTRUCTION_METHOD,
-                },
+                raw_payload=_bar_lineage_payload(
+                    symbol=ticker,
+                    from_date=from_date,
+                    through_date=through_date,
+                    bars=bars,
+                    feature_version=self._feature_version,
+                    symbol_field="ticker",
+                ),
                 source_authority="fmp_eod",
-                data_quality_flags={
-                    "derived_feature_replay": True,
-                    "adapter_raw_payload_hash": resp.lineage.raw_payload_hash,
-                },
+                data_quality_flags=_lineage_quality_flags(
+                    resp,
+                    derived_feature_replay=True,
+                    lineage_payload_schema="compact_bar_digest_v1",
+                    adapter_raw_payload_hash=resp.lineage.raw_payload_hash,
+                ),
                 job_run_id=ctx.job_run_id,
             )
+            pending_lineages.append(lineage)
+            _record_timing(stage_timings, "ticker_lineage_record_seconds", started)
             lineages_recorded += 1
-            existing = self._existing_rows(ticker_signals)
+            started = perf_counter()
             for signal in ticker_signals:
                 result = self._persist_signal_rows(
                     signal,
@@ -523,16 +565,35 @@ class MarketPathFeatureJob(BaseJob):
                     benchmark_series=benchmark_series,
                     sector_resolver=sector_resolver,
                     sector_etf_series=sector_etf_series,
+                    same_day_pattern_strengths=same_day_pattern_strengths,
+                    pending_feature_rows=pending_feature_rows,
+                    stage_timings=stage_timings,
                 )
                 rows_inserted += result["inserted"]
                 rows_updated += result["updated"]
+                rows_unchanged += result["unchanged"]
                 rows_skipped += result["skipped"]
                 missing_entry_rows += result["missing_entry"]
+            _record_timing(stage_timings, "per_ticker_feature_persist_seconds", started)
 
+        started = perf_counter()
+        if pending_lineages:
+            self._session.add_all(pending_lineages)
+            self._session.flush()
+        _record_timing(stage_timings, "batched_lineage_flush_seconds", started)
+        started = perf_counter()
+        _bulk_upsert_market_path_features(self._session, pending_feature_rows)
+        if pending_feature_rows:
+            self._session.expire_all()
+        _record_timing(stage_timings, "row_upsert_persist_seconds", started)
+
+        started = perf_counter()
         rank_rows_updated = self._populate_cross_sectional_ranks(
             start_date=signal_start,
             through_date=through_date,
         )
+        _record_timing(stage_timings, "cross_sectional_rank_pass_seconds", started)
+        _record_timing(stage_timings, "job_internal_total_seconds", job_started)
         metrics = {
             "decision_date": decision_date.isoformat(),
             "pattern_ids": list(self._pattern_ids),
@@ -546,6 +607,8 @@ class MarketPathFeatureJob(BaseJob):
             "lineages_recorded": lineages_recorded,
             "rows_inserted": rows_inserted,
             "rows_updated": rows_updated,
+            "rows_unchanged": rows_unchanged,
+            "rows_upserted": len(pending_feature_rows),
             "rows_skipped": rows_skipped,
             "rank_rows_updated": rank_rows_updated,
             "missing_entry_row_count": missing_entry_rows,
@@ -554,8 +617,10 @@ class MarketPathFeatureJob(BaseJob):
             "benchmark_fetch_error_count": _reference_error_count(benchmark_series),
             "sector_etf_fetch_count": len(sector_etf_series),
             "sector_etf_fetch_error_count": _reference_error_count(sector_etf_series),
+            "same_day_pattern_strength_key_count": len(same_day_pattern_strengths),
             "liquidity_proxy_min_dollar_volume_20d": self._liquidity_min_dollar_volume_20d,
             "liquidity_proxy_min_price": self._liquidity_min_price,
+            "stage_timing_seconds": stage_timings,
         }
         status = "partial_failed" if fetch_errors else "finished"
         return JobResult(status=status, metrics=metrics, errors=fetch_errors)
@@ -601,6 +666,7 @@ class MarketPathFeatureJob(BaseJob):
         run_ts: datetime,
         job_run_id: str,
         source_role: str,
+        pending_lineages: list[DataLineage],
     ) -> dict[str, _ReferenceSeries]:
         series: dict[str, _ReferenceSeries] = {}
         for symbol in sorted({item.upper() for item in symbols if item}):
@@ -627,28 +693,30 @@ class MarketPathFeatureJob(BaseJob):
                 )
                 continue
             bars = tuple(_clean_bars(resp.data))
-            lineage = record_data_lineage(
-                self._session,
+            lineage = _build_data_lineage(
                 provider="FMP",
                 endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
                 asof_timestamp=run_ts,
-                raw_payload={
-                    "symbol": symbol,
-                    "from": from_date.isoformat(),
-                    "to": through_date.isoformat(),
-                    "bars": [_bar_payload(bar) for bar in bars],
-                    "feature_version": self._feature_version,
-                    "reconstruction_method": RECONSTRUCTION_METHOD,
-                    "source_role": source_role,
-                },
+                raw_payload=_bar_lineage_payload(
+                    symbol=symbol,
+                    from_date=from_date,
+                    through_date=through_date,
+                    bars=bars,
+                    feature_version=self._feature_version,
+                    symbol_field="symbol",
+                    source_role=source_role,
+                ),
                 source_authority="fmp_eod",
-                data_quality_flags={
-                    "derived_feature_replay": True,
-                    "reference_series_role": source_role,
-                    "adapter_raw_payload_hash": resp.lineage.raw_payload_hash,
-                },
+                data_quality_flags=_lineage_quality_flags(
+                    resp,
+                    derived_feature_replay=True,
+                    reference_series_role=source_role,
+                    lineage_payload_schema="compact_bar_digest_v1",
+                    adapter_raw_payload_hash=resp.lineage.raw_payload_hash,
+                ),
                 job_run_id=job_run_id,
             )
+            pending_lineages.append(lineage)
             series[symbol] = _ReferenceSeries(
                 symbol=symbol,
                 bars=bars,
@@ -694,18 +762,21 @@ class MarketPathFeatureJob(BaseJob):
         benchmark_series: dict[str, _ReferenceSeries],
         sector_resolver: "_SectorResolver",
         sector_etf_series: dict[str, _ReferenceSeries],
+        same_day_pattern_strengths: SameDayPatternStrengthCache,
+        pending_feature_rows: list[dict[str, Any]],
+        stage_timings: dict[str, float] | None = None,
     ) -> dict[str, int]:
         by_date = {bar.date: bar for bar in bars}
         entry_date = _entry_date(signal)
         signal_date = signal.signal_timestamp.date()
         start_date = signal_date if self._include_signal_session else entry_date
         if start_date is None:
-            return {"inserted": 0, "updated": 0, "skipped": 0, "missing_entry": 1}
+            return {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0, "missing_entry": 1}
         if (
             (entry_date is None or entry_date not in by_date)
             and not self._include_signal_session
         ):
-            return {"inserted": 0, "updated": 0, "skipped": 0, "missing_entry": 1}
+            return {"inserted": 0, "updated": 0, "unchanged": 0, "skipped": 0, "missing_entry": 1}
 
         entry_price = by_date[entry_date].open if entry_date in by_date else None
         end_date = through_date
@@ -717,7 +788,7 @@ class MarketPathFeatureJob(BaseJob):
             if start_date <= bar.date <= end_date
         ]
         path_sequence = 0
-        inserted = updated = skipped = 0
+        inserted = updated = unchanged = skipped = 0
         for bar in path_bars:
             if (
                 entry_date is not None
@@ -731,6 +802,7 @@ class MarketPathFeatureJob(BaseJob):
                 skipped += 1
                 continue
             role = "signal_session" if bar.date == signal_date else "forward_path_day"
+            started = perf_counter()
             payload = self._feature_payload(
                 signal,
                 bar=bar,
@@ -743,17 +815,36 @@ class MarketPathFeatureJob(BaseJob):
                 benchmark_series=benchmark_series,
                 sector_resolver=sector_resolver,
                 sector_etf_series=sector_etf_series,
+                same_day_pattern_strengths=same_day_pattern_strengths,
             )
+            if stage_timings is not None:
+                _record_timing(stage_timings, "feature_compute_seconds", started)
+            started = perf_counter()
             key = (signal.signal_id, bar.date.isoformat())
             row = existing.get(key)
             if row is None:
-                row = MarketPathFeature()
-                self._session.add(row)
                 inserted += 1
             else:
                 updated += 1
-            _assign_row(row, payload, data_lineage_id=data_lineage_id, job_run_id=job_run_id)
-        return {"inserted": inserted, "updated": updated, "skipped": skipped, "missing_entry": 0}
+            row_mapping = _market_path_feature_row_mapping(
+                payload,
+                existing_row=row,
+                data_lineage_id=data_lineage_id,
+                job_run_id=job_run_id,
+            )
+            if row is not None and not _feature_row_materially_changed(row, row_mapping):
+                unchanged += 1
+            else:
+                pending_feature_rows.append(row_mapping)
+            if stage_timings is not None:
+                _record_timing(stage_timings, "row_upsert_assign_seconds", started)
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "unchanged": unchanged,
+            "skipped": skipped,
+            "missing_entry": 0,
+        }
 
     def _feature_payload(
         self,
@@ -769,6 +860,7 @@ class MarketPathFeatureJob(BaseJob):
         benchmark_series: dict[str, _ReferenceSeries],
         sector_resolver: "_SectorResolver",
         sector_etf_series: dict[str, _ReferenceSeries],
+        same_day_pattern_strengths: SameDayPatternStrengthCache,
     ) -> dict[str, Any]:
         signal_date = signal.signal_timestamp.date()
         previous = _previous_bar(bars, bar.date)
@@ -817,13 +909,13 @@ class MarketPathFeatureJob(BaseJob):
             )
         )
         advanced_features, advanced_status = _advanced_context_features(
-            session=self._session,
             signal=signal,
             feature_date=bar.date,
             bar=bar,
             prior=prior,
             benchmark_series=benchmark_series,
             entry_price=entry_price,
+            same_day_pattern_strengths=same_day_pattern_strengths,
         )
         relative_input_hash = stable_hash(relative_input_payload)
         row_input_payload = {
@@ -1003,12 +1095,32 @@ class MarketPathFeatureJob(BaseJob):
         updated = 0
         for (feature_date, pattern_id, feature_version), group_rows in grouped.items():
             pattern_count = len(group_rows)
+            tracked_fields = _cross_sectional_tracked_fields()
+            previous_values = {
+                row.market_path_feature_id: {
+                    **{field: getattr(row, field) for field in tracked_fields},
+                    "feature_json": row.feature_json,
+                    "output_hash": row.output_hash,
+                }
+                for row in group_rows
+            }
+            desired_values = {
+                row.market_path_feature_id: {
+                    field: None
+                    for field in tracked_fields
+                }
+                for row in group_rows
+            }
             rankable_any = {
                 row.signal_id
                 for row in group_rows
                 if any(_rank_input_value(row, source) is not None for source in RANK_INPUT_TO_OUTPUT)
             }
             feature_count = len(rankable_any)
+            for row in group_rows:
+                desired_values[row.market_path_feature_id]["cohort_pattern_row_count"] = pattern_count
+                desired_values[row.market_path_feature_id]["cohort_feature_row_count"] = feature_count
+
             rank_status: dict[str, dict[str, Any]] = {}
             for source_field, (rank_field, percentile_field) in RANK_INPUT_TO_OUTPUT.items():
                 ranked = [
@@ -1024,18 +1136,12 @@ class MarketPathFeatureJob(BaseJob):
                 )
                 value_count = len(ranked)
                 for rank_index, row in enumerate(ranked, start=1):
-                    setattr(row, rank_field, rank_index)
-                    setattr(
-                        row,
-                        percentile_field,
+                    desired = desired_values[row.market_path_feature_id]
+                    desired[rank_field] = rank_index
+                    desired[percentile_field] = (
                         ((value_count - rank_index + 1) / value_count)
-                        if value_count else None,
+                        if value_count else None
                     )
-                ranked_ids = {row.market_path_feature_id for row in ranked}
-                for row in group_rows:
-                    if row.market_path_feature_id not in ranked_ids:
-                        setattr(row, rank_field, None)
-                        setattr(row, percentile_field, None)
                 rank_status[source_field] = {
                     "rank_field": rank_field,
                     "percentile_field": percentile_field,
@@ -1045,8 +1151,7 @@ class MarketPathFeatureJob(BaseJob):
                 }
 
             for row in group_rows:
-                row.cohort_pattern_row_count = pattern_count
-                row.cohort_feature_row_count = feature_count
+                desired = desired_values[row.market_path_feature_id]
                 payload = _json_dict(row.feature_json)
                 payload["cross_sectional_features"] = {
                     "rank_scope": {
@@ -1057,18 +1162,18 @@ class MarketPathFeatureJob(BaseJob):
                         "cohort_feature_row_count": feature_count,
                         "rank_direction": "higher_is_better",
                     },
-                    "dollar_volume_rank": row.dollar_volume_rank,
-                    "dollar_volume_percentile": row.dollar_volume_percentile,
-                    "volume_expansion_20d_rank": row.volume_expansion_20d_rank,
-                    "volume_expansion_20d_percentile": row.volume_expansion_20d_percentile,
-                    "volume_expansion_60d_rank": row.volume_expansion_60d_rank,
-                    "volume_expansion_60d_percentile": row.volume_expansion_60d_percentile,
-                    "dollar_volume_expansion_20d_rank": row.dollar_volume_expansion_20d_rank,
-                    "dollar_volume_expansion_20d_percentile": row.dollar_volume_expansion_20d_percentile,
-                    "dollar_volume_expansion_60d_rank": row.dollar_volume_expansion_60d_rank,
-                    "dollar_volume_expansion_60d_percentile": row.dollar_volume_expansion_60d_percentile,
-                    "liquidity_proxy_rank": row.liquidity_proxy_rank,
-                    "liquidity_proxy_percentile": row.liquidity_proxy_percentile,
+                    "dollar_volume_rank": desired["dollar_volume_rank"],
+                    "dollar_volume_percentile": desired["dollar_volume_percentile"],
+                    "volume_expansion_20d_rank": desired["volume_expansion_20d_rank"],
+                    "volume_expansion_20d_percentile": desired["volume_expansion_20d_percentile"],
+                    "volume_expansion_60d_rank": desired["volume_expansion_60d_rank"],
+                    "volume_expansion_60d_percentile": desired["volume_expansion_60d_percentile"],
+                    "dollar_volume_expansion_20d_rank": desired["dollar_volume_expansion_20d_rank"],
+                    "dollar_volume_expansion_20d_percentile": desired["dollar_volume_expansion_20d_percentile"],
+                    "dollar_volume_expansion_60d_rank": desired["dollar_volume_expansion_60d_rank"],
+                    "dollar_volume_expansion_60d_percentile": desired["dollar_volume_expansion_60d_percentile"],
+                    "liquidity_proxy_rank": desired["liquidity_proxy_rank"],
+                    "liquidity_proxy_percentile": desired["liquidity_proxy_percentile"],
                 }
                 relative_status = payload.setdefault("relative_feature_status", {})
                 row_status = {
@@ -1080,9 +1185,29 @@ class MarketPathFeatureJob(BaseJob):
                 }
                 relative_status["cross_sectional_rank"] = row_status
                 payload["feature_json_hash_includes_rank_pass"] = True
-                row.feature_json = json.dumps(payload, sort_keys=True)
-                _refresh_output_hash(row)
-                updated += 1
+                new_feature_json = json.dumps(payload, sort_keys=True)
+                new_output_hash = _output_hash_for_row(
+                    row,
+                    **desired,
+                    feature_json=new_feature_json,
+                )
+                row_previous_values = previous_values.get(row.market_path_feature_id, {})
+                rank_values_changed = any(
+                    not _values_equal(desired[field], row_previous_values.get(field))
+                    for field in tracked_fields
+                )
+                json_changed = row_previous_values.get("feature_json") != new_feature_json
+                hash_changed = row_previous_values.get("output_hash") != new_output_hash
+                if rank_values_changed:
+                    for field, value in desired.items():
+                        if not _values_equal(getattr(row, field), value):
+                            setattr(row, field, value)
+                if json_changed:
+                    row.feature_json = new_feature_json
+                if hash_changed:
+                    row.output_hash = new_output_hash
+                if rank_values_changed or json_changed or hash_changed:
+                    updated += 1
         return updated
 
 
@@ -1092,11 +1217,213 @@ def _assign_row(
     *,
     data_lineage_id: str,
     job_run_id: str,
+    preserve_rank_state: bool = False,
 ) -> None:
+    cross_sectional_fields = set(_cross_sectional_tracked_fields())
     for key, value in payload.items():
+        if preserve_rank_state and (key in cross_sectional_fields or key == "output_hash"):
+            continue
+        if preserve_rank_state and key == "feature_json":
+            value = _merge_cross_sectional_feature_json(row.feature_json, value)
         setattr(row, key, value)
     row.data_lineage_id = data_lineage_id
     row.job_run_id = job_run_id
+
+
+def _market_path_feature_row_mapping(
+    payload: dict[str, Any],
+    *,
+    existing_row: MarketPathFeature | None,
+    data_lineage_id: str,
+    job_run_id: str,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    row = dict(payload)
+    row["data_lineage_id"] = data_lineage_id
+    row["job_run_id"] = job_run_id
+    row["updated_at"] = now
+    if existing_row is None:
+        row["market_path_feature_id"] = str(uuid4())
+        row["created_at"] = now
+        return row
+
+    row["market_path_feature_id"] = existing_row.market_path_feature_id
+    row["created_at"] = existing_row.created_at
+    for field in _cross_sectional_tracked_fields():
+        row[field] = getattr(existing_row, field)
+    row["feature_json"] = _merge_cross_sectional_feature_json(
+        existing_row.feature_json,
+        row.get("feature_json"),
+    )
+    row["output_hash"] = existing_row.output_hash
+    return row
+
+
+def _feature_row_materially_changed(
+    existing_row: MarketPathFeature,
+    row: dict[str, Any],
+) -> bool:
+    ignored = {
+        "market_path_feature_id",
+        "created_at",
+        "updated_at",
+        "data_lineage_id",
+        "job_run_id",
+        "output_hash",
+        *_cross_sectional_tracked_fields(),
+    }
+    for key, value in row.items():
+        if key in ignored:
+            continue
+        if not _values_equal(getattr(existing_row, key), value):
+            return True
+    return False
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, datetime) and isinstance(right, datetime):
+        return _datetime_compare_value(left) == _datetime_compare_value(right)
+    if (
+        isinstance(left, (int, float))
+        and isinstance(right, (int, float))
+        and not isinstance(left, bool)
+        and not isinstance(right, bool)
+    ):
+        left_float = float(left)
+        right_float = float(right)
+        if math.isfinite(left_float) and math.isfinite(right_float):
+            return math.isclose(
+                left_float,
+                right_float,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+    return left == right
+
+
+def _datetime_compare_value(value: datetime) -> datetime:
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _bulk_upsert_market_path_features(
+    session: Session,
+    rows: Sequence[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    table = MarketPathFeature.__table__
+    dialect_name = session.get_bind().dialect.name
+    insert_factory = sqlite_insert if dialect_name == "sqlite" else pg_insert
+    batch_size = 1 if dialect_name == "sqlite" else 100
+    for batch in _batched(rows, batch_size):
+        stmt = insert_factory(table).values(list(batch))
+        excluded = stmt.excluded
+        update_columns = {
+            column.name: getattr(excluded, column.name)
+            for column in table.columns
+            if column.name not in {"market_path_feature_id", "created_at"}
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["signal_id", "feature_session_date", "feature_version"],
+            set_=update_columns,
+        )
+        session.execute(stmt)
+
+
+def _batched(
+    rows: Sequence[dict[str, Any]],
+    batch_size: int,
+) -> Iterable[Sequence[dict[str, Any]]]:
+    for index in range(0, len(rows), batch_size):
+        yield rows[index:index + batch_size]
+
+
+def _build_data_lineage(
+    *,
+    provider: str,
+    endpoint: str,
+    asof_timestamp: datetime,
+    raw_payload: Any | None = None,
+    raw_payload_hash: str | None = None,
+    request_timestamp: datetime | None = None,
+    freshness_seconds: float | None = None,
+    source_authority: str | None = None,
+    data_quality_flags: dict | None = None,
+    job_run_id: str | None = None,
+    dataset_id: str | None = None,
+) -> DataLineage:
+    if raw_payload_hash is None:
+        raw_payload_hash = stable_hash(raw_payload)
+    raw_payload_json = (
+        json.dumps(raw_payload, sort_keys=True, default=str)
+        if raw_payload is not None else None
+    )
+    return DataLineage(
+        data_lineage_id=str(uuid4()),
+        provider=provider,
+        endpoint=endpoint,
+        request_timestamp=request_timestamp or datetime.now(timezone.utc),
+        asof_timestamp=asof_timestamp,
+        raw_payload_hash=raw_payload_hash,
+        raw_payload_json=raw_payload_json,
+        freshness_seconds=freshness_seconds,
+        source_authority=source_authority,
+        data_quality_flags=(
+            json.dumps(data_quality_flags, sort_keys=True, default=str)
+            if data_quality_flags is not None else None
+        ),
+        job_run_id=job_run_id,
+        dataset_id=dataset_id,
+    )
+
+
+def _record_timing(timings: dict[str, float], key: str, started: float) -> None:
+    timings[key] = round(timings.get(key, 0.0) + (perf_counter() - started), 6)
+
+
+def _merge_cross_sectional_feature_json(
+    existing_json: str | None,
+    new_json: str | None,
+) -> str | None:
+    if not existing_json or not new_json:
+        return new_json
+    existing = _json_dict(existing_json)
+    new_payload = _json_dict(new_json)
+    if not new_payload:
+        return new_json
+    if "cross_sectional_features" in existing:
+        new_payload["cross_sectional_features"] = existing["cross_sectional_features"]
+    if "feature_json_hash_includes_rank_pass" in existing:
+        new_payload["feature_json_hash_includes_rank_pass"] = existing[
+            "feature_json_hash_includes_rank_pass"
+        ]
+    existing_relative_status = existing.get("relative_feature_status")
+    if isinstance(existing_relative_status, dict) and "cross_sectional_rank" in existing_relative_status:
+        new_relative_status = new_payload.setdefault("relative_feature_status", {})
+        if isinstance(new_relative_status, dict):
+            new_relative_status["cross_sectional_rank"] = existing_relative_status[
+                "cross_sectional_rank"
+            ]
+            for status_key in ("benchmark", "sector"):
+                existing_status = existing_relative_status.get(status_key)
+                new_status = new_relative_status.get(status_key)
+                if _without_lineage_ids(existing_status) == _without_lineage_ids(new_status):
+                    new_relative_status[status_key] = existing_status
+    return json.dumps(new_payload, sort_keys=True)
+
+
+def _without_lineage_ids(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_lineage_ids(item)
+            for key, item in value.items()
+            if key != "lineage_id"
+        }
+    if isinstance(value, list):
+        return [_without_lineage_ids(item) for item in value]
+    return value
 
 
 class _SectorResolver:
@@ -1263,6 +1590,41 @@ def _bar_payload(bar: _CleanBar) -> dict[str, Any]:
     }
 
 
+def _bar_lineage_payload(
+    *,
+    symbol: str,
+    from_date: date,
+    through_date: date,
+    bars: Sequence[_CleanBar],
+    feature_version: str,
+    symbol_field: str,
+    source_role: str | None = None,
+) -> dict[str, Any]:
+    bar_payloads = [_bar_payload(bar) for bar in bars]
+    payload: dict[str, Any] = {
+        symbol_field: symbol,
+        "from": from_date.isoformat(),
+        "to": through_date.isoformat(),
+        "bar_count": len(bar_payloads),
+        "first_bar_date": bar_payloads[0]["date"] if bar_payloads else None,
+        "last_bar_date": bar_payloads[-1]["date"] if bar_payloads else None,
+        "bars_payload_hash": stable_hash(bar_payloads),
+        "lineage_payload_schema": "compact_bar_digest_v1",
+        "feature_version": feature_version,
+        "reconstruction_method": RECONSTRUCTION_METHOD,
+    }
+    if source_role is not None:
+        payload["source_role"] = source_role
+    return payload
+
+
+def _lineage_quality_flags(resp: Any, **flags: Any) -> dict[str, Any]:
+    return {
+        **(getattr(resp.lineage, "data_quality_flags", None) or {}),
+        **flags,
+    }
+
+
 def _relative_features(
     *,
     ticker: str,
@@ -1415,13 +1777,13 @@ def _sector_reference_status(
 
 def _advanced_context_features(
     *,
-    session: Session,
     signal: SignalRegistry,
     feature_date: date,
     bar: _CleanBar,
     prior: Sequence[_CleanBar],
     benchmark_series: dict[str, _ReferenceSeries],
     entry_price: float | None,
+    same_day_pattern_strengths: SameDayPatternStrengthCache,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     market_features, market_status = _market_regime_features(
         feature_date=feature_date,
@@ -1431,9 +1793,9 @@ def _advanced_context_features(
     execution_features, execution_status = _execution_quality_unavailable_features()
     supply_features, supply_status = _supply_squeeze_unavailable_features()
     catalyst_features, catalyst_status = _catalyst_context_features(
-        session=session,
         signal=signal,
         feature_date=feature_date,
+        same_day_pattern_strengths=same_day_pattern_strengths,
     )
     technical_features, technical_status = _classic_technical_features(prior)
     features = {
@@ -1613,11 +1975,15 @@ def _supply_squeeze_unavailable_features() -> tuple[dict[str, Any], dict[str, An
 
 def _catalyst_context_features(
     *,
-    session: Session,
     signal: SignalRegistry,
     feature_date: date,
+    same_day_pattern_strengths: SameDayPatternStrengthCache,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    pattern_strength = _same_day_pattern_strengths(session, signal, feature_date)
+    pattern_strength = _same_day_pattern_strengths_from_cache(
+        same_day_pattern_strengths,
+        signal,
+        feature_date,
+    )
     cofire_m2 = any(pattern in pattern_strength for pattern in ("M2", "M2U"))
     strongest_pattern = None
     if pattern_strength:
@@ -1658,31 +2024,50 @@ def _catalyst_context_features(
     return features, status
 
 
-def _same_day_pattern_strengths(
-    session: Session,
+def _same_day_pattern_strengths_from_cache(
+    same_day_pattern_strengths: SameDayPatternStrengthCache,
     signal: SignalRegistry,
     feature_date: date,
 ) -> dict[str, float]:
     signal_day = signal.signal_timestamp.date()
     if feature_date < signal_day:
         return {}
-    start_dt = datetime.combine(signal_day, time.min, timezone.utc)
-    end_dt = datetime.combine(signal_day + timedelta(days=1), time.min, timezone.utc)
+    return dict(same_day_pattern_strengths.get((signal.ticker.upper(), signal_day), {}))
+
+
+def _prefetch_same_day_pattern_strengths(
+    session: Session,
+    signals: Sequence[SignalRegistry],
+) -> SameDayPatternStrengthCache:
+    if not signals:
+        return {}
+    tickers = sorted({signal.ticker for signal in signals if signal.ticker})
+    signal_days = [signal.signal_timestamp.date() for signal in signals]
+    start_dt = datetime.combine(min(signal_days), time.min, timezone.utc)
+    end_dt = datetime.combine(max(signal_days) + timedelta(days=1), time.min, timezone.utc)
     rows = (
-        session.query(SignalRegistry.pattern_id, SignalRegistry.raw_signal_strength)
+        session.query(
+            SignalRegistry.ticker,
+            SignalRegistry.pattern_id,
+            SignalRegistry.signal_timestamp,
+            SignalRegistry.raw_signal_strength,
+        )
         .filter(
-            SignalRegistry.ticker == signal.ticker,
+            SignalRegistry.ticker.in_(tickers),
             SignalRegistry.signal_timestamp >= start_dt,
             SignalRegistry.signal_timestamp < end_dt,
         )
         .all()
     )
-    strengths: dict[str, float] = {}
-    for pattern_id, strength in rows:
+    cache: SameDayPatternStrengthCache = {}
+    for ticker, pattern_id, signal_timestamp, strength in rows:
+        signal_day = signal_timestamp.date()
+        key = (str(ticker).upper(), signal_day)
+        strengths = cache.setdefault(key, {})
         normalized = str(pattern_id).upper()
         parsed_strength = float(strength or 0.0)
         strengths[normalized] = max(strengths.get(normalized, parsed_strength), parsed_strength)
-    return strengths
+    return cache
 
 
 def _classic_technical_features(
@@ -1738,6 +2123,16 @@ def _reference_error_count(series: dict[str, _ReferenceSeries]) -> int:
     return sum(1 for value in series.values() if value.status == "fetch_error")
 
 
+def _cross_sectional_tracked_fields() -> tuple[str, ...]:
+    fields = [
+        "cohort_feature_row_count",
+        "cohort_pattern_row_count",
+    ]
+    for rank_field, percentile_field in RANK_INPUT_TO_OUTPUT.values():
+        fields.extend([rank_field, percentile_field])
+    return tuple(fields)
+
+
 def _empty_cross_sectional_features() -> dict[str, Any]:
     fields: dict[str, Any] = {
         "cohort_feature_row_count": None,
@@ -1783,11 +2178,18 @@ def _json_dict(value: str | None) -> dict[str, Any]:
 
 
 def _refresh_output_hash(row: MarketPathFeature) -> None:
+    row.output_hash = _output_hash_for_row(row)
+
+
+def _output_hash_for_row(
+    row: MarketPathFeature,
+    **overrides: Any,
+) -> str:
     output_payload = {
-        key: getattr(row, key)
+        key: overrides.get(key, getattr(row, key))
         for key in ML_OUTPUT_HASH_FIELDS
     }
-    row.output_hash = stable_hash(output_payload)
+    return stable_hash(output_payload)
 
 
 def _price_basis(bar: _CleanBar) -> float:
