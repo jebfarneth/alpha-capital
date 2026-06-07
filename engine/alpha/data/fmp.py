@@ -93,6 +93,7 @@ class FmpBar:
     volume: int
     split_adjusted_close: Optional[float] = None
     adj_close: Optional[float] = None
+    vwap: Optional[float] = None
 
 
 @dataclass
@@ -780,6 +781,7 @@ def _parse_fmp_bar(
         volume=row.get("volume", 0),
         split_adjusted_close=split_adjusted_close,
         adj_close=adj_close,
+        vwap=_first_present(row, "vwap", "vw"),
     )
 
 

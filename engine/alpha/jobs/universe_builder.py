@@ -29,7 +29,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from numbers import Real
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
@@ -37,7 +37,12 @@ from sqlalchemy.exc import IntegrityError
 
 from alpha.data.contracts import AdapterResponse, stable_hash
 from alpha.data.fmp import FmpScreenerResult
-from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
+from alpha.data.universe_config import (
+    MARKET_CAP_BUCKET_LABELS,
+    MARKET_CAP_BUCKETS,
+    MCAP_MAX,
+    MCAP_MIN,
+)
 from alpha.db.models import CanonicalUniverseScan, SecurityProfile, UniverseScan, UniverseSnapshot
 from alpha.evidence.writer import (
     record_data_lineage,
@@ -105,11 +110,26 @@ def _market_cap_bucket(market_cap: object) -> str:
         return "unknown"
     # This helper is applied only after the inclusion mcap gate has already
     # enforced MCAP_MIN <= cap <= MCAP_MAX.
-    if cap < 100_000_000:
-        return "30m_100m"
-    if cap < 200_000_000:
-        return "100m_200m"
-    return "200m_250m"
+    for label, lower, upper in MARKET_CAP_BUCKETS:
+        if lower <= cap < upper or (upper == MCAP_MAX and cap <= upper):
+            return label
+    return "unknown"
+
+
+def _complete_market_cap_bucket_counts(counts: Counter[str]) -> Dict[str, int]:
+    completed = {label: int(counts.get(label, 0)) for label in MARKET_CAP_BUCKET_LABELS}
+    unknown = int(counts.get("unknown", 0))
+    if unknown:
+        completed["unknown"] = unknown
+    return completed
+
+
+def market_cap_bucket_counts(snapshots: Iterable[Any]) -> Dict[str, int]:
+    """Return the consumed canonical universe distribution by cap bucket."""
+    counts: Counter[str] = Counter()
+    for snapshot in snapshots:
+        counts[_market_cap_bucket(getattr(snapshot, "market_cap", None))] += 1
+    return _complete_market_cap_bucket_counts(counts)
 
 
 def _price_floor_reason() -> str:
@@ -1022,7 +1042,9 @@ class UniverseBuilderJob(BaseJob):
             "security_type_suffix_rescue_count": security_type_suffix_rescue_count,
             "country_profile_rescue_count": country_profile_rescue_count,
             "included_country_counts": dict(included_country_counts),
-            "included_market_cap_bucket_counts": dict(included_market_cap_bucket_counts),
+            "included_market_cap_bucket_counts": _complete_market_cap_bucket_counts(
+                included_market_cap_bucket_counts
+            ),
             "included_price_bucket_counts": dict(included_price_bucket_counts),
             "security_profile_cache_max_age_days": self._profile_cache_max_age_days,
         }

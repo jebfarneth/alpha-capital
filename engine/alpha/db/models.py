@@ -631,6 +631,173 @@ class M2InsiderTransaction(Base):
 
 
 # ---------------------------------------------------------------------------
+# m2_sec_fetch_coverage
+# ---------------------------------------------------------------------------
+class M2SecFetchCoverage(Base):
+    """Durable SEC Form 4 fetch coverage marker for M2 warm-path gating."""
+
+    __tablename__ = "m2_sec_fetch_coverage"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "issuer_cik",
+            "from_date",
+            name="ux_m2_sec_fetch_coverage_ticker_cik_from",
+        ),
+        Index("ix_m2_sec_fetch_coverage_ticker_from", "ticker", "from_date"),
+        Index("ix_m2_sec_fetch_coverage_job_run", "job_run_id"),
+    )
+
+    m2_sec_fetch_coverage_id = Column(String, primary_key=True, default=_uuid)
+    ticker = Column(String, nullable=False)
+    issuer_cik = Column(String, nullable=False)
+    from_date = Column(String, nullable=False)
+    to_date = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    transaction_count = Column(Integer, nullable=False, default=0)
+    scan_id = Column(String, ForeignKey("universe_scans.scan_id"), nullable=True)
+    universe_snapshot_id = Column(
+        String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    raw_payload_hash = Column(String, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# fmp_delisted_companies
+# ---------------------------------------------------------------------------
+class FmpDelistedCompanyRecord(Base):
+    """Durable FMP delisted-company directory rows for survivorship replay."""
+
+    __tablename__ = "fmp_delisted_companies"
+    __table_args__ = (
+        UniqueConstraint(
+            "normalized_symbol",
+            "exchange_key",
+            "delisted_date_key",
+            name="ux_fmp_delisted_companies_symbol_exchange_delisted",
+        ),
+        Index("ix_fmp_delisted_companies_symbol", "normalized_symbol"),
+        Index("ix_fmp_delisted_companies_delisted_date", "delisted_date"),
+        Index("ix_fmp_delisted_companies_ipo_date", "ipo_date"),
+        Index("ix_fmp_delisted_companies_exchange", "exchange_key"),
+        Index(
+            "ix_fmp_delisted_companies_exchange_relevance",
+            "exchange_relevance_status",
+        ),
+        Index(
+            "ix_fmp_delisted_companies_replay_filter",
+            "exchange_relevance_status",
+            "ipo_date",
+            "delisted_date",
+        ),
+        Index("ix_fmp_delisted_companies_job_run", "ingestion_job_run_id"),
+        Index("ix_fmp_delisted_companies_lineage", "data_lineage_id"),
+    )
+
+    fmp_delisted_company_id = Column(String, primary_key=True, default=_uuid)
+    symbol = Column(String, nullable=False)
+    normalized_symbol = Column(String, nullable=False)
+    company_name = Column(Text, nullable=True)
+    exchange = Column(String, nullable=True)
+    exchange_key = Column(String, nullable=False, default="UNKNOWN")
+    ipo_date = Column(Date, nullable=True)
+    delisted_date = Column(Date, nullable=True)
+    delisted_date_key = Column(String, nullable=False, default="UNKNOWN")
+    source = Column(String, nullable=False, default="FMP", server_default="FMP")
+    source_endpoint = Column(
+        String,
+        nullable=False,
+        default="/stable/delisted-companies",
+        server_default="/stable/delisted-companies",
+    )
+    page_number = Column(Integer, nullable=False)
+    page_limit = Column(Integer, nullable=False)
+    page_row_index = Column(Integer, nullable=True)
+    row_status = Column(String, nullable=False, default="active", server_default="active")
+    exchange_relevance_status = Column(String, nullable=False)
+    raw_payload_hash = Column(String, nullable=False)
+    raw_payload_json = Column(Text, nullable=True)
+    request_metadata_json = Column(Text, nullable=True)
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    ingestion_job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# historical_universe_reconstructions
+# ---------------------------------------------------------------------------
+class HistoricalUniverseReconstruction(Base):
+    """Scratch-built PIT universe membership reconstruction for historical replay."""
+
+    __tablename__ = "historical_universe_reconstructions"
+    __table_args__ = (
+        UniqueConstraint(
+            "replay_date",
+            "normalized_symbol",
+            name="ux_historical_universe_recon_date_symbol",
+        ),
+        Index("ix_historical_universe_recon_date_status", "replay_date", "inclusion_status"),
+        Index("ix_historical_universe_recon_symbol_date", "normalized_symbol", "replay_date"),
+        Index("ix_historical_universe_recon_reason", "rejection_reason"),
+        Index("ix_historical_universe_recon_job_run", "job_run_id"),
+    )
+
+    historical_universe_reconstruction_id = Column(
+        String, primary_key=True, default=_uuid
+    )
+    replay_date = Column(Date, nullable=False)
+    ticker = Column(String, nullable=False)
+    normalized_symbol = Column(String, nullable=False)
+    exchange = Column(String, nullable=True)
+    company_name = Column(Text, nullable=True)
+    ipo_date = Column(Date, nullable=True)
+    delisted_date = Column(Date, nullable=True)
+    inclusion_status = Column(String, nullable=False)
+    rejection_reason = Column(String, nullable=True)
+    source = Column(String, nullable=False)
+    source_provenance_json = Column(Text, nullable=False)
+    reconstructed = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    reconstruction_method = Column(String, nullable=False)
+    pit_filter_status_json = Column(Text, nullable=False)
+    current_universe_snapshot_id = Column(
+        String, ForeignKey("universe_snapshots.universe_snapshot_id"), nullable=True
+    )
+    fmp_delisted_company_id = Column(
+        String, ForeignKey("fmp_delisted_companies.fmp_delisted_company_id"), nullable=True
+    )
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=False)
+    output_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
 # m2_insider_classifications
 # ---------------------------------------------------------------------------
 class M2InsiderClassification(Base):
@@ -1264,6 +1431,9 @@ class SignalRegistry(Base):
     forward_context_path_rows = relationship(
         "ForwardContextPathRow", back_populates="signal"
     )
+    market_path_features = relationship(
+        "MarketPathFeature", back_populates="signal"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +1677,322 @@ class ForwardContextPathRow(Base):
     )
 
     signal = relationship("SignalRegistry", back_populates="forward_context_path_rows")
+
+
+# ---------------------------------------------------------------------------
+# market_path_features
+# ---------------------------------------------------------------------------
+class MarketPathFeature(Base):
+    """Derived market-path features for signal selection and ML.
+
+    Rows are reconstructed from versioned provider payloads and are intentionally
+    separate from immutable signal feature snapshots. This lets us backfill
+    missing candidate/path features without rewriting the original signal proof.
+    """
+
+    __tablename__ = "market_path_features"
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_id",
+            "feature_session_date",
+            "feature_version",
+            name="ux_market_path_features_signal_session_version",
+        ),
+        Index(
+            "ix_market_path_features_signal_session",
+            "signal_id",
+            "feature_session_date",
+        ),
+        Index(
+            "ix_market_path_features_pattern_ticker_session",
+            "pattern_id",
+            "ticker",
+            "feature_session_date",
+        ),
+        Index(
+            "ix_market_path_features_role_version",
+            "feature_role",
+            "feature_version",
+        ),
+    )
+
+    market_path_feature_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(
+        String, ForeignKey("signal_registry.signal_id"), nullable=False
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    signal_horizon = Column(String, nullable=True)
+    signal_date = Column(String, nullable=False)
+    entry_session_date = Column(String, nullable=True)
+    feature_session_date = Column(String, nullable=False)
+    path_sequence = Column(Integer, nullable=False)
+    feature_role = Column(String, nullable=False)
+    feature_version = Column(String, nullable=False)
+    asof_timestamp = Column(DateTime(timezone=True), nullable=False)
+    reconstruction_method = Column(String, nullable=False)
+
+    previous_close = Column(Float, nullable=True)
+    open_price = Column(Float, nullable=True)
+    high_price = Column(Float, nullable=True)
+    low_price = Column(Float, nullable=True)
+    close_price = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    split_adjusted_close = Column(Float, nullable=True)
+    adj_close = Column(Float, nullable=True)
+    dollar_volume = Column(Float, nullable=True)
+
+    median_volume_20d = Column(Float, nullable=True)
+    median_volume_60d = Column(Float, nullable=True)
+    median_dollar_volume_20d = Column(Float, nullable=True)
+    median_dollar_volume_60d = Column(Float, nullable=True)
+    volume_expansion_20d = Column(Float, nullable=True)
+    volume_expansion_60d = Column(Float, nullable=True)
+    dollar_volume_expansion_20d = Column(Float, nullable=True)
+    dollar_volume_expansion_60d = Column(Float, nullable=True)
+
+    gap_pct = Column(Float, nullable=True)
+    open_to_close_return = Column(Float, nullable=True)
+    high_from_open_return = Column(Float, nullable=True)
+    low_from_open_return = Column(Float, nullable=True)
+    return_from_entry_open = Column(Float, nullable=True)
+    return_from_entry_high = Column(Float, nullable=True)
+    return_from_entry_low = Column(Float, nullable=True)
+    return_from_entry_close = Column(Float, nullable=True)
+    sigma_20d = Column(Float, nullable=True)
+    effective_hard_stop_pct = Column(Float, nullable=True)
+
+    liquidity_proxy_score = Column(Float, nullable=True)
+    liquidity_proxy_passed = Column(Boolean, nullable=True)
+
+    prior_52w_high = Column(Float, nullable=True)
+    breakout_extension_pct = Column(Float, nullable=True)
+    open_vs_52w_high_pct = Column(Float, nullable=True)
+    close_vs_52w_high_pct = Column(Float, nullable=True)
+    high_vs_52w_high_pct = Column(Float, nullable=True)
+    gap_over_breakout = Column(Boolean, nullable=True)
+    closed_above_breakout = Column(Boolean, nullable=True)
+
+    close_location_value = Column(Float, nullable=True)
+    upper_wick_ratio = Column(Float, nullable=True)
+    lower_wick_ratio = Column(Float, nullable=True)
+    true_range_pct = Column(Float, nullable=True)
+    atr_14_pct = Column(Float, nullable=True)
+    range_expansion_vs_20d = Column(Float, nullable=True)
+
+    volume_zscore_20d = Column(Float, nullable=True)
+    volume_zscore_60d = Column(Float, nullable=True)
+    dollar_volume_zscore_20d = Column(Float, nullable=True)
+    dollar_volume_zscore_60d = Column(Float, nullable=True)
+    volume_acceleration_1d_vs_5d = Column(Float, nullable=True)
+    volume_acceleration_1d_vs_20d = Column(Float, nullable=True)
+
+    realized_volatility_5d = Column(Float, nullable=True)
+    realized_volatility_10d = Column(Float, nullable=True)
+    realized_volatility_20d = Column(Float, nullable=True)
+    base_range_10d = Column(Float, nullable=True)
+    base_range_20d = Column(Float, nullable=True)
+    base_range_60d = Column(Float, nullable=True)
+    base_max_drawdown_10d = Column(Float, nullable=True)
+    base_max_drawdown_20d = Column(Float, nullable=True)
+    base_max_drawdown_60d = Column(Float, nullable=True)
+
+    distance_from_sma_20d = Column(Float, nullable=True)
+    distance_from_sma_50d = Column(Float, nullable=True)
+    distance_from_sma_200d = Column(Float, nullable=True)
+    momentum_5d = Column(Float, nullable=True)
+    momentum_20d = Column(Float, nullable=True)
+    momentum_60d = Column(Float, nullable=True)
+
+    prior_52w_high_touches_20d = Column(Integer, nullable=True)
+    prior_52w_high_touches_60d = Column(Integer, nullable=True)
+    prior_52w_high_touches_126d = Column(Integer, nullable=True)
+    age_of_52w_high_sessions = Column(Integer, nullable=True)
+    failed_breakout_count_20d = Column(Integer, nullable=True)
+    failed_breakout_count_60d = Column(Integer, nullable=True)
+    failed_breakout_count_126d = Column(Integer, nullable=True)
+
+    vwap = Column(Float, nullable=True)
+    open_vs_vwap_pct = Column(Float, nullable=True)
+    high_vs_vwap_pct = Column(Float, nullable=True)
+    low_vs_vwap_pct = Column(Float, nullable=True)
+    close_vs_vwap_pct = Column(Float, nullable=True)
+
+    dollar_volume_rank = Column(Integer, nullable=True)
+    dollar_volume_percentile = Column(Float, nullable=True)
+    volume_expansion_20d_rank = Column(Integer, nullable=True)
+    volume_expansion_20d_percentile = Column(Float, nullable=True)
+    volume_expansion_60d_rank = Column(Integer, nullable=True)
+    volume_expansion_60d_percentile = Column(Float, nullable=True)
+    dollar_volume_expansion_20d_rank = Column(Integer, nullable=True)
+    dollar_volume_expansion_20d_percentile = Column(Float, nullable=True)
+    dollar_volume_expansion_60d_rank = Column(Integer, nullable=True)
+    dollar_volume_expansion_60d_percentile = Column(Float, nullable=True)
+    liquidity_proxy_rank = Column(Integer, nullable=True)
+    liquidity_proxy_percentile = Column(Float, nullable=True)
+    cohort_feature_row_count = Column(Integer, nullable=True)
+    cohort_pattern_row_count = Column(Integer, nullable=True)
+
+    spy_return_1d = Column(Float, nullable=True)
+    spy_return_5d = Column(Float, nullable=True)
+    spy_return_20d = Column(Float, nullable=True)
+    spy_return_60d = Column(Float, nullable=True)
+    qqq_return_1d = Column(Float, nullable=True)
+    qqq_return_5d = Column(Float, nullable=True)
+    qqq_return_20d = Column(Float, nullable=True)
+    qqq_return_60d = Column(Float, nullable=True)
+    iwm_return_1d = Column(Float, nullable=True)
+    iwm_return_5d = Column(Float, nullable=True)
+    iwm_return_20d = Column(Float, nullable=True)
+    iwm_return_60d = Column(Float, nullable=True)
+    relative_strength_vs_spy_5d = Column(Float, nullable=True)
+    relative_strength_vs_spy_20d = Column(Float, nullable=True)
+    relative_strength_vs_spy_60d = Column(Float, nullable=True)
+    relative_strength_vs_qqq_5d = Column(Float, nullable=True)
+    relative_strength_vs_qqq_20d = Column(Float, nullable=True)
+    relative_strength_vs_qqq_60d = Column(Float, nullable=True)
+    relative_strength_vs_iwm_5d = Column(Float, nullable=True)
+    relative_strength_vs_iwm_20d = Column(Float, nullable=True)
+    relative_strength_vs_iwm_60d = Column(Float, nullable=True)
+
+    sector_etf = Column(String, nullable=True)
+    sector_etf_return_5d = Column(Float, nullable=True)
+    sector_etf_return_20d = Column(Float, nullable=True)
+    sector_etf_return_60d = Column(Float, nullable=True)
+    relative_strength_vs_sector_5d = Column(Float, nullable=True)
+    relative_strength_vs_sector_20d = Column(Float, nullable=True)
+    relative_strength_vs_sector_60d = Column(Float, nullable=True)
+    sector_source = Column(String, nullable=True)
+    sector_relative_status = Column(String, nullable=True)
+
+    universe_pct_above_sma_20d = Column(Float, nullable=True)
+    universe_pct_above_sma_50d = Column(Float, nullable=True)
+    universe_pct_making_20d_highs = Column(Float, nullable=True)
+    universe_pct_making_52w_highs = Column(Float, nullable=True)
+    volatility_regime_proxy = Column(Float, nullable=True)
+    volatility_regime_source = Column(String, nullable=True)
+    market_regime_status = Column(String, nullable=True)
+
+    opening_range_high_5m = Column(Float, nullable=True)
+    opening_range_low_5m = Column(Float, nullable=True)
+    opening_range_high_15m = Column(Float, nullable=True)
+    opening_range_low_15m = Column(Float, nullable=True)
+    opening_range_high_30m = Column(Float, nullable=True)
+    opening_range_low_30m = Column(Float, nullable=True)
+    opening_range_high_60m = Column(Float, nullable=True)
+    opening_range_low_60m = Column(Float, nullable=True)
+    first_5m_return = Column(Float, nullable=True)
+    first_15m_return = Column(Float, nullable=True)
+    first_30m_return = Column(Float, nullable=True)
+    first_60m_return = Column(Float, nullable=True)
+    intraday_vwap = Column(Float, nullable=True)
+    open_vs_intraday_vwap_pct = Column(Float, nullable=True)
+    close_vs_intraday_vwap_pct = Column(Float, nullable=True)
+    intraday_volume_5m = Column(Float, nullable=True)
+    intraday_volume_15m = Column(Float, nullable=True)
+    intraday_volume_30m = Column(Float, nullable=True)
+    intraday_volume_60m = Column(Float, nullable=True)
+    pct_expected_volume_5m = Column(Float, nullable=True)
+    pct_expected_volume_15m = Column(Float, nullable=True)
+    pct_expected_volume_30m = Column(Float, nullable=True)
+    pct_expected_volume_60m = Column(Float, nullable=True)
+    held_above_breakout_after_first_hour = Column(Boolean, nullable=True)
+    intraday_mfe_timestamp = Column(DateTime(timezone=True), nullable=True)
+    intraday_mae_timestamp = Column(DateTime(timezone=True), nullable=True)
+    t1_before_stop = Column(Boolean, nullable=True)
+    intraday_structure_status = Column(String, nullable=True)
+    missing_intraday_bars = Column(Boolean, nullable=True)
+
+    bid_ask_spread = Column(Float, nullable=True)
+    bid_ask_spread_pct = Column(Float, nullable=True)
+    quote_age_seconds = Column(Float, nullable=True)
+    bid_size = Column(Float, nullable=True)
+    ask_size = Column(Float, nullable=True)
+    intended_entry_vs_mid_pct = Column(Float, nullable=True)
+    intended_entry_vs_ask_pct = Column(Float, nullable=True)
+    intended_entry_vs_bid_pct = Column(Float, nullable=True)
+    volume_participation_pct = Column(Float, nullable=True)
+    halt_risk_flag = Column(Boolean, nullable=True)
+    offering_risk_flag = Column(Boolean, nullable=True)
+    missing_quote = Column(Boolean, nullable=True)
+    stale_quote = Column(Boolean, nullable=True)
+    quote_status = Column(String, nullable=True)
+    execution_quality_status = Column(String, nullable=True)
+
+    float_shares = Column(Float, nullable=True)
+    shares_outstanding = Column(Float, nullable=True)
+    turnover_float = Column(Float, nullable=True)
+    dollar_turnover_float = Column(Float, nullable=True)
+    short_volume_ratio = Column(Float, nullable=True)
+    short_interest_pct_float = Column(Float, nullable=True)
+    short_interest_shares = Column(Float, nullable=True)
+    short_interest_days_to_cover = Column(Float, nullable=True)
+    proxy_days_to_cover = Column(Float, nullable=True)
+    borrow_fee_rate = Column(Float, nullable=True)
+    float_source_status = Column(String, nullable=True)
+    short_source_status = Column(String, nullable=True)
+    borrow_fee_status = Column(String, nullable=True)
+    supply_squeeze_status = Column(String, nullable=True)
+
+    news_count_1d = Column(Integer, nullable=True)
+    news_count_5d = Column(Integer, nullable=True)
+    news_count_20d = Column(Integer, nullable=True)
+    news_catalyst_flags_json = Column(Text, nullable=True)
+    earnings_days_to_next = Column(Integer, nullable=True)
+    earnings_days_since_last = Column(Integer, nullable=True)
+    offering_flag = Column(Boolean, nullable=True)
+    atm_flag = Column(Boolean, nullable=True)
+    shelf_registration_flag = Column(Boolean, nullable=True)
+    insider_buy_overlap_m2 = Column(Boolean, nullable=True)
+    cofire_m1 = Column(Boolean, nullable=True)
+    cofire_m2 = Column(Boolean, nullable=True)
+    cofire_m3 = Column(Boolean, nullable=True)
+    cofire_m4 = Column(Boolean, nullable=True)
+    cofire_i11 = Column(Boolean, nullable=True)
+    fda_clinical_flag = Column(Boolean, nullable=True)
+    corporate_action_flag = Column(Boolean, nullable=True)
+    cross_pattern_overlap_count = Column(Integer, nullable=True)
+    strongest_overlap_pattern_id = Column(String, nullable=True)
+    catalyst_context_status = Column(String, nullable=True)
+    missing_catalyst_source = Column(Boolean, nullable=True)
+
+    rsi_2 = Column(Float, nullable=True)
+    rsi_5 = Column(Float, nullable=True)
+    rsi_14 = Column(Float, nullable=True)
+    adx_14 = Column(Float, nullable=True)
+    plus_di_14 = Column(Float, nullable=True)
+    minus_di_14 = Column(Float, nullable=True)
+    bollinger_bandwidth_20d = Column(Float, nullable=True)
+    bollinger_percent_b_20d = Column(Float, nullable=True)
+    keltner_channel_position_20d = Column(Float, nullable=True)
+    macd_histogram = Column(Float, nullable=True)
+    obv = Column(Float, nullable=True)
+    accumulation_distribution = Column(Float, nullable=True)
+    chaikin_money_flow_20d = Column(Float, nullable=True)
+    stochastic_oscillator_14d = Column(Float, nullable=True)
+    technical_indicator_status = Column(String, nullable=True)
+
+    opening_range_json = Column(Text, nullable=True)
+    intraday_continuation_json = Column(Text, nullable=True)
+    quote_spread_json = Column(Text, nullable=True)
+    feature_json = Column(Text, nullable=False)
+
+    source_provider = Column(String, nullable=False)
+    source_endpoint = Column(String, nullable=False)
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=False)
+    output_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal = relationship("SignalRegistry", back_populates="market_path_features")
 
 
 # ---------------------------------------------------------------------------

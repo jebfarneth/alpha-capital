@@ -14,7 +14,8 @@ Three modes:
                 ``--confirm-canonical-write``. Refuses SQLite, refuses a set
                 ``ALPHA_DB_SCHEMA`` (canonical writes go to the default
                 search_path, not a scratch schema), verifies the database is at
-                the Alembic head, and refuses a future decision date.
+                the runtime-required Alembic head, and refuses a future
+                decision date.
 * ``--scratch`` Accumulate into an isolated PostgreSQL scratch schema. Requires
                 ``--schema`` and creates the schema/tables from metadata.
 * ``--dry-run`` Resolve and print the run plan only. Performs zero database
@@ -57,6 +58,7 @@ from alpha.jobs import (
     run_m2_daily,
     run_m3_daily,
     run_m4_daily,
+    run_market_path_features,
     run_universe,
 )
 from alpha.market_calendar import (
@@ -109,6 +111,9 @@ FORWARD_CONTEXT_HARD_PROVIDER_FAILURE_STATUSES = {
     "validation_error",
     "unavailable",
 }
+DEFAULT_MARKET_PATH_PATTERN_IDS = ("M4", "M1", "M2", "M2U", "M3", "M3S")
+MARKET_PATH_ALEMBIC_REVISION = "3456789abcde"
+DEFAULT_OFF_M3_ALEMBIC_HEAD = "a4b5c6d7e8f9"
 
 
 @dataclass(frozen=True)
@@ -253,8 +258,12 @@ def require_scratch_schema(schema: Optional[str], url: str) -> None:
         raise CanonicalRunError("--scratch requires a PostgreSQL DATABASE_URL")
 
 
-def verify_alembic_head(url: str) -> Dict[str, Any]:
-    """Confirm the canonical database is migrated to the Alembic head."""
+def verify_alembic_head(
+    url: str,
+    *,
+    allow_default_off_m3_pending: bool = False,
+) -> Dict[str, Any]:
+    """Confirm the canonical database is migrated to the runtime-required head."""
     from alembic.config import Config
     from alembic.runtime.migration import MigrationContext
     from alembic.script import ScriptDirectory
@@ -270,12 +279,31 @@ def verify_alembic_head(url: str) -> Dict[str, Any]:
     finally:
         engine.dispose()
     at_head = current == heads and bool(heads)
-    if not at_head:
-        raise CanonicalRunError(
-            f"database is not at the Alembic head (current={sorted(current)}, "
-            f"heads={sorted(heads)}); run migrations before canonical accumulation"
-        )
-    return {"current": sorted(current), "heads": sorted(heads)}
+    if at_head:
+        return {
+            "current": sorted(current),
+            "heads": sorted(heads),
+            "at_head": True,
+            "default_off_m3_pending": False,
+        }
+    if (
+        allow_default_off_m3_pending
+        and current == {MARKET_PATH_ALEMBIC_REVISION}
+        and heads == {DEFAULT_OFF_M3_ALEMBIC_HEAD}
+    ):
+        # Permit public to stop at market-path storage only while M3 is default-off.
+        # With --enable-m3, canonical must be upgraded to the M3 Alembic head.
+        return {
+            "current": sorted(current),
+            "heads": sorted(heads),
+            "at_head": False,
+            "default_off_m3_pending": True,
+            "allowed_pending_head": DEFAULT_OFF_M3_ALEMBIC_HEAD,
+        }
+    raise CanonicalRunError(
+        f"database is not at the Alembic head (current={sorted(current)}, "
+        f"heads={sorted(heads)}); run migrations before canonical accumulation"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +868,8 @@ def build_m4_health_report(
     m3_metrics: Optional[Dict[str, Any]] = None,
     forward_context_run_id: Optional[str] = None,
     forward_context_metrics: Optional[Dict[str, Any]] = None,
+    market_path_run_id: Optional[str] = None,
+    market_path_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the structured M4 accumulation health report (sections a-j)."""
 
@@ -858,6 +888,7 @@ def build_m4_health_report(
     m1_metrics = dict(m1_metrics or {})
     m2_metrics = dict(m2_metrics or {})
     m3_metrics = dict(m3_metrics or {})
+    market_path_metrics = dict(market_path_metrics or {})
     explicit_m4_run_ids = [
         run_id for run_id in (primary_m4_run_id, rerun_m4_run_id) if run_id
     ]
@@ -1217,6 +1248,27 @@ def build_m4_health_report(
             "no_op_reason": (forward_context_metrics or {}).get("no_op_reason"),
             "capture_complete": forward_context_capture_ok,
         },
+        "market_path_features": {
+            "job_run_id": market_path_run_id,
+            "no_op_reason": market_path_metrics.get("no_op_reason"),
+            "pattern_ids": market_path_metrics.get("pattern_ids"),
+            "signal_start_date": market_path_metrics.get("signal_start_date"),
+            "signal_end_date": market_path_metrics.get("signal_end_date"),
+            "through_date": market_path_metrics.get("through_date"),
+            "feature_version": market_path_metrics.get("feature_version"),
+            "reconstruction_method": market_path_metrics.get("reconstruction_method"),
+            "signals_scanned": market_path_metrics.get("signals_scanned"),
+            "ticker_fetch_count": market_path_metrics.get("ticker_fetch_count"),
+            "lineages_recorded": market_path_metrics.get("lineages_recorded"),
+            "rows_inserted": market_path_metrics.get("rows_inserted"),
+            "rows_updated": market_path_metrics.get("rows_updated"),
+            "rows_skipped": market_path_metrics.get("rows_skipped"),
+            "missing_entry_row_count": market_path_metrics.get("missing_entry_row_count"),
+            "fetch_error_count": market_path_metrics.get("fetch_error_count"),
+            "exit_code": market_path_metrics.get("exit_code"),
+            "run_status": market_path_metrics.get("run_status"),
+            "errors": market_path_metrics.get("errors"),
+        },
         "source_attempts": {
             "source_attempt_status_counts": source_attempt_status_counts,
             "fired_source_attempt_status_counts": fired_status_counts,
@@ -1298,6 +1350,7 @@ def _print_report(report: Dict[str, Any]) -> None:
         "data_quality",
         "forward_return_guard",
         "forward_context_panel",
+        "market_path_features",
         "source_attempts",
         "freeze_reuse",
         "idempotency_rerun",
@@ -1484,6 +1537,43 @@ def _run_forward_context(
     )
 
 
+def _run_market_path_features(
+    *,
+    schema: Optional[str],
+    run_timestamp: str,
+    decision_date: str,
+    evidence_session_date: str,
+    args: argparse.Namespace,
+) -> RunInvocation:
+    through_date = date.fromisoformat(evidence_session_date)
+    signal_start = through_date - timedelta(
+        days=args.market_path_signal_lookback_calendar_days
+    )
+    argv = [
+        "--live",
+        "--run-timestamp", run_timestamp,
+        "--decision-date", decision_date,
+        "--signal-start-date", signal_start.isoformat(),
+        "--signal-end-date", evidence_session_date,
+        "--through-date", evidence_session_date,
+        "--lookback-calendar-days", str(args.market_path_price_lookback_calendar_days),
+        "--include-signal-session",
+    ]
+    for pattern_id in DEFAULT_MARKET_PATH_PATTERN_IDS:
+        argv += ["--pattern-id", pattern_id]
+    if schema:
+        argv += ["--schema", schema, "--create-tables"]
+    print("\n== Market path feature capture ==")
+    exit_code = run_market_path_features.main(argv)
+    return _recover_invocation(
+        url=os.environ.get("DATABASE_URL", ""),
+        schema=schema,
+        job_name="market_path_feature_collector",
+        decision_date=decision_date,
+        exit_code=exit_code,
+    )
+
+
 def _coerce_invocation(value: Any) -> RunInvocation:
     if isinstance(value, RunInvocation):
         return value
@@ -1566,6 +1656,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help="Keep the M3 sector-rotation signal-only assembly step disabled.")
     parser.add_argument("--skip-forward-context", action="store_true",
                         help="Skip the post-M4 forward-context panel collector.")
+    parser.add_argument("--skip-market-path-features", action="store_true",
+                        help="Skip the post-assembly market-path feature collector.")
     parser.add_argument("--signal-context-breakout-buffer", type=float, default=0.02)
     parser.add_argument("--retry-backoff-seconds", type=float, default=0.25)
     parser.add_argument("--profile-max-workers", type=int, default=20)
@@ -1578,6 +1670,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--m2-skip-fmp-enrichment", action="store_true")
     parser.add_argument("--m3-sector-lookback-sessions", type=int, default=126)
     parser.add_argument("--m3-skip-sector-refresh", action="store_true")
+    parser.add_argument("--market-path-signal-lookback-calendar-days", type=int, default=35)
+    parser.add_argument("--market-path-price-lookback-calendar-days", type=int, default=140)
     return parser.parse_args(argv)
 
 
@@ -1670,14 +1764,24 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
         print(
             "Planned steps: universe build -> M4 daily -> "
             f"{m1_step} -> {m2_step} -> {m3_step} -> "
-            "forward context panel -> health report."
+            "market path feature capture -> forward context panel -> health report."
         )
         return 0
 
     if args.live:
         try:
-            head = verify_alembic_head(url)
-            print(f"Alembic head verified:  {head['heads']}")
+            head = verify_alembic_head(
+                url,
+                allow_default_off_m3_pending=not args.enable_m3,
+            )
+            if head.get("default_off_m3_pending"):
+                print(
+                    "Alembic runtime head verified: "
+                    f"{head['current']} (M3 head {head['allowed_pending_head']} "
+                    "pending while --enable-m3 is off)"
+                )
+            else:
+                print(f"Alembic head verified:  {head['heads']}")
         except CanonicalRunError as exc:
             print(f"ERROR: {exc}")
             return 1
@@ -1866,6 +1970,64 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
             metrics=m3_metrics,
         )
 
+    market_path_invocation = RunInvocation(
+        exit_code=0,
+        run_status="finished",
+        metrics={},
+    )
+    if args.skip_market_path_features:
+        market_path_invocation = RunInvocation(
+            exit_code=0,
+            run_status="finished",
+            metrics={"no_op_reason": "skipped_by_cli"},
+        )
+        print("\nMarket path feature capture skipped by --skip-market-path-features.")
+    else:
+        reset_globals()
+        try:
+            market_path_invocation = _coerce_invocation(_run_market_path_features(
+                schema=schema,
+                run_timestamp=effective_run_timestamp,
+                decision_date=decision_date,
+                evidence_session_date=clock["evidence_session_date"],
+                args=args,
+            ))
+        except Exception as exc:
+            market_path_invocation = RunInvocation(
+                exit_code=1,
+                run_status="failed",
+                metrics={
+                    "errors": [{
+                        "stage": "market_path_invocation",
+                        "message": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }],
+                },
+            )
+        market_path_metrics = dict(market_path_invocation.metrics or {})
+        market_path_metrics["exit_code"] = market_path_invocation.exit_code
+        market_path_metrics["run_status"] = market_path_invocation.run_status
+        if market_path_invocation.exit_code != 0:
+            print(
+                "WARNING: market path feature capture failed with exit "
+                f"{market_path_invocation.exit_code}; continuing so the canonical "
+                "producer health gate remains scoped to M4/M1/M2."
+            )
+        elif (
+            not market_path_invocation.run_id
+            or market_path_invocation.run_status not in SUCCESS_RUN_STATUSES
+        ):
+            print(
+                "WARNING: market path feature capture returned without a finished "
+                "job run; continuing so it remains backfillable enrichment."
+            )
+        market_path_invocation = RunInvocation(
+            exit_code=market_path_invocation.exit_code,
+            run_id=market_path_invocation.run_id,
+            run_status=market_path_invocation.run_status,
+            metrics=market_path_metrics,
+        )
+
     forward_context_invocation = RunInvocation(
         exit_code=0,
         run_status="finished",
@@ -1934,6 +2096,8 @@ def _main_impl(argv: Optional[List[str]] = None) -> int:
             rerun_m4_metrics=rerun_m4_invocation.metrics,
             forward_context_run_id=forward_context_invocation.run_id,
             forward_context_metrics=forward_context_invocation.metrics,
+            market_path_run_id=market_path_invocation.run_id,
+            market_path_metrics=market_path_invocation.metrics,
         )
     finally:
         session.close()

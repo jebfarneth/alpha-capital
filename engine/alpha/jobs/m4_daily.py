@@ -27,6 +27,7 @@ from alpha.db.models import CanonicalUniverseScan, UniverseScan, UniverseSnapsho
 from alpha.evidence.writer import record_data_lineage
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
+from alpha.jobs.universe_builder import market_cap_bucket_counts
 from alpha.market_calendar import (
     resolve_us_equity_session,
     us_equity_session_close_timestamp,
@@ -129,6 +130,7 @@ class M4DailyAssemblyJob(BaseJob):
                 },
                 errors=[{"stage": "canonical_universe", "message": canonical_error}],
             )
+        included_market_cap_bucket_counts = market_cap_bucket_counts(snapshots)
 
         daily_bars: Dict[str, List[DailyBar]] = {}
         fetch_errors: List[Dict[str, Any]] = []
@@ -245,6 +247,7 @@ class M4DailyAssemblyJob(BaseJob):
                     "session_resolution": asdict(session_resolution),
                     "canonical_scan_id": scan_id,
                     "included_universe_size": len(snapshots),
+                    "included_market_cap_bucket_counts": included_market_cap_bucket_counts,
                     "fetched_symbol_count": fetched_symbol_count,
                     "fetched_bar_count": fetched_bar_count,
                     "fetch_error_count": len(fetch_errors),
@@ -274,6 +277,7 @@ class M4DailyAssemblyJob(BaseJob):
             "session_resolution": asdict(session_resolution),
             "canonical_scan_id": scan_id,
             "included_universe_size": len(snapshots),
+            "included_market_cap_bucket_counts": included_market_cap_bucket_counts,
             "fetch_endpoint": HISTORICAL_PRICE_FULL_ENDPOINT,
             "fetch_from_date": from_date.isoformat(),
             "fetch_to_date": evidence_session_date,

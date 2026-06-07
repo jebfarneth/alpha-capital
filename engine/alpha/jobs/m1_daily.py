@@ -42,6 +42,7 @@ from alpha.db.models import (
 from alpha.evidence.writer import record_data_lineage
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
+from alpha.jobs.universe_builder import market_cap_bucket_counts
 from alpha.market_calendar import (
     next_us_equity_session,
     previous_us_equity_session,
@@ -144,6 +145,7 @@ class M1DailyAssemblyJob(BaseJob):
                 },
                 errors=[{"stage": "canonical_universe", "message": canonical_error}],
             )
+        included_market_cap_bucket_counts = market_cap_bucket_counts(snapshots)
         snapshot_by_ticker = {snapshot.ticker.upper(): snapshot for snapshot in snapshots}
 
         trailing_fetch = _fetch_earnings_calendar_window(
@@ -165,6 +167,7 @@ class M1DailyAssemblyJob(BaseJob):
                     session_resolution,
                     scan_id=scan_id,
                     included_universe_size=len(snapshots),
+                    included_market_cap_bucket_counts=included_market_cap_bucket_counts,
                     earnings_from=earnings_from,
                     earnings_to=evidence_day,
                     price_from=price_from,
@@ -199,6 +202,7 @@ class M1DailyAssemblyJob(BaseJob):
                     session_resolution,
                     scan_id=scan_id,
                     included_universe_size=len(snapshots),
+                    included_market_cap_bucket_counts=included_market_cap_bucket_counts,
                     earnings_from=earnings_from,
                     earnings_to=evidence_day,
                     price_from=price_from,
@@ -306,6 +310,7 @@ class M1DailyAssemblyJob(BaseJob):
                     session_resolution,
                     scan_id=scan_id,
                     included_universe_size=len(snapshots),
+                    included_market_cap_bucket_counts=included_market_cap_bucket_counts,
                     earnings_from=earnings_from,
                     earnings_to=evidence_day,
                     price_from=price_from,
@@ -395,6 +400,7 @@ class M1DailyAssemblyJob(BaseJob):
             session_resolution,
             scan_id=scan_id,
             included_universe_size=len(snapshots),
+            included_market_cap_bucket_counts=included_market_cap_bucket_counts,
             earnings_from=earnings_from,
             earnings_to=evidence_day,
             price_from=price_from,
@@ -778,6 +784,7 @@ def _base_metrics(
     *,
     scan_id: Optional[str],
     included_universe_size: int,
+    included_market_cap_bucket_counts: Dict[str, int],
     earnings_from: date,
     earnings_to: date,
     price_from: date,
@@ -790,6 +797,7 @@ def _base_metrics(
         "session_resolution": asdict(session_resolution),
         "canonical_scan_id": scan_id,
         "included_universe_size": included_universe_size,
+        "included_market_cap_bucket_counts": included_market_cap_bucket_counts,
         "earnings_from_date": earnings_from.isoformat(),
         "earnings_to_date": earnings_to.isoformat(),
         "price_from_date": price_from.isoformat(),

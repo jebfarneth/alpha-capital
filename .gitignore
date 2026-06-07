@@ -3,8 +3,16 @@ dist/
 build/
 .env
 .env.local
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
 *.log
 .DS_Store
+CLAUDE.md
+expansion.md
+m4_backfill_task_list.md
 
 # Python
 __pycache__/
@@ -12,7 +20,19 @@ __pycache__/
 *.pyo
 *.egg-info/
 .venv/
+venv/
 *.db
+*.sqlite
+*.sqlite3
+*.dump
+*.parquet
+*.csv
+*.pkl
+*.npy
+*.zip
+*.tar
+*.tar.gz
+*.tgz
 .pytest_cache/
 .coverage
 htmlcov/

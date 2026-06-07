@@ -468,6 +468,7 @@ def test_m4_production_job_caps_fetch_at_evidence_session_and_persists(db_sessio
     assert result.metrics["decision_date"] == "2026-05-26"
     assert result.metrics["evidence_session_date"] == "2026-05-22"
     assert result.metrics["fetch_to_date"] == "2026-05-22"
+    assert result.metrics["included_market_cap_bucket_counts"]["30m_100m"] == 1
     assert result.metrics["assembly"]["assembled_count"] == 1
     feature = db_session.query(FeatureSnapshot).filter_by(ticker="LCUT").one()
     assert result.metrics["orchestration"]["total_signals_persisted"] == 1, (

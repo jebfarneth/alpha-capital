@@ -1,11 +1,13 @@
 """
 Sliced FMP universe source.
 
-Pulls the configured operating market-cap band in equal-width slices to avoid
+Pulls the configured operating market-cap band in bounded slices to avoid
 provider limit truncation (FMP returns the largest names first when a
-single broad request hits the limit). Recursively subdivides any slice
-that returns exactly ``limit`` results until the slice width reaches
-``min_slice_width``, then fails closed with ``slice_limit_exhausted``.
+single broad request hits the limit). The default grid is adaptive across the
+widened global universe, and explicit uniform slicing remains available for
+focused audits/operator overrides. Recursively subdivides any slice that returns
+exactly ``limit`` results until the slice width reaches ``min_slice_width``,
+then fails closed with ``slice_limit_exhausted``.
 
 Per Data-Sourcing-Audit.md Universe Filter section.
 """
@@ -14,7 +16,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from alpha.data.contracts import (
     AdapterResponse,
@@ -24,7 +26,12 @@ from alpha.data.contracts import (
     utcnow,
 )
 from alpha.data.fmp import FmpAdapter, FmpScreenerResult
-from alpha.data.universe_config import MCAP_MAX, MCAP_MIN, MIN_SLICE_WIDTH, SLICE_WIDTH
+from alpha.data.universe_config import (
+    DEFAULT_SLICE_GRID,
+    MCAP_MAX,
+    MCAP_MIN,
+    MIN_SLICE_WIDTH,
+)
 
 DEFAULT_SLICE_LIMIT = 1000
 DEFAULT_BOUNDARY_OVERLAP = 1_000
@@ -68,7 +75,8 @@ class SlicedUniverseFetcher:
         *,
         mcap_min: int = MCAP_MIN,
         mcap_max: int = MCAP_MAX,
-        slice_width: int = SLICE_WIDTH,
+        slice_width: Optional[int] = None,
+        slice_grid: Optional[Sequence[Tuple[int, int, int]]] = None,
         min_slice_width: int = MIN_SLICE_WIDTH,
         limit_per_slice: int = DEFAULT_SLICE_LIMIT,
         max_slice_retries: int = 2,
@@ -80,6 +88,12 @@ class SlicedUniverseFetcher:
         self._mcap_min = mcap_min
         self._mcap_max = mcap_max
         self._slice_width = slice_width
+        self._slice_grid = _resolve_slice_grid(
+            mcap_min=mcap_min,
+            mcap_max=mcap_max,
+            slice_width=slice_width,
+            slice_grid=slice_grid,
+        )
         self._min_slice_width = min_slice_width
         self._limit = limit_per_slice
         if max_slice_retries < 0:
@@ -100,14 +114,18 @@ class SlicedUniverseFetcher:
         diagnostics: List[SliceDiagnostic] = []
         payload_hashes: List[str] = []
 
-        error = self._fetch_range(
-            self._mcap_min,
-            self._mcap_max,
-            self._slice_width,
-            seen,
-            diagnostics,
-            payload_hashes,
-        )
+        error: Optional[ProviderError] = None
+        for lower, upper, width in self._slice_grid:
+            error = self._fetch_range(
+                lower,
+                upper,
+                width,
+                seen,
+                diagnostics,
+                payload_hashes,
+            )
+            if error is not None:
+                break
         total_raw = sum(
             d.returned_count for d in diagnostics if not d.subdivided
         )
@@ -263,6 +281,48 @@ def _normalize_symbol(symbol: object) -> str:
     if symbol is None:
         return ""
     return str(symbol).strip().upper()
+
+
+def _resolve_slice_grid(
+    *,
+    mcap_min: int,
+    mcap_max: int,
+    slice_width: Optional[int],
+    slice_grid: Optional[Sequence[Tuple[int, int, int]]],
+) -> Tuple[Tuple[int, int, int], ...]:
+    if mcap_min >= mcap_max:
+        raise ValueError("mcap_min must be less than mcap_max")
+    if slice_width is not None and slice_grid is not None:
+        raise ValueError("slice_width and slice_grid are mutually exclusive")
+    if slice_width is not None:
+        if slice_width <= 0:
+            raise ValueError("slice_width must be positive")
+        return ((mcap_min, mcap_max, slice_width),)
+
+    template = tuple(slice_grid or DEFAULT_SLICE_GRID)
+    resolved: List[Tuple[int, int, int]] = []
+    cursor = mcap_min
+    for lower, upper, width in sorted(template, key=lambda item: item[0]):
+        if width <= 0:
+            raise ValueError("slice_grid widths must be positive")
+        start = max(mcap_min, lower)
+        end = min(mcap_max, upper)
+        if start >= end:
+            continue
+        if start != cursor:
+            raise ValueError(
+                "slice_grid must exactly cover the requested market-cap range; "
+                "pass slice_width for an explicit uniform override"
+            )
+        resolved.append((start, end, width))
+        cursor = end
+
+    if cursor != mcap_max or not resolved:
+        raise ValueError(
+            "slice_grid must exactly cover the requested market-cap range; "
+            "pass slice_width for an explicit uniform override"
+        )
+    return tuple(resolved)
 
 
 def _stock_payload(stock: FmpScreenerResult) -> dict:

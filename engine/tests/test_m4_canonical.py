@@ -173,6 +173,131 @@ def test_live_cli_refuses_sqlite(monkeypatch, capsys):
     assert "SQLite is refused" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("extra_args,expected_allowance", [
+    ([], True),
+    (["--enable-m3"], False),
+])
+def test_live_alembic_check_allows_default_off_m3_pending_only_when_m3_off(
+    monkeypatch,
+    extra_args,
+    expected_allowance,
+):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@db.example.supabase.co/postgres")
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    calls = []
+
+    def fake_verify(url, *, allow_default_off_m3_pending=False):
+        calls.append(allow_default_off_m3_pending)
+        raise CanonicalRunError("stop after alembic check")
+
+    monkeypatch.setattr(run_nightly_canonical, "verify_alembic_head", fake_verify)
+
+    rc = run_nightly_canonical.main([
+        "--live",
+        "--confirm-canonical-write",
+        "--run-timestamp", "2026-05-26T08:00:00+00:00",
+        *extra_args,
+    ])
+
+    assert rc == 1
+    assert calls == [expected_allowance]
+
+
+def test_verify_alembic_head_allows_ml_context_market_path_with_default_off_m3(monkeypatch):
+    class FakeScript:
+        def get_heads(self):
+            return ["a4b5c6d7e8f9"]
+
+    class FakeContext:
+        def get_current_heads(self):
+            return ["3456789abcde"]
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class FakeEngine:
+        def connect(self):
+            return FakeConnection()
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(
+        "alembic.script.ScriptDirectory.from_config",
+        lambda _config: FakeScript(),
+    )
+    monkeypatch.setattr(
+        "alembic.runtime.migration.MigrationContext.configure",
+        lambda _conn: FakeContext(),
+    )
+    monkeypatch.setattr(
+        run_nightly_canonical,
+        "create_engine",
+        lambda _url: FakeEngine(),
+    )
+
+    result = run_nightly_canonical.verify_alembic_head(
+        "postgresql+psycopg://u:p@host/db",
+        allow_default_off_m3_pending=True,
+    )
+
+    assert result == {
+        "current": ["3456789abcde"],
+        "heads": ["a4b5c6d7e8f9"],
+        "at_head": False,
+        "default_off_m3_pending": True,
+        "allowed_pending_head": "a4b5c6d7e8f9",
+    }
+
+
+def test_verify_alembic_head_rejects_relative_feature_stop_after_ml_context(monkeypatch):
+    class FakeScript:
+        def get_heads(self):
+            return ["a4b5c6d7e8f9"]
+
+    class FakeContext:
+        def get_current_heads(self):
+            return ["e9f012345678"]
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class FakeEngine:
+        def connect(self):
+            return FakeConnection()
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(
+        "alembic.script.ScriptDirectory.from_config",
+        lambda _config: FakeScript(),
+    )
+    monkeypatch.setattr(
+        "alembic.runtime.migration.MigrationContext.configure",
+        lambda _conn: FakeContext(),
+    )
+    monkeypatch.setattr(
+        run_nightly_canonical,
+        "create_engine",
+        lambda _url: FakeEngine(),
+    )
+
+    with pytest.raises(CanonicalRunError, match="database is not at the Alembic head"):
+        run_nightly_canonical.verify_alembic_head(
+            "postgresql+psycopg://u:p@host/db",
+            allow_default_off_m3_pending=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # (f) --live refuses a set ALPHA_DB_SCHEMA
 # ---------------------------------------------------------------------------
@@ -1684,6 +1809,15 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
             },
         )
 
+    def fake_market_path(**kwargs):
+        calls.append(("market_path", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="market-path-run",
+            run_status="finished",
+            metrics={"rows_inserted": 3, "signals_scanned": 2},
+        )
+
     class FakeSession:
         def close(self):
             calls.append(("session_close", {}))
@@ -1720,6 +1854,7 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
     monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
     monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
     monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_market_path_features", fake_market_path)
     monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
     monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
     monkeypatch.setattr(run_nightly_canonical, "_app_commit_sha", lambda: "deadbeef")
@@ -1740,6 +1875,8 @@ def test_main_threads_current_invocation_run_ids_and_writes_scoped_json(monkeypa
     assert build_kwargs["primary_m4_run_id"] == "m4-primary"
     assert build_kwargs["rerun_m4_run_id"] == "m4-rerun"
     assert build_kwargs["m1_run_id"] == "m1-run"
+    assert build_kwargs["market_path_run_id"] == "market-path-run"
+    assert build_kwargs["market_path_metrics"]["rows_inserted"] == 3
     assert build_kwargs["m1_metrics"]["market_factor_symbol"] == "SPY"
     assert build_kwargs["m4_metrics"]["signal_context"]["context_enriched_count"] == 1
     assert build_kwargs["rerun_m4_metrics"]["signal_context"]["context_reused_from_persistence_count"] == 1
@@ -1782,6 +1919,15 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
             metrics={"rows_inserted": 4, "forward_session_date": "2026-05-29"},
         )
 
+    def fake_market_path(**kwargs):
+        calls.append(("market_path", kwargs))
+        return run_nightly_canonical.RunInvocation(
+            exit_code=0,
+            run_id="market-path-run",
+            run_status="finished",
+            metrics={"rows_inserted": 5, "signals_scanned": 3},
+        )
+
     class FakeSession:
         def close(self):
             pass
@@ -1795,6 +1941,8 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
 
     def fake_build_report(session, **kwargs):
         calls.append(("build_report", kwargs))
+        assert kwargs["market_path_run_id"] == "market-path-run"
+        assert kwargs["market_path_metrics"]["rows_inserted"] == 5
         assert kwargs["forward_context_run_id"] == "forward-context-run"
         assert kwargs["forward_context_metrics"]["rows_inserted"] == 4
         return {
@@ -1818,6 +1966,7 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
     monkeypatch.setattr(run_nightly_canonical, "_run_universe", fake_universe)
     monkeypatch.setattr(run_nightly_canonical, "_run_m4", fake_m4)
     monkeypatch.setattr(run_nightly_canonical, "_run_m1", fake_m1)
+    monkeypatch.setattr(run_nightly_canonical, "_run_market_path_features", fake_market_path)
     monkeypatch.setattr(run_nightly_canonical, "_run_forward_context", fake_forward_context)
     monkeypatch.setattr(run_nightly_canonical, "_report_session", fake_report_session)
     monkeypatch.setattr(run_nightly_canonical, "build_m4_health_report", fake_build_report)
@@ -1833,12 +1982,15 @@ def test_main_runs_forward_context_for_current_completed_session(monkeypatch):
     assert [name for name, _payload in calls] == [
         "universe",
         "m4",
+        "market_path",
         "forward_context",
         "build_report",
     ]
     build_kwargs = [payload for name, payload in calls if name == "build_report"][0]
     assert build_kwargs["m1_run_id"] is None
     assert build_kwargs["m1_metrics"]["no_op_reason"] == "skipped_default_off"
+    market_path_kwargs = [payload for name, payload in calls if name == "market_path"][0]
+    assert market_path_kwargs["evidence_session_date"] == "2026-05-29"
     forward_kwargs = [payload for name, payload in calls if name == "forward_context"][0]
     assert forward_kwargs["run_timestamp"] == "2026-05-30T00:00:00+00:00"
 
@@ -1918,6 +2070,7 @@ def test_main_runs_m1_only_when_enabled(monkeypatch):
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
     ])
 
@@ -1975,6 +2128,7 @@ def test_main_enable_m1_failure_aborts_before_health_report(monkeypatch, capsys)
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
     ])
 
@@ -2079,6 +2233,7 @@ def test_main_enable_m2_tolerated_fetch_errors_reaches_healthy_report(
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
         "--enable-m2",
         "--json-output", str(output),
@@ -2152,6 +2307,7 @@ def test_main_enable_m2_fatal_fetch_error_aborts_before_health_report(
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
         "--enable-m2",
     ])
@@ -2289,6 +2445,7 @@ def test_main_enable_m3_errors_are_observability_only(
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
         "--enable-m2",
         "--enable-m3",
@@ -2416,6 +2573,7 @@ def test_main_enable_m3_unhandled_exception_is_observability_only(
         "--run-timestamp", "2026-05-29T20:00:00-04:00",
         "--skip-rerun",
         "--skip-forward-context",
+        "--skip-market-path-features",
         "--enable-m1",
         "--enable-m2",
         "--enable-m3",

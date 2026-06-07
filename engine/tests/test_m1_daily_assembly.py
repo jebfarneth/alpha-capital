@@ -716,6 +716,7 @@ class TestM1DailyJob:
         assert result.metrics["foster_computed_count"] == 5
         assert result.metrics["foster_insufficient_history_count"] == 0
         assert result.metrics["friction_computed_count"] == 5
+        assert result.metrics["included_market_cap_bucket_counts"]["30m_100m"] == 5
         assert result.metrics["assembly"]["assembled_count"] == 5
         assert result.metrics["orchestration"]["total_signals_persisted"] >= 1
 

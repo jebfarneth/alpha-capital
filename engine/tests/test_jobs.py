@@ -119,6 +119,7 @@ def _mock_screener_data() -> List[FmpScreenerResult]:
         _stock("ETF1", market_cap=80_000_000, price=25.0, exchange="NASDAQ", is_etf=True),
         _stock("TINY", market_cap=5_000_000, price=0.50, exchange="NASDAQ"),
         _stock("HUGE", market_cap=500_000_000, price=50.0, exchange="NYSE"),
+        _stock("GIGA", market_cap=5_000_000_001, price=75.0, exchange="NYSE"),
         _stock("DEAD", market_cap=60_000_000, price=4.0, exchange="NASDAQ", is_actively_trading=False),
         _stock("FRGN", market_cap=90_000_000, price=7.0, exchange="NASDAQ", country="CA"),
     ]
@@ -271,18 +272,22 @@ class TestUniverseBuilder:
         result = run_job(db_session, job)
 
         assert result.ok
-        assert result.metrics["raw_count"] == 7
-        assert result.metrics["included"] == 2
+        assert result.metrics["raw_count"] == 8
+        assert result.metrics["included"] == 3
         assert result.metrics["excluded"] == 5
         assert result.metrics["mcap_min"] == MCAP_MIN
         assert result.metrics["mcap_max"] == MCAP_MAX
         assert result.metrics["price_min"] == PRICE_MIN
         assert result.metrics["included_market_cap_bucket_counts"] == {
             "30m_100m": 1,
-            "100m_200m": 1,
+            "100m_250m": 1,
+            "250m_500m": 0,
+            "500m_1b": 1,
+            "1b_2b": 0,
+            "2b_5b": 0,
         }
         assert result.metrics["included_price_bucket_counts"] == {
-            "5_plus": 2,
+            "5_plus": 3,
         }
         assert (
             sum(result.metrics["included_market_cap_bucket_counts"].values())
@@ -298,15 +303,15 @@ class TestUniverseBuilder:
         )
 
         snaps = db_session.query(UniverseSnapshot).all()
-        assert len(snaps) == 7
+        assert len(snaps) == 8
 
         included = [s for s in snaps if s.operating_universe_inclusion]
         excluded = [s for s in snaps if not s.operating_universe_inclusion]
-        assert len(included) == 2
+        assert len(included) == 3
         assert len(excluded) == 5
 
         included_tickers = {s.ticker for s in included}
-        assert included_tickers == {"INCL1", "INCL2"}
+        assert included_tickers == {"HUGE", "INCL1", "INCL2"}
         included_country_counts = {}
         for snap in included:
             country = snap.country or "MISSING"
@@ -323,7 +328,7 @@ class TestUniverseBuilder:
 
         assert reasons["ETF1"] == "etf"
         assert "mcap_below" in reasons["TINY"]
-        assert "mcap_above" in reasons["HUGE"]
+        assert reasons["GIGA"] == f"mcap_above_{MCAP_MAX}"
         assert reasons["DEAD"] == "not_actively_trading"
         assert reasons["FRGN"] == f"{COUNTRY_REQUIRES_SECURITY_PROFILE_PREFIX}:CA"
 
@@ -340,10 +345,16 @@ class TestUniverseBuilder:
     def test_market_cap_bucket_helper(self):
         assert _market_cap_bucket(30_000_000) == "30m_100m"
         assert _market_cap_bucket(75_000_000) == "30m_100m"
-        assert _market_cap_bucket(100_000_000) == "100m_200m"
-        assert _market_cap_bucket(150_000_000) == "100m_200m"
-        assert _market_cap_bucket(200_000_000) == "200m_250m"
-        assert _market_cap_bucket(225_000_000) == "200m_250m"
+        assert _market_cap_bucket(100_000_000) == "100m_250m"
+        assert _market_cap_bucket(249_999_999) == "100m_250m"
+        assert _market_cap_bucket(250_000_000) == "250m_500m"
+        assert _market_cap_bucket(499_999_999) == "250m_500m"
+        assert _market_cap_bucket(500_000_000) == "500m_1b"
+        assert _market_cap_bucket(999_999_999) == "500m_1b"
+        assert _market_cap_bucket(1_000_000_000) == "1b_2b"
+        assert _market_cap_bucket(1_999_999_999) == "1b_2b"
+        assert _market_cap_bucket(2_000_000_000) == "2b_5b"
+        assert _market_cap_bucket(5_000_000_000) == "2b_5b"
         assert _market_cap_bucket(None) == "unknown"
 
     def test_price_bucket_helper(self):
@@ -688,9 +699,9 @@ class TestUniverseBuilder:
         assert lineage_rows[0].raw_payload_hash == resp.lineage.raw_payload_hash
         assert lineage_rows[0].source_authority == "mock"
         raw_payload = json.loads(lineage_rows[0].raw_payload_json)
-        assert len(raw_payload) == 7
+        assert len(raw_payload) == 8
         assert {row["symbol"] for row in raw_payload} == {
-            "DEAD", "ETF1", "FRGN", "HUGE", "INCL1", "INCL2", "TINY"
+            "DEAD", "ETF1", "FRGN", "GIGA", "HUGE", "INCL1", "INCL2", "TINY"
         }
 
         snaps = db_session.query(UniverseSnapshot).all()
@@ -781,10 +792,10 @@ class TestUniverseBuilder:
         result = run_job(db_session, job)
 
         assert result.ok
-        assert result.metrics["raw_count"] == 7
-        assert result.metrics["security_profile_scan_snapshot_count"] == 7
-        assert universe_flush_flags == [False] * 7
-        assert profile_flush_flags == [False] * 7
+        assert result.metrics["raw_count"] == 8
+        assert result.metrics["security_profile_scan_snapshot_count"] == 8
+        assert universe_flush_flags == [False] * 8
+        assert profile_flush_flags == [False] * 8
 
     def test_profile_snapshot_failure_rolls_back_scan_rows(self, db_session, monkeypatch):
         import alpha.jobs.universe_builder as builder_module
@@ -900,6 +911,31 @@ class TestUniverseBuilder:
         assert hash1 == hash2
         session2.close()
         engine2.dispose()
+
+    def test_bucket_boundary_market_cap_change_changes_output_hash(self, db_session):
+        resp1 = AdapterResponse(
+            data=[_stock("ACME", market_cap=249_000_000)],
+            lineage=_mock_lineage(),
+        )
+        resp2 = AdapterResponse(
+            data=[_stock("ACME", market_cap=250_000_000)],
+            lineage=_mock_lineage(),
+        )
+
+        result1 = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp1),
+            params={"trading_date": "2026-05-20"},
+        )
+        result2 = run_job(
+            db_session,
+            UniverseBuilderJob(session=db_session, screener_response=resp2),
+            params={"trading_date": "2026-05-20"},
+        )
+
+        assert result1.output_hashes["universe_snapshots"] != result2.output_hashes["universe_snapshots"]
+        assert result1.metrics["included_market_cap_bucket_counts"]["100m_250m"] == 1
+        assert result2.metrics["included_market_cap_bucket_counts"]["250m_500m"] == 1
 
     def test_input_hashes_present(self, db_session):
         resp = _mock_screener_response()
@@ -1143,6 +1179,11 @@ class TestHardenedFilter:
         included, reason = _classify(_stock(market_cap=29_000_000))
         assert not included
         assert reason == f"mcap_below_{MCAP_MIN}"
+
+    def test_500m_market_cap_is_included(self):
+        included, reason = _classify(_stock(market_cap=500_000_000))
+        assert included is True
+        assert reason is None
 
     def test_mcap_above_excluded(self):
         included, reason = _classify(_stock(market_cap=MCAP_MAX + 1))
@@ -1472,14 +1513,20 @@ def _ok_response(stocks, key=(0, 0)):
 
 class TestSlicedUniverseFetcher:
     def test_calls_once_per_slice(self):
-        """22 slices from 30M to 250M in 10M increments."""
+        """Adaptive default grid reaches exactly 30M to 5B without uniform 10M slices."""
         adapter = _make_mock_adapter()
         fetcher = SlicedUniverseFetcher(adapter)
         result = fetcher.fetch()
 
         assert result.response.ok
-        assert result.slice_count == 22
-        assert adapter.get_stock_screener.call_count == 22
+        assert result.slice_count == 59
+        assert adapter.get_stock_screener.call_count == 59
+        diagnostics = result.slice_diagnostics
+        assert diagnostics[0].lower == MCAP_MIN
+        assert diagnostics[-1].upper == MCAP_MAX
+        assert all(left.upper == right.lower for left, right in zip(diagnostics[:-1], diagnostics[1:]))
+        assert any(d.lower == 250_000_000 and d.upper == 300_000_000 for d in diagnostics)
+        assert any(d.lower == 2_000_000_000 and d.upper == 2_250_000_000 for d in diagnostics)
         assert result.response.lineage.request_timestamp.tzinfo is not None
         assert result.response.lineage.request_timestamp.utcoffset() == timezone.utc.utcoffset(
             result.response.lineage.request_timestamp
@@ -1537,22 +1584,22 @@ class TestSlicedUniverseFetcher:
         assert result.unique_raw_count == 1
         assert result.duplicate_count == 1
 
-    def test_limit_hit_triggers_subdivision(self):
-        """A slice returning exactly limit results causes recursive subdivision."""
+    def test_limit_hit_triggers_subdivision_in_higher_cap_slice(self):
+        """A higher-cap slice returning exactly limit recursively subdivides."""
         limit = 5
-        big_slice = [_stock(f"S{i}", market_cap=35_000_000 + i * 100) for i in range(limit)]
-        sub1 = [_stock(f"S{i}", market_cap=35_000_000 + i * 100) for i in range(3)]
-        sub2 = [_stock(f"S{i}", market_cap=35_000_000 + i * 100) for i in range(3, limit)]
+        big_slice = [_stock(f"S{i}", market_cap=260_000_000 + i * 100) for i in range(limit)]
+        sub1 = [_stock(f"S{i}", market_cap=260_000_000 + i * 100) for i in range(3)]
+        sub2 = [_stock(f"S{i}", market_cap=260_000_000 + i * 100) for i in range(3, limit)]
 
         responses = {
-            (29_999_000, 40_001_000): _ok_response(big_slice, (30_000_000, 40_000_000)),
-            (29_999_000, 35_001_000): _ok_response(sub1, (30_000_000, 35_000_000)),
-            (34_999_000, 40_001_000): _ok_response(sub2, (35_000_000, 40_000_000)),
+            (249_999_000, 300_001_000): _ok_response(big_slice, (250_000_000, 300_000_000)),
+            (249_999_000, 275_001_000): _ok_response(sub1, (250_000_000, 275_000_000)),
+            (274_999_000, 300_001_000): _ok_response(sub2, (275_000_000, 300_000_000)),
         }
         adapter = _make_mock_adapter(responses_by_range=responses)
         fetcher = SlicedUniverseFetcher(
-            adapter, mcap_min=30_000_000, mcap_max=40_000_000,
-            slice_width=10_000_000, limit_per_slice=limit,
+            adapter, mcap_min=250_000_000, mcap_max=300_000_000,
+            limit_per_slice=limit,
         )
         result = fetcher.fetch()
 
@@ -1563,7 +1610,7 @@ class TestSlicedUniverseFetcher:
         assert result.slice_subdivision_count == 1
         assert result.slice_limit_exhausted is False
         assert any(d.hit_limit and d.subdivided for d in result.slice_diagnostics)
-        assert any(d.lower == 30_000_000 and d.upper == 35_000_000 for d in result.slice_diagnostics)
+        assert any(d.lower == 250_000_000 and d.upper == 275_000_000 for d in result.slice_diagnostics)
 
     def test_min_width_limit_exhausted_fails_closed(self):
         """Subdivision at minimum width that still hits limit fails with slice_limit_exhausted."""
@@ -1801,7 +1848,7 @@ class TestCanonicalUniverseScan:
         assert scan is not None
         assert scan.trading_date == "2026-05-20"
         assert scan.run_status == "finished"
-        assert scan.included_count == 2
+        assert scan.included_count == 3
 
         canonical = db_session.query(CanonicalUniverseScan).filter(
             CanonicalUniverseScan.trading_date == "2026-05-20"
@@ -2047,9 +2094,9 @@ class TestCanonicalUniverseScan:
         self._run_builder(db_session)
 
         members = get_canonical_universe_members(db_session, "2026-05-20")
-        assert len(members) == 2
+        assert len(members) == 3
         tickers = {m.ticker for m in members}
-        assert tickers == {"INCL1", "INCL2"}
+        assert tickers == {"HUGE", "INCL1", "INCL2"}
 
         scan = get_canonical_universe_scan(db_session, "2026-05-20")
         assert all(m.scan_id == scan.scan_id for m in members)
@@ -2060,8 +2107,8 @@ class TestCanonicalUniverseScan:
         included = get_canonical_universe_members(db_session, "2026-05-20", included_only=True)
         all_members = get_canonical_universe_members(db_session, "2026-05-20", included_only=False)
 
-        assert len(included) == 2
-        assert len(all_members) == 7
+        assert len(included) == 3
+        assert len(all_members) == 8
 
     def test_canonical_members_ordered_by_ticker(self, db_session):
         resp = AdapterResponse(
@@ -2095,10 +2142,10 @@ class TestCanonicalUniverseScan:
         scans = db_session.query(UniverseScan).all()
         assert len(scans) == 1
         assert scans[0].trading_date == "2026-05-20"
-        assert scans[0].raw_count == 7
-        assert scans[0].deduped_count == 7
+        assert scans[0].raw_count == 8
+        assert scans[0].deduped_count == 8
         assert scans[0].duplicate_symbol_count == 0
-        assert scans[0].included_count == 2
+        assert scans[0].included_count == 3
         assert scans[0].excluded_count == 5
         assert scans[0].run_status == "finished"
         assert scans[0].output_hash is not None
@@ -2110,7 +2157,7 @@ class TestCanonicalUniverseScan:
         snaps = db_session.query(UniverseSnapshot).filter(
             UniverseSnapshot.scan_id == scan.scan_id
         ).all()
-        assert len(snaps) == 7
+        assert len(snaps) == 8
 
     def test_duplicate_ticker_in_same_scan_blocked(self, db_session):
         """DB unique constraint blocks same ticker twice in one scan."""

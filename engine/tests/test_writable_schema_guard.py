@@ -18,6 +18,7 @@ from alpha.jobs import (
     run_forward_return,
     run_m1_daily,
     run_m4_daily,
+    run_market_path_features,
     run_nasdaq_archive,
     run_universe,
 )
@@ -255,6 +256,48 @@ def test_writable_schema_entrypoints_preflight_before_session(
 
     assert rc == 1
     assert "schema 'scratch_missing' does not exist" in captured.out
+
+
+def test_market_path_schema_preflight_does_not_require_m3_tables(monkeypatch, capsys):
+    captured_kwargs = {}
+
+    monkeypatch.setattr(run_market_path_features, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        run_market_path_features,
+        "prepare_writable_schema_target",
+        lambda **kwargs: captured_kwargs.update(kwargs) or (_ for _ in ()).throw(
+            SchemaTargetError("schema preflight stop")
+        ),
+    )
+    monkeypatch.setattr(
+        run_market_path_features,
+        "get_session",
+        lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+    )
+
+    rc = run_market_path_features.main([
+        "--live",
+        "--schema",
+        "scratch_v3",
+        "--signal-start-date",
+        "2026-06-02",
+        "--signal-end-date",
+        "2026-06-02",
+        "--through-date",
+        "2026-06-05",
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "schema preflight stop" in out
+    assert captured_kwargs["required_tables"] == (
+        "evidence_jobs",
+        "evidence_job_runs",
+        "data_lineage",
+        "feature_snapshots",
+        "signal_registry",
+        "market_path_features",
+    )
 
 
 @pytest.mark.parametrize(

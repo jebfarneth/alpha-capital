@@ -12,6 +12,7 @@ from alpha.db.models import (
     CanonicalUniverseScan,
     EvidenceJob,
     EvidenceJobRun,
+    M2SecFetchCoverage,
     SecurityIdentitySnapshot,
     SignalRegistry,
     UniverseScan,
@@ -237,6 +238,7 @@ class FakeSecAdapter:
             for ticker, rows in (rows_by_ticker or {}).items()
         }
         self.error_tickers = {ticker.upper() for ticker in (error_tickers or set())}
+        self.form4_requests: list[dict[str, object]] = []
 
     def get_company_ticker(self, ticker, *, asof=None):
         ticker = ticker.upper()
@@ -248,6 +250,11 @@ class FakeSecAdapter:
 
     def get_form4_transactions(self, cik, *, from_date, to_date, asof=None):
         ticker = self.ticker_by_cik[cik]
+        self.form4_requests.append({
+            "ticker": ticker,
+            "from_date": from_date,
+            "to_date": to_date,
+        })
         if ticker in self.error_tickers:
             error = _provider_error(FORM4_TRANSACTIONS_ENDPOINT)
             return AdapterResponse(
@@ -321,6 +328,10 @@ def test_non_firing_fetch_error_finishes_and_cli_returns_zero(
     assert metrics["fetch_error_count"] == 1
     assert metrics["fatal_fetch_error_count"] == 0
     assert metrics["tolerated_fetch_error_count"] == 1
+    assert metrics["included_market_cap_bucket_counts"]["30m_100m"] == 2
+    assert metrics["tickers_with_transaction_history_count"] == 1
+    assert metrics["full_history_fetch_ticker_count"] == 2
+    assert metrics["m2_warm_path_requires_seeded_history"] is True
     assert db_session.query(SignalRegistry).filter_by(pattern_id="M2", ticker="FIRE").count() == 1
 
 
@@ -372,6 +383,33 @@ def test_zero_fetch_errors_finishes(db_session):
     assert result.metrics["fetch_error_count"] == 0
     assert result.metrics["fatal_fetch_error_count"] == 0
     assert result.metrics["tolerated_fetch_error_count"] == 0
+    assert result.metrics["included_market_cap_bucket_counts"]["30m_100m"] == 1
+    assert result.metrics["tickers_with_transaction_history_count"] == 0
+    assert result.metrics["tickers_with_sec_fetch_coverage_count"] == 0
+    assert result.metrics["tickers_with_m2_warm_coverage_count"] == 0
+    assert result.metrics["full_history_fetch_ticker_count"] == 1
+
+
+def test_no_form4_fetch_coverage_warms_next_run(db_session):
+    cik_by_ticker = _setup_m2_universe(db_session, ["QUIET"])
+    first_adapter = FakeSecAdapter(cik_by_ticker=cik_by_ticker)
+    first = _run_direct(db_session, first_adapter)
+
+    assert first.status == "finished"
+    assert first.metrics["full_history_fetch_ticker_count"] == 1
+    assert db_session.query(M2SecFetchCoverage).filter_by(ticker="QUIET").count() == 1
+
+    second_adapter = FakeSecAdapter(cik_by_ticker=cik_by_ticker)
+    second = _run_direct(db_session, second_adapter)
+
+    assert second.status == "finished"
+    assert second.metrics["tickers_with_transaction_history_count"] == 0
+    assert second.metrics["tickers_with_sec_fetch_coverage_count"] == 1
+    assert second.metrics["tickers_with_m2_warm_coverage_count"] == 1
+    assert second.metrics["full_history_fetch_ticker_count"] == 0
+    assert len(second_adapter.form4_requests) == 1
+    assert first_adapter.form4_requests
+    assert second_adapter.form4_requests[0]["from_date"] != first_adapter.form4_requests[0]["from_date"]
 
 
 def test_orchestration_partial_failed_still_escalates_without_fetch_errors(

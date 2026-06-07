@@ -27,6 +27,7 @@ from alpha.db.models import (
     M2ClusterMember,
     M2InsiderClassification,
     M2InsiderTransaction,
+    M2SecFetchCoverage,
     SecurityIdentitySnapshot,
     SignalRegistry,
     UniverseScan,
@@ -35,6 +36,7 @@ from alpha.db.models import (
 from alpha.evidence.writer import record_data_lineage
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.detector_orchestration import DetectorOrchestrationJob
+from alpha.jobs.universe_builder import market_cap_bucket_counts
 from alpha.market_calendar import EASTERN_TZ, resolve_us_equity_session
 from alpha.patterns.m2 import M2Detector
 
@@ -112,6 +114,7 @@ class M2DailyAssemblyJob(BaseJob):
                 errors=[{"stage": "canonical_universe", "message": canonical_error}],
             )
 
+        included_market_cap_bucket_counts = market_cap_bucket_counts(snapshots)
         identity_by_ticker = _load_identity_ciks(self._session, scan_id or "")
         lineage_ids_by_ticker: Dict[str, List[str]] = {}
         lineage_hashes_by_ticker: Dict[str, List[str]] = {}
@@ -132,11 +135,18 @@ class M2DailyAssemblyJob(BaseJob):
             has_prior_detection_window=has_prior_detection_window,
         )
         tickers = [snapshot.ticker.upper() for snapshot in snapshots]
-        tickers_with_history = _tickers_with_transaction_history(
+        tickers_with_transactions = _tickers_with_transaction_history(
             self._session,
             tickers=tickers,
             from_date=history_from_date,
         )
+        tickers_with_fetch_coverage = _tickers_with_sec_fetch_coverage(
+            self._session,
+            tickers=tickers,
+            ticker_to_cik=identity_by_ticker,
+            from_date=history_from_date,
+        )
+        tickers_with_history = tickers_with_transactions | tickers_with_fetch_coverage
         full_history_fetch_tickers: List[str] = []
 
         for snapshot in snapshots:
@@ -218,6 +228,19 @@ class M2DailyAssemblyJob(BaseJob):
                 )
                 for row in (sec_resp.data or [])
             ]
+            _persist_sec_fetch_coverage(
+                self._session,
+                ticker=ticker,
+                issuer_cik=issuer_cik,
+                from_date=ticker_fetch_from_date,
+                to_date=decision_day,
+                transaction_count=len(sec_evidence),
+                scan_id=scan_id,
+                snapshot=snapshot,
+                job_run_id=ctx.job_run_id,
+                data_lineage_id=sec_lineage.data_lineage_id,
+                raw_payload_hash=sec_resp.lineage.raw_payload_hash,
+            )
             for evidence in sec_evidence:
                 _persist_transaction(
                     self._session,
@@ -329,12 +352,24 @@ class M2DailyAssemblyJob(BaseJob):
             included_universe_size=len(snapshots),
             from_date=history_from_date,
             to_date=decision_day,
+            included_market_cap_bucket_counts=included_market_cap_bucket_counts,
         )
         metrics.update({
             "sec_form4_fetch_from_date": sec_fetch_from_date.isoformat(),
             "prior_detection_window_start": live_detection_window_start.isoformat(),
             "prior_detection_window_found": has_prior_detection_window,
+            # Widening the canonical universe can cold-pull M2 until newly
+            # included names have transaction history or successful SEC fetch
+            # coverage, including no-Form-4 coverage.
+            "tickers_with_transaction_history_count": len(tickers_with_transactions),
+            "tickers_with_transaction_history_sample": sorted(tickers_with_transactions)[:50],
+            "tickers_with_sec_fetch_coverage_count": len(tickers_with_fetch_coverage),
+            "tickers_with_sec_fetch_coverage_sample": sorted(tickers_with_fetch_coverage)[:50],
+            "tickers_with_m2_warm_coverage_count": len(tickers_with_history),
+            "tickers_with_m2_warm_coverage_sample": sorted(tickers_with_history)[:50],
             "full_history_fetch_ticker_count": len(full_history_fetch_tickers),
+            "full_history_fetch_ticker_sample": sorted(full_history_fetch_tickers)[:50],
+            "m2_warm_path_requires_seeded_history": bool(full_history_fetch_tickers),
             "sec_transaction_count": sec_transaction_count,
             "fmp_enrichment_count": fmp_enrichment_count,
             "unresolved_cik_count": unresolved_cik_count,
@@ -569,6 +604,51 @@ def _persist_transaction(
     session.flush()
 
 
+def _persist_sec_fetch_coverage(
+    session: Session,
+    *,
+    ticker: str,
+    issuer_cik: str,
+    from_date: date,
+    to_date: date,
+    transaction_count: int,
+    scan_id: Optional[str],
+    snapshot: UniverseSnapshot,
+    job_run_id: str,
+    data_lineage_id: Optional[str],
+    raw_payload_hash: Optional[str],
+) -> None:
+    ticker = ticker.upper()
+    from_value = from_date.isoformat()
+    to_value = to_date.isoformat()
+    existing = (
+        session.query(M2SecFetchCoverage)
+        .filter(
+            M2SecFetchCoverage.ticker == ticker,
+            M2SecFetchCoverage.issuer_cik == issuer_cik,
+            M2SecFetchCoverage.from_date == from_value,
+        )
+        .first()
+    )
+    if existing is None:
+        existing = M2SecFetchCoverage(
+            ticker=ticker,
+            issuer_cik=issuer_cik,
+            from_date=from_value,
+        )
+        session.add(existing)
+    existing.to_date = max(str(existing.to_date or to_value), to_value)
+    existing.status = "success"
+    existing.transaction_count = transaction_count
+    existing.scan_id = scan_id
+    existing.universe_snapshot_id = snapshot.universe_snapshot_id
+    existing.job_run_id = job_run_id
+    existing.data_lineage_id = data_lineage_id
+    existing.raw_payload_hash = raw_payload_hash
+    existing.fetched_at = datetime.now(timezone.utc)
+    session.flush()
+
+
 def _load_transactions(
     session: Session,
     *,
@@ -603,6 +683,40 @@ def _tickers_with_transaction_history(
         .all()
     )
     return {str(row[0]).upper() for row in rows if row[0]}
+
+
+def _tickers_with_sec_fetch_coverage(
+    session: Session,
+    *,
+    tickers: List[str],
+    ticker_to_cik: Dict[str, str],
+    from_date: date,
+) -> set[str]:
+    if not tickers:
+        return set()
+    rows = (
+        session.query(
+            M2SecFetchCoverage.ticker,
+            M2SecFetchCoverage.issuer_cik,
+        )
+        .filter(
+            M2SecFetchCoverage.ticker.in_(tickers),
+            M2SecFetchCoverage.from_date <= from_date.isoformat(),
+            M2SecFetchCoverage.status == "success",
+        )
+        .distinct()
+        .all()
+    )
+    covered: set[str] = set()
+    for ticker, issuer_cik in rows:
+        normalized = str(ticker or "").upper()
+        if not normalized:
+            continue
+        expected_cik = ticker_to_cik.get(normalized)
+        if expected_cik and issuer_cik and str(issuer_cik) != str(expected_cik):
+            continue
+        covered.add(normalized)
+    return covered
 
 
 def _with_detection_clock(evidence: Any, detected_at: Optional[datetime]) -> Any:
@@ -773,6 +887,7 @@ def _base_metrics(
     included_universe_size: int,
     from_date: date,
     to_date: date,
+    included_market_cap_bucket_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     return {
         "decision_date": session_resolution.decision_date,
@@ -782,6 +897,7 @@ def _base_metrics(
         "session_resolution": asdict(session_resolution),
         "canonical_scan_id": scan_id,
         "included_universe_size": included_universe_size,
+        "included_market_cap_bucket_counts": included_market_cap_bucket_counts or {},
         "form4_from_date": from_date.isoformat(),
         "form4_to_date": to_date.isoformat(),
     }
