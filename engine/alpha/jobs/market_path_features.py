@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from time import perf_counter
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 from sqlalchemy import inspect, text
@@ -78,6 +79,18 @@ RANK_INPUT_TO_OUTPUT = {
     "liquidity_proxy_score": ("liquidity_proxy_rank", "liquidity_proxy_percentile"),
 }
 SameDayPatternStrengthCache = dict[tuple[str, date], dict[str, float]]
+ProgressCallback = Callable[[str, dict[str, Any]], None]
+_URL_RE = re.compile(r"https?://[^\s'\"<>),]+")
+_RELATIVE_URL_QUERY_RE = re.compile(r"(?P<path>/[A-Za-z0-9._~:/%-]+)\?[^\s'\"<>),]+")
+_SECRET_FIELD_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|apikey|token|access[_-]?token|secret|authorization|bearer|key)"
+    r"\s*[:=]\s*[^\s,;&)\]}'\"]+"
+)
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&])(?:api[_-]?key|apikey|token|access[_-]?token|secret|authorization|key)="
+    r"[^&#\s,;)\]}'\"]+"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[^\s,;&)\]}'\"]+")
 
 ADVANCED_CONTEXT_FIELDS = (
     "universe_pct_above_sma_20d",
@@ -358,6 +371,85 @@ class _SectorResolution:
     pit_safe: bool
 
 
+@dataclass
+class MarketPathFeatureCollection:
+    decision_date: date | None
+    signal_start: date | None
+    signal_end: date | None
+    through_date: date | None
+    feature_version: str
+    pattern_ids: tuple[str, ...]
+    signals_scanned: int = 0
+    ticker_planned_count: int = 0
+    ticker_fetch_started_count: int = 0
+    ticker_fetch_finished_count: int = 0
+    ticker_fetch_error_count: int = 0
+    ticker_fetch_count: int = 0
+    lineages_recorded: int = 0
+    rows_inserted: int = 0
+    rows_updated: int = 0
+    rows_unchanged: int = 0
+    rows_skipped: int = 0
+    missing_entry_rows: int = 0
+    benchmark_fetch_count: int = 0
+    benchmark_fetch_error_count: int = 0
+    sector_etf_fetch_count: int = 0
+    sector_etf_fetch_error_count: int = 0
+    same_day_pattern_strength_key_count: int = 0
+    pending_lineages: list[DataLineage] | None = None
+    pending_feature_rows: list[dict[str, Any]] | None = None
+    fetch_errors: list[dict[str, Any]] | None = None
+    errors: list[dict[str, Any]] | None = None
+    stage_timings: dict[str, float] | None = None
+    no_op_reason: str | None = None
+
+    @property
+    def status(self) -> str:
+        if self.errors:
+            return "failed"
+        if self.fetch_errors:
+            return "partial_failed"
+        return "finished"
+
+    @property
+    def rows_upserted(self) -> int:
+        return len(self.pending_feature_rows or [])
+
+    def metrics(self) -> dict[str, Any]:
+        metrics = {
+            "decision_date": self.decision_date.isoformat() if self.decision_date else None,
+            "pattern_ids": list(self.pattern_ids),
+            "signal_start_date": self.signal_start.isoformat() if self.signal_start else None,
+            "signal_end_date": self.signal_end.isoformat() if self.signal_end else None,
+            "through_date": self.through_date.isoformat() if self.through_date else None,
+            "feature_version": self.feature_version,
+            "reconstruction_method": RECONSTRUCTION_METHOD,
+            "signals_scanned": self.signals_scanned,
+            "ticker_planned_count": self.ticker_planned_count,
+            "ticker_fetch_started_count": self.ticker_fetch_started_count,
+            "ticker_fetch_finished_count": self.ticker_fetch_finished_count,
+            "ticker_fetch_error_count": self.ticker_fetch_error_count,
+            "ticker_fetch_count": self.ticker_fetch_count,
+            "lineages_recorded": self.lineages_recorded,
+            "rows_inserted": self.rows_inserted,
+            "rows_updated": self.rows_updated,
+            "rows_unchanged": self.rows_unchanged,
+            "rows_upserted": self.rows_upserted,
+            "rows_skipped": self.rows_skipped,
+            "missing_entry_row_count": self.missing_entry_rows,
+            "fetch_error_count": len(self.fetch_errors or []),
+            "benchmark_fetch_count": self.benchmark_fetch_count,
+            "benchmark_fetch_error_count": self.benchmark_fetch_error_count,
+            "sector_etf_fetch_count": self.sector_etf_fetch_count,
+            "sector_etf_fetch_error_count": self.sector_etf_fetch_error_count,
+            "same_day_pattern_strength_key_count": self.same_day_pattern_strength_key_count,
+            "stage_timing_seconds": self.stage_timings or {},
+        }
+        if self.no_op_reason:
+            metrics["no_op_reason"] = self.no_op_reason
+        return metrics
+
+
 class MarketPathFeatureJob(BaseJob):
     """Compute and persist daily market-path features for existing signals."""
 
@@ -377,7 +469,14 @@ class MarketPathFeatureJob(BaseJob):
         include_signal_session: bool = False,
         liquidity_min_dollar_volume_20d: float = 100_000.0,
         liquidity_min_price: float = 1.0,
+        progress_callback: ProgressCallback | None = None,
+        progress_every: int = 10,
+        max_fetch_concurrency: int = 1,
     ) -> None:
+        if progress_every < 1:
+            raise ValueError("progress_every must be >= 1")
+        if max_fetch_concurrency < 1:
+            raise ValueError("max_fetch_concurrency must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._run_timestamp = run_timestamp
@@ -391,6 +490,9 @@ class MarketPathFeatureJob(BaseJob):
         self._include_signal_session = include_signal_session
         self._liquidity_min_dollar_volume_20d = liquidity_min_dollar_volume_20d
         self._liquidity_min_price = liquidity_min_price
+        self._progress_callback = progress_callback
+        self._progress_every = progress_every
+        self._max_fetch_concurrency = max_fetch_concurrency
 
     @property
     def job_name(self) -> str:
@@ -401,6 +503,55 @@ class MarketPathFeatureJob(BaseJob):
         return "feature_enrichment"
 
     def run(self, ctx: JobContext) -> JobResult:
+        collection = self.collect_feature_rows(ctx)
+        if collection.errors:
+            return JobResult(
+                status="failed",
+                metrics=collection.metrics(),
+                errors=collection.errors,
+            )
+
+        stage_timings = collection.stage_timings or {}
+        started = perf_counter()
+        if collection.pending_lineages:
+            self._session.add_all(collection.pending_lineages)
+            self._session.flush()
+        _record_timing(stage_timings, "batched_lineage_flush_seconds", started)
+
+        started = perf_counter()
+        _bulk_upsert_market_path_features(
+            self._session,
+            collection.pending_feature_rows or [],
+        )
+        if collection.pending_feature_rows:
+            self._session.expire_all()
+        _record_timing(stage_timings, "row_upsert_persist_seconds", started)
+
+        rank_rows_updated = 0
+        if collection.signal_start is not None and collection.through_date is not None:
+            started = perf_counter()
+            rank_rows_updated = self._populate_cross_sectional_ranks(
+                start_date=collection.signal_start,
+                through_date=collection.through_date,
+                progress_callback=self._emit_progress,
+                progress_every=self._progress_every,
+            )
+            _record_timing(stage_timings, "cross_sectional_rank_pass_seconds", started)
+
+        metrics = collection.metrics()
+        metrics["rank_rows_updated"] = rank_rows_updated
+        metrics["liquidity_proxy_min_dollar_volume_20d"] = (
+            self._liquidity_min_dollar_volume_20d
+        )
+        metrics["liquidity_proxy_min_price"] = self._liquidity_min_price
+        metrics["stage_timing_seconds"] = stage_timings
+        return JobResult(
+            status=collection.status,
+            metrics=metrics,
+            errors=collection.fetch_errors or [],
+        )
+
+    def collect_feature_rows(self, ctx: JobContext) -> MarketPathFeatureCollection:
         job_started = perf_counter()
         stage_timings: dict[str, float] = {}
         run_ts = _ensure_aware(self._run_timestamp or ctx.started_at)
@@ -412,41 +563,64 @@ class MarketPathFeatureJob(BaseJob):
         signal_end = self._signal_end_date or through_date
         decision_date = self._decision_date or signal_end
         if signal_start > signal_end:
-            return JobResult(
-                status="failed",
+            return MarketPathFeatureCollection(
+                decision_date=decision_date,
+                signal_start=signal_start,
+                signal_end=signal_end,
+                through_date=through_date,
+                feature_version=self._feature_version,
+                pattern_ids=self._pattern_ids,
                 errors=[{
                     "stage": "args",
                     "message": "signal_start_date must be on or before signal_end_date",
                 }],
             )
         if self._lookback_calendar_days < 70:
-            return JobResult(
-                status="failed",
+            return MarketPathFeatureCollection(
+                decision_date=decision_date,
+                signal_start=signal_start,
+                signal_end=signal_end,
+                through_date=through_date,
+                feature_version=self._feature_version,
+                pattern_ids=self._pattern_ids,
                 errors=[{
                     "stage": "args",
                     "message": "lookback_calendar_days must be at least 70",
                 }],
             )
 
+        self._emit_progress(
+            "signal_load_start",
+            {
+                "pattern_ids": list(self._pattern_ids),
+                "signal_start_date": signal_start.isoformat(),
+                "signal_end_date": signal_end.isoformat(),
+            },
+        )
         started = perf_counter()
         signals = self._signals(signal_start, signal_end)
         _record_timing(stage_timings, "signal_load_seconds", started)
+        self._emit_progress(
+            "signal_load_finish",
+            {
+                "signals_loaded": len(signals),
+                "elapsed_seconds": _elapsed_since(started),
+            },
+        )
         if not signals:
             _record_timing(stage_timings, "job_internal_total_seconds", job_started)
-            return JobResult(
-                status="finished",
-                metrics={
-                    "decision_date": decision_date.isoformat(),
-                    "pattern_ids": list(self._pattern_ids),
-                    "signal_start_date": signal_start.isoformat(),
-                    "signal_end_date": signal_end.isoformat(),
-                    "through_date": through_date.isoformat(),
-                    "signals_scanned": 0,
-                    "rows_inserted": 0,
-                    "rows_updated": 0,
-                    "no_op_reason": "no_matching_signals",
-                    "stage_timing_seconds": stage_timings,
-                },
+            return MarketPathFeatureCollection(
+                decision_date=decision_date,
+                signal_start=signal_start,
+                signal_end=signal_end,
+                through_date=through_date,
+                feature_version=self._feature_version,
+                pattern_ids=self._pattern_ids,
+                pending_lineages=[],
+                pending_feature_rows=[],
+                fetch_errors=[],
+                stage_timings=stage_timings,
+                no_op_reason="no_matching_signals",
             )
 
         rows_inserted = 0
@@ -460,6 +634,15 @@ class MarketPathFeatureJob(BaseJob):
         pending_lineages: list[DataLineage] = []
         pending_feature_rows: list[dict[str, Any]] = []
         reference_from_date = _fetch_start(signals, self._lookback_calendar_days)
+        self._emit_progress(
+            "reference_fetch_start",
+            {
+                "source_role": "market_benchmark",
+                "symbol_count": len(BENCHMARK_SYMBOLS),
+                "from_date": reference_from_date.isoformat(),
+                "through_date": through_date.isoformat(),
+            },
+        )
         started = perf_counter()
         benchmark_series = self._fetch_reference_series(
             BENCHMARK_SYMBOLS,
@@ -471,6 +654,15 @@ class MarketPathFeatureJob(BaseJob):
             pending_lineages=pending_lineages,
         )
         _record_timing(stage_timings, "benchmark_reference_fetch_seconds", started)
+        self._emit_progress(
+            "reference_fetch_finish",
+            {
+                "source_role": "market_benchmark",
+                "symbol_count": len(BENCHMARK_SYMBOLS),
+                "fetch_error_count": _reference_error_count(benchmark_series),
+                "elapsed_seconds": _elapsed_since(started),
+            },
+        )
         started = perf_counter()
         sector_resolver = _SectorResolver(self._session)
         _record_timing(stage_timings, "sector_resolver_table_check_seconds", started)
@@ -481,6 +673,15 @@ class MarketPathFeatureJob(BaseJob):
             sector_resolver=sector_resolver,
         )
         _record_timing(stage_timings, "sector_etf_resolution_seconds", started)
+        self._emit_progress(
+            "reference_fetch_start",
+            {
+                "source_role": "sector_etf",
+                "symbol_count": len(needed_sector_etfs),
+                "from_date": reference_from_date.isoformat(),
+                "through_date": through_date.isoformat(),
+            },
+        )
         started = perf_counter()
         sector_etf_series = self._fetch_reference_series(
             needed_sector_etfs,
@@ -492,10 +693,27 @@ class MarketPathFeatureJob(BaseJob):
             pending_lineages=pending_lineages,
         )
         _record_timing(stage_timings, "sector_reference_fetch_seconds", started)
+        self._emit_progress(
+            "reference_fetch_finish",
+            {
+                "source_role": "sector_etf",
+                "symbol_count": len(needed_sector_etfs),
+                "fetch_error_count": _reference_error_count(sector_etf_series),
+                "elapsed_seconds": _elapsed_since(started),
+            },
+        )
 
         started = perf_counter()
         by_ticker = _group_by_ticker(signals)
         _record_timing(stage_timings, "signal_grouping_seconds", started)
+        self._emit_progress(
+            "tickers_planned",
+            {
+                "ticker_count": len(by_ticker),
+                "max_fetch_concurrency_requested": self._max_fetch_concurrency,
+                "max_fetch_concurrency_effective": 1,
+            },
+        )
         started = perf_counter()
         same_day_pattern_strengths = _prefetch_same_day_pattern_strengths(
             self._session,
@@ -505,8 +723,22 @@ class MarketPathFeatureJob(BaseJob):
         started = perf_counter()
         existing = self._existing_rows(signals)
         _record_timing(stage_timings, "existing_row_lookup_seconds", started)
+        ticker_fetch_started = 0
+        ticker_fetch_finished = 0
+        ticker_fetch_error_count = 0
         for ticker, ticker_signals in by_ticker.items():
             from_date = _fetch_start(ticker_signals, self._lookback_calendar_days)
+            ticker_fetch_started += 1
+            self._emit_ticker_progress(
+                "ticker_fetch_start",
+                ticker=ticker,
+                started=ticker_fetch_started,
+                finished=ticker_fetch_finished,
+                errors=ticker_fetch_error_count,
+                total=len(by_ticker),
+                from_date=from_date,
+                through_date=through_date,
+            )
             started = perf_counter()
             resp = self._fmp.get_historical_price(
                 ticker,
@@ -517,14 +749,52 @@ class MarketPathFeatureJob(BaseJob):
             )
             _record_timing(stage_timings, "ticker_fmp_fetch_seconds", started)
             tickers_fetched += 1
+            ticker_fetch_finished += 1
             if not resp.ok or resp.data is None:
-                fetch_errors.append({
+                ticker_fetch_error_count += 1
+                fetch_error = {
                     "ticker": ticker,
                     "stage": "fmp_historical_price",
-                    "message": getattr(resp.error, "message", "missing response"),
+                    "message": sanitize_provider_error_message(
+                        getattr(resp.error, "message", "missing response")
+                    ),
                     "error_type": getattr(resp.error, "error_type", None),
-                })
+                    "retryable": getattr(resp.error, "retryable", None),
+                    "status_code": getattr(resp.error, "status_code", None),
+                    "provider": getattr(resp.error, "provider", None),
+                    **_retry_metadata_from_lineage(resp),
+                }
+                fetch_errors.append(fetch_error)
+                self._emit_ticker_progress(
+                    "ticker_fetch_error",
+                    ticker=ticker,
+                    started=ticker_fetch_started,
+                    finished=ticker_fetch_finished,
+                    errors=ticker_fetch_error_count,
+                    total=len(by_ticker),
+                    from_date=from_date,
+                    through_date=through_date,
+                    elapsed_seconds=_elapsed_since(started),
+                    message=sanitize_provider_error_message(
+                        getattr(resp.error, "message", "missing response")
+                    ),
+                    error_type=getattr(resp.error, "error_type", None),
+                    retry_attempt_count=fetch_error.get("retry_attempt_count"),
+                    retry_exhausted=fetch_error.get("retry_exhausted"),
+                )
                 continue
+            self._emit_ticker_progress(
+                "ticker_fetch_finish",
+                ticker=ticker,
+                started=ticker_fetch_started,
+                finished=ticker_fetch_finished,
+                errors=ticker_fetch_error_count,
+                total=len(by_ticker),
+                from_date=from_date,
+                through_date=through_date,
+                elapsed_seconds=_elapsed_since(started),
+                bar_count=len(resp.data or []),
+            )
             started = perf_counter()
             bars = _clean_bars(resp.data)
             _record_timing(stage_timings, "ticker_bar_clean_seconds", started)
@@ -575,55 +845,91 @@ class MarketPathFeatureJob(BaseJob):
                 rows_skipped += result["skipped"]
                 missing_entry_rows += result["missing_entry"]
             _record_timing(stage_timings, "per_ticker_feature_persist_seconds", started)
+            self._emit_progress(
+                "feature_rows_generated",
+                {
+                    "ticker": ticker,
+                    "pending_feature_rows": len(pending_feature_rows),
+                    "inserted": rows_inserted,
+                    "updated": rows_updated,
+                    "unchanged": rows_unchanged,
+                    "skipped": rows_skipped,
+                },
+            )
 
-        started = perf_counter()
-        if pending_lineages:
-            self._session.add_all(pending_lineages)
-            self._session.flush()
-        _record_timing(stage_timings, "batched_lineage_flush_seconds", started)
-        started = perf_counter()
-        _bulk_upsert_market_path_features(self._session, pending_feature_rows)
-        if pending_feature_rows:
-            self._session.expire_all()
-        _record_timing(stage_timings, "row_upsert_persist_seconds", started)
-
-        started = perf_counter()
-        rank_rows_updated = self._populate_cross_sectional_ranks(
-            start_date=signal_start,
-            through_date=through_date,
-        )
-        _record_timing(stage_timings, "cross_sectional_rank_pass_seconds", started)
         _record_timing(stage_timings, "job_internal_total_seconds", job_started)
-        metrics = {
-            "decision_date": decision_date.isoformat(),
-            "pattern_ids": list(self._pattern_ids),
-            "signal_start_date": signal_start.isoformat(),
-            "signal_end_date": signal_end.isoformat(),
-            "through_date": through_date.isoformat(),
-            "feature_version": self._feature_version,
-            "reconstruction_method": RECONSTRUCTION_METHOD,
-            "signals_scanned": len(signals),
-            "ticker_fetch_count": tickers_fetched,
-            "lineages_recorded": lineages_recorded,
-            "rows_inserted": rows_inserted,
-            "rows_updated": rows_updated,
-            "rows_unchanged": rows_unchanged,
-            "rows_upserted": len(pending_feature_rows),
-            "rows_skipped": rows_skipped,
-            "rank_rows_updated": rank_rows_updated,
-            "missing_entry_row_count": missing_entry_rows,
-            "fetch_error_count": len(fetch_errors),
-            "benchmark_fetch_count": len(BENCHMARK_SYMBOLS),
-            "benchmark_fetch_error_count": _reference_error_count(benchmark_series),
-            "sector_etf_fetch_count": len(sector_etf_series),
-            "sector_etf_fetch_error_count": _reference_error_count(sector_etf_series),
-            "same_day_pattern_strength_key_count": len(same_day_pattern_strengths),
-            "liquidity_proxy_min_dollar_volume_20d": self._liquidity_min_dollar_volume_20d,
-            "liquidity_proxy_min_price": self._liquidity_min_price,
-            "stage_timing_seconds": stage_timings,
-        }
-        status = "partial_failed" if fetch_errors else "finished"
-        return JobResult(status=status, metrics=metrics, errors=fetch_errors)
+        return MarketPathFeatureCollection(
+            decision_date=decision_date,
+            signal_start=signal_start,
+            signal_end=signal_end,
+            through_date=through_date,
+            feature_version=self._feature_version,
+            pattern_ids=self._pattern_ids,
+            signals_scanned=len(signals),
+            ticker_planned_count=len(by_ticker),
+            ticker_fetch_started_count=ticker_fetch_started,
+            ticker_fetch_finished_count=ticker_fetch_finished,
+            ticker_fetch_error_count=ticker_fetch_error_count,
+            ticker_fetch_count=tickers_fetched,
+            lineages_recorded=lineages_recorded,
+            rows_inserted=rows_inserted,
+            rows_updated=rows_updated,
+            rows_unchanged=rows_unchanged,
+            rows_skipped=rows_skipped,
+            missing_entry_rows=missing_entry_rows,
+            benchmark_fetch_count=len(BENCHMARK_SYMBOLS),
+            benchmark_fetch_error_count=_reference_error_count(benchmark_series),
+            sector_etf_fetch_count=len(sector_etf_series),
+            sector_etf_fetch_error_count=_reference_error_count(sector_etf_series),
+            same_day_pattern_strength_key_count=len(same_day_pattern_strengths),
+            pending_lineages=pending_lineages,
+            pending_feature_rows=pending_feature_rows,
+            fetch_errors=fetch_errors,
+            stage_timings=stage_timings,
+        )
+
+    def _emit_progress(self, event: str, payload: dict[str, Any]) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(event, payload)
+        except Exception:
+            return
+
+    def _emit_ticker_progress(
+        self,
+        event: str,
+        *,
+        ticker: str,
+        started: int,
+        finished: int,
+        errors: int,
+        total: int,
+        from_date: date,
+        through_date: date,
+        **extra: Any,
+    ) -> None:
+        should_emit = (
+            event == "ticker_fetch_error"
+            or started == 1
+            or finished == total
+            or finished % self._progress_every == 0
+        )
+        if not should_emit:
+            return
+        self._emit_progress(
+            event,
+            {
+                "ticker": ticker,
+                "ticker_fetch_started_count": started,
+                "ticker_fetch_finished_count": finished,
+                "ticker_fetch_error_count": errors,
+                "ticker_count": total,
+                "from_date": from_date.isoformat(),
+                "through_date": through_date.isoformat(),
+                **extra,
+            },
+        )
 
     def _signals(self, start: date, end: date) -> list[SignalRegistry]:
         start_dt = datetime.combine(start, time.min, timezone.utc)
@@ -687,8 +993,14 @@ class MarketPathFeatureJob(BaseJob):
                     error={
                         "symbol": symbol,
                         "stage": f"fmp_{source_role}",
-                        "message": getattr(resp.error, "message", "missing response"),
+                        "message": sanitize_provider_error_message(
+                            getattr(resp.error, "message", "missing response")
+                        ),
                         "error_type": getattr(resp.error, "error_type", None),
+                        "provider": getattr(resp.error, "provider", None),
+                        "status_code": getattr(resp.error, "status_code", None),
+                        "retryable": getattr(resp.error, "retryable", None),
+                        **_retry_metadata_from_lineage(resp),
                     },
                 )
                 continue
@@ -1068,7 +1380,10 @@ class MarketPathFeatureJob(BaseJob):
         *,
         start_date: date,
         through_date: date,
+        progress_callback: ProgressCallback | None = None,
+        progress_every: int | None = None,
     ) -> int:
+        rank_started = perf_counter()
         rows = (
             self._session.query(MarketPathFeature)
             .filter(
@@ -1093,7 +1408,9 @@ class MarketPathFeatureJob(BaseJob):
             ).append(row)
 
         updated = 0
-        for (feature_date, pattern_id, feature_version), group_rows in grouped.items():
+        rank_group_total = len(grouped)
+        progress_step = progress_every or self._progress_every
+        for group_index, ((feature_date, pattern_id, feature_version), group_rows) in enumerate(grouped.items(), start=1):
             pattern_count = len(group_rows)
             tracked_fields = _cross_sectional_tracked_fields()
             previous_values = {
@@ -1208,6 +1525,34 @@ class MarketPathFeatureJob(BaseJob):
                     row.output_hash = new_output_hash
                 if rank_values_changed or json_changed or hash_changed:
                     updated += 1
+            if (
+                group_index == 1
+                or group_index == rank_group_total
+                or group_index % progress_step == 0
+            ):
+                _safe_rank_progress(
+                    progress_callback,
+                    {
+                        "rank_group_processed": group_index,
+                        "rank_group_total": rank_group_total,
+                        "feature_session_date": feature_date,
+                        "pattern_id": pattern_id,
+                        "feature_version": feature_version,
+                        "elapsed_seconds": _elapsed_since(rank_started),
+                    },
+                )
+        if rank_group_total == 0:
+            _safe_rank_progress(
+                progress_callback,
+                {
+                    "rank_group_processed": 0,
+                    "rank_group_total": 0,
+                    "feature_session_date": None,
+                    "pattern_id": None,
+                    "feature_version": self._feature_version,
+                    "elapsed_seconds": _elapsed_since(rank_started),
+                },
+            )
         return updated
 
 
@@ -1381,6 +1726,86 @@ def _build_data_lineage(
 
 def _record_timing(timings: dict[str, float], key: str, started: float) -> None:
     timings[key] = round(timings.get(key, 0.0) + (perf_counter() - started), 6)
+
+
+def _elapsed_since(started: float) -> float:
+    return round(perf_counter() - started, 6)
+
+
+def _safe_rank_progress(
+    callback: ProgressCallback | None,
+    payload: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback("rank_group_progress", payload)
+    except Exception:
+        return
+
+
+def _retry_metadata_from_lineage(response: Any) -> dict[str, Any]:
+    lineage = getattr(response, "lineage", None)
+    flags = getattr(lineage, "data_quality_flags", None)
+    if not isinstance(flags, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    field_map = {
+        "market_path_bulk_retry_attempt_count": "retry_attempt_count",
+        "market_path_bulk_retry_max_retries": "retry_max_retries",
+        "market_path_bulk_retry_exhausted": "retry_exhausted",
+        "market_path_bulk_request_timeout_seconds": "request_timeout_seconds",
+    }
+    for source, target in field_map.items():
+        if source in flags:
+            metadata[target] = flags[source]
+    attempts = flags.get("market_path_bulk_retry_attempts")
+    if isinstance(attempts, list):
+        metadata["retry_attempts"] = [
+            {
+                key: _sanitize_retry_value(attempt.get(key))
+                for key in (
+                    "attempt",
+                    "ok",
+                    "elapsed_seconds",
+                    "provider",
+                    "endpoint",
+                    "status_code",
+                    "error_type",
+                    "message",
+                    "retryable",
+                )
+                if isinstance(attempt, dict) and key in attempt
+            }
+            for attempt in attempts
+            if isinstance(attempt, dict)
+        ]
+    return metadata
+
+
+def sanitize_provider_error_message(value: Any) -> Any:
+    """Return a diagnostics-safe provider error string without credentials."""
+
+    if value is None:
+        return value
+    text_value = str(value)
+
+    def strip_url_query(match: re.Match[str]) -> str:
+        url = match.group(0)
+        return url.split("?", 1)[0]
+
+    sanitized = _URL_RE.sub(strip_url_query, text_value)
+    sanitized = _RELATIVE_URL_QUERY_RE.sub(lambda match: match.group("path"), sanitized)
+    sanitized = _SECRET_QUERY_RE.sub(r"\1credential=<redacted>", sanitized)
+    sanitized = _BEARER_TOKEN_RE.sub("credential=<redacted>", sanitized)
+    sanitized = _SECRET_FIELD_RE.sub("credential=<redacted>", sanitized)
+    return sanitized
+
+
+def _sanitize_retry_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_provider_error_message(value)
+    return value
 
 
 def _merge_cross_sectional_feature_json(

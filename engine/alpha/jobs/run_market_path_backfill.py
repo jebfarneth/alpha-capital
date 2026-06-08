@@ -164,6 +164,16 @@ class CachedHistoricalPriceFmpAdapter:
             asof=asof,
             **kwargs,
         )
+        if response.ok and response.data is not None:
+            response = AdapterResponse(
+                data=_filter_cached_bars(
+                    response.data,
+                    from_date=requested_from,
+                    to_date=requested_to,
+                ),
+                lineage=response.lineage,
+                rate_limit=response.rate_limit,
+            )
         self._historical_price_cache.append(
             _CachedHistoricalPrice(
                 ticker=normalized_ticker,

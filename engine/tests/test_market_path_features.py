@@ -15,11 +15,19 @@ from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, 
 from alpha.jobs.contracts import JobResult
 from alpha.jobs.market_path_features import MarketPathFeatureJob
 from alpha.jobs.market_path_features import _same_day_pattern_strengths_from_cache
+from alpha.jobs.market_path_features import sanitize_provider_error_message
 from alpha.jobs.run_market_path_backfill import (
     BackfillRunConfig,
     CachedHistoricalPriceFmpAdapter,
     plan_chunks,
     run_backfill_chunks,
+)
+from alpha.jobs.run_market_path_bulk_backfill import (
+    MarketPathBulkBackfillJob,
+    RetryingHistoricalPriceFmpAdapter,
+    _TimeoutRequestsSession,
+    _validate_write_target,
+    plan_bulk_batches,
 )
 from alpha.jobs.runner import run_job
 
@@ -28,9 +36,15 @@ RUN_TS = datetime(2026, 6, 5, 21, 0, tzinfo=timezone.utc)
 
 
 class FakeFmpAdapter:
-    def __init__(self, bars_by_ticker, fail_symbols: set[str] | None = None):
+    def __init__(
+        self,
+        bars_by_ticker,
+        fail_symbols: set[str] | None = None,
+        fail_message: str | None = None,
+    ):
         self.bars_by_ticker = bars_by_ticker
         self.fail_symbols = {symbol.upper() for symbol in (fail_symbols or set())}
+        self.fail_message = fail_message
         self.calls = []
 
     def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
@@ -57,7 +71,7 @@ class FakeFmpAdapter:
                     endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
                     status_code=503,
                     error_type="http",
-                    message=f"forced failure for {ticker}",
+                    message=self.fail_message or f"forced failure for {ticker}",
                     retryable=True,
                 ),
             )
@@ -993,6 +1007,164 @@ def test_market_path_backfill_fmp_cache_reuses_superset_requests():
     assert different_asof.lineage.data_quality_flags is None
 
 
+def test_market_path_bulk_retry_wrapper_retries_retryable_historical_fetch():
+    class TransientAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
+            self.calls += 1
+            lineage = LineageMeta(
+                provider="FMP",
+                endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                request_timestamp=RUN_TS,
+                asof_timestamp=asof or RUN_TS,
+                raw_payload_hash=stable_hash({"ticker": ticker, "call": self.calls}),
+            )
+            if self.calls == 1:
+                return AdapterResponse(
+                    data=None,
+                    lineage=lineage,
+                    error=ProviderError(
+                        provider="FMP",
+                        endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                        status_code=503,
+                        error_type="http",
+                        message="transient",
+                        retryable=True,
+                    ),
+                )
+            return AdapterResponse(data=_bars(), lineage=lineage)
+
+    adapter = TransientAdapter()
+    retrying = RetryingHistoricalPriceFmpAdapter(
+        adapter,
+        max_retries=2,
+        retry_sleep_seconds=0.0,
+    )
+
+    response = retrying.get_historical_price(
+        "LCUT",
+        from_date=date(2026, 6, 1),
+        to_date=date(2026, 6, 3),
+        asof=RUN_TS,
+        adjusted=False,
+    )
+
+    assert response.ok
+    assert adapter.calls == 2
+    flags = response.lineage.data_quality_flags
+    assert flags["market_path_bulk_retry_attempt_count"] == 2
+    assert flags["market_path_bulk_retry_exhausted"] is False
+    assert flags["market_path_bulk_retry_attempts"][0]["error_type"] == "http"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "GET https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=ABC&apikey=SECRET failed",
+        "GET https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=ABC&api_key=SECRET&from=2026-01-01 failed",
+        "GET https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=ABC&token=SECRET&to=2026-01-02 failed",
+        "Max retries exceeded with url: /stable/historical-price-eod/full?symbol=ABC&apikey=SECRET (Caused by NewConnectionError('https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=ABC&api_key=SECRET'))",
+        "Authorization: Bearer SECRET failed for https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=ABC&token=SECRET&apikey=ALSOSECRET",
+    ],
+)
+def test_market_path_bulk_sanitizes_provider_error_messages(message):
+    sanitized = sanitize_provider_error_message(message)
+    dumped = json.dumps({"message": sanitized})
+
+    assert "SECRET" not in dumped
+    assert "ALSOSECRET" not in dumped
+    assert "apikey" not in dumped.lower()
+    assert "api_key" not in dumped.lower()
+    assert "token" not in dumped.lower()
+    assert "authorization" not in dumped.lower()
+    assert "?" not in sanitized
+    assert "/stable/historical-price-eod/full" in sanitized
+
+
+def test_market_path_bulk_retry_lineage_flags_are_sanitized_on_exhaustion():
+    leaky_message = (
+        "HTTPSConnectionPool(host='financialmodelingprep.com', port=443): "
+        "Max retries exceeded with url: "
+        "/stable/historical-price-eod/full?symbol=LCUT&from=2026-06-01"
+        "&apikey=SECRET&token=ALSOSECRET"
+    )
+
+    class LeakyFailureAdapter:
+        def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider="FMP",
+                    endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                    request_timestamp=RUN_TS,
+                    asof_timestamp=asof or RUN_TS,
+                    raw_payload_hash=stable_hash({"ticker": ticker, "failed": True}),
+                    data_quality_flags={
+                        "upstream_message": leaky_message,
+                    },
+                ),
+                error=ProviderError(
+                    provider="FMP",
+                    endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                    status_code=None,
+                    error_type="http",
+                    message=leaky_message,
+                    retryable=True,
+                ),
+            )
+
+    retrying = RetryingHistoricalPriceFmpAdapter(
+        LeakyFailureAdapter(),
+        max_retries=1,
+        retry_sleep_seconds=0.0,
+        request_timeout_seconds=4.0,
+    )
+
+    response = retrying.get_historical_price(
+        "LCUT",
+        from_date=date(2026, 6, 1),
+        to_date=date(2026, 6, 3),
+        asof=RUN_TS,
+        adjusted=False,
+    )
+    dumped = json.dumps(response.lineage.data_quality_flags, sort_keys=True)
+
+    assert not response.ok
+    assert response.error.message != leaky_message
+    assert response.lineage.data_quality_flags["market_path_bulk_retry_attempt_count"] == 2
+    assert response.lineage.data_quality_flags["market_path_bulk_retry_max_retries"] == 1
+    assert response.lineage.data_quality_flags["market_path_bulk_retry_exhausted"] is True
+    assert response.lineage.data_quality_flags["market_path_bulk_request_timeout_seconds"] == 4.0
+    assert "SECRET" not in dumped
+    assert "ALSOSECRET" not in dumped
+    assert "apikey" not in dumped.lower()
+    assert "api_key" not in dumped.lower()
+    assert "token" not in dumped.lower()
+    assert "authorization" not in dumped.lower()
+    assert "?" not in dumped
+
+
+def test_market_path_bulk_timeout_session_overrides_adapter_default_timeout(monkeypatch):
+    captured = {}
+
+    def fake_request(self, method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        response = type("Response", (), {})()
+        response.status_code = 200
+        response.headers = {}
+        response.text = "[]"
+        response.json = lambda: []
+        return response
+
+    monkeypatch.setattr("requests.sessions.Session.request", fake_request)
+    session = _TimeoutRequestsSession(7.5)
+    session.get("https://example.invalid/test", timeout=30)
+
+    assert captured["timeout"] == 7.5
+
+
 def test_market_path_backfill_persists_cache_hit_lineage_flag(db_session, tmp_path):
     _add_signal(
         db_session,
@@ -1039,6 +1211,271 @@ def test_market_path_backfill_persists_cache_hit_lineage_flag(db_session, tmp_pa
     assert flags["derived_feature_replay"] is True
     assert flags["lineage_payload_schema"] == "compact_bar_digest_v1"
     assert flags["adapter_raw_payload_hash"]
+
+
+def test_market_path_bulk_backfill_refuses_unconfirmed_public_write():
+    with pytest.raises(ValueError, match="confirm-live-write"):
+        _validate_write_target(schema=None, confirm_live_write=False)
+
+    _validate_write_target(schema="scratch_market_path", confirm_live_write=False)
+    _validate_write_target(schema=None, confirm_live_write=True)
+
+
+def test_market_path_bulk_backfill_plans_pattern_date_batches():
+    batches = plan_bulk_batches(
+        ["M4", "M1"],
+        signal_start_date=date(2026, 6, 1),
+        signal_end_date=date(2026, 6, 5),
+        batch_days=2,
+    )
+
+    assert [
+        (batch.pattern_id, batch.signal_start_date.isoformat(), batch.signal_end_date.isoformat())
+        for batch in batches
+    ] == [
+        ("M4", "2026-06-01", "2026-06-02"),
+        ("M4", "2026-06-03", "2026-06-04"),
+        ("M4", "2026-06-05", "2026-06-05"),
+        ("M1", "2026-06-01", "2026-06-02"),
+        ("M1", "2026-06-03", "2026-06-04"),
+        ("M1", "2026-06-05", "2026-06-05"),
+    ]
+
+
+def test_market_path_bulk_backfill_stage_merge_idempotent_and_deferred_rank(
+    db_session,
+    tmp_path,
+):
+    _add_signal(
+        db_session,
+        ticker="AAAA",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="BBBB",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="CCCC",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    _add_signal(
+        db_session,
+        ticker="DDDD",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    adapter = CachedHistoricalPriceFmpAdapter(_adapter_with_references({
+        "AAAA": _replace_bar(_rich_bars(), date(2026, 6, 3), close=40.0, volume=1_000_000),
+        "BBBB": _replace_bar(_rich_bars(), date(2026, 6, 3), close=20.0, volume=500_000),
+        "CCCC": _replace_bar(_rich_bars(), date(2026, 6, 3), close=30.0, volume=800_000),
+        "DDDD": _replace_bar(_rich_bars(), date(2026, 6, 3), close=10.0, volume=300_000),
+    }))
+
+    def bulk_job(fmp_adapter, artifact_name):
+        return MarketPathBulkBackfillJob(
+            session=db_session,
+            fmp_adapter=fmp_adapter,
+            pattern_ids=("M4",),
+            signal_start_date=date(2026, 6, 1),
+            signal_end_date=date(2026, 6, 2),
+            through_date=date(2026, 6, 3),
+            run_timestamp=RUN_TS,
+            batch_days=1,
+            include_signal_session=True,
+            progress_artifact=tmp_path / artifact_name,
+            schema="scratch_test",
+        )
+
+    first = run_job(db_session, bulk_job(adapter, "bulk_first.json"))
+    assert first.status == "finished"
+    assert first.metrics["batch_count"] == 2
+    assert first.metrics["rank_pass_count"] == 1
+    assert first.metrics["ticker_fetch_started_count"] == 4
+    assert first.metrics["ticker_fetch_finished_count"] == 4
+    assert first.metrics["ticker_fetch_error_count"] == 0
+    assert first.metrics["scoped_feature_row_count"] == 10
+    assert first.metrics["duplicate_groups"] == 0
+    assert first.metrics["pre_entry_leakage_count"] == 0
+    assert first.metrics["missing_lineage_hash_count"] == 0
+    assert first.metrics["rank_populated_count"] == 10
+    assert first.metrics["rows_merged"] == 10
+    assert adapter.cache_hits > 0
+    first_artifact = json.loads((tmp_path / "bulk_first.json").read_text())
+    first_batch_events = {
+        event["event"]
+        for event in first_artifact["batches"][0]["progress_events"]
+    }
+    assert {
+        "batch_start",
+        "signal_load_start",
+        "signal_load_finish",
+        "reference_fetch_start",
+        "reference_fetch_finish",
+        "tickers_planned",
+        "ticker_fetch_start",
+        "ticker_fetch_finish",
+        "feature_rows_generated",
+        "collect_finish",
+        "staging_write_start",
+        "stage_load_start",
+        "stage_load_finish",
+        "merge_upsert_start",
+        "merge_upsert_finish",
+        "staging_write_finish",
+        "batch_finish",
+        "batch_artifact_written",
+    } <= first_batch_events
+    run_events = {event["event"] for event in first_artifact["progress_events"]}
+    assert {
+        "rank_pass_start",
+        "rank_group_progress",
+        "rank_pass_finish",
+        "validation_start",
+        "validation_finish",
+    } <= run_events
+    ordered_run_events = [event["event"] for event in first_artifact["progress_events"]]
+    assert ordered_run_events.index("rank_group_progress") < ordered_run_events.index("rank_pass_finish")
+    rank_events = [
+        event for event in first_artifact["progress_events"]
+        if event["event"] == "rank_group_progress"
+    ]
+    assert rank_events[-1]["rank_group_processed"] == rank_events[-1]["rank_group_total"]
+    assert rank_events[-1]["feature_session_date"]
+    assert rank_events[-1]["pattern_id"] == "M4"
+    assert rank_events[-1]["feature_version"] == "market_path_daily_v3"
+    assert rank_events[-1]["elapsed_seconds"] >= 0
+    first_hashes = {
+        (row.signal_id, row.feature_session_date): (
+            row.output_hash,
+            row.feature_json,
+        )
+        for row in db_session.query(MarketPathFeature).all()
+    }
+
+    second = run_job(db_session, bulk_job(adapter, "bulk_second.json"))
+    assert second.status == "finished"
+    assert second.metrics["rows_inserted"] == 0
+    assert second.metrics["rows_updated"] == 0
+    assert second.metrics["rows_unchanged"] == 10
+    assert second.metrics["rows_merged"] == 0
+    assert second.metrics["rank_rows_updated"] == 0
+    assert second.metrics["duplicate_groups"] == 0
+    assert second.metrics["pre_entry_leakage_count"] == 0
+    assert {
+        (row.signal_id, row.feature_session_date): (
+            row.output_hash,
+            row.feature_json,
+        )
+        for row in db_session.query(MarketPathFeature).all()
+    } == first_hashes
+
+    changed_adapter = CachedHistoricalPriceFmpAdapter(_adapter_with_references({
+        "AAAA": _replace_bar(_rich_bars(), date(2026, 6, 3), close=40.0, volume=1_000_000),
+        "BBBB": _replace_bar(_rich_bars(), date(2026, 6, 3), close=95.0, volume=3_000_000),
+        "CCCC": _replace_bar(_rich_bars(), date(2026, 6, 3), close=30.0, volume=800_000),
+        "DDDD": _replace_bar(_rich_bars(), date(2026, 6, 3), close=10.0, volume=300_000),
+    }))
+    material = run_job(db_session, bulk_job(changed_adapter, "bulk_material.json"))
+    assert material.status == "finished"
+    assert material.metrics["rows_updated"] > 0
+    assert material.metrics["rows_merged"] > 0
+    assert material.metrics["rank_rows_updated"] > 0
+    assert any(
+        first_hashes[key][0] != row.output_hash
+        for row in db_session.query(MarketPathFeature).all()
+        if (key := (row.signal_id, row.feature_session_date)) in first_hashes
+    )
+
+
+def test_market_path_bulk_failed_fetch_artifact_preserves_retry_metadata(
+    db_session,
+    tmp_path,
+):
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+    leaky_message = (
+        "HTTPSConnectionPool(host='financialmodelingprep.com', port=443): "
+        "Max retries exceeded with url: "
+        "/stable/historical-price-eod/full?symbol=LCUT&apikey=SECRET"
+        "&api_key=ALSOSECRET&token=THIRDSECRET"
+    )
+    adapter = RetryingHistoricalPriceFmpAdapter(
+        FakeFmpAdapter(
+            {
+                "LCUT": _rich_bars(),
+                "SPY": _reference_bars(),
+                "QQQ": _reference_bars(),
+                "IWM": _reference_bars(),
+            },
+            fail_symbols={"LCUT"},
+            fail_message=leaky_message,
+        ),
+        max_retries=1,
+        retry_sleep_seconds=0.0,
+        request_timeout_seconds=6.5,
+    )
+    artifact_path = tmp_path / "bulk_failed_fetch.json"
+
+    result = run_job(
+        db_session,
+        MarketPathBulkBackfillJob(
+            session=db_session,
+            fmp_adapter=adapter,
+            pattern_ids=("M4",),
+            signal_start_date=date(2026, 6, 2),
+            signal_end_date=date(2026, 6, 2),
+            through_date=date(2026, 6, 3),
+            run_timestamp=RUN_TS,
+            batch_days=1,
+            progress_artifact=artifact_path,
+            schema="scratch_test",
+        ),
+    )
+
+    assert result.status == "partial_failed"
+    assert result.errors
+    error = result.errors[0]
+    assert error["ticker"] == "LCUT"
+    assert error["provider"] == "FMP"
+    assert error["status_code"] == 503
+    assert error["error_type"] == "http"
+    assert error["message"] != leaky_message
+    assert error["retryable"] is True
+    assert error["retry_attempt_count"] == 2
+    assert error["retry_max_retries"] == 1
+    assert error["retry_exhausted"] is True
+    assert error["request_timeout_seconds"] == 6.5
+    assert [attempt["attempt"] for attempt in error["retry_attempts"]] == [1, 2]
+
+    artifact = json.loads(artifact_path.read_text())
+    batch_error = artifact["batches"][0]["fetch_errors"][0]
+    summary_error = artifact["summary"]["fetch_error_sample"][0]
+    for persisted in (batch_error, summary_error):
+        dumped = json.dumps(persisted, sort_keys=True)
+        assert persisted["ticker"] == "LCUT"
+        assert persisted["message"] != leaky_message
+        assert persisted["retry_attempt_count"] == 2
+        assert persisted["retry_max_retries"] == 1
+        assert persisted["retry_exhausted"] is True
+        assert persisted["request_timeout_seconds"] == 6.5
+        assert persisted["retry_attempts"][0]["error_type"] == "http"
+        assert "SECRET" not in dumped
+        assert "ALSOSECRET" not in dumped
+        assert "THIRDSECRET" not in dumped
+        assert "apikey" not in dumped.lower()
+        assert "api_key" not in dumped.lower()
+        assert "token" not in dumped.lower()
+        assert "?" not in dumped
 
 
 def test_market_path_v3_rank_pass_isolates_date_pattern_and_version(db_session):
