@@ -113,7 +113,15 @@ The platform treats nulls as first-class evidence. A null with `missing_intraday
 
 ## Market-Path Feature Store
 
-`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity.
+`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The current public proof covers M4 and M1 signal-day plus forward-path rows for 2026-06-01 through 2026-06-05; the next planned extension is pre-signal setup context so models can learn what strong winners looked like before the signal fired.
+
+The intended ML corpus has three separate zones:
+
+| Zone | Purpose | Leakage rule |
+|---|---|---|
+| Pre-signal setup | T-60 through T-1 context before a signal fires. | Predictors only; no signal-day or forward-path values. |
+| Signal-day anatomy | T0 close/candle/volume/context and day-zero behavior. | Usable only when the decision clock could have known it. |
+| Forward outcome path | T+1 through horizon returns, MFE/MAE, barrier/exit labels. | Labels and diagnostics only; never same-row predictors. |
 
 Already built locally:
 
@@ -146,8 +154,8 @@ Alpha Capital uses a pattern roster rather than a single monolithic signal. Each
 
 | Pattern | Thesis | Current status |
 |---|---|---|
-| M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Producer/assembler/detector built; integrated into measurement spine. |
-| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Producer/assembler/detector built; source-gating fixed; widened-universe seed staged. |
+| M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Producer/assembler/detector built; integrated into measurement spine; early evidence suggests signal-day/intraday timing matters more than next-session entry. |
+| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Producer/assembler/detector built; source-gating fixed; paused in production until the widened-universe SEC seed is made resumable/batched. |
 | M2U - Insider Cluster Upside | M2 variant focused on upside cluster behavior. | Built with M2 path. |
 | M3 - Sector Rotation | PIT sector-relative return and cross-sectional sector rank. | Detector and sector-history pipeline built; default-off pending coverage gates. |
 | M4 - 52-Week High | EOD close breaks prior 52-week high. | Original live signal-accumulation lane. |
@@ -187,7 +195,7 @@ Key design decisions:
 - Fetch errors on tickers that actually fire are fatal because the signal would be certified on incomplete evidence.
 - A SEC fetch-coverage ledger warms tickers even when they have no Form 4 history, preventing repeated full-history cold pulls.
 
-The widened `$30M-$5B` universe materially increases the number of tickers M2 must scan. The system therefore stages the SEC warm seed before enabling the wide universe with M2 in production.
+The widened `$30M-$5B` universe materially increases the number of tickers M2 must scan. The first long SEC warm seed exposed a runtime/DB reliability problem, so production currently skips M2 while the seed path is redesigned as a resumable/batched job.
 
 ---
 
@@ -266,14 +274,15 @@ The immediate research loop is:
 
 ```text
 Build historical PIT universe by date
--> replay M4/I11-style fires by date
--> reconstruct 15-session forward paths
--> persist market-path features
+-> replay pattern fires by date
+-> persist pre-signal setup context
+-> persist signal-day anatomy
+-> reconstruct forward paths and labels
 -> train ranking/exit/selection models
 -> test by date, universe bucket, liquidity bucket, and pattern
 ```
 
-This is also why the current system is collecting broad feature rows before broker execution. Without clean labels and features, an optimizer would only automate guesswork.
+This is also why the current system is collecting broad feature rows before broker execution. The M-patterns are useful as event and evidence generators even if their naive next-session trade rules are not profitable. The likely trading edge is expected to come from point-in-time meta-labeling and intraday derivative patterns such as I11, after the corpus proves which day-zero setups actually follow through.
 
 ---
 
