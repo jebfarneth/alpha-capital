@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
-from sqlalchemy import func
+from sqlalchemy import event, func
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
@@ -18,6 +19,8 @@ from alpha.db.models import (
     UniverseSnapshot,
 )
 from alpha.jobs.run_historical_m4_range_replay import (
+    _BulkDetectionRecord,
+    _existing_feature_snapshots,
     main as range_cli_main,
     run_historical_m4_range_replay,
 )
@@ -636,6 +639,50 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
         progress_every=1,
     )
     _seed_unrelated_feature_snapshots(db_session, START_DAY, count=1200)
+    existing_feature = (
+        db_session.query(FeatureSnapshot)
+        .filter(
+            FeatureSnapshot.pattern_id == "M4",
+            FeatureSnapshot.ticker == "RIDM",
+            FeatureSnapshot.asof_timestamp == us_equity_session_close_timestamp(START_DAY),
+        )
+        .one()
+    )
+    lookup_record = _BulkDetectionRecord(
+        result=SimpleNamespace(
+            pattern_id="M4",
+            asof_timestamp=existing_feature.asof_timestamp,
+        ),
+        ticker="RIDM",
+        feature_payload={},
+        feature_hash=existing_feature.feature_hash,
+        feature_json="{}",
+        output_hash="lookup-test",
+        data_lineage_ids=[],
+        universe_snapshot_id=None,
+        next_execution_session=None,
+    )
+    captured_sql: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        captured_sql.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", capture_sql)
+    try:
+        lookup = _existing_feature_snapshots(db_session, [lookup_record])
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", capture_sql)
+
+    assert lookup.row_count >= 1201
+    assert existing_feature.feature_snapshot_id in lookup.rows.values()
+    lookup_sql = "\n".join(captured_sql).casefold()
+    assert "feature_json" not in lookup_sql
+    assert "data_lineage_ids" not in lookup_sql
+    assert "input_hashes" not in lookup_sql
+    assert "output_hash" not in lookup_sql
+    assert "feature_snapshot_id" in lookup_sql
+    assert "feature_hash" in lookup_sql
+
     second = run_historical_m4_range_replay(
         session=db_session,
         fmp_adapter=adapter,

@@ -1632,9 +1632,9 @@ class HistoricalM4RangeReplayJob(BaseJob):
             },
         )
 
-        feature_ids_by_key: dict[tuple[str, str, datetime, str], str] = {
-            key: row.feature_snapshot_id for key, row in existing_features.items()
-        }
+        feature_ids_by_key: dict[tuple[str, str, datetime, str], str] = dict(
+            existing_features
+        )
         feature_insert_mappings: list[dict[str, Any]] = []
         feature_records_by_id: dict[str, _BulkDetectionRecord] = {}
         fired_feature_ids: set[str] = set()
@@ -2098,11 +2098,17 @@ def _existing_feature_snapshots(
         return _ExistingLookup(rows={}, row_count=0)
     target_keys = {_feature_key(record) for record in records}
     asofs = sorted({key[2] for key in target_keys})
-    by_key: dict[tuple[str, str, datetime, str], FeatureSnapshot] = {}
+    by_key: dict[tuple[str, str, datetime, str], str] = {}
     row_count = 0
     for asof in asofs:
         rows = (
-            session.query(FeatureSnapshot)
+            session.query(
+                FeatureSnapshot.feature_snapshot_id,
+                FeatureSnapshot.pattern_id,
+                FeatureSnapshot.ticker,
+                FeatureSnapshot.asof_timestamp,
+                FeatureSnapshot.feature_hash,
+            )
             .filter(
                 FeatureSnapshot.pattern_id == "M4",
                 FeatureSnapshot.asof_timestamp == asof,
@@ -2118,7 +2124,7 @@ def _existing_feature_snapshots(
                 row.feature_hash,
             )
             if key in target_keys:
-                by_key[key] = row
+                by_key[key] = row.feature_snapshot_id
     return _ExistingLookup(rows=by_key, row_count=row_count)
 
 
