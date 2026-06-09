@@ -21,7 +21,7 @@ from time import perf_counter
 from typing import Any, Callable, Sequence
 from uuid import uuid4
 
-from sqlalchemy import func, text
+from sqlalchemy import func, text, tuple_
 from sqlalchemy.orm import Session
 
 from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
@@ -125,6 +125,12 @@ class _BulkDetectionRecord:
     next_execution_session: str | None
     signal_identity_hash: str | None = None
     signal_identity_components: dict[str, Any] | None = None
+
+
+@dataclass
+class _ExistingLookup:
+    rows: dict[Any, Any]
+    row_count: int
 
 
 class HistoricalM4RangeReplayJob(BaseJob):
@@ -1591,8 +1597,40 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 "record_count": len(records),
             },
         )
-        existing_features = _existing_feature_snapshots(self._session, records)
-        existing_signals = _existing_signals(self._session, records)
+        feature_lookup_started = perf_counter()
+        existing_feature_lookup = _existing_feature_snapshots(self._session, records)
+        existing_features = existing_feature_lookup.rows
+        existing_feature_lookup_seconds = round(
+            perf_counter() - feature_lookup_started,
+            6,
+        )
+        self._emit_progress(
+            "range_date_existing_feature_lookup_finish",
+            {
+                "replay_date": replay_date,
+                "record_count": len(records),
+                "row_count": existing_feature_lookup.row_count,
+                "matched_count": len(existing_features),
+                "elapsed_seconds": existing_feature_lookup_seconds,
+            },
+        )
+        signal_lookup_started = perf_counter()
+        existing_signal_lookup = _existing_signals(self._session, records)
+        existing_signals = existing_signal_lookup.rows
+        existing_signal_lookup_seconds = round(
+            perf_counter() - signal_lookup_started,
+            6,
+        )
+        self._emit_progress(
+            "range_date_existing_signal_lookup_finish",
+            {
+                "replay_date": replay_date,
+                "record_count": len(records),
+                "row_count": existing_signal_lookup.row_count,
+                "matched_count": len(existing_signals),
+                "elapsed_seconds": existing_signal_lookup_seconds,
+            },
+        )
 
         feature_ids_by_key: dict[tuple[str, str, datetime, str], str] = {
             key: row.feature_snapshot_id for key, row in existing_features.items()
@@ -1673,6 +1711,9 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 "replay_date": replay_date,
                 "features_inserted": len(feature_insert_mappings),
                 "features_reused": len(records) - len(feature_insert_mappings),
+                "existing_feature_lookup_seconds": existing_feature_lookup_seconds,
+                "existing_feature_lookup_record_count": len(records),
+                "existing_feature_lookup_row_count": existing_feature_lookup.row_count,
                 "elapsed_seconds": feature_stage_seconds,
             },
         )
@@ -1697,6 +1738,8 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 "signals_inserted": len(signal_insert_mappings),
                 "signals_reused": len(reused_signal_ids),
                 "next_execution_updates": signal_next_execution_updates,
+                "existing_signal_lookup_seconds": existing_signal_lookup_seconds,
+                "existing_signal_lookup_row_count": existing_signal_lookup.row_count,
                 "elapsed_seconds": signal_stage_seconds,
             },
         )
@@ -1726,9 +1769,16 @@ class HistoricalM4RangeReplayJob(BaseJob):
             "inserted_signal_ids": inserted_signal_ids,
             "reused_signal_ids": reused_signal_ids,
             "signal_next_execution_updates": signal_next_execution_updates,
+            "existing_feature_lookup_seconds": existing_feature_lookup_seconds,
+            "existing_feature_lookup_record_count": len(records),
+            "existing_feature_lookup_row_count": existing_feature_lookup.row_count,
+            "existing_signal_lookup_seconds": existing_signal_lookup_seconds,
+            "existing_signal_lookup_row_count": existing_signal_lookup.row_count,
             "persistence_timing_seconds": {
                 "feature_snapshot_stage_seconds": feature_stage_seconds,
                 "signal_stage_seconds": signal_stage_seconds,
+                "existing_feature_lookup_seconds": existing_feature_lookup_seconds,
+                "existing_signal_lookup_seconds": existing_signal_lookup_seconds,
                 "total_persistence_seconds": round(perf_counter() - started, 6),
             },
         }
@@ -2043,62 +2093,76 @@ def _feature_key(record: _BulkDetectionRecord) -> tuple[str, str, datetime, str]
 def _existing_feature_snapshots(
     session: Session,
     records: Sequence[_BulkDetectionRecord],
-) -> dict[tuple[str, str, datetime, str], FeatureSnapshot]:
+) -> _ExistingLookup:
     if not records:
-        return {}
-    tickers = sorted({record.ticker for record in records})
-    asofs = sorted({_aware_utc(record.result.asof_timestamp) for record in records})
-    feature_hashes = sorted({record.feature_hash for record in records})
-    rows = (
-        session.query(FeatureSnapshot)
-        .filter(
-            FeatureSnapshot.pattern_id == "M4",
-            FeatureSnapshot.ticker.in_(tickers),
-            FeatureSnapshot.asof_timestamp.in_(asofs),
-            FeatureSnapshot.feature_hash.in_(feature_hashes),
-        )
-        .all()
-    )
+        return _ExistingLookup(rows={}, row_count=0)
+    target_keys = {_feature_key(record) for record in records}
+    asofs = sorted({key[2] for key in target_keys})
     by_key: dict[tuple[str, str, datetime, str], FeatureSnapshot] = {}
-    for row in rows:
-        by_key[
-            (
+    row_count = 0
+    for asof in asofs:
+        rows = (
+            session.query(FeatureSnapshot)
+            .filter(
+                FeatureSnapshot.pattern_id == "M4",
+                FeatureSnapshot.asof_timestamp == asof,
+            )
+            .all()
+        )
+        row_count += len(rows)
+        for row in rows:
+            key = (
                 row.pattern_id,
                 row.ticker,
                 _aware_utc(row.asof_timestamp),
                 row.feature_hash,
             )
-        ] = row
-    return by_key
+            if key in target_keys:
+                by_key[key] = row
+    return _ExistingLookup(rows=by_key, row_count=row_count)
 
 
 def _existing_signals(
     session: Session,
     records: Sequence[_BulkDetectionRecord],
-) -> dict[tuple[str, str, str | None], SignalRegistry]:
-    hashes = sorted(
-        {
-            record.signal_identity_hash
-            for record in records
-            if record.signal_identity_hash
-        }
-    )
-    if not hashes:
-        return {}
-    tickers = sorted({record.ticker for record in records if record.signal_identity_hash})
-    rows = (
-        session.query(SignalRegistry)
-        .filter(
-            SignalRegistry.pattern_id == "M4",
-            SignalRegistry.ticker.in_(tickers),
-            SignalRegistry.signal_identity_hash.in_(hashes),
+) -> _ExistingLookup:
+    keys = sorted(
+        (
+            record.result.pattern_id,
+            record.ticker,
+            record.signal_identity_hash,
         )
-        .all()
+        for record in records
+        if record.signal_identity_hash
     )
-    return {
-        (row.pattern_id, row.ticker, row.signal_identity_hash): row
-        for row in rows
-    }
+    if not keys:
+        return _ExistingLookup(rows={}, row_count=0)
+    by_key: dict[tuple[str, str, str | None], SignalRegistry] = {}
+    row_count = 0
+    for chunk in _chunks(keys, 500):
+        rows = (
+            session.query(SignalRegistry)
+            .filter(
+                tuple_(
+                    SignalRegistry.pattern_id,
+                    SignalRegistry.ticker,
+                    SignalRegistry.signal_identity_hash,
+                ).in_(chunk)
+            )
+            .all()
+        )
+        row_count += len(rows)
+        by_key.update(
+            {
+                (row.pattern_id, row.ticker, row.signal_identity_hash): row
+                for row in rows
+            }
+        )
+    return _ExistingLookup(rows=by_key, row_count=row_count)
+
+
+def _chunks(values: Sequence[Any], size: int) -> list[Sequence[Any]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
 
 
 def _resolved_input_lineage_ids_from_cache(

@@ -305,6 +305,41 @@ def _feature_for(db_session, ticker: str, replay_day: date) -> dict:
     return json.loads(row.feature_json)
 
 
+def _seed_unrelated_feature_snapshots(
+    db_session,
+    replay_day: date,
+    *,
+    count: int,
+) -> None:
+    asof = us_equity_session_close_timestamp(replay_day)
+    mappings = [
+        {
+            "feature_snapshot_id": f"noise-feature-{replay_day.isoformat()}-{index}",
+            "pattern_id": "M4",
+            "ticker": f"ZZ{index:04d}",
+            "asof_timestamp": asof,
+            "feature_manifest_version": "noise",
+            "feature_json": json.dumps(
+                {
+                    "reconstruction_method": "historical_m4_replay_fmp_eod",
+                    "replay_date": replay_day.isoformat(),
+                    "lookback_end": previous_us_equity_session(
+                        replay_day,
+                    ).isoformat(),
+                },
+                sort_keys=True,
+            ),
+            "feature_hash": f"noise-hash-{replay_day.isoformat()}-{index}",
+            "data_lineage_ids": json.dumps([f"noise-lineage-{index}"]),
+            "input_hashes": json.dumps({"noise": index}),
+            "output_hash": f"noise-output-{replay_day.isoformat()}-{index}",
+        }
+        for index in range(count)
+    ]
+    db_session.execute(FeatureSnapshot.__table__.insert(), mappings)
+    db_session.flush()
+
+
 def test_range_replay_fetches_each_ticker_once_and_slices_bars_per_date(db_session):
     _seed_active_universe(db_session, ["RNGF", "RNGN"])
     adapter = _FakeFmpAdapter(
@@ -600,6 +635,7 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
         run_timestamp=_ts(),
         progress_every=1,
     )
+    _seed_unrelated_feature_snapshots(db_session, START_DAY, count=1200)
     second = run_historical_m4_range_replay(
         session=db_session,
         fmp_adapter=adapter,
@@ -612,6 +648,22 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
     assert first.metrics["total_rows_inserted"] == 2
     assert second.metrics["total_rows_inserted"] == 0
     assert second.metrics["total_rows_reused"] == 2
+    first_date_orchestration = second.metrics["date_results"][0]["orchestration"]
+    second_date_orchestration = second.metrics["date_results"][1]["orchestration"]
+    assert first_date_orchestration["features_inserted"] == 0
+    assert first_date_orchestration["features_reused"] == 1
+    assert first_date_orchestration["existing_feature_lookup_record_count"] == 1
+    assert first_date_orchestration["existing_feature_lookup_row_count"] >= 1201
+    assert first_date_orchestration["existing_feature_lookup_seconds"] >= 0
+    assert first_date_orchestration["existing_signal_lookup_row_count"] == 1
+    assert first_date_orchestration["existing_signal_lookup_seconds"] >= 0
+    assert second_date_orchestration["features_inserted"] == 0
+    assert second_date_orchestration["features_reused"] == 1
+    assert second_date_orchestration["existing_feature_lookup_record_count"] == 1
+    assert second_date_orchestration["existing_feature_lookup_row_count"] == 1
+    event_names = [event["event"] for event in second.metrics["progress_events"]]
+    assert "range_date_existing_feature_lookup_finish" in event_names
+    assert "range_date_existing_signal_lookup_finish" in event_names
     assert second.metrics["validation"]["duplicate_m4_signal_identity_groups"] == 0
     assert second.metrics["validation"]["duplicate_m4_feature_snapshot_groups"] == 0
     assert second.metrics["validation"]["duplicate_historical_universe_groups"] == 0
