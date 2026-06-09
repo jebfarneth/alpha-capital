@@ -10,12 +10,16 @@ from sqlalchemy import event, inspect, text
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
-from alpha.db.models import DataLineage, MarketPathFeature
+from alpha.db.models import DataLineage, FeatureSnapshot, MarketPathFeature, SignalRegistry
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import JobResult
 from alpha.jobs.market_path_features import MarketPathFeatureJob
 from alpha.jobs.market_path_features import _same_day_pattern_strengths_from_cache
 from alpha.jobs.market_path_features import sanitize_provider_error_message
+from alpha.jobs.historical_m4_signal_selector import (
+    HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD,
+    SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
+)
 from alpha.jobs.run_market_path_backfill import (
     BackfillRunConfig,
     CachedHistoricalPriceFmpAdapter,
@@ -140,6 +144,18 @@ def _add_signal(
         signal_identity_hash=f"{ticker}-{signal_day}",
         data_lineage_ids=[lineage.data_lineage_id],
     )
+
+
+def _stamp_signal_historical_m4_replay(db_session, signal_id: str) -> None:
+    signal = db_session.get(SignalRegistry, signal_id)
+    feature = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    payload = json.loads(feature.feature_json)
+    payload["reconstruction_method"] = HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD
+    payload["historical_replay"] = {
+        "reconstruction_method": HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD,
+    }
+    feature.feature_json = json.dumps(payload, sort_keys=True)
+    db_session.flush()
 
 
 def _bars() -> list[FmpBar]:
@@ -456,6 +472,53 @@ def test_market_path_feature_job_writes_daily_features(db_session):
     assert feature_json["stop_basis"] == "split_adjusted_close_when_available_else_raw_close"
     assert feature_json["rich_eod_status"]["missing_vwap"] is True
     assert feature_json["rich_eod_status"]["insufficient_history"]["prior_52w_high"] is True
+
+
+def test_market_path_historical_m4_signal_source_excludes_unreplayed_live_rows(db_session):
+    historical_signal = _add_signal(db_session, ticker="HIST")
+    stale_live_signal = _add_signal(db_session, ticker="RKTO")
+    _stamp_signal_historical_m4_replay(db_session, historical_signal.signal_id)
+
+    default_job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"HIST": _bars(), "RKTO": _bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 2),
+        signal_end_date=date(2026, 6, 2),
+        through_date=date(2026, 6, 5),
+    )
+    assert {
+        signal.ticker
+        for signal in default_job._signals(date(2026, 6, 2), date(2026, 6, 2))
+    } == {"HIST", "RKTO"}
+
+    historical_job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"HIST": _bars(), "RKTO": _bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 2),
+        signal_end_date=date(2026, 6, 2),
+        through_date=date(2026, 6, 5),
+        signal_source=SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
+    )
+
+    result = run_job(db_session, historical_job)
+
+    assert result.status == "finished"
+    assert result.metrics["signal_source"] == SIGNAL_SOURCE_HISTORICAL_M4_REPLAY
+    assert result.metrics["signals_scanned"] == 1
+    assert (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id == historical_signal.signal_id)
+        .count()
+    ) == 3
+    assert (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id == stale_live_signal.signal_id)
+        .count()
+    ) == 0
 
 
 def test_market_path_rich_columns_exist_in_metadata(db_session):

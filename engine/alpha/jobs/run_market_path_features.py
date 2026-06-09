@@ -30,6 +30,10 @@ from alpha.jobs.market_path_features import (
     MarketPathFeatureJob,
 )
 from alpha.jobs.runner import run_job
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_CHOICES,
+    SIGNAL_SOURCE_LIVE,
+)
 from alpha.runtime_env import load_runtime_env
 
 
@@ -99,6 +103,7 @@ def _run_live(args: argparse.Namespace) -> int:
             include_signal_session=args.include_signal_session,
             liquidity_min_dollar_volume_20d=args.liquidity_min_dollar_volume_20d,
             liquidity_min_price=args.liquidity_min_price,
+            signal_source=args.signal_source,
         )
         result = run_job(
             session,
@@ -113,6 +118,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "through_date": args.through_date,
                 "lookback_calendar_days": args.lookback_calendar_days,
                 "include_signal_session": args.include_signal_session,
+                "signal_source": args.signal_source,
                 "schema": args.schema,
             },
         )
@@ -124,6 +130,7 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Signal end date:        {metrics.get('signal_end_date')}")
         print(f"Through date:           {metrics.get('through_date')}")
         print(f"Feature version:        {metrics.get('feature_version')}")
+        print(f"Signal source:          {metrics.get('signal_source')}")
         print(f"Signals scanned:        {metrics.get('signals_scanned')}")
         print(f"Ticker fetches:         {metrics.get('ticker_fetch_count')}")
         print(f"Rows inserted:          {metrics.get('rows_inserted')}")
@@ -173,6 +180,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_LOOKBACK_CALENDAR_DAYS,
     )
     parser.add_argument("--include-signal-session", action="store_true")
+    parser.add_argument(
+        "--signal-source",
+        choices=SIGNAL_SOURCE_CHOICES,
+        default=SIGNAL_SOURCE_LIVE,
+        help=(
+            "Signal corpus to consume. Use historical-m4-replay for ML/backfills "
+            "that must exclude stale live M4 rows outside replay membership."
+        ),
+    )
     parser.add_argument("--liquidity-min-dollar-volume-20d", type=float, default=100_000.0)
     parser.add_argument("--liquidity-min-price", type=float, default=1.0)
     args = parser.parse_args(argv)

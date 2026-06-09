@@ -29,6 +29,7 @@ from alpha.data.nasdaq import (
 from alpha.db.engine import schema_connect_args
 from alpha.db.models import (
     DataLineage,
+    FeatureSnapshot,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     ForwardReturnPathRow,
@@ -51,6 +52,11 @@ from alpha.jobs.forward_return import (
     _security_identity_from_payload,
     current_forward_path_rows,
     m4_entry_exit_plan,
+)
+from alpha.jobs.historical_m4_signal_selector import (
+    HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD,
+    SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
+    SIGNAL_SOURCE_LIVE,
 )
 from alpha.jobs.run_forward_return import _live_timestamp_error
 from alpha.jobs.runner import run_job
@@ -648,6 +654,17 @@ def _make_signal(
     return sig.signal_id
 
 
+def _stamp_signal_historical_m4_replay(db_session, signal_id: str) -> None:
+    signal = db_session.get(SignalRegistry, signal_id)
+    feature = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    payload = json.loads(feature.feature_json)
+    payload["historical_replay"] = {
+        "reconstruction_method": HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD,
+    }
+    feature.feature_json = json.dumps(payload, sort_keys=True)
+    db_session.flush()
+
+
 def _run_job(
     db_session,
     adapter,
@@ -662,6 +679,7 @@ def _run_job(
     price_drift_rel_tol=0.0005,
     survivorship_adapters=None,
     listing_authority_adapter=None,
+    signal_source=SIGNAL_SOURCE_LIVE,
 ):
     return run_job(
         db_session,
@@ -678,6 +696,7 @@ def _run_job(
             revision_window_sessions=revision_window_sessions,
             price_drift_abs_tol=price_drift_abs_tol,
             price_drift_rel_tol=price_drift_rel_tol,
+            signal_source=signal_source,
         ),
         params={
             "run_timestamp": run_ts.isoformat(),
@@ -686,6 +705,7 @@ def _run_job(
             "revision_window_sessions": revision_window_sessions,
             "price_drift_abs_tol": price_drift_abs_tol,
             "price_drift_rel_tol": price_drift_rel_tol,
+            "signal_source": signal_source,
         },
     )
 
@@ -3906,6 +3926,32 @@ def test_idempotent_rerun_does_not_duplicate_observation_or_signal_summary(db_se
     assert db_session.query(ForwardReturnObservation).count() == 1
     assert db_session.query(ForwardReturnObservationEvent).count() == 1
     assert db_session.query(SignalRegistry).one().forward_return_status == "computed"
+
+
+def test_forward_return_historical_m4_signal_source_excludes_unreplayed_live_rows(db_session):
+    historical_id = _make_signal(db_session, ticker="ACME")
+    stale_live_id = _make_signal(db_session, ticker="RKTO")
+    _stamp_signal_historical_m4_replay(db_session, historical_id)
+    adapter = FakeHistoricalAdapter(
+        {
+            "ACME": _bars(entry_open=10.0, exit_open=12.0),
+            "RKTO": _bars(entry_open=20.0, exit_open=25.0),
+        }
+    )
+
+    result = _run_job(
+        db_session,
+        adapter,
+        signal_source=SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["signal_source"] == SIGNAL_SOURCE_HISTORICAL_M4_REPLAY
+    assert result.metrics["total_eligible"] == 1
+    assert result.metrics["computed"] == 1
+    assert [call["ticker"] for call in adapter.calls] == ["ACME"]
+    assert db_session.get(SignalRegistry, historical_id).forward_return_status == "computed"
+    assert db_session.get(SignalRegistry, stale_live_id).forward_return_status == "pending"
 
 
 def test_reconcile_computed_mode_appends_pass_event_and_keeps_return(db_session):

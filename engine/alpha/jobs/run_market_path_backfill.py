@@ -36,6 +36,10 @@ from alpha.jobs.market_path_features import (
     MarketPathFeatureJob,
 )
 from alpha.jobs.runner import run_job
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_CHOICES,
+    SIGNAL_SOURCE_LIVE,
+)
 from alpha.runtime_env import load_runtime_env
 
 
@@ -66,6 +70,7 @@ class BackfillRunConfig:
     liquidity_min_dollar_volume_20d: float = 100_000.0
     liquidity_min_price: float = 1.0
     schema: str | None = None
+    signal_source: str = SIGNAL_SOURCE_LIVE
 
 
 SessionFactory = Callable[[], Session]
@@ -287,6 +292,7 @@ def run_backfill_chunks(
                     config.liquidity_min_dollar_volume_20d
                 ),
                 liquidity_min_price=config.liquidity_min_price,
+                signal_source=config.signal_source,
             )
             result = job_runner(
                 session,
@@ -303,6 +309,7 @@ def run_backfill_chunks(
                     ),
                     "lookback_calendar_days": config.lookback_calendar_days,
                     "include_signal_session": config.include_signal_session,
+                    "signal_source": config.signal_source,
                     "schema": config.schema,
                 },
             )
@@ -461,6 +468,7 @@ def _run_live(args: argparse.Namespace) -> int:
         liquidity_min_dollar_volume_20d=args.liquidity_min_dollar_volume_20d,
         liquidity_min_price=args.liquidity_min_price,
         schema=target_schema,
+        signal_source=args.signal_source,
     )
     summary = run_backfill_chunks(
         chunks,
@@ -500,6 +508,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_LOOKBACK_CALENDAR_DAYS,
     )
     parser.add_argument("--include-signal-session", action="store_true")
+    parser.add_argument(
+        "--signal-source",
+        choices=SIGNAL_SOURCE_CHOICES,
+        default=SIGNAL_SOURCE_LIVE,
+        help=(
+            "Signal corpus to consume. Use historical-m4-replay for ML/backfills "
+            "that must exclude stale live M4 rows outside replay membership."
+        ),
+    )
     parser.add_argument("--liquidity-min-dollar-volume-20d", type=float, default=100_000.0)
     parser.add_argument("--liquidity-min-price", type=float, default=1.0)
     args = parser.parse_args(argv)
@@ -623,6 +640,7 @@ def _config_payload(config: BackfillRunConfig) -> dict[str, Any]:
         ),
         "liquidity_min_price": config.liquidity_min_price,
         "schema": config.schema,
+        "signal_source": config.signal_source,
     }
 
 

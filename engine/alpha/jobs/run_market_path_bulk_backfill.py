@@ -44,6 +44,11 @@ from alpha.jobs.market_path_features import (
     _bulk_upsert_market_path_features,
     sanitize_provider_error_message,
 )
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_CHOICES,
+    SIGNAL_SOURCE_LIVE,
+    normalize_signal_source,
+)
 from alpha.jobs.run_market_path_backfill import (
     CachedHistoricalPriceFmpAdapter,
     MARKET_PATH_REQUIRED_TABLES,
@@ -198,6 +203,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         progress_every: int = 10,
         request_timeout_seconds: float = 30.0,
         max_fetch_concurrency: int = 1,
+        signal_source: str = SIGNAL_SOURCE_LIVE,
         print_fn: PrintFn = print,
     ) -> None:
         if batch_days < 1:
@@ -224,6 +230,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._progress_every = progress_every
         self._request_timeout_seconds = request_timeout_seconds
         self._max_fetch_concurrency = max_fetch_concurrency
+        self._signal_source = normalize_signal_source(signal_source)
         self._print_fn = print_fn
 
     @property
@@ -253,6 +260,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "schema": self._schema,
             "feature_version": self._feature_version,
             "request_timeout_seconds": self._request_timeout_seconds,
+            "signal_source": self._signal_source,
             "max_fetch_concurrency_requested": self._max_fetch_concurrency,
             "max_fetch_concurrency_effective": 1,
             "batches": [],
@@ -319,6 +327,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 progress_callback=batch_progress,
                 progress_every=self._progress_every,
                 max_fetch_concurrency=self._max_fetch_concurrency,
+                signal_source=self._signal_source,
             )
             collect_started = time.perf_counter()
             collection = feature_job.collect_feature_rows(ctx)
@@ -448,6 +457,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 lookback_calendar_days=self._lookback_calendar_days,
                 feature_version=self._feature_version,
                 include_signal_session=self._include_signal_session,
+                signal_source=self._signal_source,
             )
             rank_rows_updated = rank_job._populate_cross_sectional_ranks(
                 start_date=self._signal_start_date,
@@ -512,6 +522,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "ticker_fetch_finished_count": ticker_fetch_finished_total,
             "ticker_fetch_error_count": ticker_fetch_error_total,
             "request_timeout_seconds": self._request_timeout_seconds,
+            "signal_source": self._signal_source,
             "max_fetch_concurrency_requested": self._max_fetch_concurrency,
             "max_fetch_concurrency_effective": 1,
             "rows_inserted": rows_inserted,
@@ -866,6 +877,7 @@ def _run_live(args: argparse.Namespace) -> int:
         progress_every=args.progress_every,
         request_timeout_seconds=args.request_timeout_seconds,
         max_fetch_concurrency=args.max_fetch_concurrency,
+        signal_source=args.signal_source,
     )
     try:
         result = run_job(
@@ -885,6 +897,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "progress_every": args.progress_every,
                 "request_timeout_seconds": args.request_timeout_seconds,
                 "max_fetch_concurrency": args.max_fetch_concurrency,
+                "signal_source": args.signal_source,
             },
         )
     finally:
@@ -918,6 +931,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--max-fetch-concurrency", type=int, default=1)
+    parser.add_argument(
+        "--signal-source",
+        choices=SIGNAL_SOURCE_CHOICES,
+        default=SIGNAL_SOURCE_LIVE,
+        help=(
+            "Signal corpus to consume. Use historical-m4-replay for ML/backfills "
+            "that must exclude stale live M4 rows outside replay membership."
+        ),
+    )
     parser.add_argument("--progress-artifact")
     parser.add_argument(
         "--lookback-calendar-days",

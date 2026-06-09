@@ -35,6 +35,11 @@ from alpha.db.models import (
 )
 from alpha.evidence.writer import record_data_lineage
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_LIVE,
+    apply_signal_source_filter,
+    normalize_signal_source,
+)
 from alpha.market_calendar import (
     next_us_equity_session,
     nth_us_equity_session,
@@ -557,6 +562,7 @@ class ForwardReturnJob(BaseJob):
         revision_window_sessions: int = DEFAULT_REVISION_WINDOW_SESSIONS,
         price_drift_abs_tol: float = PRICE_DRIFT_ABS_TOL,
         price_drift_rel_tol: float = PRICE_DRIFT_REL_TOL,
+        signal_source: str = SIGNAL_SOURCE_LIVE,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -583,6 +589,7 @@ class ForwardReturnJob(BaseJob):
         self._revision_window_sessions = revision_window_sessions
         self._price_drift_abs_tol = price_drift_abs_tol
         self._price_drift_rel_tol = price_drift_rel_tol
+        self._signal_source = normalize_signal_source(signal_source)
 
     def run(self, ctx: JobContext) -> JobResult:
         """Run either legacy injected pricing, M4 production pricing, or sweep mode."""
@@ -736,6 +743,7 @@ class ForwardReturnJob(BaseJob):
             metrics={
                 "mode": "production_forward_return",
                 "pattern_id": self._pattern_id,
+                "signal_source": self._signal_source,
                 "decision_evidence_session_date": (
                     session_resolution.evidence_session_date
                 ),
@@ -832,7 +840,7 @@ class ForwardReturnJob(BaseJob):
         )
 
     def _production_signal_query(self):
-        return (
+        query = (
             self._session.query(SignalRegistry)
             .filter(
                 SignalRegistry.pattern_id == self._pattern_id,
@@ -843,8 +851,13 @@ class ForwardReturnJob(BaseJob):
                     SignalRegistry.forward_return_status.is_(None),
                 ),
             )
-            .order_by(SignalRegistry.signal_timestamp, SignalRegistry.ticker)
         )
+        query = apply_signal_source_filter(
+            query,
+            self._session,
+            signal_source=self._signal_source,
+        )
+        return query.order_by(SignalRegistry.signal_timestamp, SignalRegistry.ticker)
 
     def _computed_observation_query(self):
         return (

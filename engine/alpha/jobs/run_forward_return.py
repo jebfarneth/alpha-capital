@@ -33,6 +33,10 @@ from alpha.jobs.forward_return import (
     PRICE_DRIFT_REL_TOL,
     ForwardReturnJob,
 )
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_CHOICES,
+    SIGNAL_SOURCE_LIVE,
+)
 from alpha.jobs.runner import run_job
 from alpha.runtime_env import load_runtime_env
 
@@ -144,6 +148,7 @@ def _run_live(args: argparse.Namespace) -> int:
             revision_window_sessions=args.revision_window_sessions,
             price_drift_abs_tol=args.price_drift_abs_tol,
             price_drift_rel_tol=args.price_drift_rel_tol,
+            signal_source=args.signal_source,
         )
         result = run_job(
             session,
@@ -159,6 +164,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "revision_window_sessions": args.revision_window_sessions,
                 "price_drift_abs_tol": args.price_drift_abs_tol,
                 "price_drift_rel_tol": args.price_drift_rel_tol,
+                "signal_source": args.signal_source,
                 "schema": args.schema,
             },
         )
@@ -166,6 +172,7 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Status:                  {result.status}")
         print(f"Mode:                    {metrics.get('mode')}")
         print(f"Pattern:                 {metrics.get('pattern_id')}")
+        print(f"Signal source:           {metrics.get('signal_source')}")
         print(f"Schema:                  {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
         print(f"Survivorship sources:    {survivorship_source_names}")
         print(f"Eligible signals:        {metrics.get('total_eligible')}")
@@ -257,6 +264,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=PRICE_DRIFT_REL_TOL,
         help="Relative provider-row drift tolerance for price reconciliation.",
+    )
+    parser.add_argument(
+        "--signal-source",
+        choices=SIGNAL_SOURCE_CHOICES,
+        default=SIGNAL_SOURCE_LIVE,
+        help=(
+            "Signal corpus to label. Use historical-m4-replay to exclude stale "
+            "live M4 rows outside replay membership."
+        ),
     )
     parser.add_argument(
         "--create-tables",

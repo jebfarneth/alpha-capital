@@ -27,6 +27,11 @@ from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter, FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import DataLineage, MarketPathFeature, SignalRegistry
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.historical_m4_signal_selector import (
+    SIGNAL_SOURCE_LIVE,
+    apply_signal_source_filter,
+    normalize_signal_source,
+)
 from alpha.market_calendar import (
     next_us_equity_session,
     nth_us_equity_session,
@@ -379,6 +384,7 @@ class MarketPathFeatureCollection:
     through_date: date | None
     feature_version: str
     pattern_ids: tuple[str, ...]
+    signal_source: str = SIGNAL_SOURCE_LIVE
     signals_scanned: int = 0
     ticker_planned_count: int = 0
     ticker_fetch_started_count: int = 0
@@ -419,6 +425,7 @@ class MarketPathFeatureCollection:
         metrics = {
             "decision_date": self.decision_date.isoformat() if self.decision_date else None,
             "pattern_ids": list(self.pattern_ids),
+            "signal_source": self.signal_source,
             "signal_start_date": self.signal_start.isoformat() if self.signal_start else None,
             "signal_end_date": self.signal_end.isoformat() if self.signal_end else None,
             "through_date": self.through_date.isoformat() if self.through_date else None,
@@ -472,6 +479,7 @@ class MarketPathFeatureJob(BaseJob):
         progress_callback: ProgressCallback | None = None,
         progress_every: int = 10,
         max_fetch_concurrency: int = 1,
+        signal_source: str = SIGNAL_SOURCE_LIVE,
     ) -> None:
         if progress_every < 1:
             raise ValueError("progress_every must be >= 1")
@@ -493,6 +501,7 @@ class MarketPathFeatureJob(BaseJob):
         self._progress_callback = progress_callback
         self._progress_every = progress_every
         self._max_fetch_concurrency = max_fetch_concurrency
+        self._signal_source = normalize_signal_source(signal_source)
 
     @property
     def job_name(self) -> str:
@@ -570,6 +579,7 @@ class MarketPathFeatureJob(BaseJob):
                 through_date=through_date,
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
+                signal_source=self._signal_source,
                 errors=[{
                     "stage": "args",
                     "message": "signal_start_date must be on or before signal_end_date",
@@ -583,6 +593,7 @@ class MarketPathFeatureJob(BaseJob):
                 through_date=through_date,
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
+                signal_source=self._signal_source,
                 errors=[{
                     "stage": "args",
                     "message": "lookback_calendar_days must be at least 70",
@@ -593,6 +604,7 @@ class MarketPathFeatureJob(BaseJob):
             "signal_load_start",
             {
                 "pattern_ids": list(self._pattern_ids),
+                "signal_source": self._signal_source,
                 "signal_start_date": signal_start.isoformat(),
                 "signal_end_date": signal_end.isoformat(),
             },
@@ -616,6 +628,7 @@ class MarketPathFeatureJob(BaseJob):
                 through_date=through_date,
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
+                signal_source=self._signal_source,
                 pending_lineages=[],
                 pending_feature_rows=[],
                 fetch_errors=[],
@@ -865,6 +878,7 @@ class MarketPathFeatureJob(BaseJob):
             through_date=through_date,
             feature_version=self._feature_version,
             pattern_ids=self._pattern_ids,
+            signal_source=self._signal_source,
             signals_scanned=len(signals),
             ticker_planned_count=len(by_ticker),
             ticker_fetch_started_count=ticker_fetch_started,
@@ -934,16 +948,22 @@ class MarketPathFeatureJob(BaseJob):
     def _signals(self, start: date, end: date) -> list[SignalRegistry]:
         start_dt = datetime.combine(start, time.min, timezone.utc)
         end_dt = datetime.combine(end + timedelta(days=1), time.min, timezone.utc)
-        return (
+        query = (
             self._session.query(SignalRegistry)
             .filter(
                 SignalRegistry.pattern_id.in_(self._pattern_ids),
                 SignalRegistry.signal_timestamp >= start_dt,
                 SignalRegistry.signal_timestamp < end_dt,
             )
-            .order_by(SignalRegistry.ticker, SignalRegistry.signal_timestamp)
-            .all()
         )
+        query = apply_signal_source_filter(
+            query,
+            self._session,
+            signal_source=self._signal_source,
+            signal_start_date=start,
+            signal_end_date=end,
+        )
+        return query.order_by(SignalRegistry.ticker, SignalRegistry.signal_timestamp).all()
 
     def _existing_rows(
         self,
