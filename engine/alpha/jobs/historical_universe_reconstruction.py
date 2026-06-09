@@ -9,10 +9,15 @@ mutates live canonical universe snapshots.
 from __future__ import annotations
 
 import json
+import csv
+from io import StringIO
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
+from uuid import uuid4
 
+from sqlalchemy import Column, MetaData, Table, or_, text, tuple_
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import stable_hash
@@ -23,6 +28,7 @@ from alpha.db.models import (
     FmpDelistedCompanyRecord,
     HistoricalUniverseReconstruction,
     SecurityProfile,
+    UniverseScan,
     UniverseSnapshot,
 )
 from alpha.evidence.writer import record_data_lineage
@@ -36,6 +42,8 @@ JOB_NAME = "historical_universe_reconstruction"
 RECONSTRUCTION_METHOD = "active_current_plus_fmp_delisted_v1"
 ALLOWED_OPERATING_EXCHANGES = ALLOWED_EXCHANGES
 DERIVED_ENDPOINT = "historical_universe_reconstruction"
+HISTORICAL_REPLAY_SCAN_PROVIDER = "HISTORICAL_REPLAY"
+HISTORICAL_REPLAY_SCAN_SELECTION_REASON = "historical_m4_replay_scratch_scan"
 
 
 @dataclass
@@ -80,6 +88,11 @@ class HistoricalUniverseReconstructionJob(BaseJob):
         replay_date: date,
         run_timestamp: datetime | None = None,
         allow_partial_delisted_source: bool = False,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        progress_every: int = 1000,
+        persistence_batch_size: int = 1000,
+        persist_pre_replay_delisted_exclusions: bool = True,
+        compact_persisted_provenance: bool = False,
     ) -> None:
         if replay_date < date(2024, 1, 1):
             raise ValueError("historical replay reconstruction starts at 2024-01-01")
@@ -87,6 +100,15 @@ class HistoricalUniverseReconstructionJob(BaseJob):
         self.replay_date = replay_date
         self.run_timestamp = _aware_utc(run_timestamp)
         self.allow_partial_delisted_source = allow_partial_delisted_source
+        self.progress_callback = progress_callback
+        self.progress_every = max(int(progress_every), 1)
+        self.persistence_batch_size = max(int(persistence_batch_size), 1)
+        self.persist_pre_replay_delisted_exclusions = (
+            persist_pre_replay_delisted_exclusions
+        )
+        self.compact_persisted_provenance = compact_persisted_provenance
+        self._progress_events: list[dict[str, Any]] = []
+        self._started_perf = perf_counter()
 
     @property
     def job_name(self) -> str:
@@ -102,8 +124,21 @@ class HistoricalUniverseReconstructionJob(BaseJob):
 
     def run(self, ctx: JobContext) -> JobResult:
         candidates: dict[str, _Candidate] = {}
+        self._emit_progress("candidate_load_start", {})
         active_rows = self._load_active_current_candidates(candidates)
         delisted_rows = self._load_fmp_delisted_candidates(candidates)
+        source_interval_count = sum(
+            len(candidate.intervals) for candidate in candidates.values()
+        )
+        self._emit_progress(
+            "candidate_load_finish",
+            {
+                "active_current_rows_seen": active_rows,
+                "fmp_delisted_rows_seen": delisted_rows,
+                "candidate_count": len(candidates),
+                "source_interval_count": source_interval_count,
+            },
+        )
         delisted_source = self._delisted_source_status(delisted_rows)
         lineage = record_data_lineage(
             self.session,
@@ -134,9 +169,6 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             job_run_id=ctx.job_run_id,
         )
 
-        source_interval_count = sum(
-            len(candidate.intervals) for candidate in candidates.values()
-        )
         metrics: dict[str, Any] = {
             "replay_date": self.replay_date.isoformat(),
             "active_current_rows_seen": active_rows,
@@ -150,6 +182,10 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             "allow_partial_delisted_source": self.allow_partial_delisted_source,
             "rows_inserted": 0,
             "rows_updated": 0,
+            "rows_unchanged": 0,
+            "rows_processed": 0,
+            "rows_suppressed_pre_replay_delisted_exclusions": 0,
+            "rows_suppressed_excluded_fmp_delisted": 0,
             "included_count": 0,
             "excluded_count": 0,
             "rejection_reason_counts": {},
@@ -157,7 +193,14 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             "source_interval_rejection_reason_counts": {},
         }
         output_hashes: list[str] = []
-        for candidate in sorted(candidates.values(), key=lambda row: row.normalized_symbol):
+        row_mappings: list[dict[str, Any]] = []
+        sorted_candidates = sorted(candidates.values(), key=lambda row: row.normalized_symbol)
+        total_candidates = len(sorted_candidates)
+        self._emit_progress(
+            "interval_evaluation_start",
+            {"candidate_count": total_candidates},
+        )
+        for index, candidate in enumerate(sorted_candidates, start=1):
             evaluated_intervals = [
                 _evaluate_interval(interval, self.replay_date)
                 for interval in candidate.intervals
@@ -174,23 +217,6 @@ class HistoricalUniverseReconstructionJob(BaseJob):
                 ctx.job_run_id,
                 delisted_source,
             )
-            output_hashes.append(row_values["output_hash"])
-            existing = (
-                self.session.query(HistoricalUniverseReconstruction)
-                .filter(
-                    HistoricalUniverseReconstruction.replay_date == self.replay_date,
-                    HistoricalUniverseReconstruction.normalized_symbol
-                    == candidate.normalized_symbol,
-                )
-                .one_or_none()
-            )
-            if existing is None:
-                self.session.add(HistoricalUniverseReconstruction(**row_values))
-                metrics["rows_inserted"] += 1
-            else:
-                for key, value in row_values.items():
-                    setattr(existing, key, value)
-                metrics["rows_updated"] += 1
 
             if row_values["inclusion_status"] == "included":
                 metrics["included_count"] += 1
@@ -202,8 +228,40 @@ class HistoricalUniverseReconstructionJob(BaseJob):
                 )
             source = row_values["source"]
             metrics["source_counts"][source] = metrics["source_counts"].get(source, 0) + 1
+            if self._should_persist_row(row_values):
+                row_mappings.append(row_values)
+                output_hashes.append(row_values["output_hash"])
+            else:
+                metrics["rows_suppressed_excluded_fmp_delisted"] += 1
+                if (
+                    row_values.get("rejection_reason")
+                    == "delisted_on_or_before_replay_date"
+                ):
+                    metrics["rows_suppressed_pre_replay_delisted_exclusions"] += 1
+            if index == total_candidates or index % self.progress_every == 0:
+                self._emit_progress(
+                    "interval_evaluation_progress",
+                    {
+                        "rows_processed": index,
+                        "rows_total": total_candidates,
+                        "included_count": metrics["included_count"],
+                        "excluded_count": metrics["excluded_count"],
+                    },
+                )
 
-        self.session.flush()
+        self._emit_progress(
+            "interval_evaluation_finish",
+            {
+                "rows_processed": len(row_mappings),
+                "included_count": metrics["included_count"],
+                "excluded_count": metrics["excluded_count"],
+            },
+        )
+        self._emit_progress("persistence_start", {"rows_total": len(row_mappings)})
+        persistence_metrics = self._bulk_persist_rows(row_mappings)
+        metrics.update(persistence_metrics)
+        self._emit_progress("persistence_finish", persistence_metrics)
+        metrics["progress_events"] = list(self._progress_events)
         errors: list[dict[str, Any]] = []
         status = "finished"
         if delisted_source["partial"] and not self.allow_partial_delisted_source:
@@ -253,9 +311,24 @@ class HistoricalUniverseReconstructionJob(BaseJob):
         candidates: dict[str, _Candidate],
     ) -> int:
         snapshots = self._current_active_snapshots()
+        snapshot_symbols = [
+            symbol
+            for symbol in (_clean_symbol(snapshot.ticker) for snapshot in snapshots)
+            if symbol
+        ]
         profile_by_symbol = {
-            profile.symbol.upper(): profile
-            for profile in self.session.query(SecurityProfile).all()
+            row.symbol.upper(): row
+            for row in (
+                self.session.query(
+                    SecurityProfile.symbol,
+                    SecurityProfile.profile_payload_hash,
+                    SecurityProfile.raw_profile_json,
+                )
+                .filter(SecurityProfile.symbol.in_(snapshot_symbols))
+                .all()
+                if snapshot_symbols
+                else []
+            )
         }
         for snapshot in snapshots:
             symbol = _clean_symbol(snapshot.ticker)
@@ -317,7 +390,23 @@ class HistoricalUniverseReconstructionJob(BaseJob):
         self,
         candidates: dict[str, _Candidate],
     ) -> int:
-        rows = self.session.query(FmpDelistedCompanyRecord).all()
+        rows = (
+            self.session.query(
+                FmpDelistedCompanyRecord.fmp_delisted_company_id,
+                FmpDelistedCompanyRecord.symbol,
+                FmpDelistedCompanyRecord.normalized_symbol,
+                FmpDelistedCompanyRecord.company_name,
+                FmpDelistedCompanyRecord.exchange_key,
+                FmpDelistedCompanyRecord.ipo_date,
+                FmpDelistedCompanyRecord.delisted_date,
+                FmpDelistedCompanyRecord.data_lineage_id,
+                FmpDelistedCompanyRecord.raw_payload_hash,
+                FmpDelistedCompanyRecord.raw_payload_json,
+                FmpDelistedCompanyRecord.exchange_relevance_status,
+            )
+            .yield_per(1000)
+            .all()
+        )
         for row in rows:
             symbol = _clean_symbol(row.normalized_symbol or row.symbol)
             if not symbol:
@@ -369,14 +458,34 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             )
         return len(rows)
 
-    def _current_active_snapshots(self) -> list[UniverseSnapshot]:
+    def _current_active_snapshots(self) -> list[Any]:
         canonical = (
             self.session.query(CanonicalUniverseScan)
+            .outerjoin(UniverseScan, UniverseScan.scan_id == CanonicalUniverseScan.scan_id)
+            .filter(
+                or_(
+                    UniverseScan.scan_id.is_(None),
+                    UniverseScan.provider.is_(None),
+                    UniverseScan.provider != HISTORICAL_REPLAY_SCAN_PROVIDER,
+                ),
+                or_(
+                    CanonicalUniverseScan.selection_reason.is_(None),
+                    CanonicalUniverseScan.selection_reason
+                    != HISTORICAL_REPLAY_SCAN_SELECTION_REASON,
+                ),
+            )
             .order_by(CanonicalUniverseScan.trading_date.desc())
             .first()
         )
-        query = self.session.query(UniverseSnapshot).filter(
-            UniverseSnapshot.operating_universe_inclusion.is_(True)
+        query = self.session.query(
+            UniverseSnapshot.universe_snapshot_id,
+            UniverseSnapshot.scan_id,
+            UniverseSnapshot.ticker,
+            UniverseSnapshot.primary_exchange,
+            UniverseSnapshot.source_lineage_hash,
+            UniverseSnapshot.security_type,
+        ).filter(
+            UniverseSnapshot.operating_universe_inclusion.is_(True),
         )
         if canonical is not None:
             query = query.filter(UniverseSnapshot.scan_id == canonical.scan_id)
@@ -414,31 +523,60 @@ class HistoricalUniverseReconstructionJob(BaseJob):
                 ),
             )
         ]
-        provenance = {
-            "source_rows": [payload["source_row"] for payload in interval_payloads],
-            "source_intervals": interval_payloads,
-            "selected_source_interval": _interval_identity(interval),
-            "missing_delisted_date_source": any(
-                evaluated.interval.missing_delisted_date_source
-                for evaluated in evaluated_intervals
-            ),
-            "lineage_ids": sorted(lineage_ids),
-            "delisted_source_complete": delisted_source["complete"],
-            "delisted_source_partial_reason": delisted_source["partial_reason"],
-            "allow_partial_delisted_source": self.allow_partial_delisted_source,
-        }
-        pit_filter_status = {
-            "exchange_filter": "applied",
-            "ipo_date_filter": "applied",
-            "delisted_date_filter": "applied",
-            "delisted_security_type_filter": "applied",
-            "delisted_symbol_suffix_filter": "applied",
-            "market_cap_filter": "not_applied_not_pit_safe",
-            "price_filter": "not_applied_not_pit_safe",
-            "liquidity_filter": "not_applied_not_pit_safe",
-            "delisted_source_complete": delisted_source["complete"],
-            "delisted_source_partial_reason": delisted_source["partial_reason"],
-        }
+        source_row_hashes = sorted(
+            stable_hash(evaluated.interval.source_row)
+            for evaluated in evaluated_intervals
+        )
+        missing_delisted_date_source = any(
+            evaluated.interval.missing_delisted_date_source
+            for evaluated in evaluated_intervals
+        )
+        if self.compact_persisted_provenance:
+            provenance = {
+                "provenance_payload_policy": "compact_public_cohort_row_v4",
+                "source_interval_count": len(interval_payloads),
+                "source_row_hash": stable_hash(source_row_hashes),
+                "selected_interval_input_hash": interval.input_hash,
+                "selected_interval_lineage_id": interval.data_lineage_id,
+                "missing_delisted_date_source": missing_delisted_date_source,
+                "delisted_source_complete": delisted_source["complete"],
+                "delisted_source_partial_reason": delisted_source["partial_reason"],
+                "allow_partial_delisted_source": self.allow_partial_delisted_source,
+            }
+            pit_filter_status = {
+                "pit_filter_payload_policy": "compact_public_cohort_row_v3",
+                "applied": "exchange,ipo,delisted,security,suffix",
+                "not_pit": "mcap,price,liquidity",
+                "delisted_source_complete": delisted_source["complete"],
+                "delisted_source_partial_reason": delisted_source["partial_reason"],
+            }
+        else:
+            provenance = {
+                "provenance_payload_policy": (
+                    "compact_row_interval_summary_full_run_facts_in_lineage"
+                ),
+                "source_intervals": interval_payloads,
+                "selected_source_interval": _interval_identity(interval),
+                "source_interval_count": len(interval_payloads),
+                "source_row_hashes": source_row_hashes,
+                "missing_delisted_date_source": missing_delisted_date_source,
+                "lineage_ids": sorted(lineage_ids),
+                "delisted_source_complete": delisted_source["complete"],
+                "delisted_source_partial_reason": delisted_source["partial_reason"],
+                "allow_partial_delisted_source": self.allow_partial_delisted_source,
+            }
+            pit_filter_status = {
+                "exchange_filter": "applied",
+                "ipo_date_filter": "applied",
+                "delisted_date_filter": "applied",
+                "delisted_security_type_filter": "applied",
+                "delisted_symbol_suffix_filter": "applied",
+                "market_cap_filter": "not_applied_not_pit_safe",
+                "price_filter": "not_applied_not_pit_safe",
+                "liquidity_filter": "not_applied_not_pit_safe",
+                "delisted_source_complete": delisted_source["complete"],
+                "delisted_source_partial_reason": delisted_source["partial_reason"],
+            }
         input_hash = stable_hash(
             {
                 "replay_date": self.replay_date.isoformat(),
@@ -524,6 +662,586 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             "run_status": run.run_status,
             "max_pages_reached": max_pages_reached,
         }
+
+    def _should_persist_row(self, row_values: dict[str, Any]) -> bool:
+        if self.persist_pre_replay_delisted_exclusions:
+            return True
+        return not (
+            row_values.get("fmp_delisted_company_id") is not None
+            and row_values.get("current_universe_snapshot_id") is None
+            and row_values.get("inclusion_status") == "excluded"
+        )
+
+    def _bulk_persist_rows(self, row_mappings: list[dict[str, Any]]) -> dict[str, int]:
+        return bulk_persist_historical_universe_reconstructions(
+            self.session,
+            row_mappings,
+            progress_callback=self._emit_progress,
+            persistence_batch_size=self.persistence_batch_size,
+        )
+
+    def _emit_progress(self, event: str, payload: dict[str, Any]) -> None:
+        event_payload = {
+            "event": event,
+            "replay_date": self.replay_date.isoformat(),
+            "elapsed_seconds": round(perf_counter() - self._started_perf, 6),
+            **payload,
+        }
+        self._progress_events.append(event_payload)
+        if self.progress_callback is not None:
+            try:
+                self.progress_callback(event, event_payload)
+            except Exception:
+                pass
+
+
+
+def _row_mapping_matches_existing(
+    existing: HistoricalUniverseReconstruction,
+    mapping: dict[str, Any],
+) -> bool:
+    ignored = {
+        "historical_universe_reconstruction_id",
+        "created_at",
+        "updated_at",
+    }
+    for key, value in mapping.items():
+        if key in ignored:
+            continue
+        if getattr(existing, key) != value:
+            return False
+    return True
+
+
+def bulk_persist_historical_universe_reconstructions(
+    session: Session,
+    row_mappings: list[dict[str, Any]],
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    persistence_batch_size: int = 1000,
+) -> dict[str, int]:
+    """Persist historical universe rows across one or more replay dates.
+
+    The conflict key is the table's natural replay identity:
+    ``(replay_date, normalized_symbol)``. This keeps date-range replay from
+    paying the remote write cost once per date.
+    """
+
+    payload_metrics = _serialized_payload_metrics(row_mappings)
+    if not row_mappings:
+        return {
+            "rows_processed": 0,
+            "rows_inserted": 0,
+            "rows_updated": 0,
+            "rows_unchanged": 0,
+            **payload_metrics,
+        }
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        return _postgres_stage_merge_historical_universe_rows(
+            session,
+            row_mappings=row_mappings,
+            payload_metrics=payload_metrics,
+            progress_callback=progress_callback,
+        )
+
+    keys = sorted(
+        {
+            (row["replay_date"], row["normalized_symbol"])
+            for row in row_mappings
+        }
+    )
+    existing_rows = (
+        session.query(HistoricalUniverseReconstruction)
+        .filter(
+            tuple_(
+                HistoricalUniverseReconstruction.replay_date,
+                HistoricalUniverseReconstruction.normalized_symbol,
+            ).in_(keys)
+        )
+        .all()
+        if keys
+        else []
+    )
+    existing_by_key = {
+        (row.replay_date, row.normalized_symbol): row
+        for row in existing_rows
+    }
+    now = datetime.now(timezone.utc)
+    insert_mappings: list[dict[str, Any]] = []
+    update_mappings: list[dict[str, Any]] = []
+    unchanged = 0
+    for row_values in row_mappings:
+        key = (row_values["replay_date"], row_values["normalized_symbol"])
+        existing = existing_by_key.get(key)
+        if existing is None:
+            insert_mappings.append(
+                {
+                    **row_values,
+                    "historical_universe_reconstruction_id": str(uuid4()),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            continue
+        update_mapping = {
+            **row_values,
+            "historical_universe_reconstruction_id": (
+                existing.historical_universe_reconstruction_id
+            ),
+            "created_at": existing.created_at,
+            "updated_at": now,
+        }
+        if _row_mapping_matches_existing(existing, update_mapping):
+            unchanged += 1
+        else:
+            update_mappings.append(update_mapping)
+
+    processed = 0
+    total_write_rows = len(insert_mappings) + len(update_mappings)
+    insert_stmt = _historical_reconstruction_insert_stmt()
+    update_stmt = _historical_reconstruction_update_stmt()
+    batch_size = max(int(persistence_batch_size), 1)
+    for chunk in _chunks(insert_mappings, batch_size):
+        session.execute(insert_stmt, chunk)
+        session.flush()
+        processed += len(chunk)
+        _safe_progress(
+            progress_callback,
+            "persistence_progress",
+            {
+                "operation": "insert",
+                "rows_processed": processed,
+                "rows_total": total_write_rows,
+                "rows_inserted": processed,
+                "rows_updated": 0,
+            },
+        )
+    updated_processed = 0
+    for chunk in _chunks(update_mappings, batch_size):
+        session.execute(update_stmt, chunk)
+        session.flush()
+        updated_processed += len(chunk)
+        processed += len(chunk)
+        _safe_progress(
+            progress_callback,
+            "persistence_progress",
+            {
+                "operation": "update",
+                "rows_processed": processed,
+                "rows_total": total_write_rows,
+                "rows_inserted": len(insert_mappings),
+                "rows_updated": updated_processed,
+            },
+        )
+    return {
+        "rows_processed": len(row_mappings),
+        "rows_inserted": len(insert_mappings),
+        "rows_updated": len(update_mappings),
+        "rows_unchanged": unchanged,
+        **payload_metrics,
+    }
+
+
+def _postgres_stage_merge_historical_universe_rows(
+    session: Session,
+    *,
+    row_mappings: list[dict[str, Any]],
+    payload_metrics: dict[str, int],
+    progress_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    write_mappings = [
+        {
+            **row,
+            "historical_universe_reconstruction_id": str(uuid4()),
+            "created_at": now,
+            "updated_at": now,
+        }
+        for row in row_mappings
+    ]
+    inserted = 0
+    updated = 0
+    unchanged = 0
+    if write_mappings:
+        stage_table = f"tmp_hur_{uuid4().hex}"
+        stage_started = perf_counter()
+        _safe_progress(
+            progress_callback,
+            "copy_stage_start",
+            {
+                "rows_total": len(write_mappings),
+                **payload_metrics,
+            },
+        )
+        session.execute(text("SET LOCAL statement_timeout = 0"))
+        session.execute(
+            text(
+                f"CREATE TEMP TABLE {stage_table} "
+                "(LIKE historical_universe_reconstructions INCLUDING DEFAULTS) "
+                "ON COMMIT DROP"
+            )
+        )
+        stage_load_method = _copy_historical_reconstruction_stage_rows(
+            session,
+            stage_table,
+            write_mappings,
+            progress_callback=progress_callback,
+        )
+        stage_elapsed = perf_counter() - stage_started
+        stage_payload = {
+            "stage_load_method": stage_load_method,
+            "rows_processed": len(write_mappings),
+            "rows_total": len(write_mappings),
+            "elapsed_seconds": round(stage_elapsed, 6),
+        }
+        _safe_progress(progress_callback, "copy_stage_progress", stage_payload)
+        _safe_progress(
+            progress_callback,
+            "persistence_progress",
+            {"operation": "postgres_stage_insert", **stage_payload},
+        )
+        _safe_progress(
+            progress_callback,
+            "copy_stage_finish",
+            {**stage_payload, **payload_metrics},
+        )
+        merge_started = perf_counter()
+        inserted = int(
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {stage_table} s "
+                    "LEFT JOIN historical_universe_reconstructions t "
+                    "ON t.replay_date = s.replay_date "
+                    "AND t.normalized_symbol = s.normalized_symbol "
+                    "WHERE t.historical_universe_reconstruction_id IS NULL"
+                )
+            ).scalar()
+            or 0
+        )
+        changed_predicate = _historical_reconstruction_changed_predicate("t", "s")
+        updated = int(
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {stage_table} s "
+                    "JOIN historical_universe_reconstructions t "
+                    "ON t.replay_date = s.replay_date "
+                    "AND t.normalized_symbol = s.normalized_symbol "
+                    f"WHERE {changed_predicate}"
+                )
+            ).scalar()
+            or 0
+        )
+        unchanged = len(write_mappings) - inserted - updated
+        merge_start_payload = {
+            "rows_processed": len(write_mappings),
+            "rows_total": len(write_mappings),
+            "rows_inserted": inserted,
+            "rows_updated": updated,
+            "rows_unchanged": unchanged,
+        }
+        _safe_progress(progress_callback, "merge_upsert_start", merge_start_payload)
+        _safe_progress(
+            progress_callback,
+            "persistence_progress",
+            {"operation": "postgres_stage_merge_start", **merge_start_payload},
+        )
+        session.execute(_historical_reconstruction_stage_insert_new_stmt(stage_table))
+        if updated:
+            session.execute(
+                _historical_reconstruction_stage_update_changed_stmt(stage_table)
+            )
+        session.flush()
+        merge_elapsed = perf_counter() - merge_started
+        merge_finish_payload = {
+            **merge_start_payload,
+            "elapsed_seconds": round(merge_elapsed, 6),
+        }
+        _safe_progress(progress_callback, "merge_upsert_finish", merge_finish_payload)
+        _safe_progress(
+            progress_callback,
+            "persistence_progress",
+            {"operation": "postgres_stage_merge_finish", **merge_finish_payload},
+        )
+    return {
+        "rows_processed": len(row_mappings),
+        "rows_inserted": inserted,
+        "rows_updated": updated,
+        "rows_unchanged": unchanged,
+        **payload_metrics,
+    }
+
+
+def _safe_progress(
+    callback: Callable[[str, dict[str, Any]], None] | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event, payload)
+    except Exception:
+        pass
+
+
+def _copy_historical_reconstruction_stage_rows(
+    session: Session,
+    stage_table: str,
+    rows: list[dict[str, Any]],
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> str:
+    """Load HUR rows into a PostgreSQL temp stage table with psycopg COPY."""
+
+    columns = ", ".join(_INSERT_COLUMNS)
+    copy_sql = f"COPY {stage_table} ({columns}) FROM STDIN"
+    connection = session.connection()
+    driver_connection = getattr(
+        getattr(connection, "connection", None),
+        "driver_connection",
+        None,
+    )
+    if driver_connection is None:
+        stage_model = _historical_reconstruction_stage_table(stage_table)
+        session.execute(stage_model.insert(), rows)
+        return "sqlalchemy_insertmanyvalues_temp_insert"
+    try:
+        with driver_connection.cursor() as cursor:
+            with cursor.copy(copy_sql) as copy:
+                for index, row in enumerate(rows, start=1):
+                    copy.write_row(
+                        [_copy_row_scalar(row.get(column)) for column in _INSERT_COLUMNS]
+                    )
+                    if index == len(rows) or index % _COPY_ROW_PROGRESS_EVERY == 0:
+                        _safe_progress(
+                            progress_callback,
+                            "copy_stage_row_progress",
+                            {
+                                "rows_processed": index,
+                                "rows_total": len(rows),
+                            },
+                        )
+        return "psycopg_copy_write_row"
+    except AttributeError:
+        stage_model = _historical_reconstruction_stage_table(stage_table)
+        session.execute(stage_model.insert(), rows)
+        return "sqlalchemy_insertmanyvalues_temp_insert"
+
+
+def _copy_csv_payload(rows: list[dict[str, Any]]) -> str:
+    output = StringIO()
+    writer = csv.writer(
+        output,
+        delimiter="\t",
+        lineterminator="\n",
+        quoting=csv.QUOTE_MINIMAL,
+    )
+    for row in rows:
+        writer.writerow([_copy_scalar(row.get(column)) for column in _INSERT_COLUMNS])
+    return output.getvalue()
+
+
+def _copy_scalar(value: Any) -> str:
+    if value is None:
+        return _COPY_NULL_SENTINEL
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value).replace("\x00", "")
+
+
+def _copy_row_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    return value
+
+
+def _chunks(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def _historical_reconstruction_stage_table(stage_name: str) -> Table:
+    metadata = MetaData()
+    return Table(
+        stage_name,
+        metadata,
+        *[
+            Column(column.name, column.type)
+            for column in HistoricalUniverseReconstruction.__table__.columns
+        ],
+    )
+
+
+def _serialized_payload_metrics(rows: list[dict[str, Any]]) -> dict[str, int]:
+    total_bytes = 0
+    max_row_bytes = 0
+    source_provenance_bytes = 0
+    pit_filter_status_bytes = 0
+    hash_bytes = 0
+    identifier_bytes = 0
+    for row in rows:
+        row_bytes = 0
+        for column in _INSERT_COLUMNS:
+            value = row.get(column)
+            encoded = _metric_bytes(value)
+            row_bytes += encoded
+            if column == "source_provenance_json":
+                source_provenance_bytes += encoded
+            elif column == "pit_filter_status_json":
+                pit_filter_status_bytes += encoded
+            elif column in {"input_hash", "output_hash"}:
+                hash_bytes += encoded
+            elif column in {
+                "historical_universe_reconstruction_id",
+                "ticker",
+                "normalized_symbol",
+                "current_universe_snapshot_id",
+                "fmp_delisted_company_id",
+                "data_lineage_id",
+                "job_run_id",
+            }:
+                identifier_bytes += encoded
+        total_bytes += row_bytes
+        max_row_bytes = max(max_row_bytes, row_bytes)
+    return {
+        "total_serialized_payload_bytes": total_bytes,
+        "max_row_serialized_payload_bytes": max_row_bytes,
+        "source_provenance_json_bytes": source_provenance_bytes,
+        "pit_filter_status_json_bytes": pit_filter_status_bytes,
+        "input_output_hash_bytes": hash_bytes,
+        "identifier_bytes": identifier_bytes,
+    }
+
+
+def _metric_bytes(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, (date, datetime)):
+        return len(value.isoformat().encode())
+    return len(str(value).encode())
+
+
+_INSERT_COLUMNS = (
+    "historical_universe_reconstruction_id",
+    "replay_date",
+    "ticker",
+    "normalized_symbol",
+    "exchange",
+    "company_name",
+    "ipo_date",
+    "delisted_date",
+    "inclusion_status",
+    "rejection_reason",
+    "source",
+    "source_provenance_json",
+    "reconstructed",
+    "reconstruction_method",
+    "pit_filter_status_json",
+    "current_universe_snapshot_id",
+    "fmp_delisted_company_id",
+    "data_lineage_id",
+    "job_run_id",
+    "input_hash",
+    "output_hash",
+    "created_at",
+    "updated_at",
+)
+
+_COPY_NULL_SENTINEL = "__ALPHA_COPY_NULL__"
+_COPY_WRITE_CHUNK_SIZE = 250
+_COPY_ROW_PROGRESS_EVERY = 100
+
+_UPDATE_COLUMNS = tuple(
+    column
+    for column in _INSERT_COLUMNS
+    if column not in {"historical_universe_reconstruction_id", "created_at"}
+)
+
+
+def _historical_reconstruction_insert_stmt(
+    table_name: str = "historical_universe_reconstructions",
+):
+    columns = ", ".join(_INSERT_COLUMNS)
+    values = ", ".join(f":{column}" for column in _INSERT_COLUMNS)
+    return text(
+        f"INSERT INTO {table_name} ({columns}) "
+        f"VALUES ({values})"
+    )
+
+
+def _historical_reconstruction_update_stmt():
+    assignments = ", ".join(
+        f"{column} = :{column}"
+        for column in _UPDATE_COLUMNS
+    )
+    return text(
+        "UPDATE historical_universe_reconstructions "
+        f"SET {assignments} "
+        "WHERE historical_universe_reconstruction_id = "
+        ":historical_universe_reconstruction_id"
+    )
+
+
+def _historical_reconstruction_stage_merge_stmt(stage_table: str):
+    columns = ", ".join(_INSERT_COLUMNS)
+    update_assignments = ", ".join(
+        f"{column} = EXCLUDED.{column}"
+        for column in _UPDATE_COLUMNS
+        if column != "created_at"
+    )
+    return text(
+        f"INSERT INTO historical_universe_reconstructions ({columns}) "
+        f"SELECT {columns} FROM {stage_table} "
+        "ON CONFLICT (replay_date, normalized_symbol) DO UPDATE SET "
+        f"{update_assignments}"
+    )
+
+
+def _historical_reconstruction_stage_insert_new_stmt(stage_table: str):
+    columns = ", ".join(_INSERT_COLUMNS)
+    return text(
+        f"INSERT INTO historical_universe_reconstructions ({columns}) "
+        f"SELECT {columns} FROM {stage_table} "
+        "ON CONFLICT (replay_date, normalized_symbol) DO NOTHING"
+    )
+
+
+def _historical_reconstruction_stage_update_changed_stmt(stage_table: str):
+    assignments = ", ".join(
+        f"{column} = s.{column}"
+        for column in _UPDATE_COLUMNS
+    )
+    changed_predicate = _historical_reconstruction_changed_predicate("t", "s")
+    return text(
+        "UPDATE historical_universe_reconstructions t "
+        f"SET {assignments} "
+        f"FROM {stage_table} s "
+        "WHERE t.replay_date = s.replay_date "
+        "AND t.normalized_symbol = s.normalized_symbol "
+        f"AND ({changed_predicate})"
+    )
+
+
+def _historical_reconstruction_changed_predicate(
+    target_alias: str,
+    stage_alias: str,
+) -> str:
+    compared_columns = [
+        column
+        for column in _UPDATE_COLUMNS
+        if column not in {
+            "updated_at",
+            "job_run_id",
+            "data_lineage_id",
+        }
+    ]
+    return " OR ".join(
+        f"{target_alias}.{column} IS DISTINCT FROM {stage_alias}.{column}"
+        for column in compared_columns
+    )
 
 
 def _evaluate_interval(interval: _SourceInterval, replay_date: date) -> _EvaluatedInterval:
@@ -620,7 +1338,6 @@ def _interval_provenance_payload(evaluated: _EvaluatedInterval) -> dict[str, Any
         "data_lineage_id": interval.data_lineage_id,
         "input_hash": interval.input_hash,
         "missing_delisted_date_source": interval.missing_delisted_date_source,
-        "source_row": interval.source_row,
     }
 
 

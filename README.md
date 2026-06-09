@@ -292,16 +292,19 @@ The historical replay path is designed to answer: "What would the live engine ha
 
 Target path:
 
-1. Reconstruct the point-in-time universe for each historical session.
-2. Include names alive on that date, including names later delisted.
-3. Exclude names not yet IPO'd or already delisted.
-4. Pull historical OHLCV and source-backed context.
-5. Recompute the exact pattern gates from the code, not from an approximation.
-6. Persist reconstructed signals with provenance.
-7. Compute forward labels immediately because the 15-session windows are already in the past.
-8. Keep reconstructed rows separate from live-collected rows.
+1. Load a point-in-time delisted-company source before public replay.
+2. Reconstruct the point-in-time universe for each historical session.
+3. Include names alive on that date, including names later delisted.
+4. Exclude names not yet IPO'd, already delisted, foreign, or non-common securities.
+5. Pull historical OHLCV and source-backed context.
+6. Recompute the exact pattern gates from the code, not from an approximation.
+7. Persist reconstructed signals with provenance.
+8. Compute forward labels immediately because the 15-session windows are already in the past.
+9. Keep reconstructed rows separate from live-collected rows.
 
-The initial target window is 2024 through present, with provider checks for delisted ticker bar availability before trusting results.
+For bounded replay windows, the FMP delisted-company ingest supports a date cutoff such as `--stop-after-delisted-before 2026-01-01`. The cohort runner accepts that bounded source only when the recorded cutoff covers the requested replay start date; otherwise public replay fails closed.
+
+The immediate operational target is Jan-May 2026 M4 cohort reconstruction, then post-signal market-path enrichment, then pre-signal context rows for the same reconstructed signals.
 
 ---
 

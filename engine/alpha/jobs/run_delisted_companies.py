@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from alpha.data.config import ConfigError, FmpConfig
@@ -42,6 +42,12 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    return date.fromisoformat(value)
 
 
 def _run_live(args: argparse.Namespace) -> int:
@@ -87,6 +93,7 @@ def _run_live(args: argparse.Namespace) -> int:
             run_timestamp=_parse_timestamp(args.run_timestamp),
             page_limit=args.page_limit,
             max_pages=args.max_pages,
+            stop_after_delisted_before=_parse_date(args.stop_after_delisted_before),
         )
         result = run_job(
             session,
@@ -96,6 +103,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "run_timestamp": args.run_timestamp,
                 "page_limit": args.page_limit,
                 "max_pages": args.max_pages,
+                "stop_after_delisted_before": args.stop_after_delisted_before,
                 "schema": args.schema,
                 "confirm_live_write": args.confirm_live_write,
                 "allow_partial": args.allow_partial,
@@ -114,6 +122,8 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"U.S.-listed rows:          {metrics.get('us_listed_rows')}")
         print(f"Fetch errors:              {metrics.get('fetch_error_count')}")
         print(f"Max pages reached:         {metrics.get('max_pages_reached')}")
+        print(f"Date cutoff reached:       {metrics.get('date_cutoff_reached')}")
+        print(f"Oldest delisted date seen: {metrics.get('oldest_delisted_date_seen')}")
         if result.errors:
             print("Errors:")
             for error in result.errors[:20]:
@@ -154,6 +164,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-timestamp")
     parser.add_argument("--page-limit", type=int, default=100)
     parser.add_argument("--max-pages", type=int, default=1000)
+    parser.add_argument(
+        "--stop-after-delisted-before",
+        help=(
+            "Stop once FMP's descending delisted-date directory has moved before "
+            "this date. Use for bounded replay windows, e.g. 2026-01-01."
+        ),
+    )
     return parser.parse_args(argv)
 
 

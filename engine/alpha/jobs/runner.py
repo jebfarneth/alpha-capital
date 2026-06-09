@@ -78,6 +78,12 @@ def run_job(
     # 3. Execute — catch everything so failures are always recorded
     try:
         result = job.run(ctx)
+    except KeyboardInterrupt as exc:
+        session.rollback()
+        result = JobResult(
+            status="failed",
+            errors=[{"exception": str(exc), "traceback": traceback.format_exc()}],
+        )
     except Exception as exc:
         session.rollback()
         result = JobResult(

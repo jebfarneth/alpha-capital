@@ -9,6 +9,7 @@ from sqlalchemy import func
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import (
+    DataLineage,
     FeatureSnapshot,
     HistoricalUniverseReconstruction,
     SignalRegistry,
@@ -155,13 +156,15 @@ def _seed_reconstruction(
     )
 
 
-def _run_replay(db_session, adapter, *, allow_partial_universe=False):
+def _run_replay(db_session, adapter, *, allow_partial_universe=False, progress_callback=None):
     job = HistoricalM4ReplayJob(
         session=db_session,
         fmp_adapter=adapter,
         replay_dates=[REPLAY_DAY],
         run_timestamp=_ts(),
         allow_partial_universe=allow_partial_universe,
+        progress_callback=progress_callback,
+        progress_every=1,
     )
     return run_job(
         db_session,
@@ -268,6 +271,42 @@ def test_replay_provenance_is_stamped(db_session):
 
     features = _feature(db_session, "STAMP")
     _assert_replay_stamped(features)
+
+
+def test_replay_progress_and_compact_bar_lineage_payload(db_session):
+    _seed_reconstruction(db_session, "PROG")
+    events = []
+    adapter = _FakeFmpAdapter({"PROG": _bars(evidence_close=10.1, prior_close=10.0)})
+
+    result = _run_replay(
+        db_session,
+        adapter,
+        progress_callback=lambda event, payload: events.append((event, payload)),
+    )
+
+    assert result.status == "finished"
+    date_metrics = result.metrics["date_results"][0]
+    event_names = [event for event, _payload in events]
+    assert "included_universe_load_start" in event_names
+    assert "ticker_fetch_progress" in event_names
+    assert "ticker_fetch_finish" in event_names
+    assert "assembly_finish" in event_names
+    assert "detector_finish" in event_names
+    assert "persistence_metadata_finish" in event_names
+    assert date_metrics["stage_timing_seconds"]["ticker_fetch_seconds"] >= 0
+    assert date_metrics["progress_events"]
+
+    lineage = (
+        db_session.query(DataLineage)
+        .filter(DataLineage.provider == "FMP")
+        .filter(DataLineage.endpoint == HISTORICAL_PRICE_FULL_ENDPOINT)
+        .one()
+    )
+    payload = json.loads(lineage.raw_payload_json)
+    assert payload["payload_policy"] == "compact_bar_digest"
+    assert payload["bar_count"] == 253
+    assert payload["bars_digest"]
+    assert "bars" not in payload
 
 
 def test_replay_provenance_stamps_fired_and_no_fire_feature_snapshots(db_session):

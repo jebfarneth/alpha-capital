@@ -54,6 +54,7 @@ def persist_detection_result(
     detector_version: Optional[str] = None,
     point_in_time_passed: Optional[bool] = None,
     lookahead_guard_passed: Optional[bool] = None,
+    flush: bool = True,
 ) -> PersistedDetection:
     """
     Write a detection result into the evidence tables.
@@ -133,6 +134,7 @@ def persist_detection_result(
         point_in_time_passed=result.features.point_in_time_passed,
         lookahead_guard_passed=result.features.lookahead_guard_passed,
         input_hashes=result.input_hashes or None,
+        flush=flush,
     )
     persisted.feature_snapshot_id = feat.feature_snapshot_id
 
@@ -168,6 +170,7 @@ def persist_detection_result(
             lookahead_guard_passed=lookahead_guard_passed,
             signal_event_sequence=sequence,
             signal_identity_hash=signal_identity_hash,
+            flush=flush,
         )
         persisted.signal_ids.append(sr.signal_id)
 

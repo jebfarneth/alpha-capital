@@ -7,6 +7,7 @@ from sqlalchemy import func, inspect
 
 from alpha.db.models import (
     CanonicalUniverseScan,
+    EvidenceJobRun,
     FmpDelistedCompanyRecord,
     HistoricalUniverseReconstruction,
     SecurityProfile,
@@ -15,8 +16,13 @@ from alpha.db.models import (
 )
 from alpha.evidence.writer import create_job, finish_run, start_run
 from alpha.jobs.fmp_delisted_companies import JOB_NAME as FMP_DELISTED_JOB_NAME
+from alpha.jobs.contracts import BaseJob
 from alpha.jobs.historical_universe_reconstruction import (
     HistoricalUniverseReconstructionJob,
+    _COPY_NULL_SENTINEL,
+    _INSERT_COLUMNS,
+    _copy_csv_payload,
+    _historical_reconstruction_stage_update_changed_stmt,
 )
 from alpha.jobs.runner import run_job
 
@@ -226,6 +232,15 @@ def test_schema_contains_reconstruction_table_columns_and_uniqueness(db_session)
     )
 
 
+def test_postgres_stage_update_changed_predicate_is_grouped():
+    sql = _historical_reconstruction_stage_update_changed_stmt("tmp_hur_stage").text
+
+    assert "WHERE t.replay_date = s.replay_date " in sql
+    assert "AND t.normalized_symbol = s.normalized_symbol " in sql
+    assert "AND (t.replay_date IS DISTINCT FROM s.replay_date OR" in sql
+    assert "s.output_hash)" in sql
+
+
 def test_reconstruction_inclusion_and_rejection_rules(db_session):
     _active(db_session, "ACTIVE", ipo_date="2020-01-01")
     _active(db_session, "NEWIPO", ipo_date="2025-01-01")
@@ -394,6 +409,160 @@ def test_rerun_updates_without_duplicate_rows(db_session):
         .count()
     )
     assert duplicate_groups == 0
+
+
+def test_pre_replay_delisted_exclusion_persistence_can_be_suppressed(db_session):
+    _delisted(
+        db_session,
+        "DEADOLD",
+        ipo_date=date(2020, 1, 1),
+        delisted_date=date(2023, 12, 31),
+    )
+    job = HistoricalUniverseReconstructionJob(
+        session=db_session,
+        replay_date=date(2024, 6, 1),
+        run_timestamp=_ts(),
+        persist_pre_replay_delisted_exclusions=False,
+    )
+
+    result = run_job(db_session, job, params={"source": "test_suppression"})
+
+    assert result.status == "finished"
+    assert result.metrics["excluded_count"] == 1
+    assert result.metrics["rows_inserted"] == 0
+    assert result.metrics["rows_suppressed_pre_replay_delisted_exclusions"] == 1
+    assert result.metrics["rows_suppressed_excluded_fmp_delisted"] == 1
+    assert db_session.query(HistoricalUniverseReconstruction).count() == 0
+
+
+def test_reconstruction_progress_events_cover_load_eval_and_persist(db_session):
+    _active(db_session, "ACTIVE", ipo_date="2020-01-01")
+    _delisted(db_session, "LATERD")
+    events = []
+    job = HistoricalUniverseReconstructionJob(
+        session=db_session,
+        replay_date=date(2024, 6, 1),
+        run_timestamp=_ts(),
+        progress_callback=lambda event, payload: events.append((event, payload)),
+        progress_every=1,
+    )
+
+    result = run_job(
+        db_session,
+        job,
+        params={"source": "test_progress"},
+    )
+
+    assert result.status == "finished"
+    event_names = [event for event, _payload in events]
+    assert "candidate_load_start" in event_names
+    assert "candidate_load_finish" in event_names
+    assert "interval_evaluation_progress" in event_names
+    assert "persistence_start" in event_names
+    assert "persistence_progress" in event_names
+    assert "persistence_finish" in event_names
+    assert result.metrics["rows_processed"] == 2
+    assert result.metrics["total_serialized_payload_bytes"] > 0
+    assert result.metrics["source_provenance_json_bytes"] > 0
+    assert result.metrics["max_row_serialized_payload_bytes"] > 0
+    assert result.metrics["progress_events"][-1]["event"] == "persistence_finish"
+    provenance = json.loads(_row(db_session, "ACTIVE").source_provenance_json)
+    assert provenance["provenance_payload_policy"] == (
+        "compact_row_interval_summary_full_run_facts_in_lineage"
+    )
+    assert "source_rows" not in provenance
+    assert provenance["source_row_hashes"]
+
+
+def test_compact_persisted_provenance_omits_repeated_interval_payloads(db_session):
+    _record_delisted_ingest_run(db_session)
+    _active(db_session, "REUSE", ipo_date="2025-01-01", company_name="New Issuer")
+    _delisted(
+        db_session,
+        "REUSE",
+        ipo_date=date(2020, 1, 1),
+        delisted_date=date(2024, 12, 31),
+        company_name="Old Issuer",
+    )
+
+    job = HistoricalUniverseReconstructionJob(
+        session=db_session,
+        replay_date=date(2024, 6, 1),
+        run_timestamp=_ts(),
+        compact_persisted_provenance=True,
+    )
+    result = run_job(
+        db_session,
+        job,
+        params={"source": "test_compact_persisted_provenance"},
+    )
+
+    assert result.status == "finished"
+    provenance = json.loads(_row(db_session, "REUSE").source_provenance_json)
+    assert provenance["provenance_payload_policy"] == "compact_public_cohort_row_v4"
+    assert provenance["source_interval_count"] == 2
+    assert "source_intervals" not in provenance
+    assert "selected_source_interval" not in provenance
+    assert "source_row_hashes" not in provenance
+    assert provenance["source_row_hash"]
+    assert provenance["delisted_source_complete"] is True
+    filter_status = json.loads(_row(db_session, "REUSE").pit_filter_status_json)
+    assert filter_status["pit_filter_payload_policy"] == "compact_public_cohort_row_v3"
+
+
+def test_copy_csv_payload_sanitizes_nul_and_preserves_null_sentinel():
+    row = {column: None for column in _INSERT_COLUMNS}
+    row.update(
+        {
+            "historical_universe_reconstruction_id": "hur-test",
+            "replay_date": date(2024, 6, 1),
+            "ticker": "NUL",
+            "normalized_symbol": "NUL",
+            "company_name": "Bad\x00Name",
+            "inclusion_status": "included",
+            "source_provenance_json": json.dumps({"note": "contains\x00nul"}),
+            "reconstructed": True,
+            "reconstruction_method": "historical_pit_universe_reconstruction_v1",
+            "pit_filter_status_json": "{}",
+            "data_lineage_id": "lineage",
+            "job_run_id": "job-run",
+            "input_hash": "input",
+            "output_hash": "output",
+            "created_at": _ts(),
+            "updated_at": _ts(),
+        }
+    )
+
+    payload = _copy_csv_payload([row])
+
+    assert "\x00" not in payload
+    assert "BadName" in payload
+    assert _COPY_NULL_SENTINEL in payload
+
+
+def test_keyboard_interrupt_marks_evidence_run_failed(db_session):
+    class InterruptingJob(BaseJob):
+        @property
+        def job_name(self) -> str:
+            return "interrupting_historical_universe_test"
+
+        @property
+        def job_type(self) -> str:
+            return "test"
+
+        def run(self, _ctx):
+            raise KeyboardInterrupt("operator stopped test")
+
+    result = run_job(db_session, InterruptingJob(), params={"source": "test"})
+
+    assert result.status == "failed"
+    run = (
+        db_session.query(EvidenceJobRun)
+        .order_by(EvidenceJobRun.started_at.desc())
+        .first()
+    )
+    assert run.run_status == "failed"
+    assert "KeyboardInterrupt" in run.error_json
 
 
 def test_reconstruction_rows_are_distinct_from_live_universe_snapshots(db_session):

@@ -307,6 +307,7 @@ def record_feature_snapshot(
     point_in_time_passed: bool | None = None,
     lookahead_guard_passed: bool | None = None,
     input_hashes: dict | None = None,
+    flush: bool = True,
 ) -> FeatureSnapshot:
     """Persist feature evidence and deterministic hashes for one pattern/ticker."""
 
@@ -329,7 +330,8 @@ def record_feature_snapshot(
         output_hash=_hash(features),
     )
     session.add(snap)
-    session.flush()
+    if flush:
+        session.flush()
     return snap
 
 
@@ -367,6 +369,7 @@ def record_signal(
     intended_entry_price: float | None = None,
     forward_return_status: str = "pending",
     forward_return_attempts: int = 0,
+    flush: bool = True,
 ) -> SignalRegistry:
     """Persist a deterministic pattern signal firing."""
 
@@ -403,7 +406,8 @@ def record_signal(
         forward_return_attempts=forward_return_attempts,
     )
     session.add(sig)
-    session.flush()
+    if flush:
+        session.flush()
     return sig
 
 

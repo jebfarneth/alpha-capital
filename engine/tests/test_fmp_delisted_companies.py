@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 from sqlalchemy import func, inspect
@@ -68,13 +68,20 @@ class FakeFmpAdapter:
         return AdapterResponse(data=rows, lineage=_lineage(page, rows))
 
 
-def _run_ingestion(db_session, adapter: FakeFmpAdapter, *, max_pages: int = 10):
+def _run_ingestion(
+    db_session,
+    adapter: FakeFmpAdapter,
+    *,
+    max_pages: int = 10,
+    stop_after_delisted_before: date | None = None,
+):
     job = FmpDelistedCompaniesIngestionJob(
         session=db_session,
         fmp_adapter=adapter,
         run_timestamp=_ts(),
         page_limit=2,
         max_pages=max_pages,
+        stop_after_delisted_before=stop_after_delisted_before,
     )
     return run_job(
         db_session,
@@ -144,6 +151,64 @@ def test_pagination_stops_on_empty_page(db_session):
     assert result.metrics["max_pages_reached"] is False
     assert result.metrics["rows_inserted"] == 2
     assert db_session.query(FmpDelistedCompanyRecord).count() == 2
+
+
+def test_date_cutoff_stops_after_descending_page_crosses_cutoff(db_session):
+    adapter = FakeFmpAdapter(
+        {
+            0: [
+                _row("NEW1", delisted_date="2026-02-02"),
+                _row("NEW2", delisted_date="2026-01-15"),
+            ],
+            1: [
+                _row("OLD1", delisted_date="2025-12-31"),
+                _row("OLD2", delisted_date="2025-12-15"),
+            ],
+            2: [_row("TOOOLD", delisted_date="2025-11-01")],
+        }
+    )
+
+    result = _run_ingestion(
+        db_session,
+        adapter,
+        stop_after_delisted_before=date(2026, 1, 1),
+    )
+
+    assert result.status == "finished"
+    assert adapter.calls == [(0, 2), (1, 2)]
+    assert result.metrics["date_cutoff_reached"] is True
+    assert result.metrics["stop_after_delisted_before"] == "2026-01-01"
+    assert result.metrics["oldest_delisted_date_seen"] == "2025-12-15"
+    assert result.metrics["newest_delisted_date_seen"] == "2026-02-02"
+    assert result.metrics["pagination_order_valid"] is True
+    assert db_session.query(FmpDelistedCompanyRecord).count() == 4
+
+
+def test_date_cutoff_does_not_stop_if_pagination_order_is_invalid(db_session):
+    adapter = FakeFmpAdapter(
+        {
+            0: [
+                _row("NEW1", delisted_date="2026-02-02"),
+                _row("NEW2", delisted_date="2026-01-15"),
+            ],
+            1: [
+                _row("OUTOFORDER", delisted_date="2026-03-01"),
+                _row("OLD1", delisted_date="2025-12-31"),
+            ],
+        }
+    )
+
+    result = _run_ingestion(
+        db_session,
+        adapter,
+        stop_after_delisted_before=date(2026, 1, 1),
+    )
+
+    assert result.status == "finished"
+    assert adapter.calls == [(0, 2), (1, 2), (2, 2)]
+    assert result.metrics["date_cutoff_reached"] is False
+    assert result.metrics["pagination_order_valid"] is False
+    assert db_session.query(FmpDelistedCompanyRecord).count() == 4
 
 
 def test_max_pages_reached_is_partial_failed_not_finished(db_session):

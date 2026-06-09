@@ -59,6 +59,7 @@ class FmpDelistedCompaniesIngestionJob(BaseJob):
         run_timestamp: datetime | None = None,
         page_limit: int = 100,
         max_pages: int = 1000,
+        stop_after_delisted_before: date | None = None,
     ) -> None:
         if page_limit <= 0:
             raise ValueError("page_limit must be positive")
@@ -69,6 +70,7 @@ class FmpDelistedCompaniesIngestionJob(BaseJob):
         self.run_timestamp = _aware_utc(run_timestamp)
         self.page_limit = page_limit
         self.max_pages = max_pages
+        self.stop_after_delisted_before = stop_after_delisted_before
 
     @property
     def job_name(self) -> str:
@@ -97,9 +99,18 @@ class FmpDelistedCompaniesIngestionJob(BaseJob):
             "page_limit": self.page_limit,
             "max_pages": self.max_pages,
             "max_pages_reached": False,
+            "stop_after_delisted_before": (
+                self.stop_after_delisted_before.isoformat()
+                if self.stop_after_delisted_before else None
+            ),
+            "date_cutoff_reached": False,
+            "oldest_delisted_date_seen": None,
+            "newest_delisted_date_seen": None,
+            "pagination_order_valid": True,
         }
         errors: list[dict[str, Any]] = []
         output_hash_parts: list[str] = []
+        previous_page_min_date: date | None = None
 
         for page in range(self.max_pages):
             response = self.fmp_adapter.get_delisted_companies(
@@ -151,6 +162,35 @@ class FmpDelistedCompaniesIngestionJob(BaseJob):
             if not rows:
                 break
 
+            page_dates: list[date] = []
+            for row in rows:
+                try:
+                    parsed = _parse_optional_date(getattr(row, "delisted_date", None))
+                except ValueError:
+                    continue
+                if parsed is not None:
+                    page_dates.append(parsed)
+            page_has_complete_dates = len(page_dates) == len(rows)
+            page_min_date = min(page_dates) if page_dates else None
+            page_max_date = max(page_dates) if page_dates else None
+            if page_dates:
+                oldest_seen = metrics["oldest_delisted_date_seen"]
+                newest_seen = metrics["newest_delisted_date_seen"]
+                metrics["oldest_delisted_date_seen"] = (
+                    min(date.fromisoformat(oldest_seen), page_min_date).isoformat()
+                    if oldest_seen else page_min_date.isoformat()
+                )
+                metrics["newest_delisted_date_seen"] = (
+                    max(date.fromisoformat(newest_seen), page_max_date).isoformat()
+                    if newest_seen else page_max_date.isoformat()
+                )
+                if (
+                    previous_page_min_date is not None
+                    and page_max_date is not None
+                    and page_max_date > previous_page_min_date
+                ):
+                    metrics["pagination_order_valid"] = False
+
             metrics["pages_with_data"] += 1
             page_hashes = self._persist_page(
                 rows=rows,
@@ -160,6 +200,17 @@ class FmpDelistedCompaniesIngestionJob(BaseJob):
                 metrics=metrics,
             )
             output_hash_parts.extend(page_hashes)
+            if (
+                self.stop_after_delisted_before is not None
+                and metrics["pagination_order_valid"] is True
+                and page_has_complete_dates
+                and page_max_date is not None
+                and page_max_date < self.stop_after_delisted_before
+            ):
+                metrics["date_cutoff_reached"] = True
+                break
+            if page_min_date is not None:
+                previous_page_min_date = page_min_date
         else:
             metrics["max_pages_reached"] = True
             errors.append(

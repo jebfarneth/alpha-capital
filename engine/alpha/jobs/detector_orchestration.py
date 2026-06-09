@@ -15,9 +15,10 @@ import importlib
 import inspect
 import pkgutil
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
@@ -334,12 +335,18 @@ class DetectorOrchestrationJob(BaseJob):
         trading_date: Optional[str] = None,
         inputs: Optional[List[PatternInput]] = None,
         assembled_inputs: Optional[Dict[str, List[PatternInput]]] = None,
+        nested_persistence: bool = True,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        progress_every: int = 100,
     ):
         self._session = session
         self._detectors = detectors
         self._trading_date = trading_date
         self._inputs = inputs
         self._assembled_inputs = assembled_inputs
+        self._nested_persistence = nested_persistence
+        self._progress_callback = progress_callback
+        self._progress_every = max(int(progress_every), 1)
 
     def run(self, ctx: JobContext) -> JobResult:
         """Run callable detectors over canonical or explicitly assembled inputs."""
@@ -591,8 +598,26 @@ class DetectorOrchestrationJob(BaseJob):
             detector_version=detector_version,
         )
 
+        previous_autoflush = self._session.autoflush
+        if not self._nested_persistence:
+            self._session.autoflush = False
         for inp in inputs:
             diag.evaluated_count += 1
+            if diag.evaluated_count == 1 or diag.evaluated_count % self._progress_every == 0:
+                self._emit_progress(
+                    "detector_progress",
+                    {
+                        "detector_id": detector.pattern_id,
+                        "trading_date": trading_date,
+                        "evaluated_count": diag.evaluated_count,
+                        "input_count": len(inputs),
+                        "feature_snapshot_count": diag.feature_snapshot_count,
+                        "fired_count": diag.fired_count,
+                        "skipped_count": diag.skipped_count,
+                        "error_count": diag.error_count,
+                        "nested_persistence": self._nested_persistence,
+                    },
+                )
 
             if inp.universe_snapshot_id not in valid_universe_snapshot_ids:
                 diag.identity_refused_count += 1
@@ -688,21 +713,19 @@ class DetectorOrchestrationJob(BaseJob):
 
             if not result.has_signal:
                 try:
-                    with self._session.begin_nested():
-                        persisted = persist_detection_result(
-                            self._session,
-                            result,
-                            detector,
-                            job_run_id=job_run_id,
-                            universe_snapshot_id=inp.universe_snapshot_id,
-                            data_lineage_ids=self._resolved_input_lineage_ids(inp),
-                            code_commit_sha=code_commit_sha,
-                            trading_date=trading_date,
-                            scan_id=scan_id,
-                            detector_version=detector_version,
-                            point_in_time_passed=result.features.point_in_time_passed,
-                            lookahead_guard_passed=result.features.lookahead_guard_passed,
-                        )
+                    persisted = self._persist_detection_result(
+                        result=result,
+                        detector=detector,
+                        job_run_id=job_run_id,
+                        universe_snapshot_id=inp.universe_snapshot_id,
+                        data_lineage_ids=self._resolved_input_lineage_ids(inp),
+                        code_commit_sha=code_commit_sha,
+                        trading_date=trading_date,
+                        scan_id=scan_id,
+                        detector_version=detector_version,
+                        point_in_time_passed=result.features.point_in_time_passed,
+                        lookahead_guard_passed=result.features.lookahead_guard_passed,
+                    )
                 except Exception as exc:
                     diag.error_count += 1
                     diag.errors.append({
@@ -803,21 +826,19 @@ class DetectorOrchestrationJob(BaseJob):
 
             # Persist through evidence bridge
             try:
-                with self._session.begin_nested():
-                    persisted = persist_detection_result(
-                        self._session,
-                        result,
-                        detector,
-                        job_run_id=job_run_id,
-                        universe_snapshot_id=inp.universe_snapshot_id,
-                        data_lineage_ids=self._resolved_input_lineage_ids(inp),
-                        code_commit_sha=code_commit_sha,
-                        trading_date=trading_date,
-                        scan_id=scan_id,
-                        detector_version=detector_version,
-                        point_in_time_passed=result.features.point_in_time_passed,
-                        lookahead_guard_passed=result.features.lookahead_guard_passed,
-                    )
+                persisted = self._persist_detection_result(
+                    result=result,
+                    detector=detector,
+                    job_run_id=job_run_id,
+                    universe_snapshot_id=inp.universe_snapshot_id,
+                    data_lineage_ids=self._resolved_input_lineage_ids(inp),
+                    code_commit_sha=code_commit_sha,
+                    trading_date=trading_date,
+                    scan_id=scan_id,
+                    detector_version=detector_version,
+                    point_in_time_passed=result.features.point_in_time_passed,
+                    lookahead_guard_passed=result.features.lookahead_guard_passed,
+                )
             except IntegrityError:
                 existing_after_race = (
                     self._session.query(SignalRegistry.signal_id)
@@ -856,6 +877,23 @@ class DetectorOrchestrationJob(BaseJob):
             else:
                 diag.identity_refused_count += 1
 
+        if not self._nested_persistence:
+            self._session.autoflush = previous_autoflush
+        self._emit_progress(
+            "detector_progress",
+            {
+                "detector_id": detector.pattern_id,
+                "trading_date": trading_date,
+                "evaluated_count": diag.evaluated_count,
+                "input_count": len(inputs),
+                "feature_snapshot_count": diag.feature_snapshot_count,
+                "fired_count": diag.fired_count,
+                "skipped_count": diag.skipped_count,
+                "error_count": diag.error_count,
+                "nested_persistence": self._nested_persistence,
+            },
+        )
+
         failure_count = (
             diag.error_count
             + diag.identity_refused_count
@@ -865,6 +903,28 @@ class DetectorOrchestrationJob(BaseJob):
             diag.detector_status = "partial_failed" if diag.fired_count > 0 else "failed"
 
         return diag
+
+    def _persist_detection_result(self, **kwargs):
+        if self._nested_persistence:
+            with self._session.begin_nested():
+                return persist_detection_result(
+                    self._session,
+                    flush=True,
+                    **kwargs,
+                )
+        return persist_detection_result(
+            self._session,
+            flush=False,
+            **kwargs,
+        )
+
+    def _emit_progress(self, event: str, payload: dict[str, Any]) -> None:
+        if self._progress_callback is None:
+            return
+        try:
+            self._progress_callback(event, payload)
+        except Exception:
+            pass
 
     def _resolved_input_lineage_ids(self, inp: PatternInput) -> List[str]:
         """Resolve input lineage hashes to data_lineage IDs when rows exist."""
