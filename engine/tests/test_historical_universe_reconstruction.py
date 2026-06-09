@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 
+import pytest
 from sqlalchemy import func, inspect
 
 from alpha.db.models import (
@@ -155,7 +156,9 @@ def _record_delisted_ingest_run(
     *,
     status: str = "finished",
     max_pages_reached: bool = False,
-) -> None:
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
+) -> str:
     job = create_job(
         db_session,
         name=FMP_DELISTED_JOB_NAME,
@@ -163,12 +166,26 @@ def _record_delisted_ingest_run(
         owner="historical_replay",
     )
     run = start_run(db_session, job_id=job.job_id, params={"source": "test"})
-    finish_run(
-        db_session,
-        run,
-        status=status,
-        metrics={"max_pages_reached": max_pages_reached, "rows_seen": 1},
-    )
+    if started_at is not None:
+        run.started_at = started_at
+    if status == "running":
+        run.metric_json = json.dumps(
+            {"max_pages_reached": max_pages_reached, "rows_seen": 1}
+        )
+        db_session.flush()
+    else:
+        finish_run(
+            db_session,
+            run,
+            status=status,
+            metrics={"max_pages_reached": max_pages_reached, "rows_seen": 1},
+        )
+        if ended_at is not None:
+            run.ended_at = ended_at
+        elif started_at is not None:
+            run.ended_at = started_at
+        db_session.flush()
+    return run.job_run_id
 
 
 def _run(
@@ -242,6 +259,7 @@ def test_postgres_stage_update_changed_predicate_is_grouped():
 
 
 def test_reconstruction_inclusion_and_rejection_rules(db_session):
+    _record_delisted_ingest_run(db_session)
     _active(db_session, "ACTIVE", ipo_date="2020-01-01")
     _active(db_session, "NEWIPO", ipo_date="2025-01-01")
     _active(db_session, "MISSIPO", ipo_date=None)
@@ -292,6 +310,7 @@ def test_reconstruction_inclusion_and_rejection_rules(db_session):
 
 
 def test_delisted_non_common_symbols_are_excluded_before_replay_eligibility(db_session):
+    _record_delisted_ingest_run(db_session)
     _delisted(db_session, "BTMWW")
     _delisted(db_session, "WARRW")
     _delisted(db_session, "ABCDU")
@@ -316,6 +335,7 @@ def test_delisted_non_common_symbols_are_excluded_before_replay_eligibility(db_s
 
 
 def test_ticker_reuse_evaluates_delisted_and_current_intervals_independently(db_session):
+    _record_delisted_ingest_run(db_session)
     _active(db_session, "REUSE", ipo_date="2025-01-01", company_name="New Issuer")
     _delisted(
         db_session,
@@ -345,10 +365,39 @@ def test_ticker_reuse_evaluates_delisted_and_current_intervals_independently(db_
     }
 
 
+@pytest.mark.parametrize("duplicate_status", ["failed", "partial_failed"])
+def test_finished_delisted_run_ignores_newer_failed_duplicate(
+    db_session,
+    duplicate_status: str,
+):
+    accepted_run_id = _record_delisted_ingest_run(
+        db_session,
+        max_pages_reached=False,
+        started_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+    _record_delisted_ingest_run(
+        db_session,
+        status=duplicate_status,
+        max_pages_reached=True,
+        started_at=datetime(2026, 6, 2, tzinfo=timezone.utc),
+    )
+    _delisted(db_session, "LATERD")
+
+    result = _run(db_session, date(2024, 6, 1))
+
+    assert result.status == "finished"
+    assert result.metrics["delisted_source_complete"] is True
+    assert result.metrics["delisted_source_partial_reason"] is None
+    assert result.metrics["delisted_source_latest_job_run_id"] == accepted_run_id
+    assert result.metrics["delisted_source_latest_run_status"] == "finished"
+    provenance = json.loads(_row(db_session, "LATERD").source_provenance_json)
+    assert provenance["delisted_source_complete"] is True
+
+
 def test_partial_delisted_source_returns_partial_failed_by_default(db_session):
     _record_delisted_ingest_run(
         db_session,
-        status="partial_failed",
+        status="finished",
         max_pages_reached=True,
     )
     _delisted(db_session, "LATERD")
@@ -368,7 +417,7 @@ def test_partial_delisted_source_returns_partial_failed_by_default(db_session):
 def test_allow_partial_delisted_source_keeps_success_but_stamps_provenance(db_session):
     _record_delisted_ingest_run(
         db_session,
-        status="partial_failed",
+        status="finished",
         max_pages_reached=True,
     )
     _delisted(db_session, "LATERD")
@@ -385,6 +434,34 @@ def test_allow_partial_delisted_source_keeps_success_but_stamps_provenance(db_se
     provenance = json.loads(_row(db_session, "LATERD").source_provenance_json)
     assert provenance["allow_partial_delisted_source"] is True
     assert provenance["delisted_source_complete"] is False
+
+
+def test_no_finished_delisted_ingest_run_returns_missing_run_partial(db_session):
+    _record_delisted_ingest_run(
+        db_session,
+        status="failed",
+        max_pages_reached=False,
+    )
+    _delisted(db_session, "LATERD")
+
+    result = _run(db_session, date(2024, 6, 1))
+
+    assert result.status == "partial_failed"
+    assert result.metrics["delisted_source_complete"] is False
+    assert (
+        result.metrics["delisted_source_partial_reason"]
+        == "fmp_delisted_ingestion_run_not_found"
+    )
+    assert result.metrics["delisted_source_latest_job_run_id"] is None
+    assert result.errors[0]["partial_reason"] == (
+        "fmp_delisted_ingestion_run_not_found"
+    )
+    provenance = json.loads(_row(db_session, "LATERD").source_provenance_json)
+    assert provenance["delisted_source_complete"] is False
+    assert (
+        provenance["delisted_source_partial_reason"]
+        == "fmp_delisted_ingestion_run_not_found"
+    )
 
 
 def test_rerun_updates_without_duplicate_rows(db_session):
@@ -412,6 +489,7 @@ def test_rerun_updates_without_duplicate_rows(db_session):
 
 
 def test_pre_replay_delisted_exclusion_persistence_can_be_suppressed(db_session):
+    _record_delisted_ingest_run(db_session)
     _delisted(
         db_session,
         "DEADOLD",
@@ -436,6 +514,7 @@ def test_pre_replay_delisted_exclusion_persistence_can_be_suppressed(db_session)
 
 
 def test_reconstruction_progress_events_cover_load_eval_and_persist(db_session):
+    _record_delisted_ingest_run(db_session)
     _active(db_session, "ACTIVE", ipo_date="2020-01-01")
     _delisted(db_session, "LATERD")
     events = []

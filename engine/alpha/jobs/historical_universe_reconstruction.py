@@ -630,13 +630,15 @@ class HistoricalUniverseReconstructionJob(BaseJob):
             self.session.query(EvidenceJobRun)
             .join(EvidenceJob, EvidenceJob.job_id == EvidenceJobRun.job_id)
             .filter(EvidenceJob.job_name == FMP_DELISTED_JOB_NAME)
+            .filter(EvidenceJobRun.run_status == "finished")
             .order_by(EvidenceJobRun.started_at.desc(), EvidenceJobRun.ended_at.desc())
             .first()
         )
         if run is None:
+            partial = bool(delisted_rows)
             return {
-                "complete": None if delisted_rows else True,
-                "partial": False,
+                "complete": not partial,
+                "partial": partial,
                 "partial_reason": (
                     "fmp_delisted_ingestion_run_not_found" if delisted_rows else None
                 ),
@@ -651,9 +653,6 @@ class HistoricalUniverseReconstructionJob(BaseJob):
         if max_pages_reached:
             partial = True
             partial_reason = "max_pages_reached"
-        elif run.run_status != "finished":
-            partial = True
-            partial_reason = f"ingestion_run_status:{run.run_status}"
         return {
             "complete": not partial,
             "partial": partial,
