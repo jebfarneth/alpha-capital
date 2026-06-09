@@ -14,7 +14,9 @@ from alpha.db.models import (
 from alpha.jobs.fmp_delisted_companies import JOB_NAME as FMP_DELISTED_JOB_NAME
 from alpha.jobs.contracts import JobResult
 from alpha.jobs.run_historical_cohort_reconstruction import (
+    HISTORICAL_M4_RANGE_REPLAY_JOB_NAME,
     MARKET_PATH_ALEMBIC_REVISION,
+    _has_completed_m4_replay_evidence,
     _preflight_public_delisted_source,
     _validate_pattern_ids,
     _validate_write_target,
@@ -45,6 +47,72 @@ class _FakeJob:
 
     def run(self, _ctx):  # pragma: no cover - tests inject the runner.
         raise AssertionError("fake job should be handled by injected job_runner")
+
+
+def _range_replay_metrics(replay_dates: list[str]) -> dict:
+    date_results = []
+    for index, replay_date in enumerate(replay_dates):
+        date_results.append(
+            {
+                "replay_date": replay_date,
+                "rows_inserted": 1 if index == 0 else 0,
+                "rows_reused": 0 if index == 0 else 1,
+                "fired_m4_signal_count": 1 if index == 0 else 0,
+                "rejected_or_no_fire_count": 2,
+                "polygon_fallback_count": 1 if index == 0 else 0,
+                "missing_price_evidence_count": index,
+                "non_evaluable_ticker_count": index,
+                "fetch_error_count": 0,
+            }
+        )
+    return {
+        "replay_dates": replay_dates,
+        "active_replay_dates": replay_dates,
+        "skipped_replay_dates": [],
+        "unique_ticker_count": 3,
+        "date_ticker_equivalent_fetch_count": len(replay_dates) * 3,
+        "fmp_fetch": {
+            "requested_ticker_count": 3,
+            "fmp_success_count": 2,
+            "polygon_fallback_count": 1,
+        },
+        "validation": {
+            "duplicate_hur_groups": 0,
+            "duplicate_signal_identity_groups": 0,
+            "feature_lineage_missing_count": 0,
+            "replay_stamp_missing_count": 0,
+            "lookahead_violation_count": 0,
+        },
+        "stage_timing_seconds": {
+            "universe_load_reconstruction_seconds": 0.1,
+            "fmp_fetch_seconds": 0.2,
+            "validation_seconds": 0.01,
+        },
+        "universe": {
+            "persistence": {
+                "rows_inserted": 4,
+                "rows_updated": 1,
+            },
+            "date_metrics": [
+                {
+                    "replay_date": replay_date,
+                    "included_count": 3,
+                    "rows_inserted": 2,
+                    "rows_updated": 0,
+                }
+                for replay_date in replay_dates
+            ],
+        },
+        "total_rows_inserted": sum(row["rows_inserted"] for row in date_results),
+        "total_rows_reused": sum(row["rows_reused"] for row in date_results),
+        "total_fired_m4_signal_count": sum(
+            row["fired_m4_signal_count"] for row in date_results
+        ),
+        "total_rejected_or_no_fire_count": sum(
+            row["rejected_or_no_fire_count"] for row in date_results
+        ),
+        "date_results": date_results,
+    }
 
 
 def test_cohort_cli_refuses_unconfirmed_public_write(monkeypatch):
@@ -118,6 +186,44 @@ def test_cohort_public_cli_requires_polygon_fallback_config_before_db(
 
     assert rc == 1
     assert "requires Polygon fallback configuration" in capsys.readouterr().out
+
+
+def test_cohort_public_cli_refuses_date_by_date_before_db(monkeypatch, capsys):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction."
+        "_verify_public_market_path_revision",
+        lambda _url: {"current": [MARKET_PATH_ALEMBIC_REVISION]},
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction._optional_polygon_adapter",
+        lambda: object(),
+    )
+
+    def fail_get_session():
+        raise AssertionError("date-by-date public mode should fail before DB session")
+
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.get_session",
+        fail_get_session,
+    )
+
+    rc = cohort_cli_main(
+        [
+            "--live",
+            "--confirm-live-write",
+            "--start-date",
+            "2026-01-02",
+            "--end-date",
+            "2026-01-05",
+            "--execution-mode",
+            "date-by-date",
+        ]
+    )
+
+    assert rc == 1
+    assert "--execution-mode range-cached" in capsys.readouterr().out
 
 
 def test_cohort_public_write_requires_market_path_pre_m3_revision(monkeypatch):
@@ -294,6 +400,38 @@ def test_cohort_public_preflight_rejects_bounded_delisted_gap(db_session):
         )
 
 
+def test_cohort_completion_checker_accepts_range_replay_evidence(db_session):
+    job = EvidenceJob(
+        job_name=HISTORICAL_M4_RANGE_REPLAY_JOB_NAME,
+        job_type="historical_replay",
+        owner_component="test",
+    )
+    db_session.add(job)
+    db_session.flush()
+    db_session.add(
+        EvidenceJobRun(
+            job_id=job.job_id,
+            run_status="finished",
+            started_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            metric_json=json.dumps(
+                {
+                    "date_results": [
+                        {
+                            "replay_date": "2026-01-02",
+                            "rows_inserted": 1,
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    db_session.commit()
+
+    assert _has_completed_m4_replay_evidence(db_session, date(2026, 1, 2))
+    assert not _has_completed_m4_replay_evidence(db_session, date(2026, 1, 5))
+
+
 def test_cohort_runner_explicitly_defers_m1():
     with pytest.raises(ValueError, match="Only audited M4 replay is implemented"):
         _validate_pattern_ids(["M1"])
@@ -372,6 +510,7 @@ def test_cohort_checkpoint_and_idempotent_rerun(tmp_path):
         job_runner=fake_runner,
         universe_job_factory=_FakeJob,
         m4_replay_job_factory=_FakeJob,
+        execution_mode="date-by-date",
         print_fn=lambda _message: None,
     )
     second_artifact = tmp_path / "second.json"
@@ -386,6 +525,7 @@ def test_cohort_checkpoint_and_idempotent_rerun(tmp_path):
         job_runner=fake_runner,
         universe_job_factory=_FakeJob,
         m4_replay_job_factory=_FakeJob,
+        execution_mode="date-by-date",
         print_fn=lambda _message: None,
     )
 
@@ -412,6 +552,137 @@ def test_cohort_checkpoint_and_idempotent_rerun(tmp_path):
     assert artifact["date_results"][0]["historical_m4_replay_progress_last"]["event"] == (
         "ticker_fetch_progress"
     )
+
+
+def test_cohort_range_cached_mode_invokes_one_range_replay_and_maps_metrics(tmp_path):
+    session = _FakeSession()
+    artifact_path = tmp_path / "range_cached.json"
+    calls: list[dict] = []
+
+    def fake_runner(_session, _job, *, params=None, **_kwargs):
+        params = params or {}
+        calls.append(params)
+        assert params["stage"] == "historical_m4_range_replay"
+        progress = _job.kwargs.get("progress_callback")
+        if progress:
+            progress(
+                "range_date_start",
+                {
+                    "event": "range_date_start",
+                    "replay_date": "2026-01-02",
+                    "ticker_total": 3,
+                },
+            )
+        return JobResult(
+            status="finished",
+            metrics=_range_replay_metrics(params["replay_dates"]),
+        )
+
+    result = run_historical_cohort_reconstruction(
+        session=session,
+        fmp_adapter=object(),
+        polygon_adapter=object(),
+        pattern_ids=["M4"],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 5),
+        schema="scratch_cohort",
+        progress_artifact=artifact_path,
+        job_runner=fake_runner,
+        m4_range_replay_job_factory=_FakeJob,
+        print_fn=lambda _message: None,
+    )
+
+    assert result.status == "finished"
+    assert len(calls) == 1
+    assert calls[0]["replay_dates"] == ["2026-01-02", "2026-01-05"]
+    assert calls[0]["execution_mode"] == "range_cached"
+    assert result.metrics["execution_mode"] == "range_cached"
+    assert result.metrics["dates_finished"] == 2
+    assert result.metrics["range_unique_ticker_count"] == 3
+    assert result.metrics["range_date_ticker_equivalent_fetch_count"] == 6
+    assert result.metrics["m4_rows_inserted_total"] == 1
+    assert result.metrics["m4_rows_reused_total"] == 1
+    assert result.metrics["m4_fired_signal_count_total"] == 1
+    assert result.metrics["m4_rejected_or_no_fire_count_total"] == 4
+    assert result.metrics["polygon_fallback_count_total"] == 1
+    assert result.metrics["missing_price_evidence_count_total"] == 1
+    assert result.metrics["non_evaluable_ticker_count_total"] == 1
+    assert result.metrics["universe_rows_inserted_total"] == 4
+    assert result.metrics["universe_rows_updated_total"] == 1
+    assert session.commit_count == 1
+
+    artifact = json.loads(artifact_path.read_text())
+    assert artifact["execution_mode"] == "range_cached"
+    assert artifact["historical_m4_range_replay_status"] == "finished"
+    assert artifact["summary"]["range_fetch_metrics"]["requested_ticker_count"] == 3
+    assert [row["status"] for row in artifact["date_results"]] == [
+        "finished",
+        "finished",
+    ]
+    assert artifact["date_results"][0]["m4_replay_metrics"]["range_replay"] is True
+    assert artifact["date_results"][0]["historical_m4_range_replay_progress_last"][
+        "event"
+    ] == "range_date_start"
+
+
+def test_cohort_range_cached_resume_skips_verified_dates_before_range_job(tmp_path):
+    session = _FakeSession()
+    previous_artifact = tmp_path / "previous_range.json"
+    previous_artifact.write_text(
+        json.dumps(
+            {
+                "date_results": [
+                    {
+                        "replay_date": "2026-01-02",
+                        "status": "finished",
+                        "m4_replay_status": "finished",
+                    },
+                    {
+                        "replay_date": "2026-01-05",
+                        "status": "failed",
+                        "m4_replay_status": "failed",
+                    },
+                ]
+            }
+        )
+    )
+    calls: list[dict] = []
+
+    def fake_runner(_session, _job, *, params=None, **_kwargs):
+        params = params or {}
+        calls.append(params)
+        return JobResult(
+            status="finished",
+            metrics=_range_replay_metrics(params["replay_dates"]),
+        )
+
+    result = run_historical_cohort_reconstruction(
+        session=session,
+        fmp_adapter=object(),
+        polygon_adapter=object(),
+        pattern_ids=["M4"],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 5),
+        schema="scratch_cohort",
+        progress_artifact=tmp_path / "resume_range.json",
+        resume_from_artifact=previous_artifact,
+        completion_checker=lambda _session, replay_day: replay_day == date(2026, 1, 2),
+        job_runner=fake_runner,
+        m4_range_replay_job_factory=_FakeJob,
+        print_fn=lambda _message: None,
+    )
+
+    assert result.status == "finished"
+    assert len(calls) == 1
+    assert calls[0]["stage"] == "historical_m4_range_replay"
+    assert calls[0]["replay_dates"] == ["2026-01-05"]
+    assert result.metrics["dates_skipped"] == 1
+    assert result.metrics["dates_finished"] == 1
+    artifact = json.loads((tmp_path / "resume_range.json").read_text())
+    assert [row["status"] for row in artifact["date_results"]] == [
+        "skipped",
+        "finished",
+    ]
 
 
 def test_cohort_artifact_and_summary_expose_polygon_fallback_metrics(tmp_path):
@@ -465,6 +736,7 @@ def test_cohort_artifact_and_summary_expose_polygon_fallback_metrics(tmp_path):
         job_runner=fake_runner,
         universe_job_factory=_FakeJob,
         m4_replay_job_factory=_FakeJob,
+        execution_mode="date-by-date",
         print_fn=lambda _message: None,
     )
 
@@ -542,6 +814,7 @@ def test_cohort_resume_from_artifact_skips_only_verified_finished_dates(tmp_path
         job_runner=fake_runner,
         universe_job_factory=_FakeJob,
         m4_replay_job_factory=_FakeJob,
+        execution_mode="date-by-date",
         print_fn=lambda _message: None,
     )
 
