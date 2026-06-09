@@ -41,6 +41,7 @@ from alpha.db.models import (
     EvidenceJob,
     EvidenceJobRun,
     FeatureSnapshot,
+    FmpDelistedCompanyRecord,
     HistoricalUniverseReconstruction,
     SignalRegistry,
     UniverseScan,
@@ -292,18 +293,23 @@ class HistoricalM4RangeReplayJob(BaseJob):
             6,
         )
         metrics["fmp_fetch"] = range_bars["metrics"]
-        errors.extend(range_bars["errors"])
 
         total_inserted = 0
         total_reused = 0
         total_fired = 0
         total_rejected = 0
+        total_historical_universe_included = 0
+        total_m4_evaluable = 0
+        total_m4_non_evaluable = 0
+        total_missing_price_evidence = 0
+        total_polygon_fallback = 0
         output_hashes: list[str] = []
         for replay_day in active_dates:
             date_result = self._run_one_replay_date(
                 replay_day,
                 ctx,
                 replay_helper,
+                included_rows_by_date[replay_day],
                 snapshots_by_date[replay_day],
                 range_bars["bars_by_ticker"],
                 range_bars["fetch_by_ticker"],
@@ -316,6 +322,25 @@ class HistoricalM4RangeReplayJob(BaseJob):
             total_reused += int(date_result.metrics.get("rows_reused") or 0)
             total_fired += int(date_result.metrics.get("fired_m4_signal_count") or 0)
             total_rejected += int(date_result.metrics.get("rejected_or_no_fire_count") or 0)
+            total_historical_universe_included += int(
+                date_result.metrics.get("historical_universe_included_count")
+                or date_result.metrics.get("universe_included_count")
+                or 0
+            )
+            total_m4_evaluable += int(
+                date_result.metrics.get("m4_evaluable_count") or 0
+            )
+            total_m4_non_evaluable += int(
+                date_result.metrics.get("m4_non_evaluable_count")
+                or date_result.metrics.get("non_evaluable_ticker_count")
+                or 0
+            )
+            total_missing_price_evidence += int(
+                date_result.metrics.get("missing_price_evidence_count") or 0
+            )
+            total_polygon_fallback += int(
+                date_result.metrics.get("polygon_fallback_count") or 0
+            )
 
         validation_started = perf_counter()
         validation = _validate_range_replay(self._session, active_dates)
@@ -331,14 +356,42 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 "total_rows_reused": total_reused,
                 "total_fired_m4_signal_count": total_fired,
                 "total_rejected_or_no_fire_count": total_rejected,
+                "total_historical_universe_included_count": (
+                    total_historical_universe_included
+                ),
+                "total_m4_evaluable_count": total_m4_evaluable,
+                "total_m4_non_evaluable_count": total_m4_non_evaluable,
+                "total_missing_price_evidence_count": total_missing_price_evidence,
+                "total_polygon_fallback_count": total_polygon_fallback,
                 "validation": validation,
                 "progress_events": self._progress_events[-200:],
                 "total_seconds": round(perf_counter() - self._started_perf, 6),
             }
         )
+        non_evaluable_samples = _summarize_non_evaluable_samples(
+            metrics["date_results"],
+        )
+        metrics["non_evaluable_price_evidence_samples"] = non_evaluable_samples
+        metrics["non_evaluable_symbol_count"] = len(non_evaluable_samples)
+        metrics["coverage_status"] = _coverage_status(
+            missing_price_evidence_count=total_missing_price_evidence,
+            m4_evaluable_count=total_m4_evaluable,
+            hard_error_count=len(errors),
+        )
+        metrics["completion_classification"] = _completion_classification(
+            missing_price_evidence_count=total_missing_price_evidence,
+            m4_evaluable_count=total_m4_evaluable,
+            hard_error_count=len(errors),
+        )
         status = "finished"
         if errors:
             status = "partial_failed" if total_fired or total_rejected else "failed"
+        elif total_missing_price_evidence and total_m4_evaluable <= 0:
+            status = "failed"
+            errors = _missing_price_evidence_errors_from_date_results(
+                metrics["date_results"],
+            )
+        metrics["errors"] = errors[:50]
         return JobResult(
             status=status,
             metrics=metrics,
@@ -935,6 +988,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
         replay_day: date,
         ctx: JobContext,
         replay_helper: HistoricalM4ReplayJob,
+        included_rows: list[HistoricalUniverseReconstruction],
         snapshots: list[Any],
         range_bars_by_ticker: dict[str, list[Any]],
         range_fetch_by_ticker: dict[str, Any],
@@ -948,6 +1002,11 @@ class HistoricalM4RangeReplayJob(BaseJob):
         fetch_errors: list[dict[str, Any]] = []
         daily_bars: dict[str, list[Any]] = {}
         bar_lineage_by_ticker: dict[str, DataLineage] = {}
+        rows_by_ticker = {
+            str(row.normalized_symbol).upper(): row
+            for row in included_rows
+            if row.normalized_symbol
+        }
         polygon_fallback_count = 0
         lineage_started = perf_counter()
         self._emit_progress(
@@ -1145,18 +1204,43 @@ class HistoricalM4RangeReplayJob(BaseJob):
             for error in fetch_errors
             if error.get("error_type") == "missing_price_evidence"
         )
+        hard_errors = list(bulk_result.errors or [])
+        has_hard_failure = bulk_result.status != "finished" or bool(hard_errors)
+        completion_classification = _date_completion_classification(
+            missing_price_evidence_count=missing_price_evidence_count,
+            m4_evaluable_count=len(daily_bars),
+            has_hard_failure=has_hard_failure,
+            detector_status=bulk_result.status,
+        )
+        coverage_status = _coverage_status(
+            missing_price_evidence_count=missing_price_evidence_count,
+            m4_evaluable_count=len(daily_bars),
+            hard_error_count=1 if has_hard_failure else 0,
+        )
+        non_evaluable_samples = _non_evaluable_price_evidence_samples(
+            self._session,
+            rows_by_ticker=rows_by_ticker,
+            fetch_errors=fetch_errors,
+            replay_day=replay_day,
+        )
         metrics = {
             "replay_date": replay_date_str,
             "evidence_session_date": replay_date_str,
             "next_execution_session": next_execution.isoformat(),
+            "historical_universe_included_count": len(snapshots),
             "universe_included_count": len(snapshots),
             "partial_universe_reason": partial_reason,
+            "m4_evaluable_count": len(daily_bars),
+            "m4_non_evaluable_count": missing_price_evidence_count,
             "tickers_with_bars": len(daily_bars),
             "tickers_missing_bars": len(snapshots) - len(daily_bars),
             "non_evaluable_ticker_count": missing_price_evidence_count,
             "fetch_error_count": len(fetch_errors),
             "fetch_errors": fetch_errors[:50],
             "missing_price_evidence_count": missing_price_evidence_count,
+            "coverage_status": coverage_status,
+            "completion_classification": completion_classification,
+            "non_evaluable_price_evidence_samples": non_evaluable_samples,
             "polygon_fallback_count": polygon_fallback_count,
             "assembled_count": assembly.assembled_count,
             "assembly": _assembly_metrics(assembly),
@@ -1187,13 +1271,8 @@ class HistoricalM4RangeReplayJob(BaseJob):
             "orchestration": bulk_result.metrics,
             "stage_timing_seconds": stage_timings,
         }
-        errors = list(fetch_errors)
-        errors.extend(bulk_result.errors or [])
-        status = bulk_result.status
-        if not assembly.inputs and fetch_errors:
-            status = "failed"
-        elif fetch_errors and status == "finished":
-            status = "partial_failed"
+        errors = hard_errors
+        status = bulk_result.status if has_hard_failure else "finished"
         return JobResult(status=status, metrics=metrics, errors=errors)
 
     def _run_bulk_m4_detector_persistence(
@@ -2308,6 +2387,201 @@ def _validate_range_replay(session: Session, replay_dates: Sequence[date]) -> di
         "missing_historical_replay_stamp_count": missing_replay_stamp,
         "feature_lookahead_violation_count": lookahead_violations,
     }
+
+
+def _coverage_status(
+    *,
+    missing_price_evidence_count: int,
+    m4_evaluable_count: int,
+    hard_error_count: int,
+) -> str:
+    if hard_error_count:
+        return "hard_error"
+    if missing_price_evidence_count and m4_evaluable_count <= 0:
+        return "no_evaluable_price_evidence"
+    if missing_price_evidence_count:
+        return "partial_price_evidence"
+    return "complete_price_evidence"
+
+
+def _completion_classification(
+    *,
+    missing_price_evidence_count: int,
+    m4_evaluable_count: int,
+    hard_error_count: int,
+) -> str:
+    if hard_error_count:
+        return "hard_failure"
+    if missing_price_evidence_count and m4_evaluable_count <= 0:
+        return "failed_no_evaluable_price_evidence"
+    if missing_price_evidence_count:
+        return "completed_with_non_evaluable_price_evidence"
+    return "completed"
+
+
+def _date_completion_classification(
+    *,
+    missing_price_evidence_count: int,
+    m4_evaluable_count: int,
+    has_hard_failure: bool,
+    detector_status: str,
+) -> str:
+    if has_hard_failure:
+        return (
+            "partial_hard_failure"
+            if detector_status == "partial_failed"
+            else "hard_failure"
+        )
+    if missing_price_evidence_count and m4_evaluable_count <= 0:
+        return "completed_with_no_evaluable_price_evidence"
+    if missing_price_evidence_count:
+        return "completed_with_non_evaluable_price_evidence"
+    return "completed"
+
+
+def _missing_price_evidence_errors_from_date_results(
+    date_results: Sequence[dict[str, Any]],
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    for row in date_results:
+        for error in row.get("fetch_errors") or []:
+            if error.get("error_type") != "missing_price_evidence":
+                continue
+            errors.append(error)
+            if len(errors) >= limit:
+                return errors
+    return errors
+
+
+def _non_evaluable_price_evidence_samples(
+    session: Session,
+    *,
+    rows_by_ticker: dict[str, HistoricalUniverseReconstruction],
+    fetch_errors: Sequence[dict[str, Any]],
+    replay_day: date,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    replay_iso = replay_day.isoformat()
+    for error in fetch_errors:
+        if error.get("error_type") != "missing_price_evidence":
+            continue
+        ticker = str(error.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        row = rows_by_ticker.get(ticker)
+        source_attempts = error.get("source_attempts") or []
+        samples.append(
+            {
+                "ticker": ticker,
+                "source": getattr(row, "source", None) if row is not None else None,
+                "exchange": getattr(row, "exchange", None) if row is not None else None,
+                "security_type": _source_security_type(session, row),
+                "category_hint": _symbol_category_hint(ticker),
+                "provider_attempt_statuses": _compact_source_attempts(source_attempts),
+                "missing_evidence_dates": _missing_evidence_dates(
+                    source_attempts,
+                    default_date=replay_iso,
+                ),
+            }
+        )
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def _summarize_non_evaluable_samples(
+    date_results: Sequence[dict[str, Any]],
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    by_ticker: dict[str, dict[str, Any]] = {}
+    for row in date_results:
+        for sample in row.get("non_evaluable_price_evidence_samples") or []:
+            ticker = sample.get("ticker")
+            if not ticker:
+                continue
+            existing = by_ticker.setdefault(ticker, {**sample})
+            dates = set(existing.get("missing_evidence_dates") or [])
+            dates.update(sample.get("missing_evidence_dates") or [])
+            existing["missing_evidence_dates"] = sorted(dates)
+    return [by_ticker[ticker] for ticker in sorted(by_ticker)][:limit]
+
+
+def _compact_source_attempts(
+    source_attempts: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    allowed = {
+        "provider",
+        "status",
+        "row_count",
+        "usable_bar_count",
+        "missing_evidence_dates",
+        "evidence_session_bar_present",
+        "requested_adjusted",
+        "adjusted",
+        "price_basis",
+        "fallback_used",
+        "error_type",
+        "message",
+        "retryable",
+    }
+    for attempt in source_attempts:
+        if not isinstance(attempt, dict):
+            continue
+        compact.append({key: attempt.get(key) for key in allowed if key in attempt})
+    return compact
+
+
+def _missing_evidence_dates(
+    source_attempts: Sequence[dict[str, Any]],
+    *,
+    default_date: str,
+) -> list[str]:
+    dates: set[str] = {default_date}
+    for attempt in source_attempts:
+        if not isinstance(attempt, dict):
+            continue
+        for value in attempt.get("missing_evidence_dates") or []:
+            dates.add(str(value))
+    return sorted(dates)
+
+
+def _source_security_type(
+    session: Session,
+    row: HistoricalUniverseReconstruction | None,
+) -> str | None:
+    if row is None:
+        return None
+    if row.current_universe_snapshot_id:
+        snapshot = session.get(UniverseSnapshot, row.current_universe_snapshot_id)
+        if snapshot is not None:
+            return snapshot.security_type
+    if row.fmp_delisted_company_id:
+        delisted = session.get(FmpDelistedCompanyRecord, row.fmp_delisted_company_id)
+        if delisted is not None:
+            payload = _json_dict(delisted.raw_payload_json)
+            for key in ("securityType", "security_type", "type"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+    return None
+
+
+def _symbol_category_hint(ticker: str) -> str | None:
+    symbol = ticker.upper()
+    if "." in symbol or "-" in symbol:
+        return "contains_symbol_separator"
+    if symbol.endswith(("WS", "WT", "WTS", "W")):
+        return "possible_warrant_suffix"
+    if symbol.endswith(("UN", "U")):
+        return "possible_unit_suffix"
+    if symbol.endswith(("RT", "R")):
+        return "possible_right_suffix"
+    return None
 
 
 def _json_dict(value: Any) -> dict[str, Any]:

@@ -321,6 +321,11 @@ def run_historical_cohort_reconstruction(
         "dates_partial": 0,
         "dates_skipped": 0,
         "execution_mode": normalized_execution_mode,
+        "completion_classification": "not_started",
+        "coverage_status": "not_started",
+        "historical_universe_included_count_total": 0,
+        "m4_evaluable_count_total": 0,
+        "m4_non_evaluable_count_total": 0,
         "m4_rows_inserted_total": 0,
         "m4_rows_reused_total": 0,
         "m4_fired_signal_count_total": 0,
@@ -483,6 +488,21 @@ def run_historical_cohort_reconstruction(
         date_detail = _first_date_result(replay_metrics)
         if date_detail:
             date_record["m4_date_metrics"] = date_detail
+            summary["historical_universe_included_count_total"] += _date_metric(
+                date_detail,
+                "historical_universe_included_count",
+                "universe_included_count",
+            )
+            summary["m4_evaluable_count_total"] += _date_metric(
+                date_detail,
+                "m4_evaluable_count",
+                "tickers_with_bars",
+            )
+            summary["m4_non_evaluable_count_total"] += _date_metric(
+                date_detail,
+                "m4_non_evaluable_count",
+                "non_evaluable_ticker_count",
+            )
         summary["m4_rows_inserted_total"] += int(
             replay_metrics.get("total_rows_inserted") or 0
         )
@@ -535,6 +555,12 @@ def run_historical_cohort_reconstruction(
             f"elapsed_seconds={elapsed:.3f}"
         )
 
+    if summary.get("completion_classification") == "not_started":
+        summary["completion_classification"] = _completion_classification_from_summary(
+            summary
+        )
+    if summary.get("coverage_status") == "not_started":
+        summary["coverage_status"] = _coverage_status_from_summary(summary)
     _finish_artifact(artifact_path, artifact, summary, "finished")
     return CohortReconstructionResult(
         status="finished",
@@ -603,6 +629,8 @@ def _run_range_cached_m4_cohort(
     _write_artifact(artifact_path, artifact)
 
     if not active_dates:
+        summary["completion_classification"] = "completed_all_dates_skipped"
+        summary["coverage_status"] = "not_applicable_all_dates_skipped"
         _finish_artifact(artifact_path, artifact, summary, "finished")
         return CohortReconstructionResult(
             status="finished",
@@ -673,6 +701,10 @@ def _run_range_cached_m4_cohort(
         },
     )
     range_metrics = range_result.metrics or {}
+    range_has_completion_classification = bool(
+        range_metrics.get("completion_classification")
+    )
+    range_has_coverage_status = bool(range_metrics.get("coverage_status"))
     artifact["historical_m4_range_replay_status"] = range_result.status
     artifact["historical_m4_range_replay_metrics"] = range_metrics
     summary["range_fetch_metrics"] = range_metrics.get("fmp_fetch") or {}
@@ -686,6 +718,9 @@ def _run_range_cached_m4_cohort(
     summary["range_date_ticker_equivalent_fetch_count"] = int(
         range_metrics.get("date_ticker_equivalent_fetch_count") or 0
     )
+    summary["non_evaluable_price_evidence_samples"] = (
+        range_metrics.get("non_evaluable_price_evidence_samples") or []
+    )
     universe_metrics = range_metrics.get("universe") or {}
     summary["universe_rows_inserted_total"] += int(
         (universe_metrics.get("persistence") or {}).get("rows_inserted") or 0
@@ -697,6 +732,20 @@ def _run_range_cached_m4_cohort(
         range_metrics.get("total_rows_inserted") or 0
     )
     summary["m4_rows_reused_total"] += int(range_metrics.get("total_rows_reused") or 0)
+    summary["historical_universe_included_count_total"] += int(
+        range_metrics.get("total_historical_universe_included_count")
+        or _sum_date_metric(range_metrics, "historical_universe_included_count")
+        or _sum_date_metric(range_metrics, "universe_included_count")
+    )
+    summary["m4_evaluable_count_total"] += int(
+        range_metrics.get("total_m4_evaluable_count")
+        or _sum_date_metric(range_metrics, "m4_evaluable_count")
+    )
+    summary["m4_non_evaluable_count_total"] += int(
+        range_metrics.get("total_m4_non_evaluable_count")
+        or _sum_date_metric(range_metrics, "m4_non_evaluable_count")
+        or _sum_date_metric(range_metrics, "non_evaluable_ticker_count")
+    )
     summary["m4_fired_signal_count_total"] += int(
         range_metrics.get("total_fired_m4_signal_count") or 0
     )
@@ -715,6 +764,14 @@ def _run_range_cached_m4_cohort(
         range_metrics,
         "non_evaluable_ticker_count",
     )
+    summary["completion_classification"] = (
+        range_metrics.get("completion_classification")
+        or _completion_classification_from_summary(summary)
+    )
+    summary["coverage_status"] = (
+        range_metrics.get("coverage_status")
+        or _coverage_status_from_summary(summary)
+    )
 
     for date_detail in range_metrics.get("date_results") or []:
         replay_iso = date_detail.get("replay_date")
@@ -728,6 +785,10 @@ def _run_range_cached_m4_cohort(
         date_record["m4_replay_metrics"] = {
             "stage": "historical_m4_range_replay",
             "range_replay": True,
+            "completion_classification": date_detail.get(
+                "completion_classification"
+            ),
+            "coverage_status": date_detail.get("coverage_status"),
             "range_fetch": range_metrics.get("fmp_fetch") or {},
             "validation": range_metrics.get("validation") or {},
             "stage_timing_seconds": range_metrics.get("stage_timing_seconds") or {},
@@ -753,6 +814,10 @@ def _run_range_cached_m4_cohort(
     if range_result.errors:
         errors.extend(range_result.errors)
     if not range_result.ok:
+        if not range_has_completion_classification:
+            summary["completion_classification"] = "hard_failure"
+        if not range_has_coverage_status:
+            summary["coverage_status"] = "hard_error"
         _finish_artifact(artifact_path, artifact, summary, "failed")
         print_fn(
             "range_replay_failed "
@@ -797,10 +862,28 @@ def _sum_date_metric(metrics: dict[str, Any], key: str) -> int:
     )
 
 
+def _date_metric(date_detail: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in date_detail:
+            return int(date_detail.get(key) or 0)
+    return 0
+
+
 def _date_status_from_range_detail(date_detail: dict[str, Any]) -> str:
     explicit_status = date_detail.get("status")
     if explicit_status in {"finished", "partial_failed", "failed", "skipped"}:
         return str(explicit_status)
+    classification = date_detail.get("completion_classification")
+    if classification in {
+        "completed",
+        "completed_with_non_evaluable_price_evidence",
+        "completed_with_no_evaluable_price_evidence",
+    }:
+        return "finished"
+    if classification in {"hard_failure", "failed_no_evaluable_price_evidence"}:
+        return "failed"
+    if classification == "partial_hard_failure":
+        return "partial_failed"
     if int(date_detail.get("fetch_error_count") or 0) <= 0:
         return "finished"
     has_evaluable_outputs = any(
@@ -821,6 +904,22 @@ def _mark_summary_failure(summary: dict[str, Any], status: str) -> None:
         summary["dates_partial"] += 1
     else:
         summary["dates_failed"] += 1
+
+
+def _coverage_status_from_summary(summary: dict[str, Any]) -> str:
+    if int(summary.get("missing_price_evidence_count_total") or 0) <= 0:
+        return "complete_price_evidence"
+    if int(summary.get("m4_evaluable_count_total") or 0) <= 0:
+        return "no_evaluable_price_evidence"
+    return "partial_price_evidence"
+
+
+def _completion_classification_from_summary(summary: dict[str, Any]) -> str:
+    if int(summary.get("missing_price_evidence_count_total") or 0) <= 0:
+        return "completed"
+    if int(summary.get("m4_evaluable_count_total") or 0) <= 0:
+        return "failed_no_evaluable_price_evidence"
+    return "completed_with_non_evaluable_price_evidence"
 
 
 def _completed_dates_from_artifact(path: str | Path | None) -> set[str]:
@@ -940,6 +1039,8 @@ def _finish_artifact(
     status: str,
 ) -> None:
     artifact["status"] = status
+    artifact["completion_classification"] = summary.get("completion_classification")
+    artifact["coverage_status"] = summary.get("coverage_status")
     artifact["summary"] = summary
     artifact["ended_at"] = datetime.now(timezone.utc).isoformat()
     _write_artifact(path, artifact)
@@ -1043,12 +1144,20 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Target mode:            {target['mode']}")
         print(f"Schema:                 {target_schema or 'default'}")
         print(f"Execution mode:         {metrics.get('execution_mode')}")
+        print(f"Completion class:       {metrics.get('completion_classification')}")
+        print(f"Coverage status:        {metrics.get('coverage_status')}")
         print(f"Patterns:               {', '.join(patterns)}")
         print(f"Start date:             {args.start_date}")
         print(f"End date:               {args.end_date}")
         print(f"Dates finished:         {metrics.get('dates_finished')}")
         print(f"Dates failed:           {metrics.get('dates_failed')}")
         print(f"Dates skipped:          {metrics.get('dates_skipped')}")
+        print(
+            "Historical universe:    "
+            f"{metrics.get('historical_universe_included_count_total')}"
+        )
+        print(f"M4 evaluable:           {metrics.get('m4_evaluable_count_total')}")
+        print(f"M4 non-evaluable:       {metrics.get('m4_non_evaluable_count_total')}")
         print(f"M4 rows inserted:       {metrics.get('m4_rows_inserted_total')}")
         print(f"M4 rows reused:         {metrics.get('m4_rows_reused_total')}")
         print(f"M4 fired signals:       {metrics.get('m4_fired_signal_count_total')}")

@@ -470,6 +470,77 @@ def test_range_replay_uses_polygon_only_for_dates_missing_fmp_evidence_bar(
     assert second_features["P_close"] == 10.3
 
 
+def test_range_replay_quarantines_missing_price_without_no_fire_label(db_session):
+    _seed_active_universe(db_session, ["RGOOD", "RMISS"])
+    fmp = _FakeFmpAdapter(
+        {
+            "RGOOD": _bars_for_range(
+                evidence_closes={
+                    START_DAY: 10.1,
+                    END_DAY: 10.2,
+                }
+            ),
+            "RMISS": [],
+        }
+    )
+    polygon = _FakePolygonAdapter({"RMISS": []})
+
+    result = run_historical_m4_range_replay(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=START_DAY,
+        end_date=END_DAY,
+        run_timestamp=_ts(),
+        progress_every=1,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["completion_classification"] == (
+        "completed_with_non_evaluable_price_evidence"
+    )
+    assert result.metrics["coverage_status"] == "partial_price_evidence"
+    assert result.metrics["total_historical_universe_included_count"] == 4
+    assert result.metrics["total_m4_evaluable_count"] == 2
+    assert result.metrics["total_m4_non_evaluable_count"] == 2
+    assert result.metrics["total_missing_price_evidence_count"] == 2
+    assert result.metrics["total_fired_m4_signal_count"] == 2
+    assert result.metrics["total_rejected_or_no_fire_count"] == 0
+    assert result.errors == []
+    assert db_session.query(SignalRegistry).filter(SignalRegistry.ticker == "RGOOD").count() == 2
+    assert db_session.query(FeatureSnapshot).filter(FeatureSnapshot.ticker == "RGOOD").count() == 2
+    assert db_session.query(SignalRegistry).filter(SignalRegistry.ticker == "RMISS").count() == 0
+    assert db_session.query(FeatureSnapshot).filter(FeatureSnapshot.ticker == "RMISS").count() == 0
+
+    first_date, second_date = result.metrics["date_results"]
+    for date_metrics in (first_date, second_date):
+        assert date_metrics["completion_classification"] == (
+            "completed_with_non_evaluable_price_evidence"
+        )
+        assert date_metrics["coverage_status"] == "partial_price_evidence"
+        assert date_metrics["historical_universe_included_count"] == 2
+        assert date_metrics["m4_evaluable_count"] == 1
+        assert date_metrics["m4_non_evaluable_count"] == 1
+        assert date_metrics["missing_price_evidence_count"] == 1
+        assert date_metrics["rejected_or_no_fire_count"] == 0
+        sample = date_metrics["non_evaluable_price_evidence_samples"][0]
+        assert sample["ticker"] == "RMISS"
+        assert sample["source"] == "current_active_universe"
+        assert sample["exchange"] == "NASDAQ"
+        assert sample["security_type"] == "common_stock"
+        assert date_metrics["replay_date"] in sample["missing_evidence_dates"]
+        assert [attempt["status"] for attempt in sample["provider_attempt_statuses"]] == [
+            "no_usable_bars",
+            "no_usable_bars",
+        ]
+    summary_sample = result.metrics["non_evaluable_price_evidence_samples"][0]
+    assert summary_sample["ticker"] == "RMISS"
+    assert summary_sample["missing_evidence_dates"] == [
+        START_DAY.isoformat(),
+        END_DAY.isoformat(),
+    ]
+
+
 def test_range_replay_missing_after_fmp_and_fallback_is_non_evaluable(db_session):
     _seed_active_universe(db_session, ["MISSPX"])
     fmp = _FakeFmpAdapter({"MISSPX": []})
@@ -491,11 +562,20 @@ def test_range_replay_missing_after_fmp_and_fallback_is_non_evaluable(db_session
     assert result.metrics["fmp_fetch"]["tickers_missing_bars"] == 1
     assert result.metrics["fmp_fetch"]["non_evaluable_ticker_count"] == 1
     assert result.metrics["fmp_fetch"]["missing_price_evidence_count"] == 1
+    assert result.metrics["completion_classification"] == (
+        "failed_no_evaluable_price_evidence"
+    )
+    assert result.metrics["coverage_status"] == "no_evaluable_price_evidence"
+    assert result.metrics["total_m4_evaluable_count"] == 0
+    assert result.metrics["total_m4_non_evaluable_count"] == 2
+    assert result.metrics["total_missing_price_evidence_count"] == 2
     assert result.metrics["total_fired_m4_signal_count"] == 0
     assert db_session.query(SignalRegistry).count() == 0
     assert db_session.query(FeatureSnapshot).count() == 0
     first_date = result.metrics["date_results"][0]
     assert first_date["missing_price_evidence_count"] == 1
+    assert first_date["m4_evaluable_count"] == 0
+    assert first_date["rejected_or_no_fire_count"] == 0
     assert first_date["fetch_errors"][0]["error_type"] == "missing_price_evidence"
 
 

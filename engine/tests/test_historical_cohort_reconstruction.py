@@ -14,6 +14,7 @@ from alpha.db.models import (
 from alpha.jobs.fmp_delisted_companies import JOB_NAME as FMP_DELISTED_JOB_NAME
 from alpha.jobs.contracts import JobResult
 from alpha.jobs.run_historical_cohort_reconstruction import (
+    CohortReconstructionResult,
     HISTORICAL_M4_RANGE_REPLAY_JOB_NAME,
     MARKET_PATH_ALEMBIC_REVISION,
     _has_completed_m4_replay_evidence,
@@ -55,6 +56,9 @@ def _range_replay_metrics(replay_dates: list[str]) -> dict:
         date_results.append(
             {
                 "replay_date": replay_date,
+                "historical_universe_included_count": 3,
+                "m4_evaluable_count": 3 - index,
+                "m4_non_evaluable_count": index,
                 "rows_inserted": 1 if index == 0 else 0,
                 "rows_reused": 0 if index == 0 else 1,
                 "fired_m4_signal_count": 1 if index == 0 else 0,
@@ -63,6 +67,16 @@ def _range_replay_metrics(replay_dates: list[str]) -> dict:
                 "missing_price_evidence_count": index,
                 "non_evaluable_ticker_count": index,
                 "fetch_error_count": 0,
+                "coverage_status": (
+                    "complete_price_evidence"
+                    if index == 0
+                    else "partial_price_evidence"
+                ),
+                "completion_classification": (
+                    "completed"
+                    if index == 0
+                    else "completed_with_non_evaluable_price_evidence"
+                ),
             }
         )
     return {
@@ -88,6 +102,24 @@ def _range_replay_metrics(replay_dates: list[str]) -> dict:
             "fmp_fetch_seconds": 0.2,
             "validation_seconds": 0.01,
         },
+        "completion_classification": "completed_with_non_evaluable_price_evidence",
+        "coverage_status": "partial_price_evidence",
+        "non_evaluable_price_evidence_samples": [
+            {
+                "ticker": "MISS",
+                "source": "current_active_universe",
+                "exchange": "NASDAQ",
+                "security_type": "common_stock",
+                "category_hint": None,
+                "provider_attempt_statuses": [
+                    {"provider": "FMP", "status": "no_usable_bars"},
+                    {"provider": "Polygon", "status": "no_usable_bars"},
+                ],
+                "missing_evidence_dates": replay_dates[1:],
+            }
+        ]
+        if len(replay_dates) > 1
+        else [],
         "universe": {
             "persistence": {
                 "rows_inserted": 4,
@@ -105,6 +137,21 @@ def _range_replay_metrics(replay_dates: list[str]) -> dict:
         },
         "total_rows_inserted": sum(row["rows_inserted"] for row in date_results),
         "total_rows_reused": sum(row["rows_reused"] for row in date_results),
+        "total_historical_universe_included_count": sum(
+            row["historical_universe_included_count"] for row in date_results
+        ),
+        "total_m4_evaluable_count": sum(
+            row["m4_evaluable_count"] for row in date_results
+        ),
+        "total_m4_non_evaluable_count": sum(
+            row["m4_non_evaluable_count"] for row in date_results
+        ),
+        "total_missing_price_evidence_count": sum(
+            row["missing_price_evidence_count"] for row in date_results
+        ),
+        "total_polygon_fallback_count": sum(
+            row["polygon_fallback_count"] for row in date_results
+        ),
         "total_fired_m4_signal_count": sum(
             row["fired_m4_signal_count"] for row in date_results
         ),
@@ -224,6 +271,94 @@ def test_cohort_public_cli_refuses_date_by_date_before_db(monkeypatch, capsys):
 
     assert rc == 1
     assert "--execution-mode range-cached" in capsys.readouterr().out
+
+
+def test_cohort_cli_summary_prints_evaluable_coverage(monkeypatch, capsys, tmp_path):
+    class _ClosableSession(_FakeSession):
+        def close(self) -> None:
+            pass
+
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.prepare_writable_schema_target",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.get_session",
+        lambda: _ClosableSession(),
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.FmpConfig.from_env",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.FmpAdapter",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction."
+        "CachedHistoricalPriceFmpAdapter",
+        lambda adapter: adapter,
+    )
+
+    def fake_cohort(**_kwargs):
+        return CohortReconstructionResult(
+            status="finished",
+            metrics={
+                "dates_finished": 1,
+                "dates_failed": 0,
+                "dates_skipped": 0,
+                "execution_mode": "range_cached",
+                "completion_classification": (
+                    "completed_with_non_evaluable_price_evidence"
+                ),
+                "coverage_status": "partial_price_evidence",
+                "historical_universe_included_count_total": 3,
+                "m4_evaluable_count_total": 2,
+                "m4_non_evaluable_count_total": 1,
+                "m4_rows_inserted_total": 1,
+                "m4_rows_reused_total": 0,
+                "m4_fired_signal_count_total": 1,
+                "m4_rejected_or_no_fire_count_total": 1,
+                "polygon_fallback_configured": False,
+                "polygon_fallback_count_total": 0,
+                "missing_price_evidence_count_total": 1,
+                "non_evaluable_ticker_count_total": 1,
+                "range_unique_ticker_count": 3,
+                "range_date_ticker_equivalent_fetch_count": 3,
+            },
+            errors=[],
+            artifact_path=str(tmp_path / "artifact.json"),
+        )
+
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction."
+        "run_historical_cohort_reconstruction",
+        fake_cohort,
+    )
+
+    rc = cohort_cli_main(
+        [
+            "--live",
+            "--schema",
+            "scratch_cli",
+            "--start-date",
+            "2026-01-02",
+            "--end-date",
+            "2026-01-02",
+            "--progress-artifact",
+            str(tmp_path / "artifact.json"),
+        ]
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Completion class:       completed_with_non_evaluable_price_evidence" in output
+    assert "Coverage status:        partial_price_evidence" in output
+    assert "Historical universe:    3" in output
+    assert "M4 evaluable:           2" in output
+    assert "M4 non-evaluable:       1" in output
 
 
 def test_cohort_public_write_requires_market_path_pre_m3_revision(monkeypatch):
@@ -597,9 +732,16 @@ def test_cohort_range_cached_mode_invokes_one_range_replay_and_maps_metrics(tmp_
     assert calls[0]["replay_dates"] == ["2026-01-02", "2026-01-05"]
     assert calls[0]["execution_mode"] == "range_cached"
     assert result.metrics["execution_mode"] == "range_cached"
+    assert result.metrics["completion_classification"] == (
+        "completed_with_non_evaluable_price_evidence"
+    )
+    assert result.metrics["coverage_status"] == "partial_price_evidence"
     assert result.metrics["dates_finished"] == 2
     assert result.metrics["range_unique_ticker_count"] == 3
     assert result.metrics["range_date_ticker_equivalent_fetch_count"] == 6
+    assert result.metrics["historical_universe_included_count_total"] == 6
+    assert result.metrics["m4_evaluable_count_total"] == 5
+    assert result.metrics["m4_non_evaluable_count_total"] == 1
     assert result.metrics["m4_rows_inserted_total"] == 1
     assert result.metrics["m4_rows_reused_total"] == 1
     assert result.metrics["m4_fired_signal_count_total"] == 1
@@ -613,8 +755,15 @@ def test_cohort_range_cached_mode_invokes_one_range_replay_and_maps_metrics(tmp_
 
     artifact = json.loads(artifact_path.read_text())
     assert artifact["execution_mode"] == "range_cached"
+    assert artifact["completion_classification"] == (
+        "completed_with_non_evaluable_price_evidence"
+    )
+    assert artifact["coverage_status"] == "partial_price_evidence"
     assert artifact["historical_m4_range_replay_status"] == "finished"
     assert artifact["summary"]["range_fetch_metrics"]["requested_ticker_count"] == 3
+    assert artifact["summary"]["non_evaluable_price_evidence_samples"][0]["ticker"] == (
+        "MISS"
+    )
     assert [row["status"] for row in artifact["date_results"]] == [
         "finished",
         "finished",
@@ -623,6 +772,54 @@ def test_cohort_range_cached_mode_invokes_one_range_replay_and_maps_metrics(tmp_
     assert artifact["date_results"][0]["historical_m4_range_replay_progress_last"][
         "event"
     ] == "range_date_start"
+
+
+def test_cohort_range_cached_hard_failure_remains_failed(tmp_path):
+    session = _FakeSession()
+
+    def fake_runner(_session, _job, *, params=None, **_kwargs):
+        return JobResult(
+            status="partial_failed",
+            metrics={
+                "replay_dates": (params or {})["replay_dates"],
+                "date_results": [
+                    {
+                        "replay_date": "2026-01-02",
+                        "historical_universe_included_count": 1,
+                        "m4_evaluable_count": 1,
+                        "m4_non_evaluable_count": 0,
+                        "missing_price_evidence_count": 0,
+                        "fetch_error_count": 0,
+                        "rows_inserted": 0,
+                        "rows_reused": 0,
+                        "fired_m4_signal_count": 0,
+                        "rejected_or_no_fire_count": 0,
+                    }
+                ],
+            },
+            errors=[{"stage": "detector", "error_type": "runtime_error"}],
+        )
+
+    result = run_historical_cohort_reconstruction(
+        session=session,
+        fmp_adapter=object(),
+        polygon_adapter=object(),
+        pattern_ids=["M4"],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 2),
+        schema="scratch_cohort",
+        progress_artifact=tmp_path / "hard_failure.json",
+        job_runner=fake_runner,
+        m4_range_replay_job_factory=_FakeJob,
+        print_fn=lambda _message: None,
+    )
+
+    assert result.status == "failed"
+    assert result.metrics["completion_classification"] == "hard_failure"
+    assert result.metrics["coverage_status"] == "hard_error"
+    artifact = json.loads((tmp_path / "hard_failure.json").read_text())
+    assert artifact["status"] == "failed"
+    assert artifact["completion_classification"] == "hard_failure"
 
 
 def test_cohort_range_cached_resume_skips_verified_dates_before_range_job(tmp_path):
