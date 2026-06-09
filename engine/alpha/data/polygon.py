@@ -47,6 +47,8 @@ TICKER_EVENT_IDENTIFIER_ALLOWED_CHARS = frozenset(
 )
 PATH_TICKER_MAX_LENGTH = 64
 PATH_TICKER_ALLOWED_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+DAILY_BAR_SPLIT_ADJUSTED_PRICE_BASIS = "polygon_daily_close_split_adjusted"
+DAILY_BAR_UNADJUSTED_PRICE_BASIS = "polygon_daily_close_unadjusted"
 
 
 # --- Response types ---
@@ -1298,6 +1300,8 @@ class PolygonAdapter:
         from_date: str,
         to_date: str,
         limit: int = 5000,
+        *,
+        adjusted: bool = True,
     ) -> AdapterResponse[List[PolygonBar]]:
         """Fetch daily aggregate bars for a ticker and date range."""
 
@@ -1328,30 +1332,64 @@ class PolygonAdapter:
             )
 
         endpoint = f"/v2/aggs/ticker/{normalized_ticker}/range/1/day/{from_text}/{to_text}"
-        params: Dict[str, Any] = {"limit": limit, "sort": "asc"}
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "sort": "asc",
+            "adjusted": str(bool(adjusted)).lower(),
+        }
         resp = self._request(endpoint, params=params)
         if not resp.ok:
-            return resp  # type: ignore[return-value]
+            return AdapterResponse(
+                data=resp.data,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                rate_limit=resp.rate_limit,
+                error=resp.error,
+            )  # type: ignore[arg-type]
 
         if not isinstance(resp.data, dict):
             return _parse_error_response(
-                lineage=resp.lineage,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
                 endpoint=endpoint,
                 message="Polygon daily bars response missing results list",
             )
         if "results" not in resp.data:
             if resp.data.get("resultsCount") == 0 or resp.data.get("queryCount") == 0:
-                lineage = _corporate_action_row_lineage(resp.lineage, 0, 0)
+                lineage = _polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                )
                 return AdapterResponse(data=[], lineage=lineage)
             return _parse_error_response(
-                lineage=resp.lineage,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
                 endpoint=endpoint,
                 message="Polygon daily bars response missing results list",
             )
         results_list = resp.data.get("results")
         if not isinstance(results_list, list):
             return _parse_error_response(
-                lineage=resp.lineage,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
                 endpoint=endpoint,
                 message="Polygon daily bars response missing results list",
             )
@@ -1361,7 +1399,12 @@ class PolygonAdapter:
         for row in results_list:
             raw_rows += 1
             if not isinstance(row, dict):
-                lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+                lineage = _polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    raw_rows,
+                    len(bars),
+                    adjusted=adjusted,
+                )
                 return _parse_error_response(
                     lineage=lineage,
                     endpoint=endpoint,
@@ -1369,14 +1412,24 @@ class PolygonAdapter:
                 )
             parsed = _parse_daily_bar_row(row)
             if parsed is None:
-                lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+                lineage = _polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    raw_rows,
+                    len(bars),
+                    adjusted=adjusted,
+                )
                 return _parse_error_response(
                     lineage=lineage,
                     endpoint=endpoint,
                     message="Polygon daily bars response contains malformed result row",
                 )
             bars.append(parsed)
-        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(bars))
+        lineage = _polygon_daily_bar_row_lineage(
+            resp.lineage,
+            raw_rows,
+            len(bars),
+            adjusted=adjusted,
+        )
         return AdapterResponse(data=bars, lineage=lineage)
 
 
@@ -2230,6 +2283,31 @@ def _corporate_action_row_lineage(
         flags["all_rows_skipped"] = True
     else:
         flags.pop("all_rows_skipped", None)
+    return replace(lineage, data_quality_flags=flags)
+
+
+def _polygon_daily_bar_row_lineage(
+    lineage: LineageMeta,
+    raw_rows: int,
+    parsed_rows: int,
+    *,
+    adjusted: bool,
+) -> LineageMeta:
+    lineage = _corporate_action_row_lineage(lineage, raw_rows, parsed_rows)
+    flags = dict(lineage.data_quality_flags or {})
+    adjusted_bool = bool(adjusted)
+    flags.update(
+        {
+            "adjusted": adjusted_bool,
+            "requested_adjusted": adjusted_bool,
+            "price_basis": (
+                DAILY_BAR_SPLIT_ADJUSTED_PRICE_BASIS
+                if adjusted_bool
+                else DAILY_BAR_UNADJUSTED_PRICE_BASIS
+            ),
+            "adjustment_basis": "split_adjusted" if adjusted_bool else "unadjusted",
+        }
+    )
     return replace(lineage, data_quality_flags=flags)
 
 

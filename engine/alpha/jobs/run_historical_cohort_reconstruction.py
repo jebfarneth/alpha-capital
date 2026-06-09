@@ -21,8 +21,9 @@ from typing import Any, Callable, Sequence
 
 from sqlalchemy import func
 
-from alpha.data.config import ConfigError, FmpConfig
+from alpha.data.config import ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter
+from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
     SchemaTargetError,
     get_session,
@@ -258,6 +259,7 @@ def run_historical_cohort_reconstruction(
     pattern_ids: Sequence[str],
     start_date: date,
     end_date: date,
+    polygon_adapter: Any | None = None,
     run_timestamp: datetime | None = None,
     schema: str | None = None,
     progress_artifact: str | Path | None = None,
@@ -279,6 +281,7 @@ def run_historical_cohort_reconstruction(
     is_completed = completion_checker or _has_completed_m4_replay_evidence
     started_at = datetime.now(timezone.utc)
     artifact_path = Path(progress_artifact) if progress_artifact else None
+    polygon_fallback_configured = polygon_adapter is not None
     artifact: dict[str, Any] = {
         "job_name": JOB_NAME,
         "schema": schema or "default",
@@ -287,6 +290,7 @@ def run_historical_cohort_reconstruction(
         "end_date": end_date.isoformat(),
         "trading_dates": [day.isoformat() for day in replay_dates],
         "started_at": started_at.isoformat(),
+        "polygon_fallback_configured": polygon_fallback_configured,
         "skip_completed_dates": skip_completed_dates,
         "resume_from_artifact": str(resume_from_artifact) if resume_from_artifact else None,
         "date_results": [],
@@ -304,6 +308,10 @@ def run_historical_cohort_reconstruction(
         "m4_rows_reused_total": 0,
         "m4_fired_signal_count_total": 0,
         "m4_rejected_or_no_fire_count_total": 0,
+        "polygon_fallback_configured": polygon_fallback_configured,
+        "polygon_fallback_count_total": 0,
+        "missing_price_evidence_count_total": 0,
+        "non_evaluable_ticker_count_total": 0,
         "universe_rows_inserted_total": 0,
         "universe_rows_updated_total": 0,
     }
@@ -406,6 +414,7 @@ def run_historical_cohort_reconstruction(
         replay_job = m4_replay_job_factory(
             session=session,
             fmp_adapter=fmp_adapter,
+            polygon_adapter=polygon_adapter,
             replay_dates=[replay_day],
             run_timestamp=run_timestamp,
             allow_partial_universe=allow_partial_universe,
@@ -422,6 +431,7 @@ def run_historical_cohort_reconstruction(
                 "schema": schema,
                 "allow_partial_universe": allow_partial_universe,
                 "lookback_calendar_days": lookback_calendar_days,
+                "polygon_fallback_configured": polygon_adapter is not None,
             },
         )
         replay_metrics = replay_result.metrics or {}
@@ -439,6 +449,15 @@ def run_historical_cohort_reconstruction(
         )
         summary["m4_rejected_or_no_fire_count_total"] += int(
             replay_metrics.get("total_rejected_or_no_fire_count") or 0
+        )
+        summary["polygon_fallback_count_total"] += int(
+            replay_metrics.get("total_polygon_fallback_count") or 0
+        )
+        summary["missing_price_evidence_count_total"] += int(
+            replay_metrics.get("total_missing_price_evidence_count") or 0
+        )
+        summary["non_evaluable_ticker_count_total"] += int(
+            replay_metrics.get("total_non_evaluable_ticker_count") or 0
         )
         if not replay_result.ok:
             date_record["status"] = replay_result.status
@@ -652,6 +671,14 @@ def _run_live(args: argparse.Namespace) -> int:
             print(f"ERROR: {exc}")
             return 1
 
+    polygon_adapter = _optional_polygon_adapter()
+    if target["mode"] == "public" and polygon_adapter is None:
+        print(
+            "ERROR: public/default historical cohort reconstruction requires "
+            "Polygon fallback configuration for historical M4 price evidence."
+        )
+        return 1
+
     session = get_session()
     artifact_path = args.progress_artifact or _default_artifact_path()
     try:
@@ -666,7 +693,9 @@ def _run_live(args: argparse.Namespace) -> int:
                 print(f"ERROR: {exc}")
                 return 1
         try:
-                fmp_adapter = CachedHistoricalPriceFmpAdapter(FmpAdapter(FmpConfig.from_env()))
+            fmp_adapter = CachedHistoricalPriceFmpAdapter(
+                FmpAdapter(FmpConfig.from_env())
+            )
         except ConfigError as exc:
             print(f"ERROR: {exc}")
             return 1
@@ -674,6 +703,7 @@ def _run_live(args: argparse.Namespace) -> int:
         result = run_historical_cohort_reconstruction(
             session=session,
             fmp_adapter=fmp_adapter,
+            polygon_adapter=polygon_adapter,
             pattern_ids=patterns,
             start_date=_parse_date(args.start_date),
             end_date=_parse_date(args.end_date),
@@ -698,6 +728,16 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"M4 rows inserted:       {metrics.get('m4_rows_inserted_total')}")
         print(f"M4 rows reused:         {metrics.get('m4_rows_reused_total')}")
         print(f"M4 fired signals:       {metrics.get('m4_fired_signal_count_total')}")
+        print(f"Polygon fallback:       {metrics.get('polygon_fallback_configured')}")
+        print(f"Polygon fallbacks:      {metrics.get('polygon_fallback_count_total')}")
+        print(
+            "Missing price evidence: "
+            f"{metrics.get('missing_price_evidence_count_total')}"
+        )
+        print(
+            "Non-evaluable tickers:  "
+            f"{metrics.get('non_evaluable_ticker_count_total')}"
+        )
         print(f"Artifact:               {artifact_path}")
         if target.get("alembic"):
             print(f"Alembic current:        {target['alembic'].get('current')}")
@@ -739,6 +779,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--resume-from-artifact")
     parser.add_argument("--progress-artifact")
     return parser.parse_args(argv)
+
+
+def _optional_polygon_adapter() -> PolygonAdapter | None:
+    try:
+        return PolygonAdapter(PolygonConfig.from_env())
+    except ConfigError:
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -10,9 +10,10 @@ lookahead checks.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session
 from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
 from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.jobs.market_path_features import sanitize_provider_error_message
 from alpha.db.models import (
     CanonicalUniverseScan,
     DataLineage,
@@ -46,6 +48,27 @@ SOURCE_UNIVERSE_METHOD = "active_current_plus_fmp_delisted_v1"
 REPLAY_SCAN_PROVIDER = "HISTORICAL_REPLAY"
 LOOKBACK_CALENDAR_DAYS = 430
 HISTORICAL_REPLAY_MIN_DATE = date(2024, 1, 1)
+BAR_PROVIDER_POLICY = "fmp_primary_polygon_fallback"
+FMP_PRICE_BASIS = "fmp_full_close_as_split_adjusted_close"
+POLYGON_PRICE_BASIS = "polygon_daily_close_split_adjusted"
+POLYGON_DAILY_BAR_ENDPOINT_LABEL = "/v2/aggs/ticker/{ticker}/range/1/day"
+POLYGON_DAILY_BARS_ADJUSTED = True
+
+
+@dataclass
+class _HistoricalBarFetchResult:
+    bars: list[DailyBar]
+    lineage: DataLineage | None
+    source_attempts: list[dict[str, Any]]
+    fallback_used: bool
+    provider: str | None
+    endpoint: str | None
+    price_basis: str | None
+    fetched_bar_count: int
+    error: dict[str, Any] | None = None
+    status: str | None = None
+    required_evidence_dates: tuple[str, ...] = ()
+    missing_evidence_dates: tuple[str, ...] = ()
 
 
 class HistoricalM4ReplayJob(BaseJob):
@@ -57,6 +80,7 @@ class HistoricalM4ReplayJob(BaseJob):
         session: Session,
         fmp_adapter: Any,
         replay_dates: list[date],
+        polygon_adapter: Any | None = None,
         run_timestamp: datetime | None = None,
         allow_partial_universe: bool = False,
         lookback_calendar_days: int = LOOKBACK_CALENDAR_DAYS,
@@ -70,6 +94,7 @@ class HistoricalM4ReplayJob(BaseJob):
             raise ValueError("historical M4 replay starts at 2024-01-01")
         self._session = session
         self._fmp = fmp_adapter
+        self._polygon = polygon_adapter
         self._replay_dates = sorted(set(replay_dates))
         self._run_timestamp = _aware_utc(run_timestamp)
         self._allow_partial_universe = allow_partial_universe
@@ -100,10 +125,13 @@ class HistoricalM4ReplayJob(BaseJob):
             "total_universe_included_count": 0,
             "total_tickers_with_bars": 0,
             "total_tickers_missing_bars": 0,
+            "total_non_evaluable_ticker_count": 0,
             "total_assembled_count": 0,
             "total_fired_m4_signal_count": 0,
             "total_rejected_or_no_fire_count": 0,
             "total_fetch_error_count": 0,
+            "total_missing_price_evidence_count": 0,
+            "total_polygon_fallback_count": 0,
             "total_rows_inserted": 0,
             "total_rows_reused": 0,
         }
@@ -123,6 +151,9 @@ class HistoricalM4ReplayJob(BaseJob):
             metrics["total_tickers_missing_bars"] += date_result.metrics.get(
                 "tickers_missing_bars", 0
             )
+            metrics["total_non_evaluable_ticker_count"] += date_result.metrics.get(
+                "non_evaluable_ticker_count", 0
+            )
             metrics["total_assembled_count"] += date_result.metrics.get(
                 "assembled_count", 0
             )
@@ -134,6 +165,12 @@ class HistoricalM4ReplayJob(BaseJob):
             )
             metrics["total_fetch_error_count"] += date_result.metrics.get(
                 "fetch_error_count", 0
+            )
+            metrics["total_missing_price_evidence_count"] += date_result.metrics.get(
+                "missing_price_evidence_count", 0
+            )
+            metrics["total_polygon_fallback_count"] += date_result.metrics.get(
+                "polygon_fallback_count", 0
             )
             metrics["total_rows_inserted"] += date_result.metrics.get(
                 "rows_inserted", 0
@@ -256,6 +293,8 @@ class HistoricalM4ReplayJob(BaseJob):
         bar_lineage_by_ticker: dict[str, DataLineage] = {}
         fetch_errors: list[dict[str, Any]] = []
         fetched_bar_count = 0
+        polygon_fallback_count = 0
+        missing_price_evidence_count = 0
         from_date = replay_day - timedelta(days=self._lookback_calendar_days)
         ticker_fetch_started = 0
         ticker_fetch_finished = 0
@@ -288,77 +327,27 @@ class HistoricalM4ReplayJob(BaseJob):
                         "ticker_total": len(snapshots),
                     },
                 )
-            resp = self._fmp.get_historical_price(
+            fetch = self._fetch_bars_for_ticker(
                 ticker,
                 from_date=from_date,
                 to_date=replay_day,
                 asof=cutoff_timestamp,
-                adjusted=False,
-                require_split_adjusted_close=True,
-            )
-            lineage = self._build_bar_lineage(
-                provider=resp.lineage.provider,
-                endpoint=resp.lineage.endpoint,
-                asof_timestamp=resp.lineage.asof_timestamp,
-                request_timestamp=resp.lineage.request_timestamp,
-                raw_payload=_lineage_payload(
-                    resp.data,
-                    ticker=ticker,
-                    from_date=from_date,
-                    to_date=replay_day,
-                ),
-                raw_payload_hash=resp.lineage.raw_payload_hash,
-                freshness_seconds=resp.lineage.freshness_seconds,
-                source_authority=resp.lineage.source_authority,
-                data_quality_flags={
-                    **(resp.lineage.data_quality_flags or {}),
-                    "historical_m4_replay": True,
-                    "bar_provider_policy": "fmp_primary_polygon_fallback_not_used",
-                    "price_basis": "fmp_full_close_as_split_adjusted_close",
-                    "fallback_used": False,
-                },
                 job_run_id=ctx.job_run_id,
+                range_replay=False,
             )
-            bar_lineage_by_ticker[ticker] = lineage
             ticker_fetch_finished += 1
-            if not resp.ok:
-                err = resp.error
+            if fetch.error is not None:
                 ticker_fetch_errors += 1
-                fetch_errors.append(
-                    {
-                        "stage": "fmp_historical_price",
-                        "ticker": ticker,
-                        "error_type": getattr(err, "error_type", None),
-                        "status_code": getattr(err, "status_code", None),
-                        "message": getattr(err, "message", None),
-                        "retryable": getattr(err, "retryable", None),
-                    }
-                )
+                fetch_errors.append(fetch.error)
+                if fetch.error.get("error_type") == "missing_price_evidence":
+                    missing_price_evidence_count += 1
                 continue
-            bars = [
-                _to_daily_bar(
-                    bar,
-                    source_timestamp=resp.lineage.asof_timestamp,
-                    source_provider=resp.lineage.provider,
-                    lineage_id=lineage.data_lineage_id,
-                    lineage_hash=resp.lineage.raw_payload_hash,
-                )
-                for bar in (resp.data or [])
-                if _bar_has_required_m4_fields(bar)
-            ]
-            if not bars:
-                fetch_errors.append(
-                    {
-                        "stage": "fmp_historical_price",
-                        "ticker": ticker,
-                        "error_type": "missing_bars",
-                        "message": "no complete FMP /full bars for replay window",
-                        "retryable": False,
-                    }
-                )
-                continue
-            daily_bars[ticker] = bars
-            fetched_bar_count += len(bars)
+            if fetch.lineage is not None:
+                bar_lineage_by_ticker[ticker] = fetch.lineage
+            if fetch.fallback_used:
+                polygon_fallback_count += 1
+            daily_bars[ticker] = fetch.bars
+            fetched_bar_count += fetch.fetched_bar_count
         self._session.flush()
         stage_timings["ticker_fetch_seconds"] = round(
             perf_counter() - ticker_fetch_started_at,
@@ -374,24 +363,31 @@ class HistoricalM4ReplayJob(BaseJob):
                 "ticker_total": len(snapshots),
                 "tickers_with_bars": len(daily_bars),
                 "tickers_missing_bars": len(snapshots) - len(daily_bars),
+                "non_evaluable_ticker_count": missing_price_evidence_count,
                 "fetched_bar_count": fetched_bar_count,
                 "cache_hits": int(getattr(self._fmp, "cache_hits", 0) or 0),
                 "cache_misses": int(getattr(self._fmp, "cache_misses", 0) or 0),
+                "polygon_fallback_count": polygon_fallback_count,
                 "elapsed_seconds": stage_timings["ticker_fetch_seconds"],
             },
         )
 
+        assembly_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if getattr(snapshot, "ticker", None) in daily_bars
+        ]
         self._emit_progress(
             "assembly_start",
             {
                 "replay_date": replay_date_str,
-                "snapshot_count": len(snapshots),
+                "snapshot_count": len(assembly_snapshots),
                 "tickers_with_bars": len(daily_bars),
             },
         )
         stage_started = perf_counter()
         assembly = assemble_m4_daily(
-            snapshots=snapshots,
+            snapshots=assembly_snapshots,
             daily_bars=daily_bars,
             cutoff_timestamp=cutoff_timestamp,
             universe_cutoff_timestamp=cutoff_timestamp,
@@ -471,10 +467,11 @@ class HistoricalM4ReplayJob(BaseJob):
             "source_universe_lineage_hash": universe_lineage.raw_payload_hash,
             "bar_provider": "FMP",
             "bar_endpoint": HISTORICAL_PRICE_FULL_ENDPOINT,
-            "bar_provider_policy": "fmp_primary_polygon_fallback_not_used",
-            "price_basis": "fmp_full_close_as_split_adjusted_close",
+            "bar_provider_policy": BAR_PROVIDER_POLICY,
+            "price_basis": FMP_PRICE_BASIS,
             "h52w_basis": "split_adjusted_close_prior_252_sessions",
             "partial_universe_reason": partial_reason,
+            "fallback_used": False,
         }
         replay_feature_ids = _feature_ids_for_replay_inputs(
             self._session,
@@ -530,10 +527,12 @@ class HistoricalM4ReplayJob(BaseJob):
             "partial_universe_reason": partial_reason,
             "tickers_with_bars": len(daily_bars),
             "tickers_missing_bars": len(snapshots) - len(daily_bars),
+            "non_evaluable_ticker_count": missing_price_evidence_count,
             "fetched_bar_count": fetched_bar_count,
             "fetch_error_count": len(fetch_errors),
             "fetch_errors": fetch_errors[:50],
-            "polygon_fallback_count": 0,
+            "missing_price_evidence_count": missing_price_evidence_count,
+            "polygon_fallback_count": polygon_fallback_count,
             "assembled_count": assembly.assembled_count,
             "assembly": _assembly_metrics(assembly),
             "fired_m4_signal_count": fired_count,
@@ -574,6 +573,371 @@ class HistoricalM4ReplayJob(BaseJob):
         elif fetch_errors and status == "finished":
             status = "partial_failed"
         return JobResult(status=status, metrics=metrics, errors=errors)
+
+    def _fetch_bars_for_ticker(
+        self,
+        ticker: str,
+        *,
+        from_date: date,
+        to_date: date,
+        asof: datetime,
+        job_run_id: str,
+        range_replay: bool,
+    ) -> _HistoricalBarFetchResult:
+        required_evidence_dates = (to_date,)
+        fmp_fetch = self._fetch_fmp_bars_for_ticker(
+            ticker=ticker,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+            job_run_id=job_run_id,
+            range_replay=range_replay,
+            required_evidence_dates=required_evidence_dates,
+        )
+        source_attempts = list(fmp_fetch.source_attempts)
+        if fmp_fetch.status == "usable":
+            if fmp_fetch.lineage is not None:
+                _update_bar_lineage_flags(
+                    fmp_fetch.lineage,
+                    source_attempts=source_attempts,
+                    selected_bar_provider="FMP",
+                )
+            fmp_fetch.source_attempts = source_attempts
+            return fmp_fetch
+
+        polygon_fetch = self._fetch_polygon_bars_for_ticker(
+            ticker=ticker,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+            job_run_id=job_run_id,
+            range_replay=range_replay,
+            required_evidence_dates=required_evidence_dates,
+            source_attempts=source_attempts,
+        )
+        if polygon_fetch.status == "usable":
+            if polygon_fetch.lineage is not None:
+                _update_bar_lineage_flags(
+                    polygon_fetch.lineage,
+                    source_attempts=polygon_fetch.source_attempts,
+                    selected_bar_provider=polygon_fetch.provider,
+                )
+            return polygon_fetch
+
+        if polygon_fetch.lineage is not None:
+            _update_bar_lineage_flags(
+                polygon_fetch.lineage,
+                source_attempts=polygon_fetch.source_attempts,
+                selected_bar_provider=None,
+            )
+        return _HistoricalBarFetchResult(
+            bars=[],
+            lineage=None,
+            source_attempts=polygon_fetch.source_attempts,
+            fallback_used=False,
+            provider=None,
+            endpoint=None,
+            price_basis=None,
+            fetched_bar_count=0,
+            error=_missing_price_evidence_error(
+                ticker=ticker,
+                source_attempts=polygon_fetch.source_attempts,
+            ),
+            status=polygon_fetch.status,
+            required_evidence_dates=tuple(
+                day.isoformat() for day in required_evidence_dates
+            ),
+            missing_evidence_dates=polygon_fetch.missing_evidence_dates,
+        )
+
+    def _fetch_fmp_bars_for_ticker(
+        self,
+        *,
+        ticker: str,
+        from_date: date,
+        to_date: date,
+        asof: datetime,
+        job_run_id: str,
+        range_replay: bool,
+        required_evidence_dates: Sequence[date],
+    ) -> _HistoricalBarFetchResult:
+        request = _bar_request_payload(
+            ticker=ticker,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        source_attempts: list[dict[str, Any]] = []
+        fmp_resp = self._fmp.get_historical_price(
+            ticker,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+            adjusted=False,
+            require_split_adjusted_close=True,
+        )
+        fmp_bars = [
+            bar
+            for bar in (fmp_resp.data or [])
+            if _bar_has_required_m4_fields(bar)
+        ] if fmp_resp.ok else []
+        fmp_missing_evidence_dates = _missing_required_evidence_dates(
+            fmp_bars,
+            required_evidence_dates=required_evidence_dates,
+            bar_date_fn=_generic_bar_date,
+        )
+        fmp_status = (
+            "usable"
+            if fmp_bars and not fmp_missing_evidence_dates
+            else "missing_evidence_session_bar"
+            if fmp_bars
+            else "no_usable_bars"
+            if fmp_resp.ok
+            else "provider_error"
+        )
+        fmp_lineage = self._build_bar_lineage(
+            provider=fmp_resp.lineage.provider,
+            endpoint=fmp_resp.lineage.endpoint,
+            asof_timestamp=fmp_resp.lineage.asof_timestamp,
+            request_timestamp=fmp_resp.lineage.request_timestamp,
+            raw_payload=_lineage_payload(
+                fmp_resp.data,
+                ticker=ticker,
+                from_date=from_date,
+                to_date=to_date,
+            ),
+            raw_payload_hash=fmp_resp.lineage.raw_payload_hash,
+            freshness_seconds=fmp_resp.lineage.freshness_seconds,
+            source_authority=fmp_resp.lineage.source_authority,
+            data_quality_flags={
+                **(fmp_resp.lineage.data_quality_flags or {}),
+                "historical_m4_replay": True,
+                "historical_m4_range_replay": range_replay,
+                "bar_provider": "FMP",
+                "bar_endpoint": fmp_resp.lineage.endpoint,
+                "bar_provider_policy": BAR_PROVIDER_POLICY,
+                "price_basis": FMP_PRICE_BASIS,
+                "fallback_used": False,
+                "source_attempt_status": fmp_status,
+                "required_evidence_dates": [
+                    day.isoformat() for day in required_evidence_dates
+                ],
+                "missing_evidence_dates": list(fmp_missing_evidence_dates),
+                "evidence_session_bar_present": not fmp_missing_evidence_dates,
+            },
+            job_run_id=job_run_id,
+        )
+        selected_bars = [
+            _to_daily_bar(
+                bar,
+                source_timestamp=fmp_resp.lineage.asof_timestamp,
+                source_provider=fmp_resp.lineage.provider,
+                lineage_id=fmp_lineage.data_lineage_id,
+                lineage_hash=fmp_resp.lineage.raw_payload_hash,
+            )
+            for bar in fmp_bars
+        ]
+        source_attempts.append(
+            _bar_source_attempt(
+                provider="FMP",
+                response=fmp_resp,
+                lineage=fmp_lineage,
+                request=request,
+                status=fmp_status,
+                usable_bar_count=len(fmp_bars),
+                adjusted=False,
+                requested_adjusted=False,
+                price_basis=FMP_PRICE_BASIS,
+                fallback_used=False,
+                required_evidence_dates=(
+                    day.isoformat() for day in required_evidence_dates
+                ),
+                missing_evidence_dates=fmp_missing_evidence_dates,
+            )
+        )
+        return _HistoricalBarFetchResult(
+            bars=selected_bars,
+            lineage=fmp_lineage,
+            source_attempts=source_attempts,
+            fallback_used=False,
+            provider="FMP",
+            endpoint=fmp_resp.lineage.endpoint,
+            price_basis=FMP_PRICE_BASIS,
+            fetched_bar_count=len(selected_bars),
+            status=fmp_status,
+            required_evidence_dates=tuple(
+                day.isoformat() for day in required_evidence_dates
+            ),
+            missing_evidence_dates=fmp_missing_evidence_dates,
+        )
+
+    def _fetch_polygon_bars_for_ticker(
+        self,
+        *,
+        ticker: str,
+        from_date: date,
+        to_date: date,
+        asof: datetime,
+        job_run_id: str,
+        range_replay: bool,
+        required_evidence_dates: Sequence[date],
+        source_attempts: list[dict[str, Any]],
+    ) -> _HistoricalBarFetchResult:
+        request = _bar_request_payload(
+            ticker=ticker,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if self._polygon is None or not hasattr(self._polygon, "get_daily_bars"):
+            attempts = list(source_attempts)
+            attempts.append(
+                _unavailable_bar_source_attempt(
+                    provider="Polygon",
+                    request=request,
+                    status="unavailable",
+                    message="Polygon daily-bar fallback adapter unavailable",
+                    requested_adjusted=POLYGON_DAILY_BARS_ADJUSTED,
+                    price_basis=POLYGON_PRICE_BASIS,
+                )
+            )
+            return _HistoricalBarFetchResult(
+                bars=[],
+                lineage=None,
+                source_attempts=attempts,
+                fallback_used=False,
+                provider=None,
+                endpoint=None,
+                price_basis=None,
+                fetched_bar_count=0,
+                status="unavailable",
+                required_evidence_dates=tuple(
+                    day.isoformat() for day in required_evidence_dates
+                ),
+                missing_evidence_dates=tuple(
+                    day.isoformat() for day in required_evidence_dates
+                ),
+            )
+
+        polygon_resp = self._polygon.get_daily_bars(
+            ticker,
+            from_date=from_date.isoformat(),
+            to_date=to_date.isoformat(),
+            adjusted=POLYGON_DAILY_BARS_ADJUSTED,
+        )
+        polygon_flags = polygon_resp.lineage.data_quality_flags or {}
+        polygon_price_basis = polygon_flags.get("price_basis")
+        polygon_adjusted = (
+            polygon_flags.get("adjusted") is True
+            and polygon_flags.get("requested_adjusted") is True
+            and polygon_price_basis == POLYGON_PRICE_BASIS
+        )
+        polygon_bars = [
+            bar
+            for bar in (polygon_resp.data or [])
+            if _polygon_bar_has_required_m4_fields(bar)
+        ] if polygon_resp.ok and polygon_adjusted else []
+        polygon_missing_evidence_dates = _missing_required_evidence_dates(
+            polygon_bars,
+            required_evidence_dates=required_evidence_dates,
+            bar_date_fn=_polygon_bar_date,
+        ) if polygon_resp.ok and polygon_adjusted else tuple(
+            day.isoformat() for day in required_evidence_dates
+        )
+        polygon_status = (
+            "usable"
+            if polygon_bars and not polygon_missing_evidence_dates
+            else "missing_evidence_session_bar"
+            if polygon_bars
+            else "unsupported_price_basis"
+            if polygon_resp.ok and not polygon_adjusted
+            else "no_usable_bars"
+            if polygon_resp.ok
+            else "provider_error"
+        )
+        polygon_attempt_price_basis = (
+            POLYGON_PRICE_BASIS if polygon_adjusted else polygon_price_basis
+        )
+        polygon_lineage = self._build_bar_lineage(
+            provider=polygon_resp.lineage.provider,
+            endpoint=polygon_resp.lineage.endpoint,
+            asof_timestamp=asof,
+            request_timestamp=polygon_resp.lineage.request_timestamp,
+            raw_payload=_polygon_lineage_payload(
+                polygon_resp.data,
+                ticker=ticker,
+                from_date=from_date,
+                to_date=to_date,
+                endpoint=polygon_resp.lineage.endpoint,
+                adjusted=POLYGON_DAILY_BARS_ADJUSTED,
+                price_basis=polygon_attempt_price_basis,
+            ),
+            raw_payload_hash=polygon_resp.lineage.raw_payload_hash,
+            freshness_seconds=polygon_resp.lineage.freshness_seconds,
+            source_authority=polygon_resp.lineage.source_authority,
+            data_quality_flags={
+                **(polygon_resp.lineage.data_quality_flags or {}),
+                "historical_m4_replay": True,
+                "historical_m4_range_replay": range_replay,
+                "bar_provider": polygon_resp.lineage.provider,
+                "bar_endpoint": polygon_resp.lineage.endpoint,
+                "bar_provider_policy": BAR_PROVIDER_POLICY,
+                "price_basis": polygon_attempt_price_basis,
+                "requested_adjusted": POLYGON_DAILY_BARS_ADJUSTED,
+                "adjusted": polygon_adjusted,
+                "adjustment_basis": "split_adjusted" if polygon_adjusted else "unknown",
+                "fallback_used": True,
+                "source_attempt_status": polygon_status,
+                "required_evidence_dates": [
+                    day.isoformat() for day in required_evidence_dates
+                ],
+                "missing_evidence_dates": list(polygon_missing_evidence_dates),
+                "evidence_session_bar_present": not polygon_missing_evidence_dates,
+            },
+            job_run_id=job_run_id,
+        )
+        attempts = list(source_attempts)
+        attempts.append(
+            _bar_source_attempt(
+                provider=polygon_resp.lineage.provider,
+                response=polygon_resp,
+                lineage=polygon_lineage,
+                request=request,
+                status=polygon_status,
+                usable_bar_count=len(polygon_bars),
+                adjusted=polygon_adjusted,
+                requested_adjusted=POLYGON_DAILY_BARS_ADJUSTED,
+                price_basis=polygon_attempt_price_basis,
+                fallback_used=True,
+                required_evidence_dates=(
+                    day.isoformat() for day in required_evidence_dates
+                ),
+                missing_evidence_dates=polygon_missing_evidence_dates,
+            )
+        )
+        selected_bars = [
+            _to_polygon_daily_bar(
+                bar,
+                source_timestamp=asof,
+                source_provider=polygon_resp.lineage.provider,
+                lineage_id=polygon_lineage.data_lineage_id,
+                lineage_hash=polygon_resp.lineage.raw_payload_hash,
+            )
+            for bar in polygon_bars
+        ]
+        return _HistoricalBarFetchResult(
+            bars=selected_bars,
+            lineage=polygon_lineage,
+            source_attempts=attempts,
+            fallback_used=True,
+            provider=polygon_resp.lineage.provider,
+            endpoint=polygon_resp.lineage.endpoint,
+            price_basis=POLYGON_PRICE_BASIS if polygon_adjusted else polygon_price_basis,
+            fetched_bar_count=len(selected_bars),
+            status=polygon_status,
+            required_evidence_dates=tuple(
+                day.isoformat() for day in required_evidence_dates
+            ),
+            missing_evidence_dates=polygon_missing_evidence_dates,
+        )
 
     def _record_replay_universe_lineage(
         self,
@@ -779,6 +1143,7 @@ class HistoricalM4ReplayJob(BaseJob):
             features = _json_dict(row.feature_json)
             lineage = bar_lineage_by_ticker.get(row.ticker)
             metadata = dict(replay_metadata)
+            metadata.update(_bar_metadata_from_lineage(lineage))
             if lineage is not None:
                 metadata.update(
                     {
@@ -794,10 +1159,16 @@ class HistoricalM4ReplayJob(BaseJob):
                     "replay_date": replay_metadata["replay_date"],
                     "evidence_session_date": replay_metadata["evidence_session_date"],
                     "source_universe_method": SOURCE_UNIVERSE_METHOD,
-                    "bar_provider": "FMP",
+                    "bar_provider": metadata.get("bar_provider"),
+                    "bar_endpoint": metadata.get("bar_endpoint"),
+                    "bar_provider_policy": metadata.get("bar_provider_policy"),
+                    "fallback_used": metadata.get("fallback_used"),
                     "bar_lineage_id": metadata.get("bar_lineage_id"),
                     "bar_lineage_hash": metadata.get("bar_lineage_hash"),
                     "price_basis": metadata.get("price_basis"),
+                    "bar_adjusted": metadata.get("adjusted"),
+                    "bar_requested_adjusted": metadata.get("requested_adjusted"),
+                    "bar_adjustment_basis": metadata.get("adjustment_basis"),
                 }
             )
             row.feature_json = json.dumps(features, sort_keys=True, default=str)
@@ -866,7 +1237,36 @@ def _to_daily_bar(
     )
 
 
-def _bar_has_required_m4_fields(bar: FmpBar) -> bool:
+def _to_polygon_daily_bar(
+    bar: Any,
+    *,
+    source_timestamp: datetime,
+    source_provider: str,
+    lineage_id: str,
+    lineage_hash: str,
+) -> DailyBar:
+    bar_date = datetime.fromtimestamp(
+        float(bar.timestamp) / 1000,
+        tz=timezone.utc,
+    ).date().isoformat()
+    close = float(bar.close)
+    return DailyBar(
+        date=bar_date,
+        open=float(bar.open),
+        high=float(bar.high),
+        low=float(bar.low),
+        close=close,
+        volume=float(bar.volume),
+        split_adjusted_close=close,
+        adj_close=None,
+        source_timestamp=source_timestamp,
+        source_provider=source_provider,
+        lineage_id=lineage_id,
+        lineage_hash=lineage_hash,
+    )
+
+
+def _bar_has_required_m4_fields(bar: Any) -> bool:
     return all(
         value is not None
         for value in (
@@ -879,6 +1279,210 @@ def _bar_has_required_m4_fields(bar: FmpBar) -> bool:
             bar.split_adjusted_close,
         )
     )
+
+
+def _polygon_bar_has_required_m4_fields(bar: Any) -> bool:
+    return all(
+        value is not None
+        for value in (
+            getattr(bar, "timestamp", None),
+            getattr(bar, "open", None),
+            getattr(bar, "high", None),
+            getattr(bar, "low", None),
+            getattr(bar, "close", None),
+            getattr(bar, "volume", None),
+        )
+    )
+
+
+def _generic_bar_date(bar: Any) -> date | None:
+    value = getattr(bar, "date", None)
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _polygon_bar_date(bar: Any) -> date | None:
+    timestamp = getattr(bar, "timestamp", None)
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(
+            float(timestamp) / 1000,
+            tz=timezone.utc,
+        ).date()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _missing_required_evidence_dates(
+    bars: Sequence[Any],
+    *,
+    required_evidence_dates: Sequence[date],
+    bar_date_fn: Callable[[Any], date | None],
+) -> tuple[str, ...]:
+    required = tuple(dict.fromkeys(required_evidence_dates))
+    covered = {bar_date_fn(bar) for bar in bars}
+    return tuple(day.isoformat() for day in required if day not in covered)
+
+
+def _bar_request_payload(
+    *,
+    ticker: str,
+    from_date: date,
+    to_date: date,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+    }
+
+
+def _bar_source_attempt(
+    *,
+    provider: str,
+    response: Any,
+    lineage: DataLineage,
+    request: dict[str, Any],
+    status: str,
+    usable_bar_count: int,
+    adjusted: bool | None = None,
+    requested_adjusted: bool | None = None,
+    price_basis: str | None = None,
+    fallback_used: bool | None = None,
+    required_evidence_dates: Iterable[str] | None = None,
+    missing_evidence_dates: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    error = getattr(response, "error", None)
+    data = getattr(response, "data", None) or []
+    row_count = len(data) if isinstance(data, list) else 0
+    attempt = {
+        "provider": provider,
+        "endpoint": getattr(getattr(response, "lineage", None), "endpoint", None),
+        "ticker": request["ticker"],
+        "from": request["from"],
+        "to": request["to"],
+        "status": status,
+        "row_count": row_count,
+        "usable_bar_count": usable_bar_count,
+        "lineage_id": lineage.data_lineage_id,
+        "lineage_hash": lineage.raw_payload_hash,
+    }
+    if adjusted is not None:
+        attempt["adjusted"] = adjusted
+    if requested_adjusted is not None:
+        attempt["requested_adjusted"] = requested_adjusted
+    if price_basis is not None:
+        attempt["price_basis"] = price_basis
+    if fallback_used is not None:
+        attempt["fallback_used"] = fallback_used
+    if required_evidence_dates is not None:
+        attempt["required_evidence_dates"] = list(required_evidence_dates)
+    if missing_evidence_dates is not None:
+        missing_dates = list(missing_evidence_dates)
+        attempt["missing_evidence_dates"] = missing_dates
+        attempt["evidence_session_bar_present"] = not missing_dates
+    if error is not None:
+        attempt.update(_provider_error_payload(error))
+    return attempt
+
+
+def _unavailable_bar_source_attempt(
+    *,
+    provider: str,
+    request: dict[str, Any],
+    status: str,
+    message: str,
+    requested_adjusted: bool | None = None,
+    price_basis: str | None = None,
+) -> dict[str, Any]:
+    attempt = {
+        "provider": provider,
+        "endpoint": POLYGON_DAILY_BAR_ENDPOINT_LABEL,
+        "ticker": request["ticker"],
+        "from": request["from"],
+        "to": request["to"],
+        "status": status,
+        "row_count": 0,
+        "usable_bar_count": 0,
+        "lineage_id": None,
+        "lineage_hash": None,
+        "message": sanitize_provider_error_message(message),
+    }
+    if requested_adjusted is not None:
+        attempt["requested_adjusted"] = requested_adjusted
+    if price_basis is not None:
+        attempt["price_basis"] = price_basis
+    return attempt
+
+
+def _provider_error_payload(error: Any) -> dict[str, Any]:
+    return {
+        "error_type": getattr(error, "error_type", None),
+        "status_code": getattr(error, "status_code", None),
+        "message": sanitize_provider_error_message(getattr(error, "message", None)),
+        "retryable": getattr(error, "retryable", None),
+    }
+
+
+def _missing_price_evidence_error(
+    *,
+    ticker: str,
+    source_attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "stage": "historical_price_evidence",
+        "ticker": ticker,
+        "error_type": "missing_price_evidence",
+        "message": "no usable historical daily bars after FMP primary and Polygon fallback",
+        "retryable": False,
+        "source_attempts": source_attempts,
+    }
+
+
+def _update_bar_lineage_flags(
+    lineage: DataLineage,
+    *,
+    source_attempts: list[dict[str, Any]],
+    selected_bar_provider: str | None,
+) -> None:
+    flags = _json_dict(lineage.data_quality_flags)
+    flags.update(
+        {
+            "source_attempts": source_attempts,
+            "source_attempt_count": len(source_attempts),
+            "selected_bar_provider": selected_bar_provider,
+        }
+    )
+    lineage.data_quality_flags = json.dumps(flags, sort_keys=True, default=str)
+
+
+def _bar_metadata_from_lineage(lineage: DataLineage | None) -> dict[str, Any]:
+    if lineage is None:
+        return {}
+    flags = _json_dict(lineage.data_quality_flags)
+    metadata: dict[str, Any] = {}
+    for key in (
+        "bar_provider",
+        "bar_endpoint",
+        "bar_provider_policy",
+        "price_basis",
+        "adjusted",
+        "requested_adjusted",
+        "adjustment_basis",
+        "fallback_used",
+        "source_attempts",
+        "source_attempt_count",
+    ):
+        if key in flags:
+            metadata[key] = flags[key]
+    return metadata
 
 
 def _lineage_payload(
@@ -910,6 +1514,89 @@ def _lineage_payload(
             "endpoint": HISTORICAL_PRICE_FULL_ENDPOINT,
             "adjusted": False,
             "require_split_adjusted_close": True,
+        },
+        "payload_policy": "compact_bar_digest",
+        "bar_count": len(bar_payloads),
+        "first_bar_date": bar_payloads[0]["date"] if bar_payloads else None,
+        "last_bar_date": bar_payloads[-1]["date"] if bar_payloads else None,
+        "bars_digest": stable_hash(bar_payloads),
+    }
+
+
+def _polygon_lineage_payload(
+    bars: Any,
+    *,
+    ticker: str,
+    from_date: date,
+    to_date: date,
+    endpoint: str,
+    adjusted: bool,
+    price_basis: str | None,
+) -> dict[str, Any]:
+    bar_payloads = [
+        {
+            "timestamp": getattr(bar, "timestamp", None),
+            "open": getattr(bar, "open", None),
+            "high": getattr(bar, "high", None),
+            "low": getattr(bar, "low", None),
+            "close": getattr(bar, "close", None),
+            "volume": getattr(bar, "volume", None),
+            "vwap": getattr(bar, "vwap", None),
+            "transactions": getattr(bar, "transactions", None),
+        }
+        for bar in (bars or [])
+    ]
+    return {
+        "ticker": ticker,
+        "request": {
+            "symbol": ticker,
+            "from": from_date.isoformat(),
+            "to": to_date.isoformat(),
+            "endpoint": endpoint,
+            "adjusted": adjusted,
+            "price_basis": price_basis,
+            "adjustment_basis": "split_adjusted" if adjusted else "unadjusted",
+        },
+        "payload_policy": "compact_polygon_daily_bar_digest",
+        "price_basis": price_basis,
+        "bar_count": len(bar_payloads),
+        "first_bar_timestamp": bar_payloads[0]["timestamp"] if bar_payloads else None,
+        "last_bar_timestamp": bar_payloads[-1]["timestamp"] if bar_payloads else None,
+        "bars_digest": stable_hash(bar_payloads),
+    }
+
+
+def _daily_bar_lineage_payload(
+    bars: list[DailyBar],
+    *,
+    ticker: str,
+    from_date: date,
+    to_date: date,
+    endpoint: str,
+    price_basis: str,
+) -> dict[str, Any]:
+    bar_payloads = [
+        {
+            "date": bar.date,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "split_adjusted_close": bar.split_adjusted_close,
+            "adj_close": bar.adj_close,
+            "source_provider": bar.source_provider,
+        }
+        for bar in bars
+    ]
+    return {
+        "ticker": ticker,
+        "request": {
+            "symbol": ticker,
+            "from": from_date.isoformat(),
+            "to": to_date.isoformat(),
+            "endpoint": endpoint,
+            "price_basis": price_basis,
         },
         "payload_policy": "compact_bar_digest",
         "bar_count": len(bar_payloads),

@@ -24,10 +24,11 @@ from uuid import uuid4
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from alpha.assembly.m4_daily import assemble_m4_daily
-from alpha.data.config import ConfigError, FmpConfig
-from alpha.data.contracts import AdapterResponse, stable_hash
+from alpha.assembly.m4_daily import DailyBar, assemble_m4_daily
+from alpha.data.config import ConfigError, FmpConfig, PolygonConfig
+from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
     SchemaTargetError,
     get_session,
@@ -61,14 +62,15 @@ from alpha.jobs.historical_m4_replay import (
     RECONSTRUCTION_METHOD,
     SOURCE_UNIVERSE_METHOD,
     HistoricalM4ReplayJob,
-    _bar_has_required_m4_fields,
-    _lineage_payload,
+    BAR_PROVIDER_POLICY,
+    FMP_PRICE_BASIS,
+    _bar_metadata_from_lineage,
+    _daily_bar_lineage_payload,
     _partial_universe_reason,
     _replay_scan_id,
     _replay_snapshot_id,
     _signal_ids_for_replay,
     _signal_tickers,
-    _to_daily_bar,
 )
 from alpha.jobs.historical_universe_reconstruction import (
     DERIVED_ENDPOINT,
@@ -133,6 +135,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
         session: Session,
         fmp_adapter: Any,
         replay_dates: Sequence[date],
+        polygon_adapter: Any | None = None,
         run_timestamp: datetime | None = None,
         allow_partial_delisted_source: bool = False,
         allow_partial_universe: bool = False,
@@ -149,6 +152,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
             raise ValueError("historical M4 replay starts at 2024-01-01")
         self._session = session
         self._fmp = fmp_adapter
+        self._polygon = polygon_adapter
         self._replay_dates = dates
         self._run_timestamp = _aware_utc(run_timestamp)
         self._allow_partial_delisted_source = allow_partial_delisted_source
@@ -251,6 +255,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
         replay_helper = HistoricalM4ReplayJob(
             session=self._session,
             fmp_adapter=self._fmp,
+            polygon_adapter=self._polygon,
             replay_dates=active_dates,
             run_timestamp=self._run_timestamp,
             allow_partial_universe=self._allow_partial_universe,
@@ -276,7 +281,12 @@ class HistoricalM4RangeReplayJob(BaseJob):
         )
 
         fetch_started = perf_counter()
-        range_bars = self._fetch_range_bars(unique_tickers, active_dates)
+        range_bars = self._fetch_range_bars(
+            unique_tickers,
+            active_dates,
+            replay_helper=replay_helper,
+            job_run_id=ctx.job_run_id,
+        )
         metrics["stage_timing_seconds"]["fmp_fetch_seconds"] = round(
             perf_counter() - fetch_started,
             6,
@@ -296,6 +306,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 replay_helper,
                 snapshots_by_date[replay_day],
                 range_bars["bars_by_ticker"],
+                range_bars["fetch_by_ticker"],
                 partial_by_date.get(replay_day),
             )
             metrics["date_results"].append(date_result.metrics)
@@ -783,13 +794,19 @@ class HistoricalM4RangeReplayJob(BaseJob):
         self,
         tickers: Sequence[str],
         replay_dates: Sequence[date],
+        *,
+        replay_helper: HistoricalM4ReplayJob,
+        job_run_id: str,
     ) -> dict[str, Any]:
         from_date = min(replay_dates) - timedelta(days=self._lookback_calendar_days)
         to_date = max(replay_dates)
         asof = us_equity_session_close_timestamp(to_date)
         bars_by_ticker: dict[str, list[Any]] = {}
+        fetch_by_ticker: dict[str, Any] = {}
         fetch_errors: list[dict[str, Any]] = []
         total_bars = 0
+        polygon_fallback_count = 0
+        missing_price_evidence_count = 0
         self._emit_progress(
             "range_ticker_fetch_start",
             {
@@ -810,59 +827,91 @@ class HistoricalM4RangeReplayJob(BaseJob):
                         "ticker_total": len(tickers),
                     },
                 )
-            resp = self._fmp.get_historical_price(
-                ticker,
+            fmp_fetch = replay_helper._fetch_fmp_bars_for_ticker(
+                ticker=ticker,
                 from_date=from_date,
                 to_date=to_date,
                 asof=asof,
-                adjusted=False,
-                require_split_adjusted_close=True,
+                job_run_id=job_run_id,
+                range_replay=True,
+                required_evidence_dates=replay_dates,
             )
-            if not resp.ok:
-                err = resp.error
-                fetch_errors.append(
-                    {
-                        "stage": "fmp_historical_price",
-                        "ticker": ticker,
-                        "error_type": getattr(err, "error_type", None),
-                        "status_code": getattr(err, "status_code", None),
-                        "message": getattr(err, "message", None),
-                        "retryable": getattr(err, "retryable", None),
-                    }
+            providers: dict[str, Any] = {"FMP": fmp_fetch}
+            source_attempts = list(fmp_fetch.source_attempts)
+            if fmp_fetch.missing_evidence_dates:
+                polygon_fetch = replay_helper._fetch_polygon_bars_for_ticker(
+                    ticker=ticker,
+                    from_date=from_date,
+                    to_date=to_date,
+                    asof=asof,
+                    job_run_id=job_run_id,
+                    range_replay=True,
+                    required_evidence_dates=replay_dates,
+                    source_attempts=source_attempts,
                 )
-                continue
-            bars = [
-                bar
-                for bar in (resp.data or [])
-                if _bar_has_required_m4_fields(bar)
+                providers["Polygon"] = polygon_fetch
+                source_attempts = list(polygon_fetch.source_attempts)
+
+            fetch_entry = {
+                "providers": providers,
+                "source_attempts": source_attempts,
+            }
+            fetch_by_ticker[ticker.upper()] = fetch_entry
+
+            covered_dates = [
+                replay_day
+                for replay_day in replay_dates
+                if _select_range_fetch_for_date(fetch_entry, replay_day) is not None
             ]
-            if not bars:
-                fetch_errors.append(
-                    {
-                        "stage": "fmp_historical_price",
-                        "ticker": ticker,
-                        "error_type": "missing_bars",
-                        "message": "no complete FMP /full bars for replay range",
-                        "retryable": False,
-                    }
+            if not covered_dates:
+                missing_price_evidence_count += 1
+            if any(
+                _select_range_fetch_for_date(fetch_entry, replay_day) is not None
+                and bool(
+                    getattr(
+                        _select_range_fetch_for_date(fetch_entry, replay_day),
+                        "fallback_used",
+                        False,
+                    )
                 )
+                for replay_day in replay_dates
+            ):
+                polygon_fallback_count += 1
+            if not covered_dates:
+                fetch_error = _range_missing_price_evidence_error(
+                    ticker=ticker,
+                    source_attempts=source_attempts,
+                )
+                fetch_errors.append(fetch_error)
                 continue
-            bars_by_ticker[ticker.upper()] = sorted(bars, key=lambda bar: str(bar.date))
-            total_bars += len(bars)
+            selected_bars = {
+                (getattr(fetch, "provider", None), bar.date): bar
+                for fetch in providers.values()
+                for bar in getattr(fetch, "bars", [])
+            }
+            bars_by_ticker[ticker.upper()] = sorted(
+                selected_bars.values(),
+                key=lambda bar: str(bar.date),
+            )
+            total_bars += sum(len(getattr(fetch, "bars", []) or []) for fetch in providers.values())
         self._emit_progress(
             "range_ticker_fetch_finish",
             {
                 "ticker_count": len(tickers),
                 "tickers_with_bars": len(bars_by_ticker),
                 "tickers_missing_bars": len(tickers) - len(bars_by_ticker),
+                "non_evaluable_ticker_count": missing_price_evidence_count,
                 "fetched_bar_count": total_bars,
                 "fetch_error_count": len(fetch_errors),
+                "missing_price_evidence_count": missing_price_evidence_count,
+                "polygon_fallback_count": polygon_fallback_count,
                 "cache_hits": int(getattr(self._fmp, "cache_hits", 0) or 0),
                 "cache_misses": int(getattr(self._fmp, "cache_misses", 0) or 0),
             },
         )
         return {
             "bars_by_ticker": bars_by_ticker,
+            "fetch_by_ticker": fetch_by_ticker,
             "errors": fetch_errors,
             "metrics": {
                 "from_date": from_date.isoformat(),
@@ -870,8 +919,11 @@ class HistoricalM4RangeReplayJob(BaseJob):
                 "requested_ticker_count": len(tickers),
                 "tickers_with_bars": len(bars_by_ticker),
                 "tickers_missing_bars": len(tickers) - len(bars_by_ticker),
+                "non_evaluable_ticker_count": missing_price_evidence_count,
                 "fetched_bar_count": total_bars,
                 "fetch_error_count": len(fetch_errors),
+                "missing_price_evidence_count": missing_price_evidence_count,
+                "polygon_fallback_count": polygon_fallback_count,
                 "cache_hits": int(getattr(self._fmp, "cache_hits", 0) or 0),
                 "cache_misses": int(getattr(self._fmp, "cache_misses", 0) or 0),
                 "errors": fetch_errors[:50],
@@ -885,6 +937,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
         replay_helper: HistoricalM4ReplayJob,
         snapshots: list[Any],
         range_bars_by_ticker: dict[str, list[Any]],
+        range_fetch_by_ticker: dict[str, Any],
         partial_reason: str | None,
     ) -> JobResult:
         replay_date_str = replay_day.isoformat()
@@ -895,6 +948,7 @@ class HistoricalM4RangeReplayJob(BaseJob):
         fetch_errors: list[dict[str, Any]] = []
         daily_bars: dict[str, list[Any]] = {}
         bar_lineage_by_ticker: dict[str, DataLineage] = {}
+        polygon_fallback_count = 0
         lineage_started = perf_counter()
         self._emit_progress(
             "range_date_lineage_stage_start",
@@ -905,43 +959,77 @@ class HistoricalM4RangeReplayJob(BaseJob):
         )
         for snapshot in snapshots:
             ticker = _snap_attr(snapshot, "ticker").upper()
-            slice_bars = [
-                bar
-                for bar in range_bars_by_ticker.get(ticker, [])
-                if from_date <= _bar_date(bar) <= replay_day
-            ]
-            if not slice_bars:
+            fetch_entry = range_fetch_by_ticker.get(ticker)
+            fetch = _select_range_fetch_for_date(fetch_entry, replay_day)
+            if fetch is None:
+                source_attempts = _range_fetch_source_attempts(fetch_entry)
                 fetch_errors.append(
                     {
-                        "stage": "cached_fmp_historical_price",
+                        "stage": "cached_historical_price",
                         "ticker": ticker,
-                        "error_type": "missing_bars",
-                        "message": "no cached complete bars for replay date",
+                        "error_type": "missing_price_evidence",
+                        "message": "no cached evidence-session bar for replay date",
                         "retryable": False,
+                        "source_attempts": source_attempts,
                     }
                 )
                 continue
-            payload = _lineage_payload(
+            slice_bars = _slice_fetch_bars(
+                fetch,
+                from_date=from_date,
+                replay_day=replay_day,
+            )
+            if not _slice_has_evidence_session_bar(slice_bars, replay_day):
+                source_attempts = _range_fetch_source_attempts(fetch_entry)
+                fetch_errors.append(
+                    {
+                        "stage": "cached_historical_price",
+                        "ticker": ticker,
+                        "error_type": "missing_price_evidence",
+                        "message": "cached bars missing replay-date evidence-session bar",
+                        "retryable": False,
+                        "source_attempts": source_attempts,
+                    }
+                )
+                continue
+            provider = getattr(fetch, "provider", None) or "FMP"
+            endpoint = getattr(fetch, "endpoint", None) or HISTORICAL_PRICE_FULL_ENDPOINT
+            price_basis = getattr(fetch, "price_basis", None) or FMP_PRICE_BASIS
+            fallback_used = bool(getattr(fetch, "fallback_used", False))
+            source_attempts = list(getattr(fetch, "source_attempts", []) or [])
+            fetch_metadata = _bar_metadata_from_lineage(getattr(fetch, "lineage", None))
+            if fallback_used:
+                polygon_fallback_count += 1
+            payload = _daily_bar_lineage_payload(
                 slice_bars,
                 ticker=ticker,
                 from_date=from_date,
                 to_date=replay_day,
+                endpoint=endpoint,
+                price_basis=price_basis,
             )
             lineage = replay_helper._build_bar_lineage(
-                provider="FMP",
-                endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                provider=provider,
+                endpoint=endpoint,
                 asof_timestamp=cutoff_timestamp,
                 request_timestamp=self._run_timestamp,
                 raw_payload=payload,
                 raw_payload_hash=stable_hash(payload),
                 freshness_seconds=None,
-                source_authority="FMP",
+                source_authority=provider,
                 data_quality_flags={
                     "historical_m4_replay": True,
                     "historical_m4_range_replay": True,
-                    "bar_provider_policy": "fmp_primary_polygon_fallback_not_used",
-                    "price_basis": "fmp_full_close_as_split_adjusted_close",
-                    "fallback_used": False,
+                    "bar_provider": provider,
+                    "bar_endpoint": endpoint,
+                    "bar_provider_policy": BAR_PROVIDER_POLICY,
+                    "price_basis": price_basis,
+                    "adjusted": fetch_metadata.get("adjusted"),
+                    "requested_adjusted": fetch_metadata.get("requested_adjusted"),
+                    "adjustment_basis": fetch_metadata.get("adjustment_basis"),
+                    "fallback_used": fallback_used,
+                    "source_attempts": source_attempts,
+                    "source_attempt_count": len(source_attempts),
                     "range_fetch_contains_future_bars_for_earlier_dates": True,
                     "row_input_window_end": replay_date_str,
                 },
@@ -949,10 +1037,17 @@ class HistoricalM4RangeReplayJob(BaseJob):
             )
             bar_lineage_by_ticker[ticker] = lineage
             daily_bars[ticker] = [
-                _to_daily_bar(
-                    bar,
+                DailyBar(
+                    date=bar.date,
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume=bar.volume,
+                    split_adjusted_close=bar.split_adjusted_close,
+                    adj_close=bar.adj_close,
                     source_timestamp=cutoff_timestamp,
-                    source_provider="FMP",
+                    source_provider=provider,
                     lineage_id=lineage.data_lineage_id,
                     lineage_hash=lineage.raw_payload_hash,
                 )
@@ -972,17 +1067,22 @@ class HistoricalM4RangeReplayJob(BaseJob):
             },
         )
 
+        assembly_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if _snap_attr(snapshot, "ticker").upper() in daily_bars
+        ]
         self._emit_progress(
             "range_date_assembly_start",
             {
                 "replay_date": replay_date_str,
-                "snapshot_count": len(snapshots),
+                "snapshot_count": len(assembly_snapshots),
                 "tickers_with_bars": len(daily_bars),
             },
         )
         started = perf_counter()
         assembly = assemble_m4_daily(
-            snapshots=snapshots,
+            snapshots=assembly_snapshots,
             daily_bars=daily_bars,
             cutoff_timestamp=cutoff_timestamp,
             universe_cutoff_timestamp=cutoff_timestamp,
@@ -1040,6 +1140,11 @@ class HistoricalM4RangeReplayJob(BaseJob):
         stamped_fired_feature_count = int(
             bulk_result.metrics.get("fired_feature_snapshot_count") or 0
         )
+        missing_price_evidence_count = sum(
+            1
+            for error in fetch_errors
+            if error.get("error_type") == "missing_price_evidence"
+        )
         metrics = {
             "replay_date": replay_date_str,
             "evidence_session_date": replay_date_str,
@@ -1048,8 +1153,11 @@ class HistoricalM4RangeReplayJob(BaseJob):
             "partial_universe_reason": partial_reason,
             "tickers_with_bars": len(daily_bars),
             "tickers_missing_bars": len(snapshots) - len(daily_bars),
+            "non_evaluable_ticker_count": missing_price_evidence_count,
             "fetch_error_count": len(fetch_errors),
             "fetch_errors": fetch_errors[:50],
+            "missing_price_evidence_count": missing_price_evidence_count,
+            "polygon_fallback_count": polygon_fallback_count,
             "assembled_count": assembly.assembled_count,
             "assembly": _assembly_metrics(assembly),
             "fired_m4_signal_count": fired_count,
@@ -1568,6 +1676,7 @@ def run_historical_m4_range_replay(
     fmp_adapter: Any,
     start_date: date,
     end_date: date,
+    polygon_adapter: Any | None = None,
     run_timestamp: datetime | None = None,
     allow_partial_delisted_source: bool = False,
     allow_partial_universe: bool = False,
@@ -1580,6 +1689,7 @@ def run_historical_m4_range_replay(
     job = HistoricalM4RangeReplayJob(
         session=session,
         fmp_adapter=fmp_adapter,
+        polygon_adapter=polygon_adapter,
         replay_dates=replay_dates,
         run_timestamp=run_timestamp,
         allow_partial_delisted_source=allow_partial_delisted_source,
@@ -1600,6 +1710,7 @@ def run_historical_m4_range_replay(
             "allow_partial_universe": allow_partial_universe,
             "lookback_calendar_days": lookback_calendar_days,
             "skip_completed_dates": skip_completed_dates,
+            "polygon_fallback_configured": polygon_adapter is not None,
         },
     )
     return HistoricalM4RangeReplayResult(
@@ -1639,6 +1750,89 @@ def _bar_date(bar: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _range_fetch_providers(fetch_entry: Any) -> dict[str, Any]:
+    if isinstance(fetch_entry, dict):
+        providers = fetch_entry.get("providers")
+        if isinstance(providers, dict):
+            return providers
+    if fetch_entry is None:
+        return {}
+    provider = getattr(fetch_entry, "provider", None) or "FMP"
+    return {str(provider): fetch_entry}
+
+
+def _range_fetch_source_attempts(fetch_entry: Any) -> list[dict[str, Any]]:
+    if isinstance(fetch_entry, dict):
+        attempts = fetch_entry.get("source_attempts")
+        if isinstance(attempts, list):
+            return list(attempts)
+    attempts = getattr(fetch_entry, "source_attempts", None)
+    return list(attempts or [])
+
+
+def _slice_fetch_bars(
+    fetch: Any,
+    *,
+    from_date: date,
+    replay_day: date,
+) -> list[Any]:
+    return [
+        bar
+        for bar in (getattr(fetch, "bars", None) or [])
+        if from_date <= _bar_date(bar) <= replay_day
+    ]
+
+
+def _slice_has_evidence_session_bar(bars: Sequence[Any], replay_day: date) -> bool:
+    return any(
+        _bar_date(bar) == replay_day
+        and getattr(bar, "split_adjusted_close", None) is not None
+        for bar in bars
+    )
+
+
+def _fetch_has_evidence_session_bar(fetch: Any, replay_day: date) -> bool:
+    return any(
+        _bar_date(bar) == replay_day
+        and getattr(bar, "split_adjusted_close", None) is not None
+        for bar in (getattr(fetch, "bars", None) or [])
+    )
+
+
+def _select_range_fetch_for_date(fetch_entry: Any, replay_day: date) -> Any | None:
+    providers = _range_fetch_providers(fetch_entry)
+    fmp_fetch = providers.get("FMP")
+    if fmp_fetch is not None and _fetch_has_evidence_session_bar(fmp_fetch, replay_day):
+        return fmp_fetch
+    polygon_fetch = providers.get("Polygon")
+    if polygon_fetch is not None and _fetch_has_evidence_session_bar(
+        polygon_fetch,
+        replay_day,
+    ):
+        return polygon_fetch
+    for provider, fetch in providers.items():
+        if provider in {"FMP", "Polygon"}:
+            continue
+        if _fetch_has_evidence_session_bar(fetch, replay_day):
+            return fetch
+    return None
+
+
+def _range_missing_price_evidence_error(
+    *,
+    ticker: str,
+    source_attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "stage": "historical_price_evidence",
+        "ticker": ticker,
+        "error_type": "missing_price_evidence",
+        "message": "no usable historical daily bars with evidence-session coverage",
+        "retryable": False,
+        "source_attempts": source_attempts,
+    }
 
 
 def _snap_attr(snapshot: Any, name: str) -> Any:
@@ -1858,6 +2052,7 @@ def _stamped_replay_feature_payload(
     bar_lineage: DataLineage | None,
 ) -> dict[str, Any]:
     replay_date = replay_day.isoformat()
+    lineage_metadata = _bar_metadata_from_lineage(bar_lineage)
     metadata = {
         "reconstructed": True,
         "reconstruction_method": RECONSTRUCTION_METHOD,
@@ -1866,12 +2061,14 @@ def _stamped_replay_feature_payload(
         "source_universe_method": SOURCE_UNIVERSE_METHOD,
         "bar_provider": "FMP",
         "bar_endpoint": HISTORICAL_PRICE_FULL_ENDPOINT,
-        "bar_provider_policy": "fmp_primary_polygon_fallback_not_used",
-        "price_basis": "fmp_full_close_as_split_adjusted_close",
+        "bar_provider_policy": BAR_PROVIDER_POLICY,
+        "price_basis": FMP_PRICE_BASIS,
         "h52w_basis": "split_adjusted_close_prior_252_sessions",
         "partial_universe_reason": partial_reason,
         "range_level_cached_replay": True,
+        "fallback_used": False,
     }
+    metadata.update(lineage_metadata)
     if bar_lineage is not None:
         metadata.update(
             {
@@ -1888,10 +2085,16 @@ def _stamped_replay_feature_payload(
             "replay_date": replay_date,
             "evidence_session_date": replay_date,
             "source_universe_method": SOURCE_UNIVERSE_METHOD,
-            "bar_provider": "FMP",
+            "bar_provider": metadata.get("bar_provider"),
+            "bar_endpoint": metadata.get("bar_endpoint"),
+            "bar_provider_policy": metadata.get("bar_provider_policy"),
+            "fallback_used": metadata.get("fallback_used"),
             "bar_lineage_id": metadata.get("bar_lineage_id"),
             "bar_lineage_hash": metadata.get("bar_lineage_hash"),
             "price_basis": metadata.get("price_basis"),
+            "bar_adjusted": metadata.get("adjusted"),
+            "bar_requested_adjusted": metadata.get("requested_adjusted"),
+            "bar_adjustment_basis": metadata.get("adjustment_basis"),
         }
     )
     return stamped
@@ -2183,6 +2386,7 @@ def _run_live(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"ERROR: {exc}")
         return 1
+    polygon_adapter = _optional_polygon_adapter()
 
     artifact_path = Path(args.progress_artifact or _default_artifact_path())
     artifact: dict[str, Any] = {
@@ -2209,6 +2413,7 @@ def _run_live(args: argparse.Namespace) -> int:
         result = run_historical_m4_range_replay(
             session=session,
             fmp_adapter=fmp_adapter,
+            polygon_adapter=polygon_adapter,
             start_date=_parse_date(args.start_date),
             end_date=_parse_date(args.end_date),
             run_timestamp=_parse_timestamp(args.run_timestamp),
@@ -2251,6 +2456,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--progress-artifact")
     parser.add_argument("--progress-every", type=int, default=25)
     return parser.parse_args(argv)
+
+
+def _optional_polygon_adapter() -> PolygonAdapter | None:
+    try:
+        return PolygonAdapter(PolygonConfig.from_env())
+    except ConfigError:
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

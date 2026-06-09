@@ -7,6 +7,7 @@ from sqlalchemy import func
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
     CanonicalUniverseScan,
     FeatureSnapshot,
@@ -78,6 +79,69 @@ class _FakeFmpAdapter:
             ),
             source_authority="FMP",
             data_quality_flags={"test": True},
+        )
+        return AdapterResponse(data=bars, lineage=lineage)
+
+
+class _FakePolygonAdapter:
+    def __init__(self, bars_by_ticker: dict[str, list[PolygonBar]]):
+        self.bars_by_ticker = {
+            ticker.upper(): list(bars)
+            for ticker, bars in bars_by_ticker.items()
+        }
+        self.calls: list[dict] = []
+
+    def get_daily_bars(
+        self,
+        ticker,
+        from_date,
+        to_date,
+        limit=5000,
+        *,
+        adjusted=None,
+    ):
+        self.calls.append(
+            {
+                "ticker": ticker,
+                "from_date": from_date,
+                "to_date": to_date,
+                "limit": limit,
+                "adjusted": adjusted,
+            }
+        )
+        from_day = date.fromisoformat(str(from_date))
+        to_day = date.fromisoformat(str(to_date))
+        bars = []
+        if adjusted is True:
+            bars = [
+                bar
+                for bar in self.bars_by_ticker.get(ticker.upper(), [])
+                if from_day <= _polygon_bar_date(bar) <= to_day
+            ]
+        endpoint = f"/v2/aggs/ticker/{ticker.upper()}/range/1/day/{from_date}/{to_date}"
+        lineage = LineageMeta(
+            provider="Polygon",
+            endpoint=endpoint,
+            request_timestamp=_ts(),
+            asof_timestamp=_ts(),
+            raw_payload_hash=stable_hash(
+                {
+                    "ticker": ticker.upper(),
+                    "bars": [bar.__dict__ for bar in bars],
+                }
+            ),
+            source_authority="Polygon",
+            data_quality_flags={
+                "test": True,
+                "adjusted": adjusted is True,
+                "requested_adjusted": adjusted,
+                "price_basis": "polygon_daily_close_split_adjusted"
+                if adjusted is True
+                else None,
+                "adjustment_basis": "split_adjusted"
+                if adjusted is True
+                else "unknown",
+            },
         )
         return AdapterResponse(data=bars, lineage=lineage)
 
@@ -173,6 +237,26 @@ def _bars_for_range(
     return bars
 
 
+def _polygon_bars_for_range(
+    *,
+    evidence_closes: dict[date, float],
+    prior_close: float = 10.0,
+) -> list[PolygonBar]:
+    prior_days: list[date] = []
+    cursor = START_DAY
+    for _ in range(252):
+        cursor = previous_us_equity_session(cursor)
+        prior_days.append(cursor)
+    prior_days.reverse()
+    bars = [_polygon_bar(day, prior_close) for day in prior_days]
+    cursor = START_DAY
+    while cursor <= END_DAY:
+        if cursor in evidence_closes:
+            bars.append(_polygon_bar(cursor, evidence_closes[cursor]))
+        cursor += timedelta(days=1)
+    return bars
+
+
 def _bar(day: date, close: float) -> FmpBar:
     return FmpBar(
         date=day.isoformat(),
@@ -184,6 +268,28 @@ def _bar(day: date, close: float) -> FmpBar:
         split_adjusted_close=close,
         adj_close=999.0,
     )
+
+
+def _polygon_bar(day: date, close: float) -> PolygonBar:
+    timestamp = int(
+        datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()
+        * 1000
+    )
+    return PolygonBar(
+        timestamp=timestamp,
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=100_000,
+    )
+
+
+def _polygon_bar_date(bar: PolygonBar) -> date:
+    return datetime.fromtimestamp(
+        bar.timestamp / 1000,
+        tz=timezone.utc,
+    ).date()
 
 
 def _feature_for(db_session, ticker: str, replay_day: date) -> dict:
@@ -255,6 +361,142 @@ def test_range_replay_fetches_each_ticker_once_and_slices_bars_per_date(db_sessi
     assert "range_date_signal_stage_finish" in event_names
     assert "range_date_link_stage_finish" in event_names
     assert "range_date_detector_finish" in event_names
+
+
+def test_range_replay_fmp_missing_uses_polygon_once_and_slices_per_date(db_session):
+    _seed_active_universe(db_session, ["PFALL"])
+    fmp = _FakeFmpAdapter({"PFALL": []})
+    polygon = _FakePolygonAdapter(
+        {
+            "PFALL": _polygon_bars_for_range(
+                evidence_closes={
+                    START_DAY: 10.1,
+                    END_DAY: 10.2,
+                }
+            )
+        }
+    )
+
+    result = run_historical_m4_range_replay(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=START_DAY,
+        end_date=END_DAY,
+        run_timestamp=_ts(),
+        progress_every=1,
+    )
+
+    assert result.status == "finished"
+    assert len(fmp.calls) == 1
+    assert len(polygon.calls) == 1
+    assert polygon.calls[0]["to_date"] == END_DAY.isoformat()
+    assert polygon.calls[0]["adjusted"] is True
+    assert result.metrics["fmp_fetch"]["polygon_fallback_count"] == 1
+    assert result.metrics["fmp_fetch"]["missing_price_evidence_count"] == 0
+    first_features = _feature_for(db_session, "PFALL", START_DAY)
+    second_features = _feature_for(db_session, "PFALL", END_DAY)
+    assert first_features["P_close"] == 10.1
+    assert second_features["P_close"] == 10.2
+    for features in (first_features, second_features):
+        assert features["bar_provider"] == "Polygon"
+        assert features["fallback_used"] is True
+        assert features["price_basis"] == "polygon_daily_close_split_adjusted"
+        assert features["bar_requested_adjusted"] is True
+        assert features["bar_adjusted"] is True
+        replay = features["historical_replay"]
+        assert replay["price_basis"] == "polygon_daily_close_split_adjusted"
+        assert replay["requested_adjusted"] is True
+        assert replay["adjusted"] is True
+        assert replay["source_attempt_count"] == 2
+        assert [attempt["status"] for attempt in replay["source_attempts"]] == [
+            "no_usable_bars",
+            "usable",
+        ]
+
+
+def test_range_replay_uses_polygon_only_for_dates_missing_fmp_evidence_bar(
+    db_session,
+):
+    _seed_active_universe(db_session, ["MIXPX"])
+    fmp = _FakeFmpAdapter(
+        {
+            "MIXPX": _bars_for_range(
+                evidence_closes={
+                    END_DAY: 10.3,
+                }
+            )
+        }
+    )
+    polygon = _FakePolygonAdapter(
+        {
+            "MIXPX": _polygon_bars_for_range(
+                evidence_closes={
+                    START_DAY: 10.1,
+                    END_DAY: 99.0,
+                }
+            )
+        }
+    )
+
+    result = run_historical_m4_range_replay(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=START_DAY,
+        end_date=END_DAY,
+        run_timestamp=_ts(),
+        progress_every=1,
+    )
+
+    assert result.status == "finished"
+    assert len(fmp.calls) == 1
+    assert len(polygon.calls) == 1
+    assert result.metrics["fmp_fetch"]["polygon_fallback_count"] == 1
+    assert result.metrics["fmp_fetch"]["missing_price_evidence_count"] == 0
+    first_date, second_date = result.metrics["date_results"]
+    assert first_date["missing_price_evidence_count"] == 0
+    assert first_date["polygon_fallback_count"] == 1
+    assert first_date["rejected_or_no_fire_count"] == 0
+    assert second_date["missing_price_evidence_count"] == 0
+    assert second_date["polygon_fallback_count"] == 0
+    first_features = _feature_for(db_session, "MIXPX", START_DAY)
+    second_features = _feature_for(db_session, "MIXPX", END_DAY)
+    assert first_features["bar_provider"] == "Polygon"
+    assert first_features["fallback_used"] is True
+    assert first_features["P_close"] == 10.1
+    assert second_features["bar_provider"] == "FMP"
+    assert second_features["fallback_used"] is False
+    assert second_features["P_close"] == 10.3
+
+
+def test_range_replay_missing_after_fmp_and_fallback_is_non_evaluable(db_session):
+    _seed_active_universe(db_session, ["MISSPX"])
+    fmp = _FakeFmpAdapter({"MISSPX": []})
+    polygon = _FakePolygonAdapter({"MISSPX": []})
+
+    result = run_historical_m4_range_replay(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=START_DAY,
+        end_date=END_DAY,
+        run_timestamp=_ts(),
+        progress_every=1,
+    )
+
+    assert result.status == "failed"
+    assert len(fmp.calls) == 1
+    assert len(polygon.calls) == 1
+    assert result.metrics["fmp_fetch"]["tickers_missing_bars"] == 1
+    assert result.metrics["fmp_fetch"]["non_evaluable_ticker_count"] == 1
+    assert result.metrics["fmp_fetch"]["missing_price_evidence_count"] == 1
+    assert result.metrics["total_fired_m4_signal_count"] == 0
+    assert db_session.query(SignalRegistry).count() == 0
+    assert db_session.query(FeatureSnapshot).count() == 0
+    first_date = result.metrics["date_results"][0]
+    assert first_date["missing_price_evidence_count"] == 1
+    assert first_date["fetch_errors"][0]["error_type"] == "missing_price_evidence"
 
 
 def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_session):

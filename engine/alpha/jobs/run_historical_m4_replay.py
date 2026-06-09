@@ -12,8 +12,9 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from alpha.data.config import ConfigError, FmpConfig
+from alpha.data.config import ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter
+from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
     SchemaTargetError,
     get_session,
@@ -91,6 +92,7 @@ def _run_live(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"ERROR: {exc}")
         return 1
+    polygon_adapter = _optional_polygon_adapter()
 
     if args.replay_date:
         replay_dates = [_parse_date(value) for value in args.replay_date]
@@ -102,6 +104,7 @@ def _run_live(args: argparse.Namespace) -> int:
         job = HistoricalM4ReplayJob(
             session=session,
             fmp_adapter=fmp_adapter,
+            polygon_adapter=polygon_adapter,
             replay_dates=replay_dates,
             run_timestamp=_parse_timestamp(args.run_timestamp),
             allow_partial_universe=args.allow_partial_universe,
@@ -117,6 +120,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "run_timestamp": args.run_timestamp,
                 "allow_partial_universe": args.allow_partial_universe,
                 "lookback_calendar_days": args.lookback_calendar_days,
+                "polygon_fallback_configured": polygon_adapter is not None,
             },
         )
         metrics = result.metrics or {}
@@ -171,6 +175,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     if args.start_date and not args.end_date:
         parser.error("--end-date is required with --start-date")
     return args
+
+
+def _optional_polygon_adapter() -> PolygonAdapter | None:
+    try:
+        return PolygonAdapter(PolygonConfig.from_env())
+    except ConfigError:
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

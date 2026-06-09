@@ -81,6 +81,45 @@ def test_cohort_cli_refuses_schema_public(monkeypatch):
     assert rc == 1
 
 
+def test_cohort_public_cli_requires_polygon_fallback_config_before_db(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction."
+        "_verify_public_market_path_revision",
+        lambda _url: {"current": [MARKET_PATH_ALEMBIC_REVISION]},
+    )
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction._optional_polygon_adapter",
+        lambda: None,
+    )
+
+    def fail_get_session():
+        raise AssertionError("missing Polygon config should fail before DB session")
+
+    monkeypatch.setattr(
+        "alpha.jobs.run_historical_cohort_reconstruction.get_session",
+        fail_get_session,
+    )
+
+    rc = cohort_cli_main(
+        [
+            "--live",
+            "--confirm-live-write",
+            "--start-date",
+            "2026-01-02",
+            "--end-date",
+            "2026-01-05",
+        ]
+    )
+
+    assert rc == 1
+    assert "requires Polygon fallback configuration" in capsys.readouterr().out
+
+
 def test_cohort_public_write_requires_market_path_pre_m3_revision(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@host/db")
     calls = []
@@ -373,6 +412,73 @@ def test_cohort_checkpoint_and_idempotent_rerun(tmp_path):
     assert artifact["date_results"][0]["historical_m4_replay_progress_last"]["event"] == (
         "ticker_fetch_progress"
     )
+
+
+def test_cohort_artifact_and_summary_expose_polygon_fallback_metrics(tmp_path):
+    session = _FakeSession()
+    artifact_path = tmp_path / "polygon_metrics.json"
+
+    def fake_runner(_session, _job, *, params=None, **_kwargs):
+        params = params or {}
+        replay_date = params["replay_date"]
+        if params["stage"] == "historical_universe_reconstruction":
+            return JobResult(
+                status="finished",
+                metrics={
+                    "replay_date": replay_date,
+                    "rows_inserted": 1,
+                    "rows_updated": 0,
+                },
+            )
+        return JobResult(
+            status="finished",
+            metrics={
+                "replay_dates": [replay_date],
+                "total_rows_inserted": 2,
+                "total_rows_reused": 0,
+                "total_fired_m4_signal_count": 1,
+                "total_rejected_or_no_fire_count": 1,
+                "total_polygon_fallback_count": 2,
+                "total_missing_price_evidence_count": 1,
+                "total_non_evaluable_ticker_count": 1,
+                "date_results": [
+                    {
+                        "replay_date": replay_date,
+                        "rows_inserted": 2,
+                        "polygon_fallback_count": 2,
+                        "missing_price_evidence_count": 1,
+                        "non_evaluable_ticker_count": 1,
+                    }
+                ],
+            },
+        )
+
+    result = run_historical_cohort_reconstruction(
+        session=session,
+        fmp_adapter=object(),
+        polygon_adapter=object(),
+        pattern_ids=["M4"],
+        start_date=date(2026, 1, 2),
+        end_date=date(2026, 1, 2),
+        schema="scratch_cohort",
+        progress_artifact=artifact_path,
+        job_runner=fake_runner,
+        universe_job_factory=_FakeJob,
+        m4_replay_job_factory=_FakeJob,
+        print_fn=lambda _message: None,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["polygon_fallback_configured"] is True
+    assert result.metrics["polygon_fallback_count_total"] == 2
+    assert result.metrics["missing_price_evidence_count_total"] == 1
+    assert result.metrics["non_evaluable_ticker_count_total"] == 1
+    artifact = json.loads(artifact_path.read_text())
+    assert artifact["polygon_fallback_configured"] is True
+    assert artifact["summary"]["polygon_fallback_configured"] is True
+    assert artifact["summary"]["polygon_fallback_count_total"] == 2
+    assert artifact["summary"]["missing_price_evidence_count_total"] == 1
+    assert artifact["summary"]["non_evaluable_ticker_count_total"] == 1
 
 
 def test_cohort_resume_from_artifact_skips_only_verified_finished_dates(tmp_path):
