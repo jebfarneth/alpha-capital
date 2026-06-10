@@ -1309,6 +1309,9 @@ class DataLineage(Base):
     """Persisted provenance for an external data payload or derived artifact."""
 
     __tablename__ = "data_lineage"
+    __table_args__ = (
+        Index("ix_data_lineage_raw_payload_hash", "raw_payload_hash"),
+    )
 
     data_lineage_id = Column(String, primary_key=True, default=_uuid)
     provider = Column(String, nullable=False)
