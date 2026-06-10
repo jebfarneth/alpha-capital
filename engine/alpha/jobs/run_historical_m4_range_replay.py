@@ -1572,14 +1572,18 @@ class HistoricalM4RangeReplayJob(BaseJob):
         )
         if not lineage_hashes:
             return {}
-        rows = (
-            self._session.query(DataLineage.raw_payload_hash, DataLineage.data_lineage_id)
-            .filter(DataLineage.raw_payload_hash.in_(lineage_hashes))
-            .all()
-        )
         by_hash: dict[str, list[str]] = {}
-        for raw_payload_hash, data_lineage_id in rows:
-            by_hash.setdefault(str(raw_payload_hash), []).append(str(data_lineage_id))
+        for batch in _chunks(lineage_hashes, 500):
+            rows = (
+                self._session.query(
+                    DataLineage.raw_payload_hash,
+                    DataLineage.data_lineage_id,
+                )
+                .filter(DataLineage.raw_payload_hash.in_(batch))
+                .all()
+            )
+            for raw_payload_hash, data_lineage_id in rows:
+                by_hash.setdefault(str(raw_payload_hash), []).append(str(data_lineage_id))
         return by_hash
 
     def _bulk_persist_detection_records(

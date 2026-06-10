@@ -11,6 +11,7 @@ from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
     CanonicalUniverseScan,
+    DataLineage,
     FeatureSnapshot,
     HistoricalUniverseReconstruction,
     SecurityProfile,
@@ -21,6 +22,7 @@ from alpha.db.models import (
 from alpha.jobs.run_historical_m4_range_replay import (
     _BulkDetectionRecord,
     _existing_feature_snapshots,
+    HistoricalM4RangeReplayJob,
     main as range_cli_main,
     run_historical_m4_range_replay,
 )
@@ -750,6 +752,47 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
         .count()
     )
     assert duplicate_feature_groups == 0
+
+
+def test_lineage_ids_by_hash_batches_large_lookup(db_session):
+    hashes = [f"lineage-hash-{index:04d}" for index in range(1001)]
+    db_session.add_all(
+        DataLineage(
+            data_lineage_id=f"lineage-{index:04d}",
+            provider="FMP",
+            endpoint="historical-price-full",
+            request_timestamp=_ts(),
+            asof_timestamp=_ts(),
+            raw_payload_hash=lineage_hash,
+            raw_payload_json="{}",
+            source_authority="FMP",
+            data_quality_flags="{}",
+        )
+        for index, lineage_hash in enumerate(hashes)
+    )
+    db_session.flush()
+    job = HistoricalM4RangeReplayJob(
+        session=db_session,
+        fmp_adapter=_FakeFmpAdapter({}),
+        replay_dates=[START_DAY],
+        run_timestamp=_ts(),
+    )
+    captured_sql: list[str] = []
+
+    def capture_sql(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "data_lineage" in statement:
+            captured_sql.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", capture_sql)
+    try:
+        lookup = job._lineage_ids_by_hash([SimpleNamespace(lineage_hashes=hashes)])
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", capture_sql)
+
+    assert lookup[hashes[0]] == ["lineage-0000"]
+    assert lookup[hashes[500]] == ["lineage-0500"]
+    assert lookup[hashes[-1]] == ["lineage-1000"]
+    assert len(captured_sql) == 3
 
 
 def test_range_replay_persists_included_hur_rows_only(db_session):
