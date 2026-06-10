@@ -153,6 +153,162 @@ class TestClassifier:
         st, _ = classify_security_type(_profile(company_name="ABC 7.5% Fixed Rate Series B"))
         assert st == PREFERRED
 
+    def test_preferred_from_five_char_p_symbol(self):
+        # MPLXP-style: FMP serves the PARENT issuer's profile, so only the
+        # symbol convention identifies the preferred.
+        st, reason = classify_security_type(_profile(
+            symbol="MPLXP",
+            company_name="MPLX Lp",
+            sector="Energy",
+            industry="Oil & Gas Midstream",
+            exchange="NYSE",
+        ))
+        assert st == PREFERRED
+        assert reason == "symbol_suffix:fifth_char_P"
+
+    def test_four_char_p_symbol_is_common(self):
+        st, _ = classify_security_type(_profile(
+            symbol="PUMP", company_name="ProPetro Holding Corp",
+        ))
+        assert st == COMMON_STOCK
+
+    def test_five_char_non_p_symbol_is_common(self):
+        st, _ = classify_security_type(_profile(
+            symbol="GRPON", company_name="Acme Corp",
+        ))
+        assert st == COMMON_STOCK
+
+    def test_five_char_p_symbol_with_stronger_evidence_keeps_earlier_type(self):
+        # Name evidence outranks the last-resort symbol convention.
+        st, _ = classify_security_type(_profile(
+            symbol="ABCDP", company_name="Thunder Acquisition Corp",
+        ))
+        assert st == SPAC_OR_BLANK_CHECK
+
+    def test_five_char_p_symbol_with_etf_sector_is_etf(self):
+        # ETF sector/industry fallback outranks the symbol convention.
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDP", company_name="Acme Strategy ETF Trust", sector="ETF",
+        ))
+        assert st == ETF
+        assert reason == "sector_or_industry:ETF"
+
+    def test_five_char_p_symbol_with_etf_industry_is_etf(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDP",
+            company_name="Acme Strategy Trust",
+            sector="Financial Services",
+            industry="Exchange Traded Fund",
+        ))
+        assert st == ETF
+        assert reason == "sector_or_industry:ETF"
+
+    def test_five_char_p_symbol_with_is_fund_flag_is_mutual_fund(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDP", raw={"isFund": True},
+        ))
+        assert st == MUTUAL_FUND
+        assert reason == "raw_flag:isFund"
+
+    def test_five_char_p_symbol_with_is_adr_flag_is_adr(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDP", raw={"isAdr": True},
+        ))
+        assert st == ADR
+        assert reason == "raw_flag:isAdr"
+
+    def test_five_char_p_symbol_with_warrant_name_is_warrant(self):
+        st, _ = classify_security_type(_profile(
+            symbol="ABCDP", company_name="Acme Holdings Warrants",
+        ))
+        assert st == WARRANT
+
+    def test_five_char_p_symbol_with_unit_name_is_unit(self):
+        st, _ = classify_security_type(_profile(
+            symbol="ABCDP",
+            company_name="Acme Acquisition Units consisting of common stock",
+        ))
+        assert st == UNIT
+
+    def test_five_char_p_symbol_with_right_name_is_right(self):
+        st, _ = classify_security_type(_profile(
+            symbol="ABCDP", company_name="Acme Subscription Rights",
+        ))
+        assert st == RIGHT
+
+    def test_five_char_p_symbol_with_preferred_name_uses_name_reason(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDP", company_name="Acme Corp Preferred Series A",
+        ))
+        assert st == PREFERRED
+        assert reason != "symbol_suffix:fifth_char_P"
+
+    def test_closed_end_fund_from_asset_management_fund_template(self):
+        # ASA-style: isFund=False but FMP fund-template description.
+        st, reason = classify_security_type(_profile(
+            symbol="ASA",
+            company_name="ASA Gold and Precious Metals Limited",
+            sector="Financial Services",
+            industry="Asset Management",
+            exchange="NYSE",
+            raw={"description": (
+                "ASA Gold and Precious Metals Limited is a publicly traded "
+                "investment management firm. It operates as a global manager, "
+                "primarily allocating capital in public equity markets. Its "
+                "core investment strategy focuses on acquiring shares in "
+                "companies engaged in the exploration of precious metals."
+            )},
+        ))
+        assert st == CLOSED_END_FUND
+        assert reason == "industry_description:ASSET_MANAGEMENT+FUND_TEMPLATE"
+
+    def test_operating_asset_manager_not_closed_end_fund(self):
+        # APAM-style operating manager: matches at most one template phrase.
+        st, _ = classify_security_type(_profile(
+            symbol="APAM",
+            company_name="Artisan Partners Asset Management Inc.",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "Artisan Partners Asset Management Inc. is a publicly traded "
+                "investment management firm that provides advisory services "
+                "to mutual funds and institutional clients."
+            )},
+        ))
+        assert st == COMMON_STOCK
+
+    def test_operating_manager_with_both_template_phrases_not_closed_end_fund(self):
+        # Adversarial: BOTH fund-template trigger phrases present, but the
+        # client/advisory operating language blocks CEF classification.
+        st, _ = classify_security_type(_profile(
+            symbol="ACMM",
+            company_name="Acme Capital Management Inc.",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "Acme Capital Management is an investment adviser allocating "
+                "capital on behalf of institutional clients. The firm tailors "
+                "each investment strategy to client mandates and provides "
+                "advisory services and wealth management to high-net-worth "
+                "individuals."
+            )},
+        ))
+        assert st == COMMON_STOCK
+
+    def test_fund_template_phrases_outside_asset_management_is_common(self):
+        st, _ = classify_security_type(_profile(
+            symbol="HOLDX",
+            company_name="Acme Holdings Corp",
+            sector="Industrials",
+            industry="Conglomerates",
+            raw={"description": (
+                "Acme Holdings is a diversified operator, allocating capital "
+                "across its subsidiaries; its investment strategy focuses on "
+                "long-duration industrial assets."
+            )},
+        ))
+        assert st == COMMON_STOCK
+
     def test_warrant_from_name(self):
         st, _ = classify_security_type(_profile(company_name="SPAC Holdings Warrants"))
         assert st == WARRANT

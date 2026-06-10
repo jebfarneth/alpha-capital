@@ -45,7 +45,7 @@ SPAC_OR_BLANK_CHECK = "spac_or_blank_check"
 BUSINESS_DEVELOPMENT_COMPANY = "business_development_company"
 UNKNOWN = "unknown"
 
-CLASSIFIER_VERSION = "security_type_v3"
+CLASSIFIER_VERSION = "security_type_v4"
 
 REFRESH_STATUS_ENRICHED = "enriched"
 REFRESH_STATUS_NO_DATA = "no_data"
@@ -82,6 +82,24 @@ SHELL_COMPANY_DESCRIPTION_PHRASES = (
     "STOCK PURCHASE",
     "SHARE PURCHASE",
     "CAPITAL STOCK EXCHANGE",
+)
+# Operating asset managers / advisers describe serving clients; FMP's
+# closed-end-fund template never does. Verified 2026-06-10 against live
+# profiles: ASA (true CEF) matches none of these, while every probed
+# operating manager (APAM/VCTR/WT/BSIG/PZN/DHIL) matches at least one.
+# Both CLIENT and CLIENTS are listed because _has_phrase is word-bounded.
+OPERATING_MANAGER_DESCRIPTION_PHRASES = (
+    "ADVISORY SERVICES",
+    "INVESTMENT ADVISER",
+    "INVESTMENT ADVISERS",
+    "INVESTMENT ADVISOR",
+    "INVESTMENT ADVISORS",
+    "INVESTMENT ADVISORY",
+    "CLIENT",
+    "CLIENTS",
+    "ON BEHALF OF",
+    "WEALTH MANAGEMENT",
+    "ASSET MANAGEMENT SERVICES",
 )
 SPAC_ACQUISITION_SEQUENCE_RE = re.compile(
     r"\bACQUISITION\s+(?:(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\s+)?"
@@ -406,6 +424,35 @@ def classify_security_type(
     # ETF fallback from sector/industry
     if sector == "ETF" or industry == "EXCHANGE TRADED FUND":
         return ETF, f"sector_or_industry:ETF"
+
+    # Closed-end funds FMP fails to flag (isFund=False, e.g. ASA): the
+    # profile carries FMP's fund-template description under the Asset
+    # Management industry. Both template phrases are required AND no
+    # operating-manager language may be present — operating asset
+    # managers/advisers (VCTR/APAM/WT/BSIG/PZN/DHIL) verified 2026-06-10
+    # to carry client/advisory phrasing that the FMP fund template never
+    # uses. Known residual: CEFs with a blank/atypical template (e.g.
+    # CET) remain undetectable from the profile alone.
+    if (
+        industry == "ASSET MANAGEMENT"
+        and _has_phrase(raw_description, "ALLOCATING CAPITAL")
+        and _has_phrase(raw_description, "INVESTMENT STRATEGY")
+        and _has_any_phrase(raw_description, OPERATING_MANAGER_DESCRIPTION_PHRASES)
+        is None
+    ):
+        return CLOSED_END_FUND, "industry_description:ASSET_MANAGEMENT+FUND_TEMPLATE"
+
+    # Preferred from the consolidated-tape fifth-character convention: a
+    # plain 5-letter symbol ending in P (MPLXP, VIASP, TECTP, ...). FMP
+    # serves these with the PARENT issuer's profile (same name/CIK as the
+    # common stock), so no name/description rule can catch them. Truly
+    # last-resort: every evidence-based rule above, including the ETF
+    # sector/industry fallback, has already had its chance.
+    # Corpus-verified 2026-06-10: all seven 5-char ending-P tickers in the
+    # 2024-2026 M4 corpus are genuine series preferreds.
+    symbol = _clean_text(profile.symbol)
+    if re.fullmatch(r"[A-Z]{4}P", symbol):
+        return PREFERRED, "symbol_suffix:fifth_char_P"
 
     # Sufficient data for common_stock classification
     if profile.company_name and profile.exchange:
