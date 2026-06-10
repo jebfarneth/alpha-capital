@@ -2376,6 +2376,9 @@ def _m4_detector_diagnostic(metrics: dict[str, Any] | None) -> dict[str, Any]:
 
 def _validate_range_replay(session: Session, replay_dates: Sequence[date]) -> dict[str, int]:
     replay_date_strings = [day.isoformat() for day in replay_dates]
+    replay_close_timestamps = [
+        us_equity_session_close_timestamp(day) for day in replay_dates
+    ]
     duplicate_hur_groups = int(
         session.query(
             HistoricalUniverseReconstruction.replay_date,
@@ -2420,9 +2423,7 @@ def _validate_range_replay(session: Session, replay_dates: Sequence[date]) -> di
         )
         .filter(
             FeatureSnapshot.pattern_id == "M4",
-            FeatureSnapshot.asof_timestamp.in_(
-                [us_equity_session_close_timestamp(day) for day in replay_dates]
-            ),
+            FeatureSnapshot.asof_timestamp.in_(replay_close_timestamps),
         )
         .group_by(
             FeatureSnapshot.pattern_id,
@@ -2445,29 +2446,11 @@ def _validate_range_replay(session: Session, replay_dates: Sequence[date]) -> di
         .scalar()
         or 0
     )
-    feature_rows = (
-        session.query(FeatureSnapshot)
-        .filter(
-            FeatureSnapshot.pattern_id == "M4",
-            FeatureSnapshot.asof_timestamp.in_(
-                [us_equity_session_close_timestamp(day) for day in replay_dates]
-            ),
-        )
-        .all()
-    )
-    missing_feature_hash = 0
-    missing_replay_stamp = 0
-    lookahead_violations = 0
-    for row in feature_rows:
-        if not row.input_hashes or not row.output_hash or not row.data_lineage_ids:
-            missing_feature_hash += 1
-        features = _json_dict(row.feature_json)
-        replay_date = features.get("replay_date")
-        if features.get("reconstruction_method") != RECONSTRUCTION_METHOD:
-            missing_replay_stamp += 1
-        lookback_end = features.get("lookback_end")
-        if replay_date and lookback_end and str(lookback_end) >= str(replay_date):
-            lookahead_violations += 1
+    (
+        missing_feature_hash,
+        missing_replay_stamp,
+        lookahead_violations,
+    ) = _feature_validation_counts(session, replay_close_timestamps)
     return {
         "duplicate_historical_universe_groups": duplicate_hur_groups,
         "duplicate_m4_signal_identity_groups": duplicate_signal_groups,
@@ -2477,6 +2460,78 @@ def _validate_range_replay(session: Session, replay_dates: Sequence[date]) -> di
         "missing_historical_replay_stamp_count": missing_replay_stamp,
         "feature_lookahead_violation_count": lookahead_violations,
     }
+
+
+def _feature_validation_counts(
+    session: Session,
+    replay_close_timestamps: Sequence[datetime],
+) -> tuple[int, int, int]:
+    """Count feature validation failures without materializing ORM rows."""
+
+    base_filters = (
+        FeatureSnapshot.pattern_id == "M4",
+        FeatureSnapshot.asof_timestamp.in_(list(replay_close_timestamps)),
+    )
+    missing_feature_hash = int(
+        session.query(func.count(FeatureSnapshot.feature_snapshot_id))
+        .filter(
+            *base_filters,
+            (
+                (FeatureSnapshot.input_hashes.is_(None))
+                | (FeatureSnapshot.output_hash.is_(None))
+                | (FeatureSnapshot.data_lineage_ids.is_(None))
+            ),
+        )
+        .scalar()
+        or 0
+    )
+
+    if session.bind and session.bind.dialect.name == "postgresql":
+        missing_replay_stamp = int(
+            session.query(func.count(FeatureSnapshot.feature_snapshot_id))
+            .filter(
+                *base_filters,
+                text(
+                    "coalesce((feature_json::jsonb)->>'reconstruction_method', '') "
+                    "<> :reconstruction_method"
+                ),
+            )
+            .params(reconstruction_method=RECONSTRUCTION_METHOD)
+            .scalar()
+            or 0
+        )
+        lookahead_violations = int(
+            session.query(func.count(FeatureSnapshot.feature_snapshot_id))
+            .filter(
+                *base_filters,
+                text(
+                    "(feature_json::jsonb)->>'replay_date' is not null "
+                    "and (feature_json::jsonb)->>'lookback_end' is not null "
+                    "and (feature_json::jsonb)->>'lookback_end' >= "
+                    "(feature_json::jsonb)->>'replay_date'"
+                ),
+            )
+            .scalar()
+            or 0
+        )
+        return missing_feature_hash, missing_replay_stamp, lookahead_violations
+
+    feature_payloads = (
+        session.query(FeatureSnapshot.feature_json)
+        .filter(*base_filters)
+        .yield_per(1000)
+    )
+    missing_replay_stamp = 0
+    lookahead_violations = 0
+    for (feature_json,) in feature_payloads:
+        features = _json_dict(feature_json)
+        replay_date = features.get("replay_date")
+        if features.get("reconstruction_method") != RECONSTRUCTION_METHOD:
+            missing_replay_stamp += 1
+        lookback_end = features.get("lookback_end")
+        if replay_date and lookback_end and str(lookback_end) >= str(replay_date):
+            lookahead_violations += 1
+    return missing_feature_hash, missing_replay_stamp, lookahead_violations
 
 
 def _coverage_status(
