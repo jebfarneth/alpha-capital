@@ -21,7 +21,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import stable_hash
@@ -713,12 +713,12 @@ class DetectorOrchestrationJob(BaseJob):
 
             if not result.has_signal:
                 try:
-                    persisted = self._persist_detection_result(
+                    persisted = self._persist_detection_result_with_lineage(
+                        inp=inp,
                         result=result,
                         detector=detector,
                         job_run_id=job_run_id,
                         universe_snapshot_id=inp.universe_snapshot_id,
-                        data_lineage_ids=self._resolved_input_lineage_ids(inp),
                         code_commit_sha=code_commit_sha,
                         trading_date=trading_date,
                         scan_id=scan_id,
@@ -790,15 +790,22 @@ class DetectorOrchestrationJob(BaseJob):
                 continue
 
             # Dedup check
-            existing = (
-                self._session.query(SignalRegistry.signal_id)
-                .filter(
-                    SignalRegistry.pattern_id == detector.pattern_id,
-                    SignalRegistry.ticker == inp.ticker,
-                    SignalRegistry.signal_identity_hash == identity_hash,
+            try:
+                existing = self._existing_signal_id(
+                    detector.pattern_id,
+                    inp.ticker,
+                    identity_hash,
                 )
-                .first()
-            )
+            except SQLAlchemyError as exc:
+                diag.error_count += 1
+                diag.errors.append({
+                    "detector_id": detector.pattern_id,
+                    "ticker": inp.ticker,
+                    "stage": "duplicate_check",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                continue
             if existing:
                 diag.duplicate_suppressed_count += 1
                 continue
@@ -826,12 +833,12 @@ class DetectorOrchestrationJob(BaseJob):
 
             # Persist through evidence bridge
             try:
-                persisted = self._persist_detection_result(
+                persisted = self._persist_detection_result_with_lineage(
+                    inp=inp,
                     result=result,
                     detector=detector,
                     job_run_id=job_run_id,
                     universe_snapshot_id=inp.universe_snapshot_id,
-                    data_lineage_ids=self._resolved_input_lineage_ids(inp),
                     code_commit_sha=code_commit_sha,
                     trading_date=trading_date,
                     scan_id=scan_id,
@@ -841,13 +848,11 @@ class DetectorOrchestrationJob(BaseJob):
                 )
             except IntegrityError:
                 existing_after_race = (
-                    self._session.query(SignalRegistry.signal_id)
-                    .filter(
-                        SignalRegistry.pattern_id == detector.pattern_id,
-                        SignalRegistry.ticker == inp.ticker,
-                        SignalRegistry.signal_identity_hash == identity_hash,
+                    self._existing_signal_id(
+                        detector.pattern_id,
+                        inp.ticker,
+                        identity_hash,
                     )
-                    .first()
                 )
                 if existing_after_race:
                     diag.duplicate_suppressed_count += 1
@@ -904,17 +909,41 @@ class DetectorOrchestrationJob(BaseJob):
 
         return diag
 
-    def _persist_detection_result(self, **kwargs):
+    def _existing_signal_id(
+        self,
+        pattern_id: str,
+        ticker: str,
+        signal_identity_hash: str,
+    ):
+        context = (
+            self._session.begin_nested()
+            if self._nested_persistence
+            else nullcontext()
+        )
+        with context:
+            return (
+                self._session.query(SignalRegistry.signal_id)
+                .filter(
+                    SignalRegistry.pattern_id == pattern_id,
+                    SignalRegistry.ticker == ticker,
+                    SignalRegistry.signal_identity_hash == signal_identity_hash,
+                )
+                .first()
+            )
+
+    def _persist_detection_result_with_lineage(self, *, inp: PatternInput, **kwargs):
         if self._nested_persistence:
             with self._session.begin_nested():
                 return persist_detection_result(
                     self._session,
                     flush=True,
+                    data_lineage_ids=self._resolved_input_lineage_ids(inp),
                     **kwargs,
                 )
         return persist_detection_result(
             self._session,
             flush=False,
+            data_lineage_ids=self._resolved_input_lineage_ids(inp),
             **kwargs,
         )
 

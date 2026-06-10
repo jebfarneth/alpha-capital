@@ -18,6 +18,8 @@ import json
 import inspect
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from alpha.data.contracts import stable_hash
 from alpha.db.models import (
     CanonicalUniverseScan,
@@ -849,6 +851,47 @@ class TestPartialFailure:
         assert diag["detector_status"] == "partial_failed"
         assert diag["fired_count"] == 1
         assert diag["error_count"] == 1
+
+    def test_lineage_lookup_failure_isolated_to_one_input(
+        self,
+        db_session,
+        monkeypatch,
+    ):
+        _setup_canonical_universe(db_session)
+        savepoint_state_by_ticker = {}
+
+        def flaky_lineage_lookup(self, inp):
+            savepoint_state_by_ticker[inp.ticker] = (
+                self._session.in_nested_transaction()
+            )
+            if inp.ticker == "ACME":
+                raise SQLAlchemyError("lineage lookup failed")
+            return []
+
+        monkeypatch.setattr(
+            DetectorOrchestrationJob,
+            "_resolved_input_lineage_ids",
+            flaky_lineage_lookup,
+        )
+
+        job = DetectorOrchestrationJob(
+            db_session,
+            detectors=[AlwaysFiresDetector()],
+            trading_date="2026-05-20",
+        )
+        result = run_job(db_session, job, params={"trading_date": "2026-05-20"})
+
+        assert result.status == "partial_failed"
+        assert result.metrics["total_signals_persisted"] == 1
+        assert savepoint_state_by_ticker == {"ACME": True, "BETA": True}
+
+        signals = db_session.query(SignalRegistry).all()
+        assert [signal.ticker for signal in signals] == ["BETA"]
+
+        diag = result.metrics["detector_diagnostics"][0]
+        assert diag["fired_count"] == 1
+        assert diag["error_count"] == 1
+        assert "lineage lookup failed" in diag["errors"][0]["error"]
 
 
 # -----------------------------------------------------------------------
