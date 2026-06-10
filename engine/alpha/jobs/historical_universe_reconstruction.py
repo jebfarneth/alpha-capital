@@ -389,25 +389,41 @@ class HistoricalUniverseReconstructionJob(BaseJob):
     def _load_fmp_delisted_candidates(
         self,
         candidates: dict[str, _Candidate],
+        *,
+        min_replay_date: date | None = None,
+        max_replay_date: date | None = None,
     ) -> int:
-        rows = (
-            self.session.query(
-                FmpDelistedCompanyRecord.fmp_delisted_company_id,
-                FmpDelistedCompanyRecord.symbol,
-                FmpDelistedCompanyRecord.normalized_symbol,
-                FmpDelistedCompanyRecord.company_name,
-                FmpDelistedCompanyRecord.exchange_key,
-                FmpDelistedCompanyRecord.ipo_date,
-                FmpDelistedCompanyRecord.delisted_date,
-                FmpDelistedCompanyRecord.data_lineage_id,
-                FmpDelistedCompanyRecord.raw_payload_hash,
-                FmpDelistedCompanyRecord.raw_payload_json,
-                FmpDelistedCompanyRecord.exchange_relevance_status,
-            )
-            .yield_per(1000)
-            .all()
+        query = self.session.query(
+            FmpDelistedCompanyRecord.fmp_delisted_company_id,
+            FmpDelistedCompanyRecord.symbol,
+            FmpDelistedCompanyRecord.normalized_symbol,
+            FmpDelistedCompanyRecord.company_name,
+            FmpDelistedCompanyRecord.exchange_key,
+            FmpDelistedCompanyRecord.ipo_date,
+            FmpDelistedCompanyRecord.delisted_date,
+            FmpDelistedCompanyRecord.data_lineage_id,
+            FmpDelistedCompanyRecord.raw_payload_hash,
+            FmpDelistedCompanyRecord.raw_payload_json,
+            FmpDelistedCompanyRecord.exchange_relevance_status,
         )
-        for row in rows:
+        if min_replay_date is not None:
+            query = query.filter(
+                or_(
+                    FmpDelistedCompanyRecord.delisted_date.is_(None),
+                    FmpDelistedCompanyRecord.delisted_date > min_replay_date,
+                )
+            )
+        if max_replay_date is not None:
+            query = query.filter(
+                or_(
+                    FmpDelistedCompanyRecord.ipo_date.is_(None),
+                    FmpDelistedCompanyRecord.ipo_date <= max_replay_date,
+                )
+            )
+
+        row_count = 0
+        for row in query.yield_per(1000):
+            row_count += 1
             symbol = _clean_symbol(row.normalized_symbol or row.symbol)
             if not symbol:
                 continue
@@ -456,7 +472,7 @@ class HistoricalUniverseReconstructionJob(BaseJob):
                     security_type=_delisted_security_type(raw_payload),
                 )
             )
-        return len(rows)
+        return row_count
 
     def _current_active_snapshots(self) -> list[Any]:
         canonical = (

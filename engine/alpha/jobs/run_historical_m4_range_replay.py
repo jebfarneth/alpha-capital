@@ -432,7 +432,11 @@ class HistoricalM4RangeReplayJob(BaseJob):
         )
         candidates: dict[str, Any] = {}
         active_rows = template._load_active_current_candidates(candidates)
-        delisted_rows = template._load_fmp_delisted_candidates(candidates)
+        delisted_rows = template._load_fmp_delisted_candidates(
+            candidates,
+            min_replay_date=min(replay_dates),
+            max_replay_date=max(replay_dates),
+        )
         source_interval_count = sum(
             len(candidate.intervals) for candidate in candidates.values()
         )

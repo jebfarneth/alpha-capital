@@ -513,6 +513,54 @@ def test_pre_replay_delisted_exclusion_persistence_can_be_suppressed(db_session)
     assert db_session.query(HistoricalUniverseReconstruction).count() == 0
 
 
+def test_range_delisted_candidate_load_filters_irrelevant_rows(db_session):
+    _delisted(
+        db_session,
+        "OLDPRE",
+        ipo_date=date(2020, 1, 1),
+        delisted_date=date(2025, 3, 31),
+    )
+    _delisted(
+        db_session,
+        "INRANGE",
+        ipo_date=date(2020, 1, 1),
+        delisted_date=date(2025, 4, 15),
+    )
+    _delisted(
+        db_session,
+        "ACTIVE",
+        ipo_date=date(2020, 1, 1),
+        delisted_date=None,
+    )
+    _delisted(
+        db_session,
+        "FUTIPO",
+        ipo_date=date(2025, 5, 1),
+        delisted_date=None,
+    )
+    _delisted(
+        db_session,
+        "MISSIPO",
+        ipo_date=None,
+        delisted_date=None,
+    )
+    job = HistoricalUniverseReconstructionJob(
+        session=db_session,
+        replay_date=date(2025, 4, 1),
+        run_timestamp=_ts(),
+    )
+
+    candidates = {}
+    rows_seen = job._load_fmp_delisted_candidates(
+        candidates,
+        min_replay_date=date(2025, 4, 1),
+        max_replay_date=date(2025, 4, 30),
+    )
+
+    assert rows_seen == 3
+    assert set(candidates) == {"INRANGE", "ACTIVE", "MISSIPO"}
+
+
 def test_reconstruction_progress_events_cover_load_eval_and_persist(db_session):
     _record_delisted_ingest_run(db_session)
     _active(db_session, "ACTIVE", ipo_date="2020-01-01")
