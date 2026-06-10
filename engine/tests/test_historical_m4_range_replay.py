@@ -673,7 +673,7 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
     finally:
         event.remove(db_session.bind, "before_cursor_execute", capture_sql)
 
-    assert lookup.row_count >= 1201
+    assert lookup.row_count == 1
     assert existing_feature.feature_snapshot_id in lookup.rows.values()
     lookup_sql = "\n".join(captured_sql).casefold()
     assert "feature_json" not in lookup_sql
@@ -682,6 +682,7 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
     assert "output_hash" not in lookup_sql
     assert "feature_snapshot_id" in lookup_sql
     assert "feature_hash" in lookup_sql
+    assert "ticker" in lookup_sql
 
     second = run_historical_m4_range_replay(
         session=db_session,
@@ -700,7 +701,7 @@ def test_range_replay_idempotent_rerun_reuses_signals_without_duplicates(db_sess
     assert first_date_orchestration["features_inserted"] == 0
     assert first_date_orchestration["features_reused"] == 1
     assert first_date_orchestration["existing_feature_lookup_record_count"] == 1
-    assert first_date_orchestration["existing_feature_lookup_row_count"] >= 1201
+    assert first_date_orchestration["existing_feature_lookup_row_count"] == 1
     assert first_date_orchestration["existing_feature_lookup_seconds"] >= 0
     assert first_date_orchestration["existing_signal_lookup_row_count"] == 1
     assert first_date_orchestration["existing_signal_lookup_seconds"] >= 0

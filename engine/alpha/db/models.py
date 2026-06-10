@@ -1341,6 +1341,15 @@ class FeatureSnapshot(Base):
     """Pattern feature evidence captured before signal evaluation."""
 
     __tablename__ = "feature_snapshots"
+    __table_args__ = (
+        Index(
+            "ix_feature_snapshots_pattern_asof_ticker_hash",
+            "pattern_id",
+            "asof_timestamp",
+            "ticker",
+            "feature_hash",
+        ),
+    )
 
     feature_snapshot_id = Column(String, primary_key=True, default=_uuid)
     job_run_id = Column(

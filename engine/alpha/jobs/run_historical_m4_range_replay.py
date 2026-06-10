@@ -2101,30 +2101,42 @@ def _existing_feature_snapshots(
     by_key: dict[tuple[str, str, datetime, str], str] = {}
     row_count = 0
     for asof in asofs:
-        rows = (
-            session.query(
-                FeatureSnapshot.feature_snapshot_id,
-                FeatureSnapshot.pattern_id,
-                FeatureSnapshot.ticker,
-                FeatureSnapshot.asof_timestamp,
-                FeatureSnapshot.feature_hash,
-            )
-            .filter(
-                FeatureSnapshot.pattern_id == "M4",
-                FeatureSnapshot.asof_timestamp == asof,
-            )
-            .all()
+        target_pairs = sorted(
+            {
+                (ticker, feature_hash)
+                for pattern_id, ticker, key_asof, feature_hash in target_keys
+                if pattern_id == "M4" and key_asof == asof
+            }
         )
-        row_count += len(rows)
-        for row in rows:
-            key = (
-                row.pattern_id,
-                row.ticker,
-                _aware_utc(row.asof_timestamp),
-                row.feature_hash,
+        for chunk in _chunks(target_pairs, 500):
+            rows = (
+                session.query(
+                    FeatureSnapshot.feature_snapshot_id,
+                    FeatureSnapshot.pattern_id,
+                    FeatureSnapshot.ticker,
+                    FeatureSnapshot.asof_timestamp,
+                    FeatureSnapshot.feature_hash,
+                )
+                .filter(
+                    FeatureSnapshot.pattern_id == "M4",
+                    FeatureSnapshot.asof_timestamp == asof,
+                    tuple_(
+                        FeatureSnapshot.ticker,
+                        FeatureSnapshot.feature_hash,
+                    ).in_(chunk),
+                )
+                .all()
             )
-            if key in target_keys:
-                by_key[key] = row.feature_snapshot_id
+            row_count += len(rows)
+            for row in rows:
+                key = (
+                    row.pattern_id,
+                    row.ticker,
+                    _aware_utc(row.asof_timestamp),
+                    row.feature_hash,
+                )
+                if key in target_keys:
+                    by_key[key] = row.feature_snapshot_id
     return _ExistingLookup(rows=by_key, row_count=row_count)
 
 
