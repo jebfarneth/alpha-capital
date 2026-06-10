@@ -1,7 +1,7 @@
 """add data lineage raw payload hash index
 
 Revision ID: b5c6d7e8f901
-Revises: a4b5c6d7e8f9
+Revises: 3456789abcde
 Create Date: 2026-06-09 00:00:00.000000
 """
 
@@ -11,7 +11,7 @@ from alembic import op
 
 
 revision: str = "b5c6d7e8f901"
-down_revision: Union[str, None] = "a4b5c6d7e8f9"
+down_revision: Union[str, None] = "3456789abcde"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

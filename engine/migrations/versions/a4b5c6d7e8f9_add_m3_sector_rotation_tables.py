@@ -1,7 +1,7 @@
 """add m3 sector rotation producer tables
 
 Revision ID: a4b5c6d7e8f9
-Revises: 3456789abcde
+Revises: b5c6d7e8f901
 Create Date: 2026-06-05 00:00:00.000000
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "a4b5c6d7e8f9"
-down_revision: Union[str, None] = "3456789abcde"
+down_revision: Union[str, None] = "b5c6d7e8f901"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
