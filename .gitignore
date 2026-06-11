@@ -28,6 +28,7 @@ venv/
 *.dump
 *.parquet
 *.csv
+!engine/alpha/ml/data/m4_corpus_security_types_*.csv
 *.pkl
 *.npy
 *.zip

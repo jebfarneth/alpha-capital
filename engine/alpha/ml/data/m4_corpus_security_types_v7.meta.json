@@ -1,0 +1,210 @@
+{
+  "artifact": "m4_corpus_security_types_v7.csv",
+  "artifact_sha256": "a5243d37977a7ebc1f16d66596444fda17b07e7a73ace933f2135bea38ba5f6d",
+  "classifier_version": "security_type_v7",
+  "generated_at": "2026-06-11",
+  "classified_asof": "2026-06-11",
+  "corpus_window": {
+    "pattern_id": "M4",
+    "trading_date_min": "2024-01-01",
+    "trading_date_max": "2026-06-30"
+  },
+  "generator": "alpha/ml/generate_m4_security_type_artifact.py",
+  "corpus_query": "select left(trading_date,7) as month, ticker, count(*) from signal_registry where pattern_id = :pattern_id and trading_date between :trading_date_min and :trading_date_max group by 1, 2",
+  "resolution": "FMP stable/profile (3 attempts, 2s backoff) -> fmp_delisted_companies name rules -> fail on unresolved",
+  "semantics": {
+    "ml_excluded": "ticker security_type in NON_COMMON_TYPES (alpha.jobs.security_type); mark-don't-delete \u2014 signal_registry rows untouched, exclusion applied at training-set assembly via alpha.ml.security_type_exclusions",
+    "row_coverage": "every ticker with >=1 M4 signal in corpus_window; zero unresolved/no_profile rows (generation fails otherwise)"
+  },
+  "pit_caveat": "Security type is TODAY'S (classified_asof) profile applied retroactively. De-SPACed/converted names now classify common_stock, so early-window SPAC contamination is understated; types are NOT point-in-time as of trading_date.",
+  "totals": {
+    "corpus_signals": 72666,
+    "corpus_tickers": 3274,
+    "excluded_signals": 16650,
+    "excluded_tickers": 592,
+    "excluded_signal_pct": 22.91
+  },
+  "excluded_tickers_by_type": {
+    "etf": 200,
+    "spac_or_blank_check": 189,
+    "mutual_fund": 67,
+    "adr": 41,
+    "preferred": 31,
+    "closed_end_fund": 25,
+    "exchange_traded_debt": 18,
+    "non_common_series": 9,
+    "business_development_company": 9,
+    "right": 3
+  },
+  "excluded_signals_by_type": {
+    "spac_or_blank_check": 6626,
+    "etf": 5710,
+    "mutual_fund": 1547,
+    "closed_end_fund": 808,
+    "preferred": 735,
+    "adr": 718,
+    "exchange_traded_debt": 276,
+    "non_common_series": 115,
+    "business_development_company": 102,
+    "right": 13
+  },
+  "excluded_signals_by_reason": {
+    "is_etf=True": 5615,
+    "name_contains:ACQUISITION CORP": 3669,
+    "raw_flag:isFund": 1515,
+    "name_contains:ACQUISITION CORPORATION": 1292,
+    "industry_description:SHELL_COMPANIES+BUSINESS_COMBINATION": 1267,
+    "raw_flag:isAdr": 718,
+    "symbol_suffix:fifth_char_P": 487,
+    "name_contains:SPAC": 259,
+    "name_contains:NOTES": 258,
+    "manual_override:known_cef": 244,
+    "symbol_suffix:fifth_char_O+inactive": 133,
+    "raw_description:CLOSED_END_MUTUAL_FUND": 128,
+    "raw_description:CLOSED_END_EQUITY_MUTUAL_FUND": 114,
+    "raw_description:CLOSED_END_SUBJECT_POSITION": 108,
+    "industry_description:ASSET_MANAGEMENT+FUND_TEMPLATE": 102,
+    "symbol_suffix:fifth_char_L+inactive": 95,
+    "symbol_suffix:fifth_char_M+inactive": 87,
+    "name_contains:ETF": 84,
+    "raw_description:BUSINESS_DEVELOPMENT_COMPANY": 81,
+    "industry_description:SHELL_COMPANIES+BLANK_CHECK_COMPANY": 67,
+    "raw_description:CLOSED_ENDED_MUTUAL_FUND": 51,
+    "name_contains:ACQUISITION CO": 41,
+    "name_contains:FUND": 32,
+    "raw_description:CLOSED_ENDED_EQUITY_MUTUAL_FUND": 32,
+    "raw_description:CLOSED_END_EQUITY_FUND": 29,
+    "symbol_suffix:fifth_char_N+inactive": 24,
+    "name_industry:CAPITAL_CORPORATION_BDC": 21,
+    "symbol_suffix:fifth_char_Z+inactive": 20,
+    "industry_description:SHELL_COMPANIES+ASSET_ACQUISITION": 19,
+    "name_contains:NT": 18,
+    "name_pattern:ACQUISITION_SEQUENCE": 12,
+    "delisted_name:name_contains:ETF": 11,
+    "symbol_suffix:fifth_char_R+inactive": 10,
+    "name_contains:PREFERRED": 4,
+    "name_contains:RIGHT": 3
+  },
+  "excluded_signals_by_month": {
+    "2024-01": {
+      "excluded": 1254,
+      "total": 2740
+    },
+    "2024-02": {
+      "excluded": 1273,
+      "total": 3356
+    },
+    "2024-03": {
+      "excluded": 1479,
+      "total": 3887
+    },
+    "2024-04": {
+      "excluded": 683,
+      "total": 1761
+    },
+    "2024-05": {
+      "excluded": 1034,
+      "total": 3264
+    },
+    "2024-06": {
+      "excluded": 703,
+      "total": 1437
+    },
+    "2024-07": {
+      "excluded": 1099,
+      "total": 4347
+    },
+    "2024-08": {
+      "excluded": 979,
+      "total": 2812
+    },
+    "2024-09": {
+      "excluded": 1198,
+      "total": 3200
+    },
+    "2024-10": {
+      "excluded": 829,
+      "total": 3251
+    },
+    "2024-11": {
+      "excluded": 1015,
+      "total": 4707
+    },
+    "2024-12": {
+      "excluded": 568,
+      "total": 2321
+    },
+    "2025-01": {
+      "excluded": 344,
+      "total": 1740
+    },
+    "2025-02": {
+      "excluded": 332,
+      "total": 1545
+    },
+    "2025-03": {
+      "excluded": 253,
+      "total": 848
+    },
+    "2025-04": {
+      "excluded": 178,
+      "total": 671
+    },
+    "2025-05": {
+      "excluded": 297,
+      "total": 1441
+    },
+    "2025-06": {
+      "excluded": 382,
+      "total": 1773
+    },
+    "2025-07": {
+      "excluded": 497,
+      "total": 2296
+    },
+    "2025-08": {
+      "excluded": 408,
+      "total": 2357
+    },
+    "2025-09": {
+      "excluded": 497,
+      "total": 2819
+    },
+    "2025-10": {
+      "excluded": 472,
+      "total": 2436
+    },
+    "2025-11": {
+      "excluded": 158,
+      "total": 1702
+    },
+    "2025-12": {
+      "excluded": 150,
+      "total": 2543
+    },
+    "2026-01": {
+      "excluded": 228,
+      "total": 2991
+    },
+    "2026-02": {
+      "excluded": 145,
+      "total": 2981
+    },
+    "2026-03": {
+      "excluded": 59,
+      "total": 1398
+    },
+    "2026-04": {
+      "excluded": 81,
+      "total": 2638
+    },
+    "2026-05": {
+      "excluded": 47,
+      "total": 2329
+    },
+    "2026-06": {
+      "excluded": 8,
+      "total": 1075
+    }
+  }
+}

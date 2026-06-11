@@ -43,9 +43,16 @@ UNIT = "unit"
 RIGHT = "right"
 SPAC_OR_BLANK_CHECK = "spac_or_blank_check"
 BUSINESS_DEVELOPMENT_COMPANY = "business_development_company"
+# Exchange-listed notes / baby bonds (e.g. FOSLL "7% Senior Notes due 2026").
+EXCHANGE_TRADED_DEBT = "exchange_traded_debt"
+# Non-common series-level listing identified only by the consolidated-tape
+# fifth-character convention, where FMP serves the parent issuer's profile
+# and the convention letter (L/Z = miscellaneous) does not pin the exact
+# instrument kind (note vs preferred vs warrant).
+NON_COMMON_SERIES = "non_common_series"
 UNKNOWN = "unknown"
 
-CLASSIFIER_VERSION = "security_type_v4"
+CLASSIFIER_VERSION = "security_type_v7"
 
 REFRESH_STATUS_ENRICHED = "enriched"
 REFRESH_STATUS_NO_DATA = "no_data"
@@ -64,6 +71,8 @@ NON_COMMON_TYPES = frozenset({
     RIGHT,
     SPAC_OR_BLANK_CHECK,
     BUSINESS_DEVELOPMENT_COMPANY,
+    EXCHANGE_TRADED_DEBT,
+    NON_COMMON_SERIES,
 })
 
 REFRESH_STATUSES_REQUIRING_RETRY = frozenset({
@@ -101,6 +110,48 @@ OPERATING_MANAGER_DESCRIPTION_PHRASES = (
     "WEALTH MANAGEMENT",
     "ASSET MANAGEMENT SERVICES",
 )
+CEF_DESCRIPTION_PHRASES = (
+    "CLOSED-END FUND",
+    "CLOSED END FUND",
+    "CLOSED-ENDED FUND",
+    "CLOSED ENDED FUND",
+    "CLOSED-END EQUITY FUND",
+    "CLOSED END EQUITY FUND",
+    "CLOSED-ENDED EQUITY FUND",
+    "CLOSED ENDED EQUITY FUND",
+    "CLOSED-END MUTUAL FUND",
+    "CLOSED END MUTUAL FUND",
+    "CLOSED-ENDED MUTUAL FUND",
+    "CLOSED ENDED MUTUAL FUND",
+    "CLOSED-END EQUITY MUTUAL FUND",
+    "CLOSED END EQUITY MUTUAL FUND",
+    "CLOSED-ENDED EQUITY MUTUAL FUND",
+    "CLOSED ENDED EQUITY MUTUAL FUND",
+    "CLOSED-END INVESTMENT COMPANY",
+    "CLOSED END INVESTMENT COMPANY",
+    "CLOSED-END MANAGEMENT INVESTMENT COMPANY",
+    "CLOSED END MANAGEMENT INVESTMENT COMPANY",
+    "INVESTMENT COMPANY ACT OF 1940",
+)
+CEF_SUBJECT_DESCRIPTION_RE = re.compile(
+    r"\b(?:IS\s+STRUCTURED\s+AS|OPERATES\s+AS|STRUCTURED\s+AS|"
+    r"FUNCTIONS\s+AS|IS)\s+AN?\s+"
+    r"(?:(?:[A-Z]+(?:-[A-Z]+)?),?\s+){0,5}"
+    r"CLOSED[-\s]END(?:ED)?"
+    r",?\s+"
+    r"(?:(?:[A-Z]+(?:-[A-Z]+)?),?\s+){0,5}"
+    r"(?:FUND|INVESTMENT\s+(?:FUND|COMPANY|VEHICLE)|"
+    r"MANAGEMENT(?:\s+INVESTMENT)?\s+COMPANY|VEHICLE)\b"
+)
+# Last-resort CEF overrides for profiles with no usable FMP closed-end phrase.
+# Verified 2026-06-11 against live FMP /stable/profile and SEC submissions:
+# CET CIK 0000018748 and GAM CIK 0000040417 file investment-company forms
+# including NPORT-P, N-CEN, and N-CSR. Keep this list narrow and evidence-led.
+# EIC CIK 0001805385 is a registered closed-end fund filing N-2/NPORT-P/N-CEN/
+# N-CSR. EICA/EICB/EICC are listed term-preferred series served with the parent
+# EIC profile; they are typed closed_end_fund imprecisely, but exclusion
+# membership is the training-set contract that matters.
+KNOWN_CEF_TICKERS = frozenset({"CET", "GAM", "EIC", "EICA", "EICB", "EICC"})
 SPAC_ACQUISITION_SEQUENCE_RE = re.compile(
     r"\bACQUISITION\s+(?:(?:I{1,3}|IV|V|VI{0,3}|IX|X|\d+)\s+)?"
     r"(?:CORP(?:ORATION)?|CO|LIMITED|LTD)\b"
@@ -362,6 +413,19 @@ def classify_security_type(
     if industry == "SHELL COMPANIES" and _has_phrase(name, "SPONSORED"):
         return ADR, "sponsored_adr_indicator"
 
+    # Exchange-listed debt / baby-bond indicators (FOSLL "7% Senior Notes
+    # due 2026", HROWL "8.625% Senior Notes ...", CGBDL "8.20% Notes ...").
+    # Checked before preferred so a coupon% next to NOTES is typed as debt.
+    if (
+        _has_phrase(name, "SENIOR NOTES")
+        or _has_phrase(name, "NOTES DUE")
+        or (_has_phrase(name, "NOTES") and "%" in name)
+        or (_has_phrase(name, "NT") and "%" in name)
+    ):
+        if _has_phrase(name, "NT") and "%" in name:
+            return EXCHANGE_TRADED_DEBT, "name_contains:NT"
+        return EXCHANGE_TRADED_DEBT, "name_contains:NOTES"
+
     # Preferred indicators
     if _has_phrase(name, "PREFERRED") or _has_phrase(name, "PFD"):
         return PREFERRED, "name_contains:PREFERRED"
@@ -380,9 +444,12 @@ def classify_security_type(
     if re.search(r"\bUNITS?\b$", name):
         return UNIT, "name_ends:UNIT"
 
-    # Right indicators
+    # Right indicators. SERIES added for listed series rights (AMPGR
+    # "Amplitech Group, Inc. Series A Right" — verified live 2026-06-10).
     if (_has_phrase(name, "RIGHT") or _has_phrase(name, "RIGHTS")) and (
-        _has_phrase(name, "SUBSCRIPTION") or _has_phrase(name, "CONTINGENT")
+        _has_phrase(name, "SUBSCRIPTION")
+        or _has_phrase(name, "CONTINGENT")
+        or _has_phrase(name, "SERIES")
     ):
         return RIGHT, "name_contains:RIGHT"
 
@@ -424,6 +491,20 @@ def classify_security_type(
     # ETF fallback from sector/industry
     if sector == "ETF" or industry == "EXCHANGE TRADED FUND":
         return ETF, f"sector_or_industry:ETF"
+    if _has_phrase(name, "EXCHANGE TRADED FUND") or _has_phrase(name, "ETF"):
+        return ETF, "name_contains:ETF"
+
+    # Closed-end fund descriptions. Avoid matching bare "closed-end":
+    # lenders use phrases such as "closed-end loans", so require a fund or
+    # investment-company qualifier.
+    kw = _has_any_phrase(raw_description, CEF_DESCRIPTION_PHRASES)
+    if kw:
+        return CLOSED_END_FUND, (
+            "raw_description:"
+            f"{kw.replace('-', '_').replace(' ', '_')}"
+        )
+    if CEF_SUBJECT_DESCRIPTION_RE.search(raw_description):
+        return CLOSED_END_FUND, "raw_description:CLOSED_END_SUBJECT_POSITION"
 
     # Closed-end funds FMP fails to flag (isFund=False, e.g. ASA): the
     # profile carries FMP's fund-template description under the Asset
@@ -442,17 +523,51 @@ def classify_security_type(
     ):
         return CLOSED_END_FUND, "industry_description:ASSET_MANAGEMENT+FUND_TEMPLATE"
 
-    # Preferred from the consolidated-tape fifth-character convention: a
-    # plain 5-letter symbol ending in P (MPLXP, VIASP, TECTP, ...). FMP
-    # serves these with the PARENT issuer's profile (same name/CIK as the
-    # common stock), so no name/description rule can catch them. Truly
+    if symbol := _clean_text(profile.symbol):
+        if symbol in KNOWN_CEF_TICKERS:
+            return CLOSED_END_FUND, "manual_override:known_cef"
+
+    # Consolidated-tape fifth-character convention: a plain 5-letter symbol
+    # whose last letter is a series designator (MPLXP, ZIONO, NYMTL, ...).
+    # FMP serves these with the PARENT issuer's profile (same name/CIK as
+    # the common stock), so no name/description rule can catch them. Truly
     # last-resort: every evidence-based rule above, including the ETF
     # sector/industry fallback, has already had its chance.
-    # Corpus-verified 2026-06-10: all seven 5-char ending-P tickers in the
-    # 2024-2026 M4 corpus are genuine series preferreds.
+    #
+    # P is ungated: all 21 ending-P tickers in the 2024-2026 M4 corpus are
+    # verified series preferreds, and two (NHPAP/NHPBP) carry
+    # isActivelyTrading=True, so gating P would lose real preferreds.
+    # The other letters REQUIRE isActivelyTrading is False because genuine
+    # common stocks can end in them (GOOGL, isActivelyTrading=True). FMP
+    # marks series listings inactive (all 26 corpus L/M/N/O/R/Z series
+    # instruments verified False on 2026-06-10 except AMPGZ/AMPGR, which
+    # the SERIES-right name rule catches first). Known residual: this
+    # would mistype a genuinely DELISTED 5-char common ending in one of
+    # these letters; zero such names exist in the 2024-2026 corpus.
+    # Letter -> type per the tape convention: M/N/O = preferred classes,
+    # R = rights, U = units, W = warrants, L/Z = miscellaneous (mixed
+    # notes/preferreds/warrants -> non_common_series).
     symbol = _clean_text(profile.symbol)
     if re.fullmatch(r"[A-Z]{4}P", symbol):
         return PREFERRED, "symbol_suffix:fifth_char_P"
+    suffix_match = re.fullmatch(r"[A-Z]{4}([LMNORUWZ])", symbol)
+    inactive = (
+        profile.is_actively_trading is False
+        or _raw_bool(raw_json, "isActivelyTrading", "is_actively_trading") is False
+    )
+    if suffix_match and inactive:
+        letter = suffix_match.group(1)
+        suffix_type = {
+            "M": PREFERRED,
+            "N": PREFERRED,
+            "O": PREFERRED,
+            "R": RIGHT,
+            "U": UNIT,
+            "W": WARRANT,
+            "L": NON_COMMON_SERIES,
+            "Z": NON_COMMON_SERIES,
+        }[letter]
+        return suffix_type, f"symbol_suffix:fifth_char_{letter}+inactive"
 
     # Sufficient data for common_stock classification
     if profile.company_name and profile.exchange:

@@ -41,6 +41,8 @@ from alpha.jobs.security_type import (
     ETF,
     MUTUAL_FUND,
     BUSINESS_DEVELOPMENT_COMPANY,
+    EXCHANGE_TRADED_DEBT,
+    NON_COMMON_SERIES,
     NON_COMMON_TYPES,
     PREFERRED,
     RIGHT,
@@ -120,6 +122,15 @@ class TestClassifier:
     def test_etf_from_sector(self):
         st, _ = classify_security_type(_profile(sector="ETF", is_etf=False))
         assert st == ETF
+
+    def test_etf_from_name(self):
+        st, reason = classify_security_type(_profile(
+            symbol="WILD",
+            company_name="VistaShares Animal Spirits Daily 2X Strategy ETF",
+            is_etf=False,
+        ))
+        assert st == ETF
+        assert reason == "name_contains:ETF"
 
     def test_mutual_fund_from_name(self):
         st, _ = classify_security_type(_profile(company_name="Vanguard Growth Fund"))
@@ -243,6 +254,147 @@ class TestClassifier:
         assert st == PREFERRED
         assert reason != "symbol_suffix:fifth_char_P"
 
+    def test_five_char_p_symbol_actively_trading_still_preferred(self):
+        # NHPAP/NHPBP: genuine preferreds with isActivelyTrading=True —
+        # the P rule must stay ungated.
+        st, reason = classify_security_type(_profile(
+            symbol="NHPAP", company_name="National Holdings Corp",
+            is_actively_trading=True,
+        ))
+        assert st == PREFERRED
+        assert reason == "symbol_suffix:fifth_char_P"
+
+    def test_inactive_o_suffix_is_preferred(self):
+        # ZIONO-style: Series G preferred served with the parent profile.
+        st, reason = classify_security_type(_profile(
+            symbol="ZIONO",
+            company_name="Zions Bancorporation, National Association",
+            sector="Financial Services", industry="Banks - Regional",
+            is_actively_trading=False,
+        ))
+        assert st == PREFERRED
+        assert reason == "symbol_suffix:fifth_char_O+inactive"
+
+    def test_inactive_l_suffix_is_non_common_series(self):
+        # ZIONL-style: subordinated notes served with the parent profile;
+        # L is the miscellaneous tape letter, so type stays non-specific.
+        st, reason = classify_security_type(_profile(
+            symbol="ZIONL",
+            company_name="Zions Bancorporation N.A. - 6.9",
+            sector="Financial Services", industry="Banks - Regional",
+            is_actively_trading=False,
+        ))
+        assert st == NON_COMMON_SERIES
+        assert reason == "symbol_suffix:fifth_char_L+inactive"
+
+    def test_inactive_m_and_n_suffixes_are_preferred(self):
+        for sym in ("NYMTM", "NYMTN"):
+            st, _ = classify_security_type(_profile(
+                symbol=sym, company_name="New York Mortgage Trust, Inc.",
+                is_actively_trading=False,
+            ))
+            assert st == PREFERRED, sym
+
+    def test_inactive_z_suffix_is_non_common_series(self):
+        st, _ = classify_security_type(_profile(
+            symbol="NYMTZ", company_name="New York Mortgage Trust, Inc.",
+            is_actively_trading=False,
+        ))
+        assert st == NON_COMMON_SERIES
+
+    def test_inactive_r_suffix_is_right(self):
+        # CLRCR-style SPAC right whose profile name carries no evidence.
+        st, _ = classify_security_type(_profile(
+            symbol="CLRCR", company_name="ClimateRock",
+            is_actively_trading=False,
+        ))
+        assert st == RIGHT
+
+    def test_inactive_u_suffix_is_unit(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDU", company_name="Acme Parent Holdings",
+            is_actively_trading=False,
+        ))
+        assert st == UNIT
+        assert reason == "symbol_suffix:fifth_char_U+inactive"
+
+    def test_inactive_w_suffix_is_warrant(self):
+        st, reason = classify_security_type(_profile(
+            symbol="ABCDW", company_name="Acme Parent Holdings",
+            is_actively_trading=False,
+        ))
+        assert st == WARRANT
+        assert reason == "symbol_suffix:fifth_char_W+inactive"
+
+    def test_active_l_suffix_common_stays_common(self):
+        # GOOGL: genuine common stock ending in L, actively trading —
+        # the inactive gate must keep it common.
+        st, reason = classify_security_type(_profile(
+            symbol="GOOGL", company_name="Alphabet Inc.",
+            sector="Technology", is_actively_trading=True,
+        ))
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
+    def test_active_o_suffix_common_stays_common(self):
+        st, _ = classify_security_type(_profile(
+            symbol="ABCDO", company_name="Acme Corp",
+            is_actively_trading=True,
+        ))
+        assert st == COMMON_STOCK
+
+    def test_inactive_suffix_from_raw_flag_only(self):
+        # Gate must also fire when only the raw payload carries the flag.
+        st, _ = classify_security_type(_profile(
+            symbol="ZIONO", company_name="Zions Bancorporation",
+            is_actively_trading=None, raw={"isActivelyTrading": False},
+        ))
+        assert st == PREFERRED
+
+    def test_senior_notes_name_is_exchange_traded_debt(self):
+        # FOSLL-style baby bond; name evidence works even when active.
+        st, reason = classify_security_type(_profile(
+            symbol="FOSLL",
+            company_name="Fossil Group, Inc. 7% Senior Notes due 2026",
+            is_actively_trading=True,
+        ))
+        assert st == EXCHANGE_TRADED_DEBT
+        assert reason == "name_contains:NOTES"
+
+    def test_coupon_notes_name_is_exchange_traded_debt(self):
+        # CGBDL-style: "8.20% Notes ..." without the word SENIOR or DUE.
+        st, _ = classify_security_type(_profile(
+            symbol="CGBDL",
+            company_name="Carlyle Secured Lending, Inc. 8.20% Notes",
+        ))
+        assert st == EXCHANGE_TRADED_DEBT
+
+    def test_coupon_nt_name_is_exchange_traded_debt(self):
+        # ECCX live name: "Eagle Point Credit Company Inc. 6.6875% NT 28".
+        st, reason = classify_security_type(_profile(
+            symbol="ECCX",
+            company_name="Eagle Point Credit Company Inc. 6.6875% NT 28",
+        ))
+        assert st == EXCHANGE_TRADED_DEBT
+        assert reason == "name_contains:NT"
+
+    def test_notes_word_without_coupon_is_common(self):
+        st, _ = classify_security_type(_profile(
+            symbol="LNSC", company_name="Lotus Notes Software Corp",
+        ))
+        assert st == COMMON_STOCK
+
+    def test_series_right_name_is_right(self):
+        # AMPGR "Series A Right": actively trading, so only the name rule
+        # can catch it.
+        st, reason = classify_security_type(_profile(
+            symbol="AMPGR",
+            company_name="Amplitech Group, Inc. Series A Right",
+            is_actively_trading=True,
+        ))
+        assert st == RIGHT
+        assert reason == "name_contains:RIGHT"
+
     def test_closed_end_fund_from_asset_management_fund_template(self):
         # ASA-style: isFund=False but FMP fund-template description.
         st, reason = classify_security_type(_profile(
@@ -262,6 +414,149 @@ class TestClassifier:
         assert st == CLOSED_END_FUND
         assert reason == "industry_description:ASSET_MANAGEMENT+FUND_TEMPLATE"
 
+    def test_closed_end_fund_from_closed_end_equity_fund_description(self):
+        # HQH-style live FMP profile: explicit closed-end equity fund.
+        st, reason = classify_security_type(_profile(
+            symbol="HQH",
+            company_name="Abrdn Healthcare Investors",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "Abrdn Healthcare Investors is a closed-end equity fund, "
+                "stewarded by abrdn Inc."
+            )},
+        ))
+        assert st == CLOSED_END_FUND
+        assert reason == "raw_description:CLOSED_END_EQUITY_FUND"
+
+    def test_closed_end_fund_from_closed_ended_equity_mutual_fund_description(self):
+        # HQL-style live FMP profile: explicit closed-ended equity mutual fund.
+        st, reason = classify_security_type(_profile(
+            symbol="HQL",
+            company_name="Tekla Life Sciences Investors",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "Tekla Life Sciences Investors, a closed-ended equity "
+                "mutual fund, is managed by Tekla Capital Management LLC."
+            )},
+        ))
+        assert st == CLOSED_END_FUND
+        assert reason == "raw_description:CLOSED_ENDED_EQUITY_MUTUAL_FUND"
+
+    def test_known_cef_manual_override_for_blank_fmp_evidence(self):
+        # CET/GAM live FMP profiles have Asset Management descriptions but no
+        # closed-end phrase; SEC CIKs file NPORT-P/N-CEN/N-CSR.
+        for symbol, name in (
+            ("CET", "Central Securities Corp."),
+            ("GAM", "General American Investors Company, Inc."),
+        ):
+            st, reason = classify_security_type(_profile(
+                symbol=symbol,
+                company_name=name,
+                sector="Financial Services",
+                industry="Asset Management",
+                raw={"description": (
+                    f"{name} functions as a publicly traded entity "
+                    "specializing in investment management."
+                )},
+            ))
+            assert st == CLOSED_END_FUND
+            assert reason == "manual_override:known_cef"
+
+    def test_eic_family_known_cef_override(self):
+        # EIC is a registered closed-end fund; EICA/EICB/EICC are listed
+        # term-preferred series served with the parent EIC profile.
+        for symbol in ("EIC", "EICA", "EICB", "EICC"):
+            st, reason = classify_security_type(_profile(
+                symbol=symbol,
+                company_name="Eagle Point Income Company Inc.",
+                sector="Financial Services",
+                industry="Asset Management",
+                raw={"description": (
+                    "Eagle Point Income Management manages funds through "
+                    "separately managed accounts, and publicly traded "
+                    "closed-end vehicles. The firm specializes in CLO debt."
+                )},
+            ))
+            assert st == CLOSED_END_FUND
+            assert reason == "manual_override:known_cef"
+
+    @pytest.mark.parametrize(
+        ("symbol", "description"),
+        [
+            (
+                "DXYZ",
+                "Destiny Tech100 Inc. is structured as a non-diversified, "
+                "closed-end management company.",
+            ),
+            (
+                "ECCC",
+                "Eagle Point Credit Company Inc. is a closed-end investment "
+                "fund established and overseen by Eagle Point Credit Management.",
+            ),
+            (
+                "ECCF",
+                "Eagle Point Credit Company Inc. is a closed-end investment "
+                "fund, established in the United States on March 24, 2014.",
+            ),
+            (
+                "ECCX",
+                "Eagle Point Credit Company Inc. operates as a closed-end "
+                "investment vehicle.",
+            ),
+            (
+                "FSCO",
+                "FS Credit Opportunities Corp. is an American closed-end "
+                "fixed income fund.",
+            ),
+            (
+                "SOR",
+                "Source Capital, Inc. is a closed-end, balanced investment fund.",
+            ),
+        ],
+    )
+    def test_subject_position_closed_end_descriptions_are_cefs(
+        self, symbol, description
+    ):
+        st, reason = classify_security_type(_profile(
+            symbol=symbol,
+            company_name=f"{symbol} Holdings",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": description},
+        ))
+        assert st == CLOSED_END_FUND
+        assert reason == "raw_description:CLOSED_END_SUBJECT_POSITION"
+
+    def test_closed_end_loans_lender_description_not_closed_end_fund(self):
+        st, reason = classify_security_type(_profile(
+            symbol="FISI",
+            company_name="Financial Institutions, Inc.",
+            sector="Financial Services",
+            industry="Financial - Credit Services",
+            raw={"description": (
+                "Financial Institutions, Inc. offers home improvement loans, "
+                "closed-end home equity loans, and home equity lines of credit."
+            )},
+        ))
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
+    def test_closed_end_mutual_funds_managed_for_clients_not_closed_end_fund(self):
+        st, reason = classify_security_type(_profile(
+            symbol="BLK",
+            company_name="BlackRock, Inc.",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "The firm manages open-end and closed-end mutual funds for "
+                "institutional clients."
+            )},
+        ))
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
+
     def test_operating_asset_manager_not_closed_end_fund(self):
         # APAM-style operating manager: matches at most one template phrase.
         st, _ = classify_security_type(_profile(
@@ -276,6 +571,21 @@ class TestClassifier:
             )},
         ))
         assert st == COMMON_STOCK
+
+    def test_operating_manager_with_closed_end_context_not_closed_end_fund(self):
+        st, reason = classify_security_type(_profile(
+            symbol="OMGR",
+            company_name="Operating Manager Inc.",
+            sector="Financial Services",
+            industry="Asset Management",
+            raw={"description": (
+                "Operating Manager Inc. invests through separately managed "
+                "accounts and publicly traded closed-end vehicles. The firm "
+                "specializes in CLO strategy advisory services for clients."
+            )},
+        ))
+        assert st == COMMON_STOCK
+        assert reason == "profile_fields_present"
 
     def test_operating_manager_with_both_template_phrases_not_closed_end_fund(self):
         # Adversarial: BOTH fund-template trigger phrases present, but the
@@ -542,6 +852,8 @@ class TestClassifier:
         assert RIGHT in NON_COMMON_TYPES
         assert SPAC_OR_BLANK_CHECK in NON_COMMON_TYPES
         assert BUSINESS_DEVELOPMENT_COMPANY in NON_COMMON_TYPES
+        assert EXCHANGE_TRADED_DEBT in NON_COMMON_TYPES
+        assert NON_COMMON_SERIES in NON_COMMON_TYPES
         assert COMMON_STOCK not in NON_COMMON_TYPES
         assert UNKNOWN not in NON_COMMON_TYPES
 
