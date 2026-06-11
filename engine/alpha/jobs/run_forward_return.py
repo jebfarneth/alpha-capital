@@ -9,6 +9,8 @@ Historical M4 backfill chunks:
     while true; do
       uv run python -m alpha.jobs.run_forward_return --live \
         --signal-source historical-m4-replay \
+        --signal-start-date 2024-01-01 \
+        --signal-end-date 2024-01-31 \
         --run-timestamp 2026-06-09T22:15:03.685171+00:00 \
         --limit 5000 \
         --prefetch-workers 16 \
@@ -22,7 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from alpha.data.benzinga import BenzingaAdapter
@@ -59,6 +61,12 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    return date.fromisoformat(value)
 
 
 def _live_timestamp_error(
@@ -107,6 +115,19 @@ def _run_live(args: argparse.Namespace) -> int:
     timestamp_error = _live_timestamp_error(args.run_timestamp)
     if timestamp_error:
         print(f"ERROR: {timestamp_error}")
+        return 1
+    try:
+        signal_start_date = _parse_date(args.signal_start_date)
+        signal_end_date = _parse_date(args.signal_end_date)
+    except ValueError as exc:
+        print(f"ERROR: invalid signal date: {exc}")
+        return 1
+    if (
+        signal_start_date is not None
+        and signal_end_date is not None
+        and signal_start_date > signal_end_date
+    ):
+        print("ERROR: signal_start_date must be on or before signal_end_date")
         return 1
     if target_schema is not None:
         try:
@@ -161,6 +182,8 @@ def _run_live(args: argparse.Namespace) -> int:
             price_drift_abs_tol=args.price_drift_abs_tol,
             price_drift_rel_tol=args.price_drift_rel_tol,
             signal_source=args.signal_source,
+            signal_start_date=signal_start_date,
+            signal_end_date=signal_end_date,
             limit=args.limit,
             prefetch_workers=args.prefetch_workers,
             prefetch_rate_limit_per_minute=args.prefetch_rate_limit_per_minute,
@@ -181,6 +204,8 @@ def _run_live(args: argparse.Namespace) -> int:
                 "price_drift_abs_tol": args.price_drift_abs_tol,
                 "price_drift_rel_tol": args.price_drift_rel_tol,
                 "signal_source": args.signal_source,
+                "signal_start_date": args.signal_start_date,
+                "signal_end_date": args.signal_end_date,
                 "limit": args.limit,
                 "prefetch_workers": args.prefetch_workers,
                 "prefetch_rate_limit_per_minute": (
@@ -194,6 +219,8 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Mode:                    {metrics.get('mode')}")
         print(f"Pattern:                 {metrics.get('pattern_id')}")
         print(f"Signal source:           {metrics.get('signal_source')}")
+        print(f"Signal start date:       {metrics.get('signal_start_date')}")
+        print(f"Signal end date:         {metrics.get('signal_end_date')}")
         print(f"Schema:                  {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
         print(f"Survivorship sources:    {survivorship_source_names}")
         print(f"Eligible signals:        {metrics.get('total_eligible')}")
@@ -303,6 +330,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "Signal corpus to label. Use historical-m4-replay to exclude stale "
             "live M4 rows outside replay membership."
+        ),
+    )
+    parser.add_argument(
+        "--signal-start-date",
+        help=(
+            "Inclusive signal date lower bound, YYYY-MM-DD. Use with "
+            "--signal-end-date for month-scoped historical backfills."
+        ),
+    )
+    parser.add_argument(
+        "--signal-end-date",
+        help=(
+            "Inclusive signal date upper bound, YYYY-MM-DD. Use with "
+            "--signal-start-date for month-scoped historical backfills."
         ),
     )
     parser.add_argument(

@@ -752,6 +752,8 @@ def _run_job(
     survivorship_adapters=None,
     listing_authority_adapter=None,
     signal_source=SIGNAL_SOURCE_LIVE,
+    signal_start_date=None,
+    signal_end_date=None,
     limit=None,
     prefetch_workers=0,
     prefetch_rate_limit_per_minute=1500,
@@ -773,6 +775,8 @@ def _run_job(
             price_drift_abs_tol=price_drift_abs_tol,
             price_drift_rel_tol=price_drift_rel_tol,
             signal_source=signal_source,
+            signal_start_date=signal_start_date,
+            signal_end_date=signal_end_date,
             limit=limit,
             prefetch_workers=prefetch_workers,
             prefetch_rate_limit_per_minute=prefetch_rate_limit_per_minute,
@@ -786,6 +790,14 @@ def _run_job(
             "price_drift_abs_tol": price_drift_abs_tol,
             "price_drift_rel_tol": price_drift_rel_tol,
             "signal_source": signal_source,
+            "signal_start_date": (
+                signal_start_date.isoformat()
+                if signal_start_date is not None else None
+            ),
+            "signal_end_date": (
+                signal_end_date.isoformat()
+                if signal_end_date is not None else None
+            ),
             "limit": limit,
             "prefetch_workers": prefetch_workers,
             "prefetch_rate_limit_per_minute": prefetch_rate_limit_per_minute,
@@ -1153,6 +1165,10 @@ def test_run_forward_return_wires_limit_and_prefetch_options(monkeypatch):
         "--live",
         "--run-timestamp",
         MATURE_RUN_TS.isoformat(),
+        "--signal-start-date",
+        "2026-05-26",
+        "--signal-end-date",
+        "2026-05-26",
         "--limit",
         "5000",
         "--prefetch-workers",
@@ -1162,13 +1178,66 @@ def test_run_forward_return_wires_limit_and_prefetch_options(monkeypatch):
     ])
 
     assert exit_code == 0
+    assert captured["job"]._signal_start_date == date(2026, 5, 26)
+    assert captured["job"]._signal_end_date == date(2026, 5, 26)
     assert captured["job"]._limit == 5000
     assert captured["job"]._prefetch_workers == 16
     assert captured["job"]._prefetch_rate_limit_per_minute == 1400
     assert captured["job"]._adapter_factory is not None
+    assert captured["params"]["signal_start_date"] == "2026-05-26"
+    assert captured["params"]["signal_end_date"] == "2026-05-26"
     assert captured["params"]["limit"] == 5000
     assert captured["params"]["prefetch_workers"] == 16
     assert captured["params"]["prefetch_rate_limit_per_minute"] == 1400
+
+
+def test_forward_return_signal_date_window_bounds_selection_before_limit(db_session):
+    old_ts = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    old_id = _make_signal(
+        db_session,
+        "OLD",
+        next_execution_session=ENTRY_DATE.isoformat(),
+        trading_date="2026-05-23",
+        signal_timestamp=old_ts,
+    )
+    in_window_id = _make_signal(
+        db_session,
+        "WIN",
+        next_execution_session=ENTRY_DATE.isoformat(),
+        trading_date=ENTRY_DATE.isoformat(),
+        signal_timestamp=SIGNAL_TS,
+    )
+    _stamp_signal_historical_m4_replay(db_session, old_id)
+    _stamp_signal_historical_m4_replay(db_session, in_window_id)
+    adapter = FakeHistoricalAdapter({
+        "OLD": _bars(),
+        "WIN": _bars(entry_open=20.0, exit_open=22.0),
+    })
+
+    result = _run_job(
+        db_session,
+        adapter,
+        signal_source=SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
+        signal_start_date=ENTRY_DATE,
+        signal_end_date=ENTRY_DATE,
+        limit=1,
+    )
+
+    assert result.ok
+    assert result.metrics["signal_start_date"] == ENTRY_DATE.isoformat()
+    assert result.metrics["signal_end_date"] == ENTRY_DATE.isoformat()
+    assert result.metrics["total_eligible"] == 1
+    assert result.metrics["selected_signals"] == 1
+    assert result.metrics["computed"] == 1
+    assert [call["ticker"] for call in adapter.calls] == ["WIN"]
+    assert db_session.get(SignalRegistry, old_id).forward_return_attempts == 0
+    assert (
+        db_session.query(ForwardReturnObservation)
+        .filter(ForwardReturnObservation.signal_id == old_id)
+        .count()
+        == 0
+    )
+    assert db_session.get(SignalRegistry, in_window_id).forward_return_status == "computed"
 
 
 def test_fresh_signal_before_entry_open_stays_pending_without_fetch(db_session):

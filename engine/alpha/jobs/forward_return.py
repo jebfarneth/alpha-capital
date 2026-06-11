@@ -17,7 +17,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
@@ -645,6 +645,8 @@ class ForwardReturnJob(BaseJob):
         price_drift_abs_tol: float = PRICE_DRIFT_ABS_TOL,
         price_drift_rel_tol: float = PRICE_DRIFT_REL_TOL,
         signal_source: str = SIGNAL_SOURCE_LIVE,
+        signal_start_date: Optional[date] = None,
+        signal_end_date: Optional[date] = None,
         limit: Optional[int] = None,
         prefetch_workers: int = 0,
         prefetch_rate_limit_per_minute: int = 1500,
@@ -660,6 +662,12 @@ class ForwardReturnJob(BaseJob):
             raise ValueError("revision_window_sessions must be >= 0")
         if price_drift_abs_tol < 0 or price_drift_rel_tol < 0:
             raise ValueError("price drift tolerances must be >= 0")
+        if (
+            signal_start_date is not None
+            and signal_end_date is not None
+            and signal_start_date > signal_end_date
+        ):
+            raise ValueError("signal_start_date must be on or before signal_end_date")
         if limit is not None and limit < 1:
             raise ValueError("limit must be >= 1")
         if prefetch_workers < 0:
@@ -687,6 +695,8 @@ class ForwardReturnJob(BaseJob):
         self._price_drift_abs_tol = price_drift_abs_tol
         self._price_drift_rel_tol = price_drift_rel_tol
         self._signal_source = normalize_signal_source(signal_source)
+        self._signal_start_date = signal_start_date
+        self._signal_end_date = signal_end_date
         self._limit = limit
         self._prefetch_workers = prefetch_workers
         self._prefetch_rate_limit_per_minute = prefetch_rate_limit_per_minute
@@ -767,6 +777,14 @@ class ForwardReturnJob(BaseJob):
                 "mode": "production_forward_return",
                 "pattern_id": self._pattern_id,
                 "signal_source": self._signal_source,
+                "signal_start_date": (
+                    self._signal_start_date.isoformat()
+                    if self._signal_start_date is not None else None
+                ),
+                "signal_end_date": (
+                    self._signal_end_date.isoformat()
+                    if self._signal_end_date is not None else None
+                ),
                 "decision_evidence_session_date": (
                     session_resolution.evidence_session_date
                 ),
@@ -1091,10 +1109,30 @@ class ForwardReturnJob(BaseJob):
                 ),
             )
         )
+        if self._signal_start_date is not None:
+            query = query.filter(
+                SignalRegistry.signal_timestamp
+                >= datetime.combine(
+                    self._signal_start_date,
+                    datetime_time.min,
+                    timezone.utc,
+                )
+            )
+        if self._signal_end_date is not None:
+            query = query.filter(
+                SignalRegistry.signal_timestamp
+                < datetime.combine(
+                    self._signal_end_date + timedelta(days=1),
+                    datetime_time.min,
+                    timezone.utc,
+                )
+            )
         query = apply_signal_source_filter(
             query,
             self._session,
             signal_source=self._signal_source,
+            signal_start_date=self._signal_start_date,
+            signal_end_date=self._signal_end_date,
         )
         return query.order_by(SignalRegistry.signal_timestamp, SignalRegistry.ticker)
 
