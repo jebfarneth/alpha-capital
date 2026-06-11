@@ -32,6 +32,7 @@ from alpha.data.fmp import (
 from alpha.data.nasdaq import NasdaqListingStatus
 from alpha.db.models import (
     DataLineage,
+    FmpDelistedCompanyRecord,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     ForwardReturnPathRow,
@@ -2430,10 +2431,10 @@ def resolve_missing_exit_survivorship(
     Standard FMP /full price bars are intentionally excluded here. The first
     source is a test/future-provider ``get_survivorship_events`` hook. The
     production sources currently available are Benzinga M&A calendar rows
-    for corporate-action review and FMP's paginated
-    ``/stable/delisted-companies`` directory, which can prove a delisting
-    date but not the economic reason; that lands in visible survivorship
-    review.
+    for corporate-action review and FMP delisted-company evidence. Stored FMP
+    delisted rows are preferred over paginating the provider because historical
+    replay already persists that directory with lineage; provider pagination is
+    retained as the fallback when no durable row exists.
     """
     source_adapters = [
         source for source in (survivorship_adapters or []) if source is not None
@@ -2531,6 +2532,68 @@ def resolve_missing_exit_survivorship(
                     source_attempts=source_attempts,
                     source_lineage_ids=source_lineage_ids,
                 )
+
+    resolution = _resolve_from_stored_fmp_delisted_companies(
+        session=session,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        asof=asof,
+        job_run_id=job_run_id,
+        source_attempts=source_attempts,
+        source_lineage_ids=source_lineage_ids,
+    )
+    if resolution is not None:
+        if pending_edgar_reviews:
+            if (
+                resolution.decision.reason
+                != "survivorship_unresolved_no_source_event"
+            ):
+                pending_edgar_reviews = _add_conflict_to_pending_edgar_reviews(
+                    pending_edgar_reviews,
+                    conflicting=resolution,
+                )
+            pending_edgar_review_resolution = (
+                _apply_listing_authority_to_pending_edgar_reviews(
+                    pending_edgar_reviews,
+                    listing_authority_adapter=listing_authority_adapter,
+                    session=session,
+                    ticker=ticker,
+                    signal_identity=signal_identity,
+                    entry_session_date=entry_session_date,
+                    exit_session_date=exit_session_date,
+                    asof=asof,
+                    job_run_id=job_run_id,
+                    source_attempts=source_attempts,
+                    source_lineage_ids=source_lineage_ids,
+                )
+            )
+            return _with_survivorship_source_attempts(
+                pending_edgar_review_resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+        if pending_benzinga_resolution is not None:
+            if (
+                resolution.decision.reason
+                != "survivorship_unresolved_no_source_event"
+            ):
+                pending_benzinga_resolution = (
+                    _add_survivorship_conflict_summary(
+                        pending_benzinga_resolution,
+                        conflicting=resolution,
+                    )
+                )
+            return _with_survivorship_source_attempts(
+                pending_benzinga_resolution,
+                source_attempts=source_attempts,
+                source_lineage_ids=source_lineage_ids,
+            )
+        return _with_survivorship_source_attempts(
+            resolution,
+            source_attempts=source_attempts,
+            source_lineage_ids=source_lineage_ids,
+        )
 
     if hasattr(adapter, "get_delisted_companies"):
         resolution = _resolve_from_fmp_delisted_companies(
@@ -3492,6 +3555,160 @@ def _resolve_from_benzinga_mergers_acquisitions(
     )
 
 
+def _resolve_from_stored_fmp_delisted_companies(
+    *,
+    session: Session,
+    ticker: str,
+    entry_session_date: date,
+    exit_session_date: date,
+    asof: datetime,
+    job_run_id: Optional[str],
+    source_attempts: Optional[List[Dict[str, Any]]] = None,
+    source_lineage_ids: Optional[List[str]] = None,
+) -> Optional[SurvivorshipResolution]:
+    normalized_ticker = ticker.upper()
+    row = (
+        session.query(FmpDelistedCompanyRecord)
+        .filter(
+            FmpDelistedCompanyRecord.normalized_symbol == normalized_ticker,
+            FmpDelistedCompanyRecord.delisted_date.isnot(None),
+            FmpDelistedCompanyRecord.delisted_date >= entry_session_date,
+            FmpDelistedCompanyRecord.exchange_relevance_status
+            == "us_listed_relevant",
+            FmpDelistedCompanyRecord.row_status == "active",
+        )
+        .order_by(
+            FmpDelistedCompanyRecord.delisted_date.asc(),
+            FmpDelistedCompanyRecord.created_at.asc(),
+        )
+        .first()
+    )
+    if row is None:
+        return None
+
+    lineage_id = _stored_fmp_delisted_lineage_id(
+        session,
+        row=row,
+        asof=asof,
+        job_run_id=job_run_id,
+    )
+    delisted_date = row.delisted_date
+    provider = row.source or "FMP"
+    endpoint = row.source_endpoint or DELISTED_COMPANIES_ENDPOINT
+    _append_survivorship_source_attempt(
+        source_attempts,
+        source_lineage_ids,
+        source="fmp_delisted_companies",
+        provider=provider,
+        endpoint=endpoint,
+        ticker=ticker,
+        entry_session_date=entry_session_date,
+        exit_session_date=exit_session_date,
+        lineage_id=lineage_id,
+        status="matched",
+        extra={
+            "source_table": "fmp_delisted_companies",
+            "match_basis": "stored_symbol_delisted_date",
+            "matched_id": row.normalized_symbol,
+            "fmp_delisted_company_id": row.fmp_delisted_company_id,
+            "company_name": row.company_name,
+            "exchange": row.exchange,
+            "exchange_relevance_status": row.exchange_relevance_status,
+            "delisted_date": delisted_date.isoformat(),
+        },
+    )
+
+    decision_status = STATUS_CORPORATE_ACTION_REVIEW
+    reason = "delisting_unclassified_corporate_action_review"
+    if delisted_date > exit_session_date:
+        decision_status = STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW
+        reason = "delisting_after_exit_window_survivorship_review"
+
+    return SurvivorshipResolution(
+        decision=SurvivorshipDecision(
+            status=decision_status,
+            reason=reason,
+            exit_price=None,
+            exit_price_source=None,
+            exit_basis_proof=None,
+        ),
+        data_lineage_ids=[lineage_id],
+        provider=provider,
+        endpoint=endpoint,
+        provider_request={
+            "ticker": ticker,
+            "from": entry_session_date.isoformat(),
+            "to": exit_session_date.isoformat(),
+            "event_basis": "missing_mature_exit_survivorship_review",
+            "source": "fmp_delisted_companies",
+            "source_table": "fmp_delisted_companies",
+            "match_basis": "stored_symbol_delisted_date",
+            "fmp_delisted_company_id": row.fmp_delisted_company_id,
+            "matched_symbol": row.normalized_symbol,
+            "company_name": row.company_name,
+            "exchange": row.exchange,
+            "exchange_relevance_status": row.exchange_relevance_status,
+            "delisted_date": delisted_date.isoformat(),
+        },
+        primary_data_lineage_id=lineage_id,
+    )
+
+
+def _stored_fmp_delisted_lineage_id(
+    session: Session,
+    *,
+    row: FmpDelistedCompanyRecord,
+    asof: datetime,
+    job_run_id: Optional[str],
+) -> str:
+    if row.data_lineage_id and session.get(DataLineage, row.data_lineage_id):
+        return row.data_lineage_id
+
+    raw_payload = _fmp_delisted_record_payload(row)
+    lineage = record_data_lineage(
+        session,
+        provider=row.source or "FMP",
+        endpoint=row.source_endpoint or DELISTED_COMPANIES_ENDPOINT,
+        asof_timestamp=asof,
+        raw_payload={
+            "source_table": "fmp_delisted_companies",
+            "fmp_delisted_company_id": row.fmp_delisted_company_id,
+            "row": raw_payload,
+        },
+        raw_payload_hash=stable_hash({
+            "source_table": "fmp_delisted_companies",
+            "fmp_delisted_company_id": row.fmp_delisted_company_id,
+            "row": raw_payload,
+        }),
+        request_timestamp=datetime.now(timezone.utc),
+        source_authority=row.source or "FMP",
+        data_quality_flags={
+            "lineage_scope": "fmp_delisted_companies_stored_row",
+            "source_table": "fmp_delisted_companies",
+            "fmp_delisted_company_id": row.fmp_delisted_company_id,
+        },
+        job_run_id=job_run_id,
+    )
+    return lineage.data_lineage_id
+
+
+def _fmp_delisted_record_payload(row: FmpDelistedCompanyRecord) -> Dict[str, Any]:
+    if row.raw_payload_json:
+        try:
+            parsed = json.loads(row.raw_payload_json)
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {
+        "symbol": row.symbol,
+        "companyName": row.company_name,
+        "exchange": row.exchange,
+        "ipoDate": row.ipo_date,
+        "delistedDate": row.delisted_date,
+    }
+
+
 def _resolve_from_fmp_delisted_companies(
     *,
     session: Session,
@@ -3587,12 +3804,17 @@ def _resolve_from_fmp_delisted_companies(
                 status="matched",
                 matched_id=symbol,
             )
-            reason = "delisting_unclassified_survivorship_review"
-            if delisted_date is not None and delisted_date > exit_session_date:
+            decision_status = STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW
+            reason = "delisting_date_missing_survivorship_review"
+            if delisted_date is not None and delisted_date <= exit_session_date:
+                decision_status = STATUS_CORPORATE_ACTION_REVIEW
+                reason = "delisting_unclassified_corporate_action_review"
+            elif delisted_date is not None and delisted_date > exit_session_date:
+                decision_status = STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW
                 reason = "delisting_after_exit_window_survivorship_review"
             return SurvivorshipResolution(
                 decision=SurvivorshipDecision(
-                    status=STATUS_SURVIVORSHIP_UNRESOLVED_REVIEW,
+                    status=decision_status,
                     reason=reason,
                     exit_price=None,
                     exit_price_source=None,

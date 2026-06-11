@@ -32,6 +32,7 @@ from alpha.db.models import (
     Base,
     DataLineage,
     FeatureSnapshot,
+    FmpDelistedCompanyRecord,
     ForwardReturnObservation,
     ForwardReturnObservationEvent,
     ForwardReturnPathRow,
@@ -2707,7 +2708,7 @@ def test_sec_edgar_review_collects_benzinga_and_fmp_corroboration(db_session):
     assert survivorship_request["authority_conflict"]["provider"] == "FMP"
     assert (
         survivorship_request["authority_conflict"]["reason"]
-        == "delisting_unclassified_survivorship_review"
+        == "delisting_unclassified_corporate_action_review"
     )
     assert "listing_authority_suppression" not in survivorship_request
     assert [attempt["source"] for attempt in attempts] == [
@@ -3226,13 +3227,16 @@ def test_fmp_delisted_fallback_uses_uniform_source_attempts(db_session):
     _run_job(db_session, adapter, survivorship_adapters=[benzinga])
 
     sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
     event = db_session.query(ForwardReturnObservationEvent).one()
     survivorship_request = json.loads(event.provider_request_json)[
         "survivorship_request"
     ]
     attempts = survivorship_request["source_attempts"]
 
-    assert sig.forward_return_status == "survivorship_unresolved_review"
+    assert sig.forward_return_status == "corporate_action_review"
+    assert obs.status == "corporate_action_review"
+    assert obs.reason == "delisting_unclassified_corporate_action_review"
     assert survivorship_request["source"] == DELISTED_COMPANIES_ENDPOINT
     assert attempts[0]["source"] == "benzinga_calendar_ma"
     assert attempts[0]["status"] == "no_match"
@@ -3241,6 +3245,79 @@ def test_fmp_delisted_fallback_uses_uniform_source_attempts(db_session):
     assert attempts[2]["source"] == "fmp_delisted_companies"
     assert attempts[2]["status"] == "matched"
     assert attempts[2]["matched_id"] == "ACME"
+
+
+def test_stored_fmp_delisted_row_short_circuits_provider_pagination(db_session):
+    sid = _make_signal(db_session)
+    raw_payload = {
+        "symbol": "ACME",
+        "companyName": "Acme Corp",
+        "exchange": "NASDAQ",
+        "ipoDate": "2020-01-01",
+        "delistedDate": EXIT_DATE.isoformat(),
+    }
+    db_session.add(
+        FmpDelistedCompanyRecord(
+            fmp_delisted_company_id="fmp-acme",
+            symbol="ACME",
+            normalized_symbol="ACME",
+            company_name="Acme Corp",
+            exchange="NASDAQ",
+            exchange_key="NASDAQ",
+            ipo_date=date(2020, 1, 1),
+            delisted_date=EXIT_DATE,
+            delisted_date_key=EXIT_DATE.isoformat(),
+            source="FMP",
+            source_endpoint=DELISTED_COMPANIES_ENDPOINT,
+            page_number=14,
+            page_limit=100,
+            page_row_index=3,
+            row_status="active",
+            exchange_relevance_status="us_listed_relevant",
+            raw_payload_hash=stable_hash(raw_payload),
+            raw_payload_json=json.dumps(raw_payload, sort_keys=True),
+        )
+    )
+    adapter = FakeDelistedAdapter(
+        {"ACME": [_bar(ENTRY_DATE, 10.0)]},
+        delisted_rows_by_page={
+            0: [
+                FmpDelistedCompany(
+                    symbol="ACME",
+                    company_name="Provider row should not be fetched",
+                    delisted_date=EXIT_DATE.isoformat(),
+                )
+            ]
+        },
+    )
+
+    _run_job(db_session, adapter)
+
+    sig = db_session.get(SignalRegistry, sid)
+    obs = _obs(db_session)
+    event = db_session.query(ForwardReturnObservationEvent).one()
+    survivorship_request = json.loads(event.provider_request_json)[
+        "survivorship_request"
+    ]
+    attempts = survivorship_request["source_attempts"]
+
+    assert adapter.delisted_calls == []
+    assert sig.forward_return_status == "corporate_action_review"
+    assert sig.outcome_unavailable_reason == "delisting_unclassified_corporate_action_review"
+    assert obs.status == "corporate_action_review"
+    assert obs.provider == "FMP"
+    assert obs.endpoint == DELISTED_COMPANIES_ENDPOINT
+    assert obs.reason == "delisting_unclassified_corporate_action_review"
+    assert survivorship_request["source_table"] == "fmp_delisted_companies"
+    assert survivorship_request["fmp_delisted_company_id"] == "fmp-acme"
+    assert survivorship_request["delisted_date"] == EXIT_DATE.isoformat()
+    assert attempts[0]["source"] == "survivorship_events"
+    assert attempts[0]["status"] == "no_match"
+    assert attempts[1]["source"] == "fmp_delisted_companies"
+    assert attempts[1]["status"] == "matched"
+    assert attempts[1]["source_table"] == "fmp_delisted_companies"
+    assert attempts[1]["fmp_delisted_company_id"] == "fmp-acme"
+    assert len(json.loads(obs.data_lineage_ids)) >= 2
 
 
 def test_benzinga_fmp_authority_conflict_is_surfaced(db_session):
@@ -3288,7 +3365,7 @@ def test_benzinga_fmp_authority_conflict_is_surfaced(db_session):
     assert survivorship_request["authority_conflict"]["provider"] == "FMP"
     assert (
         survivorship_request["authority_conflict"]["reason"]
-        == "delisting_unclassified_survivorship_review"
+        == "delisting_unclassified_corporate_action_review"
     )
     assert [attempt["source"] for attempt in attempts] == [
         "benzinga_calendar_ma",
