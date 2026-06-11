@@ -4,6 +4,17 @@
 Usage:
     cd engine
     uv run python -m alpha.jobs.run_forward_return --live --run-timestamp 2026-06-16T17:00:00-04:00
+
+Historical M4 backfill chunks:
+    while true; do
+      uv run python -m alpha.jobs.run_forward_return --live \
+        --signal-source historical-m4-replay \
+        --run-timestamp 2026-06-09T22:15:03.685171+00:00 \
+        --limit 5000 \
+        --prefetch-workers 16 \
+        --prefetch-rate-limit-per-minute 1500
+      # Stop when Remaining eligible prints 0.
+    done
 """
 
 from __future__ import annotations
@@ -115,7 +126,8 @@ def _run_live(args: argparse.Namespace) -> int:
         create_all_tables()
 
     try:
-        adapter = FmpAdapter(FmpConfig.from_env())
+        fmp_config = FmpConfig.from_env()
+        adapter = FmpAdapter(fmp_config)
         survivorship_adapters = []
         if os.environ.get("SEC_USER_AGENT"):
             survivorship_adapters.append(SecEdgarAdapter(SecEdgarConfig.from_env()))
@@ -149,6 +161,10 @@ def _run_live(args: argparse.Namespace) -> int:
             price_drift_abs_tol=args.price_drift_abs_tol,
             price_drift_rel_tol=args.price_drift_rel_tol,
             signal_source=args.signal_source,
+            limit=args.limit,
+            prefetch_workers=args.prefetch_workers,
+            prefetch_rate_limit_per_minute=args.prefetch_rate_limit_per_minute,
+            adapter_factory=lambda: FmpAdapter(fmp_config),
         )
         result = run_job(
             session,
@@ -165,6 +181,11 @@ def _run_live(args: argparse.Namespace) -> int:
                 "price_drift_abs_tol": args.price_drift_abs_tol,
                 "price_drift_rel_tol": args.price_drift_rel_tol,
                 "signal_source": args.signal_source,
+                "limit": args.limit,
+                "prefetch_workers": args.prefetch_workers,
+                "prefetch_rate_limit_per_minute": (
+                    args.prefetch_rate_limit_per_minute
+                ),
                 "schema": args.schema,
             },
         )
@@ -176,6 +197,16 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"Schema:                  {args.schema or os.environ.get('ALPHA_DB_SCHEMA') or 'default'}")
         print(f"Survivorship sources:    {survivorship_source_names}")
         print(f"Eligible signals:        {metrics.get('total_eligible')}")
+        print(f"Selected signals:        {metrics.get('selected_signals')}")
+        print(f"Limit applied:           {metrics.get('limit_applied')}")
+        print(f"Remaining eligible:      {metrics.get('remaining_eligible_count')}")
+        print(f"Prefetch enabled:        {metrics.get('prefetch_enabled')}")
+        print(f"Prefetch workers:        {metrics.get('prefetch_workers')}")
+        print(f"Prefetch fetches:        {metrics.get('prefetch_fetches')}")
+        print(
+            "Prefetch peak calls/min: "
+            f"{metrics.get('prefetch_peak_calls_per_minute')}"
+        )
         print(f"Computed:                {metrics.get('computed')}")
         print(f"Pending:                 {metrics.get('pending')}")
         print(f"Finality pending:        {metrics.get('price_finality_pending')}")
@@ -272,6 +303,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "Signal corpus to label. Use historical-m4-replay to exclude stale "
             "live M4 rows outside replay membership."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Process at most N eligible signals, then finish and commit normally. "
+            "For historical backfills, rerun chunks such as --limit 5000 until "
+            "Remaining eligible prints 0."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in concurrent FMP price prefetch workers. 0 or 1 preserves the "
+            "current sequential fetch path; use about 16 for historical backfills."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-rate-limit-per-minute",
+        type=int,
+        default=1500,
+        help=(
+            "Client-side cap for opt-in FMP prefetch calls per minute. "
+            "Default leaves at least 50%% headroom below the 3000/min plan."
         ),
     )
     parser.add_argument(

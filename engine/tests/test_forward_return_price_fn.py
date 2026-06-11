@@ -7,7 +7,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import sessionmaker
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.edgar import SecCompanyTicker
@@ -28,6 +29,7 @@ from alpha.data.nasdaq import (
 )
 from alpha.db.engine import schema_connect_args
 from alpha.db.models import (
+    Base,
     DataLineage,
     FeatureSnapshot,
     ForwardReturnObservation,
@@ -512,6 +514,76 @@ def _bars(
     ]
 
 
+def _enable_test_sqlite_fks(dbapi_conn, _connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
+def _new_isolated_session():
+    engine = create_engine("sqlite:///:memory:")
+    event.listen(engine, "connect", _enable_test_sqlite_fks)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    return engine, Session()
+
+
+def _forward_return_snapshot(db_session):
+    observations = (
+        db_session.query(ForwardReturnObservation)
+        .order_by(ForwardReturnObservation.ticker)
+        .all()
+    )
+    snapshot = []
+    for obs in observations:
+        lineage_hashes = []
+        for lineage_id in json.loads(obs.data_lineage_ids or "[]"):
+            lineage = db_session.get(DataLineage, lineage_id)
+            lineage_hashes.append(lineage.raw_payload_hash if lineage else None)
+        path_rows = (
+            db_session.query(ForwardReturnPathRow)
+            .filter(
+                ForwardReturnPathRow.forward_return_observation_id
+                == obs.forward_return_observation_id
+            )
+            .order_by(ForwardReturnPathRow.path_sequence)
+            .all()
+        )
+        snapshot.append({
+            "ticker": obs.ticker,
+            "status": obs.status,
+            "reason": obs.reason,
+            "forward_return": obs.forward_return,
+            "input_hash": obs.input_hash,
+            "outcome_hash": obs.outcome_hash,
+            "lineage_hashes": lineage_hashes,
+            "path_rows": [
+                {
+                    "path_sequence": row.path_sequence,
+                    "session_date": row.session_date,
+                    "open_price": row.open_price,
+                    "high_price": row.high_price,
+                    "low_price": row.low_price,
+                    "close_price": row.close_price,
+                    "return_from_entry_open": row.return_from_entry_open,
+                    "return_from_entry_close": row.return_from_entry_close,
+                    "path_status": row.path_status,
+                    "outcome_hash": row.outcome_hash,
+                    "lineage_hash": (
+                        db_session.get(
+                            DataLineage,
+                            row.data_lineage_id,
+                        ).raw_payload_hash
+                        if row.data_lineage_id
+                        else None
+                    ),
+                }
+                for row in path_rows
+            ],
+        })
+    return snapshot
+
+
 def _listing_status_result(
     status: NasdaqListingStatus = NasdaqListingStatus.LISTED_ACTIVE,
     *,
@@ -680,6 +752,10 @@ def _run_job(
     survivorship_adapters=None,
     listing_authority_adapter=None,
     signal_source=SIGNAL_SOURCE_LIVE,
+    limit=None,
+    prefetch_workers=0,
+    prefetch_rate_limit_per_minute=1500,
+    adapter_factory=None,
 ):
     return run_job(
         db_session,
@@ -697,6 +773,10 @@ def _run_job(
             price_drift_abs_tol=price_drift_abs_tol,
             price_drift_rel_tol=price_drift_rel_tol,
             signal_source=signal_source,
+            limit=limit,
+            prefetch_workers=prefetch_workers,
+            prefetch_rate_limit_per_minute=prefetch_rate_limit_per_minute,
+            adapter_factory=adapter_factory,
         ),
         params={
             "run_timestamp": run_ts.isoformat(),
@@ -706,6 +786,9 @@ def _run_job(
             "price_drift_abs_tol": price_drift_abs_tol,
             "price_drift_rel_tol": price_drift_rel_tol,
             "signal_source": signal_source,
+            "limit": limit,
+            "prefetch_workers": prefetch_workers,
+            "prefetch_rate_limit_per_minute": prefetch_rate_limit_per_minute,
         },
     )
 
@@ -1038,6 +1121,56 @@ def test_run_forward_return_wires_nasdaq_listing_authority_when_enabled(
     ]
 
 
+def test_run_forward_return_wires_limit_and_prefetch_options(monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "fmp-key")
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    monkeypatch.delenv("BENZINGA_API_KEY", raising=False)
+    monkeypatch.delenv("BENZINGA_TOKEN", raising=False)
+    monkeypatch.delenv("NASDAQ_LISTING_AUTHORITY_ENABLED", raising=False)
+    monkeypatch.setattr(run_forward_return, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_forward_return, "_live_timestamp_error", lambda _value: None)
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeFmpAdapter:
+        def __init__(self, _config):
+            pass
+
+    captured = {}
+
+    def fake_run_job(session, job, params):
+        captured["job"] = job
+        captured["params"] = params
+        return JobResult(status="finished", metrics={})
+
+    monkeypatch.setattr(run_forward_return, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(run_forward_return, "FmpAdapter", FakeFmpAdapter)
+    monkeypatch.setattr(run_forward_return, "run_job", fake_run_job)
+
+    exit_code = run_forward_return.main([
+        "--live",
+        "--run-timestamp",
+        MATURE_RUN_TS.isoformat(),
+        "--limit",
+        "5000",
+        "--prefetch-workers",
+        "16",
+        "--prefetch-rate-limit-per-minute",
+        "1400",
+    ])
+
+    assert exit_code == 0
+    assert captured["job"]._limit == 5000
+    assert captured["job"]._prefetch_workers == 16
+    assert captured["job"]._prefetch_rate_limit_per_minute == 1400
+    assert captured["job"]._adapter_factory is not None
+    assert captured["params"]["limit"] == 5000
+    assert captured["params"]["prefetch_workers"] == 16
+    assert captured["params"]["prefetch_rate_limit_per_minute"] == 1400
+
+
 def test_fresh_signal_before_entry_open_stays_pending_without_fetch(db_session):
     sid = _make_signal(db_session)
     adapter = FakeHistoricalAdapter({"ACME": _bars()})
@@ -1088,6 +1221,135 @@ def test_immature_signal_stays_pending_and_does_not_fetch(db_session):
     assert obs.status == "pending"
     assert obs.reason == "exit_session_not_complete"
     assert obs.attempts == 0
+
+
+def test_forward_return_limit_processes_chunk_and_reports_remaining(db_session):
+    _make_signal(db_session, ticker="ACME")
+    _make_signal(db_session, ticker="BETA")
+    _make_signal(db_session, ticker="CATO")
+    adapter = FakeHistoricalAdapter({
+        "ACME": _bars(),
+        "BETA": _bars(entry_open=20.0, exit_open=22.0),
+        "CATO": _bars(entry_open=30.0, exit_open=33.0),
+    })
+
+    result = _run_job(db_session, adapter, limit=2)
+
+    assert result.metrics["total_eligible"] == 3
+    assert result.metrics["selected_signals"] == 2
+    assert result.metrics["limit_applied"] is True
+    assert result.metrics["remaining_eligible_count"] == 1
+    assert result.metrics["computed"] == 2
+    assert len(adapter.calls) == 2
+    computed = {
+        sig.ticker
+        for sig in db_session.query(SignalRegistry)
+        if sig.forward_return_status == "computed"
+    }
+    assert computed == {"ACME", "BETA"}
+    assert db_session.query(ForwardReturnObservation).count() == 2
+
+
+def test_forward_return_prefetch_worker_one_uses_sequential_path(db_session):
+    _make_signal(db_session)
+    adapter = FakeHistoricalAdapter({"ACME": _bars()})
+
+    def exploding_factory():
+        raise AssertionError("worker adapter factory should not run")
+
+    result = _run_job(
+        db_session,
+        adapter,
+        prefetch_workers=1,
+        adapter_factory=exploding_factory,
+    )
+
+    assert result.metrics["prefetch_enabled"] is False
+    assert result.metrics["prefetch_fetches"] == 0
+    assert len(adapter.calls) == 1
+    assert db_session.query(SignalRegistry).one().forward_return_status == "computed"
+
+
+def test_forward_return_prefetch_fetches_only_mature_fetchable_signals(db_session):
+    _make_signal(db_session, ticker="ACME")
+    _make_signal(db_session, ticker="BADH", signal_horizon="bad-horizon")
+    shared_calls = []
+
+    class WorkerAdapter(FakeHistoricalAdapter):
+        def get_historical_price(self, *args, **kwargs):
+            response = super().get_historical_price(*args, **kwargs)
+            shared_calls.append(dict(self.calls[-1]))
+            return response
+
+    main_adapter = FakeHistoricalAdapter({"ACME": _bars()})
+
+    def adapter_factory():
+        return WorkerAdapter({"ACME": _bars()})
+
+    result = _run_job(
+        db_session,
+        main_adapter,
+        prefetch_workers=2,
+        prefetch_rate_limit_per_minute=60_000,
+        adapter_factory=adapter_factory,
+    )
+
+    assert result.metrics["prefetch_enabled"] is True
+    assert result.metrics["prefetch_workers"] == 2
+    assert result.metrics["prefetch_fetches"] == 1
+    assert result.metrics["prefetch_peak_calls_per_minute"] == 1
+    assert main_adapter.calls == []
+    assert [call["ticker"] for call in shared_calls] == ["ACME"]
+    assert result.metrics["computed"] == 1
+    assert result.metrics["pricing_errors"] == 1
+    statuses = {
+        sig.ticker: sig.forward_return_status
+        for sig in db_session.query(SignalRegistry)
+    }
+    assert statuses == {
+        "ACME": "computed",
+        "BADH": "pricing_unavailable_retry",
+    }
+
+
+def test_forward_return_prefetch_matches_sequential_hashes_and_path_rows():
+    bars_by_ticker = {
+        "ACME": [
+            _bar(ENTRY_DATE, 10.0, high=11.0, low=9.5, close=10.5),
+            _bar(date(2026, 6, 1), 11.0, high=12.0, low=10.5, close=11.5),
+            _bar(EXIT_DATE, 12.0, high=12.5, low=11.5, close=12.25),
+        ],
+        "BETA": [
+            _bar(ENTRY_DATE, 20.0, high=20.5, low=19.5, close=20.25),
+            _bar(date(2026, 6, 1), 19.0, high=19.5, low=18.5, close=18.75),
+            _bar(EXIT_DATE, 18.0, high=18.5, low=17.5, close=18.25),
+        ],
+    }
+
+    def run_case(*, prefetch_workers: int):
+        engine, session = _new_isolated_session()
+        try:
+            _make_signal(session, ticker="ACME")
+            _make_signal(session, ticker="BETA")
+            adapter = FakeHistoricalAdapter(bars_by_ticker)
+            result = _run_job(
+                session,
+                adapter,
+                prefetch_workers=prefetch_workers,
+                prefetch_rate_limit_per_minute=60_000,
+                adapter_factory=(
+                    lambda: FakeHistoricalAdapter(bars_by_ticker)
+                    if prefetch_workers > 1
+                    else None
+                ),
+            )
+            assert result.metrics["computed"] == 2
+            return _forward_return_snapshot(session)
+        finally:
+            session.close()
+            engine.dispose()
+
+    assert run_case(prefetch_workers=0) == run_case(prefetch_workers=2)
 
 
 def test_exit_complete_before_finality_lag_stores_provisional_prices(db_session):

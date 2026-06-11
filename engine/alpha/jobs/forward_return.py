@@ -12,9 +12,13 @@ from __future__ import annotations
 import inspect
 import json
 import math
-from dataclasses import dataclass, replace
+import threading
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -53,6 +57,47 @@ from alpha.market_calendar import (
 class PendingEdgarReview:
     resolution: "SurvivorshipResolution"
     identity_adapter: Any
+
+
+@dataclass(frozen=True)
+class M4PriceFetchRequest:
+    signal_id: str
+    ticker: str
+    entry_session_date: date
+    exit_session_date: date
+    asof: datetime
+
+
+@dataclass(frozen=True)
+class PlannedM4Signal:
+    signal: SignalRegistry
+    plan: Optional["M4ForwardReturnPlan"]
+    plan_error: Optional[str]
+
+    @property
+    def fetch_request(self) -> Optional[M4PriceFetchRequest]:
+        if self.plan is None or self.plan_error or not self.plan.mature:
+            return None
+        return M4PriceFetchRequest(
+            signal_id=self.signal.signal_id,
+            ticker=self.signal.ticker,
+            entry_session_date=self.plan.entry_session_date,
+            exit_session_date=self.plan.exit_session_date,
+            asof=us_equity_session_close_timestamp(self.plan.exit_session_date),
+        )
+
+
+@dataclass
+class ProductionRunCounters:
+    computed: int = 0
+    pending: int = 0
+    price_finality_pending: int = 0
+    price_drift_review: int = 0
+    retryable_unavailable: int = 0
+    terminal_unavailable: int = 0
+    pricing_errors: int = 0
+    observations_upserted: int = 0
+    fetch_errors: List[Dict[str, Any]] = field(default_factory=list)
 
 
 STATUS_PENDING = "pending"
@@ -139,6 +184,43 @@ LEGACY_NEXT_EXECUTION_SESSION_FALLBACK_REASON = (
     "legacy_next_execution_session_fallback"
 )
 CURRENT_FORWARD_PATH_STATUSES = (STATUS_COMPUTED,)
+
+
+class ForwardPrefetchRateLimiter:
+    """Thread-safe fixed-interval limiter for opt-in FMP prefetch workers."""
+
+    def __init__(self, calls_per_minute: int):
+        if calls_per_minute < 0:
+            raise ValueError("prefetch_rate_limit_per_minute must be >= 0")
+        self._interval = 0.0 if calls_per_minute == 0 else 60.0 / calls_per_minute
+        self._lock = threading.Lock()
+        self._next_allowed = time.monotonic()
+        self._call_times: Deque[float] = deque()
+        self._peak_calls_per_minute = 0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = max(0.0, self._next_allowed - now)
+            reserved_at = max(now, self._next_allowed)
+            self._next_allowed = reserved_at + self._interval
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        observed_at = time.monotonic()
+        with self._lock:
+            self._call_times.append(observed_at)
+            cutoff = observed_at - 60.0
+            while self._call_times and self._call_times[0] <= cutoff:
+                self._call_times.popleft()
+            self._peak_calls_per_minute = max(
+                self._peak_calls_per_minute,
+                len(self._call_times),
+            )
+
+    @property
+    def peak_calls_per_minute(self) -> int:
+        with self._lock:
+            return self._peak_calls_per_minute
 
 
 def current_forward_path_rows(
@@ -563,6 +645,10 @@ class ForwardReturnJob(BaseJob):
         price_drift_abs_tol: float = PRICE_DRIFT_ABS_TOL,
         price_drift_rel_tol: float = PRICE_DRIFT_REL_TOL,
         signal_source: str = SIGNAL_SOURCE_LIVE,
+        limit: Optional[int] = None,
+        prefetch_workers: int = 0,
+        prefetch_rate_limit_per_minute: int = 1500,
+        adapter_factory: Optional[Callable[[], Any]] = None,
     ):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -574,10 +660,21 @@ class ForwardReturnJob(BaseJob):
             raise ValueError("revision_window_sessions must be >= 0")
         if price_drift_abs_tol < 0 or price_drift_rel_tol < 0:
             raise ValueError("price drift tolerances must be >= 0")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
+        if prefetch_workers < 0:
+            raise ValueError("prefetch_workers must be >= 0")
+        if prefetch_rate_limit_per_minute < 0:
+            raise ValueError("prefetch_rate_limit_per_minute must be >= 0")
+        if prefetch_workers > 1 and adapter_factory is None:
+            raise ValueError(
+                "adapter_factory is required when prefetch_workers > 1"
+            )
         self._session = session
         self._price_fn = price_fn
         self._maturity_fn = maturity_fn
         self._adapter = adapter
+        self._adapter_factory = adapter_factory
         self._run_timestamp = run_timestamp
         self._pattern_id = pattern_id
         self._max_attempts = max_attempts
@@ -590,6 +687,9 @@ class ForwardReturnJob(BaseJob):
         self._price_drift_abs_tol = price_drift_abs_tol
         self._price_drift_rel_tol = price_drift_rel_tol
         self._signal_source = normalize_signal_source(signal_source)
+        self._limit = limit
+        self._prefetch_workers = prefetch_workers
+        self._prefetch_rate_limit_per_minute = prefetch_rate_limit_per_minute
 
     def run(self, ctx: JobContext) -> JobResult:
         """Run either legacy injected pricing, M4 production pricing, or sweep mode."""
@@ -617,126 +717,49 @@ class ForwardReturnJob(BaseJob):
 
         session_resolution = resolve_us_equity_session(run_timestamp)
         current_evidence_date = _parse_date(session_resolution.evidence_session_date)
-        signals = self._production_signal_query().all()
+        query = self._production_signal_query()
+        if self._limit is None:
+            total_eligible = None
+            signals = query.all()
+        else:
+            total_eligible = query.order_by(None).count()
+            signals = query.limit(self._limit).all()
 
-        computed = 0
-        pending = 0
-        price_finality_pending = 0
-        price_drift_review = 0
-        retryable_unavailable = 0
-        terminal_unavailable = 0
-        pricing_errors = 0
-        observations_upserted = 0
-        fetch_errors: List[Dict[str, Any]] = []
-
-        for sig in signals:
-            plan, plan_error = self._plan_for_signal(
-                sig,
-                current_evidence_date,
+        total_eligible = len(signals) if total_eligible is None else total_eligible
+        if self._prefetch_workers > 1:
+            counters, prefetch_metrics = self._run_prefetched_production_m4(
+                signals,
+                current_evidence_date=current_evidence_date,
                 run_timestamp=run_timestamp,
-            )
-            if plan_error:
-                attempts = (sig.forward_return_attempts or 0) + 1
-                status = _terminalize_if_needed(
-                    STATUS_PRICING_UNAVAILABLE_RETRY,
-                    attempts,
-                    self._max_attempts,
-                )
-                pricing = ProductionPricingResult(
-                    status=status,
-                    reason=plan_error,
-                    entry_price=None,
-                    exit_price=None,
-                    forward_return=None,
-                    entry_data_lineage_id=None,
-                    exit_data_lineage_id=None,
-                )
-                self._persist_production_outcome(
-                    sig, plan=None, pricing=pricing,
-                    attempts=attempts, job_run_id=ctx.job_run_id,
-                )
-                retryable_unavailable += int(status != STATUS_OUTCOME_UNAVAILABLE)
-                terminal_unavailable += int(status == STATUS_OUTCOME_UNAVAILABLE)
-                pricing_errors += 1
-                observations_upserted += 1
-                continue
-
-            plan = replace(
-                plan,
-                finality_lag_sessions=self._finality_lag_sessions,
-                finality_session_date=_m4_finality_session_date(
-                    plan.exit_session_date,
-                    self._finality_lag_sessions,
-                ),
-            )
-
-            if not plan.mature:
-                pricing = ProductionPricingResult(
-                    status=STATUS_PENDING,
-                    reason=plan.pending_reason or "not_mature",
-                    entry_price=None,
-                    exit_price=None,
-                    forward_return=None,
-                    entry_data_lineage_id=None,
-                    exit_data_lineage_id=None,
-                )
-                self._persist_production_outcome(
-                    sig, plan=plan, pricing=pricing,
-                    attempts=sig.forward_return_attempts or 0,
-                    job_run_id=ctx.job_run_id,
-                )
-                pending += 1
-                observations_upserted += 1
-                continue
-
-            attempts = (sig.forward_return_attempts or 0) + 1
-            previous_observation = self._existing_observation(sig, plan)
-            pricing, payload_hash = self._price_m4_signal(
-                sig,
-                plan,
-                ctx.job_run_id,
-                previous_observation=previous_observation,
-            )
-            if pricing.status not in (STATUS_COMPUTED, STATUS_PENDING):
-                final_status = _terminalize_if_needed(
-                    pricing.status, attempts, self._max_attempts,
-                )
-                if final_status != pricing.status:
-                    pricing = replace(pricing, status=final_status)
-            self._persist_production_outcome(
-                sig,
-                plan=plan,
-                pricing=pricing,
-                attempts=attempts,
                 job_run_id=ctx.job_run_id,
-                entry_payload_hash=payload_hash,
-                exit_payload_hash=payload_hash,
             )
-            observations_upserted += 1
-
-            if pricing.status == STATUS_COMPUTED:
-                computed += 1
-            elif pricing.status == STATUS_PRICE_FINALITY_PENDING:
-                price_finality_pending += 1
-                retryable_unavailable += 1
-            elif pricing.status in (
-                STATUS_PROVIDER_REVISION_REVIEW,
-                STATUS_PRICE_DRIFT_REVIEW,
-            ):
-                price_drift_review += 1
-                retryable_unavailable += 1
-            elif pricing.status == STATUS_OUTCOME_UNAVAILABLE:
-                terminal_unavailable += 1
-            else:
-                retryable_unavailable += 1
-            if pricing.provider_error_type:
-                fetch_errors.append({
-                    "ticker": sig.ticker,
-                    "error_type": pricing.provider_error_type,
-                    "reason": pricing.reason,
-                })
+        else:
+            counters = ProductionRunCounters()
+            for sig in signals:
+                planned = self._planned_m4_signal(
+                    sig,
+                    current_evidence_date=current_evidence_date,
+                    run_timestamp=run_timestamp,
+                )
+                self._process_production_m4_signal(
+                    planned,
+                    job_run_id=ctx.job_run_id,
+                    counters=counters,
+                )
+            prefetch_metrics = {
+                "prefetch_enabled": False,
+                "prefetch_workers": self._prefetch_workers,
+                "prefetch_fetches": 0,
+                "prefetch_rate_limit_per_minute": (
+                    self._prefetch_rate_limit_per_minute
+                ),
+                "prefetch_peak_calls_per_minute": 0,
+            }
 
         self._session.flush()
+        remaining_eligible_count = (
+            self._production_signal_query().order_by(None).count()
+        )
 
         return JobResult(
             status="finished",
@@ -747,20 +770,236 @@ class ForwardReturnJob(BaseJob):
                 "decision_evidence_session_date": (
                     session_resolution.evidence_session_date
                 ),
-                "total_eligible": len(signals),
-                "computed": computed,
-                "pending": pending,
-                "price_finality_pending": price_finality_pending,
-                "price_drift_review": price_drift_review,
-                "retryable_unavailable": retryable_unavailable,
-                "terminal_unavailable": terminal_unavailable,
-                "pricing_errors": pricing_errors,
-                "observations_upserted": observations_upserted,
-                "fetch_error_count": len(fetch_errors),
-                "fetch_errors": fetch_errors[:50],
+                "total_eligible": total_eligible,
+                "selected_signals": len(signals),
+                "limit": self._limit,
+                "limit_applied": self._limit is not None,
+                "remaining_eligible_count": remaining_eligible_count,
+                "computed": counters.computed,
+                "pending": counters.pending,
+                "price_finality_pending": counters.price_finality_pending,
+                "price_drift_review": counters.price_drift_review,
+                "retryable_unavailable": counters.retryable_unavailable,
+                "terminal_unavailable": counters.terminal_unavailable,
+                "pricing_errors": counters.pricing_errors,
+                "observations_upserted": counters.observations_upserted,
+                "fetch_error_count": len(counters.fetch_errors),
+                "fetch_errors": counters.fetch_errors[:50],
+                **prefetch_metrics,
                 "required_statuses": list(REQUIRED_FORWARD_RETURN_STATUSES),
             },
         )
+
+    def _planned_m4_signal(
+        self,
+        sig: SignalRegistry,
+        *,
+        current_evidence_date: date,
+        run_timestamp: datetime,
+    ) -> PlannedM4Signal:
+        plan, plan_error = self._plan_for_signal(
+            sig,
+            current_evidence_date,
+            run_timestamp=run_timestamp,
+        )
+        if plan is not None and not plan_error:
+            plan = replace(
+                plan,
+                finality_lag_sessions=self._finality_lag_sessions,
+                finality_session_date=_m4_finality_session_date(
+                    plan.exit_session_date,
+                    self._finality_lag_sessions,
+                ),
+            )
+        return PlannedM4Signal(signal=sig, plan=plan, plan_error=plan_error)
+
+    def _process_production_m4_signal(
+        self,
+        planned: PlannedM4Signal,
+        *,
+        job_run_id: Optional[str],
+        counters: ProductionRunCounters,
+        prefetched_response: Optional[AdapterResponse[List[FmpBar]]] = None,
+    ) -> None:
+        sig = planned.signal
+        plan = planned.plan
+        plan_error = planned.plan_error
+        if plan_error:
+            attempts = (sig.forward_return_attempts or 0) + 1
+            status = _terminalize_if_needed(
+                STATUS_PRICING_UNAVAILABLE_RETRY,
+                attempts,
+                self._max_attempts,
+            )
+            pricing = ProductionPricingResult(
+                status=status,
+                reason=plan_error,
+                entry_price=None,
+                exit_price=None,
+                forward_return=None,
+                entry_data_lineage_id=None,
+                exit_data_lineage_id=None,
+            )
+            self._persist_production_outcome(
+                sig, plan=None, pricing=pricing,
+                attempts=attempts, job_run_id=job_run_id,
+            )
+            counters.retryable_unavailable += int(status != STATUS_OUTCOME_UNAVAILABLE)
+            counters.terminal_unavailable += int(status == STATUS_OUTCOME_UNAVAILABLE)
+            counters.pricing_errors += 1
+            counters.observations_upserted += 1
+            return
+
+        if plan is None:
+            raise RuntimeError(f"missing M4 forward-return plan for {sig.signal_id}")
+
+        if not plan.mature:
+            pricing = ProductionPricingResult(
+                status=STATUS_PENDING,
+                reason=plan.pending_reason or "not_mature",
+                entry_price=None,
+                exit_price=None,
+                forward_return=None,
+                entry_data_lineage_id=None,
+                exit_data_lineage_id=None,
+            )
+            self._persist_production_outcome(
+                sig, plan=plan, pricing=pricing,
+                attempts=sig.forward_return_attempts or 0,
+                job_run_id=job_run_id,
+            )
+            counters.pending += 1
+            counters.observations_upserted += 1
+            return
+
+        attempts = (sig.forward_return_attempts or 0) + 1
+        previous_observation = self._existing_observation(sig, plan)
+        pricing, payload_hash = self._price_m4_signal(
+            sig,
+            plan,
+            job_run_id,
+            previous_observation=previous_observation,
+            price_response=prefetched_response,
+        )
+        if pricing.status not in (STATUS_COMPUTED, STATUS_PENDING):
+            final_status = _terminalize_if_needed(
+                pricing.status, attempts, self._max_attempts,
+            )
+            if final_status != pricing.status:
+                pricing = replace(pricing, status=final_status)
+        self._persist_production_outcome(
+            sig,
+            plan=plan,
+            pricing=pricing,
+            attempts=attempts,
+            job_run_id=job_run_id,
+            entry_payload_hash=payload_hash,
+            exit_payload_hash=payload_hash,
+        )
+        counters.observations_upserted += 1
+
+        if pricing.status == STATUS_COMPUTED:
+            counters.computed += 1
+        elif pricing.status == STATUS_PRICE_FINALITY_PENDING:
+            counters.price_finality_pending += 1
+            counters.retryable_unavailable += 1
+        elif pricing.status in (
+            STATUS_PROVIDER_REVISION_REVIEW,
+            STATUS_PRICE_DRIFT_REVIEW,
+        ):
+            counters.price_drift_review += 1
+            counters.retryable_unavailable += 1
+        elif pricing.status == STATUS_OUTCOME_UNAVAILABLE:
+            counters.terminal_unavailable += 1
+        else:
+            counters.retryable_unavailable += 1
+        if pricing.provider_error_type:
+            counters.fetch_errors.append({
+                "ticker": sig.ticker,
+                "error_type": pricing.provider_error_type,
+                "reason": pricing.reason,
+            })
+
+    def _run_prefetched_production_m4(
+        self,
+        signals: List[SignalRegistry],
+        *,
+        current_evidence_date: date,
+        run_timestamp: datetime,
+        job_run_id: Optional[str],
+    ) -> Tuple[ProductionRunCounters, Dict[str, Any]]:
+        if self._adapter_factory is None:
+            raise RuntimeError("adapter_factory is required for M4 prefetch")
+
+        planned_signals = [
+            self._planned_m4_signal(
+                sig,
+                current_evidence_date=current_evidence_date,
+                run_timestamp=run_timestamp,
+            )
+            for sig in signals
+        ]
+        counters = ProductionRunCounters()
+        limiter = ForwardPrefetchRateLimiter(self._prefetch_rate_limit_per_minute)
+        worker_local = threading.local()
+
+        def worker_adapter() -> Any:
+            adapter = getattr(worker_local, "adapter", None)
+            if adapter is None:
+                adapter = self._adapter_factory()
+                worker_local.adapter = adapter
+            return adapter
+
+        def fetch_price(
+            request: M4PriceFetchRequest,
+        ) -> AdapterResponse[List[FmpBar]]:
+            limiter.wait()
+            return worker_adapter().get_historical_price(
+                request.ticker,
+                from_date=request.entry_session_date,
+                to_date=request.exit_session_date,
+                asof=request.asof,
+                adjusted=False,
+                require_split_adjusted_close=True,
+            )
+
+        prefetch_fetches = 0
+        max_pending = max(1, self._prefetch_workers * 4)
+        next_submit = 0
+        pending: Dict[int, Future[AdapterResponse[List[FmpBar]]]] = {}
+
+        def fill_queue(
+            executor: ThreadPoolExecutor,
+        ) -> None:
+            nonlocal next_submit, prefetch_fetches
+            while len(pending) < max_pending and next_submit < len(planned_signals):
+                planned = planned_signals[next_submit]
+                request = planned.fetch_request
+                if request is not None:
+                    pending[next_submit] = executor.submit(fetch_price, request)
+                    prefetch_fetches += 1
+                next_submit += 1
+
+        with ThreadPoolExecutor(max_workers=self._prefetch_workers) as executor:
+            fill_queue(executor)
+            for index, planned in enumerate(planned_signals):
+                future = pending.pop(index, None)
+                response = future.result() if future is not None else None
+                self._process_production_m4_signal(
+                    planned,
+                    job_run_id=job_run_id,
+                    counters=counters,
+                    prefetched_response=response,
+                )
+                fill_queue(executor)
+
+        return counters, {
+            "prefetch_enabled": True,
+            "prefetch_workers": self._prefetch_workers,
+            "prefetch_fetches": prefetch_fetches,
+            "prefetch_rate_limit_per_minute": self._prefetch_rate_limit_per_minute,
+            "prefetch_peak_calls_per_minute": limiter.peak_calls_per_minute,
+        }
 
     def _run_computed_reconciliation(self, ctx: JobContext) -> JobResult:
         run_timestamp, timestamp_error = _resolve_run_timestamp(
@@ -1128,6 +1367,7 @@ class ForwardReturnJob(BaseJob):
         job_run_id: Optional[str],
         *,
         previous_observation: Optional[ForwardReturnObservation] = None,
+        price_response: Optional[AdapterResponse[List[FmpBar]]] = None,
     ) -> Tuple[ProductionPricingResult, Optional[str]]:
         asof = us_equity_session_close_timestamp(plan.exit_session_date)
         finality_session_date = (
@@ -1142,14 +1382,16 @@ class ForwardReturnJob(BaseJob):
             to_date=plan.exit_session_date,
             reconstruction_metadata=_input_payload(sig, plan),
         )
-        resp = self._adapter.get_historical_price(
-            sig.ticker,
-            from_date=plan.entry_session_date,
-            to_date=plan.exit_session_date,
-            asof=asof,
-            adjusted=False,
-            require_split_adjusted_close=True,
-        )
+        resp = price_response
+        if resp is None:
+            resp = self._adapter.get_historical_price(
+                sig.ticker,
+                from_date=plan.entry_session_date,
+                to_date=plan.exit_session_date,
+                asof=asof,
+                adjusted=False,
+                require_split_adjusted_close=True,
+            )
         lineage_payload = _price_lineage_payload(
             resp.data,
             ticker=sig.ticker,
@@ -1824,8 +2066,8 @@ class ForwardReturnJob(BaseJob):
             self._session.delete(row)
         self._session.flush()
 
-        for point in pricing.path_points:
-            self._session.add(ForwardReturnPathRow(
+        self._session.add_all([
+            ForwardReturnPathRow(
                 forward_return_observation_id=obs.forward_return_observation_id,
                 signal_id=sig.signal_id,
                 pattern_id=sig.pattern_id,
@@ -1858,7 +2100,9 @@ class ForwardReturnJob(BaseJob):
                 job_run_id=job_run_id,
                 input_hash=obs.input_hash,
                 outcome_hash=obs.outcome_hash,
-            ))
+            )
+            for point in pricing.path_points
+        ])
 
     def _transition_computed_observation_to_review(
         self,
