@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import false, or_
+from sqlalchemy import Column, MetaData, String, Table, false, or_, text
 from sqlalchemy.orm import Query, Session
 
 from alpha.db.models import EvidenceJob, EvidenceJobRun, FeatureSnapshot, SignalRegistry
@@ -26,6 +26,8 @@ SIGNAL_SOURCE_CHOICES = (
     SIGNAL_SOURCE_LIVE,
     SIGNAL_SOURCE_HISTORICAL_M4_REPLAY,
 )
+_REPLAY_MEMBERSHIP_TEMP_TABLE = "_tmp_historical_m4_replay_signal_ids"
+_REPLAY_MEMBERSHIP_STAGE_BATCH_SIZE = 1000
 
 
 def normalize_signal_source(value: str | None) -> str:
@@ -61,7 +63,11 @@ def apply_signal_source_filter(
     )
     if not signal_ids:
         return query.filter(false())
-    return query.filter(SignalRegistry.signal_id.in_(sorted(signal_ids)))
+    membership = _stage_replay_membership_signal_ids(session, signal_ids)
+    return query.join(
+        membership,
+        SignalRegistry.signal_id == membership.c.signal_id,
+    )
 
 
 def historical_m4_replay_signal_query(
@@ -252,8 +258,10 @@ def _filter_signal_ids_by_date(
 ) -> set[str]:
     if not signal_ids:
         return set()
-    query = session.query(SignalRegistry.signal_id).filter(
-        SignalRegistry.signal_id.in_(sorted(signal_ids))
+    membership = _stage_replay_membership_signal_ids(session, signal_ids)
+    query = session.query(SignalRegistry.signal_id).join(
+        membership,
+        SignalRegistry.signal_id == membership.c.signal_id,
     )
     query = _apply_signal_date_bounds(
         query,
@@ -261,6 +269,39 @@ def _filter_signal_ids_by_date(
         signal_end_date=signal_end_date,
     )
     return {str(signal_id) for (signal_id,) in query.all()}
+
+
+def _stage_replay_membership_signal_ids(
+    session: Session,
+    signal_ids: set[str],
+) -> Table:
+    membership = _replay_membership_table()
+    dialect_name = session.get_bind().dialect.name
+    create_sql = (
+        f"CREATE TEMPORARY TABLE IF NOT EXISTS {_REPLAY_MEMBERSHIP_TEMP_TABLE} "
+        "(signal_id VARCHAR PRIMARY KEY)"
+    )
+    if dialect_name == "postgresql":
+        create_sql += " ON COMMIT DROP"
+    session.execute(text(create_sql))
+    session.execute(text(f"DELETE FROM {_REPLAY_MEMBERSHIP_TEMP_TABLE}"))
+    rows = [{"signal_id": signal_id} for signal_id in sorted(signal_ids)]
+    for chunk in _chunks(rows, _REPLAY_MEMBERSHIP_STAGE_BATCH_SIZE):
+        session.execute(membership.insert(), chunk)
+    return membership
+
+
+def _replay_membership_table() -> Table:
+    metadata = MetaData()
+    return Table(
+        _REPLAY_MEMBERSHIP_TEMP_TABLE,
+        metadata,
+        Column("signal_id", String, primary_key=True),
+    )
+
+
+def _chunks(rows: list[dict[str, str]], size: int) -> list[list[dict[str, str]]]:
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
 
 
 def _json_like_pattern(method: str) -> str:
