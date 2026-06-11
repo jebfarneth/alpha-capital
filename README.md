@@ -26,14 +26,16 @@ As of June 2026, Alpha Capital has moved beyond a single-pattern prototype into 
 | Production DB | Supabase/Postgres canonical database with Alembic-managed schema. |
 | Production compute | Google Compute Engine VM scheduled after the market close, monitored by Healthchecks.io. |
 | Universe | Live FMP/Polygon-built operating universe widened from microcap-only to `$30M-$5B`; latest proven wide build included 2,621 names. |
-| Live accumulation | M4 is the original live lane; M1 and M2 producer paths are built and integrated behind explicit rollout gates. |
-| M2 | SEC Form 4 backfill/warm-start path built; widened-universe SEC seed is intentionally staged before the expanded universe is enabled with M2. |
+| Live accumulation | M4 live since June 1; M1 enabled June 4 (first real fire the same week); M2 live June 5 in SEC-only mode. All three run under one canonical nightly orchestrator. |
+| Historical corpus | Survivorship-correct M4 replay executed on production: ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), every month independently audited for exact trading calendars, zero duplicates, and PIT flags. |
+| ML training hygiene | Security-type exclusion artifact + fail-closed loader: every corpus ticker classified (common stock vs. SPAC/ETF/fund/preferred/listed debt/CEF), ~22% of historical signals marked non-common and excluded from training without deleting a single registry row. |
+| M2 | SEC Form 4 backfill/warm-start path built; production runs SEC-only (FMP enrichment skipped) while the widened-universe seed is staged as a resumable job. |
 | M3 | Sector-rotation detector and PIT sector-history pipeline built, default-off until coverage and governance gates are met. |
-| Market-path features | Durable per-signal/per-day feature store built for base EOD, rich EOD technicals, relative features, ML context fields, lineage, hashes, and null/status auditability. |
-| Testing | Current full-suite baseline is over 2,000 passing Python tests with scratch-schema and real-provider integration probes. |
+| Market-path features | Durable per-signal/per-day feature store built for base EOD, rich EOD technicals, relative features, ML context fields, lineage, hashes, and null/status auditability. Bulk backfill runner proven idempotent and self-healing. |
+| Testing | Current full-suite baseline is over 2,200 passing Python tests with scratch-schema and real-provider integration probes. |
 | Safety posture | Public writes are guarded; scratch schemas are isolated; M3 remains default-off; market-path failures are observability-only; M4/M1/M2 producer behavior is protected by regression tests. |
 
-The project is currently in signal accumulation, data-quality hardening, historical replay, and ML feature-corpus construction. It is not yet live broker execution.
+The project has completed historical replay and is now in label/feature backfill and ML corpus assembly, with paper-trading execution wiring as the next operational track. It is not yet live broker execution.
 
 ---
 
@@ -113,7 +115,7 @@ The platform treats nulls as first-class evidence. A null with `missing_intraday
 
 ## Market-Path Feature Store
 
-`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The current public proof covers M4 and M1 signal-day plus forward-path rows for 2026-06-01 through 2026-06-05; the next planned extension is pre-signal setup context so models can learn what strong winners looked like before the signal fired.
+`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The current public proof covers M4 and M1 signal-day plus forward-path rows for early June 2026; the next planned runs are bulk enrichment of the full 29-month historical M4 corpus, then pre-signal setup context so models can learn what strong winners looked like before the signal fired.
 
 The intended ML corpus has three separate zones:
 
@@ -155,7 +157,7 @@ Alpha Capital uses a pattern roster rather than a single monolithic signal. Each
 | Pattern | Thesis | Current status |
 |---|---|---|
 | M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Producer/assembler/detector built; integrated into measurement spine; early evidence suggests signal-day/intraday timing matters more than next-session entry. |
-| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Producer/assembler/detector built; source-gating fixed; paused in production until the widened-universe SEC seed is made resumable/batched. |
+| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Producer/assembler/detector built; source-gating fixed; live in production in SEC-only mode since June 5. |
 | M2U - Insider Cluster Upside | M2 variant focused on upside cluster behavior. | Built with M2 path. |
 | M3 - Sector Rotation | PIT sector-relative return and cross-sectional sector rank. | Detector and sector-history pipeline built; default-off pending coverage gates. |
 | M4 - 52-Week High | EOD close breaks prior 52-week high. | Original live signal-accumulation lane. |
@@ -195,7 +197,7 @@ Key design decisions:
 - Fetch errors on tickers that actually fire are fatal because the signal would be certified on incomplete evidence.
 - A SEC fetch-coverage ledger warms tickers even when they have no Form 4 history, preventing repeated full-history cold pulls.
 
-The widened `$30M-$5B` universe materially increases the number of tickers M2 must scan. The first long SEC warm seed exposed a runtime/DB reliability problem, so production currently skips M2 while the seed path is redesigned as a resumable/batched job.
+The widened `$30M-$5B` universe materially increases the number of tickers M2 must scan. The first long SEC warm seed exposed a runtime/DB reliability problem; M2 now runs live in production in SEC-only mode (FMP enrichment skipped) while the widened-universe seed path is staged as a resumable/batched job.
 
 ---
 
@@ -268,7 +270,8 @@ The design principles:
 4. Never pool M1/M2/M3/M4/I11 blindly.
 5. Treat source-missing flags as model inputs, not data-cleaning noise.
 6. Backfill historical cohorts only with survivorship-correct PIT universe reconstruction.
-7. Prefer robust ranking and capital allocation over a single binary classifier.
+7. Mark, never delete: non-common instruments (SPACs, ETFs, funds, preferreds, listed debt) are excluded from training through a fail-closed classification artifact, not registry mutation.
+8. Prefer robust ranking and capital allocation over a single binary classifier.
 
 The immediate research loop is:
 
@@ -304,7 +307,7 @@ Target path:
 
 For bounded replay windows, the FMP delisted-company ingest supports a date cutoff such as `--stop-after-delisted-before 2026-01-01`. The cohort runner accepts that bounded source only when the recorded cutoff covers the requested replay start date; otherwise public replay fails closed.
 
-The immediate operational target is Jan-May 2026 M4 cohort reconstruction, then post-signal market-path enrichment, then pre-signal context rows for the same reconstructed signals.
+This plan has been executed on production: the full M4 historical corpus now covers ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), with every month independently audited for exact trading calendars, zero duplicates, and PIT provenance flags. The immediate operational targets are now full-corpus forward-return labels and post-signal market-path enrichment for all reconstructed signals, then pre-signal context rows for the same corpus.
 
 ---
 
@@ -358,6 +361,8 @@ Recent examples of issues caught by this process:
 - Market-path feature lineage containing batch bars that needed row-scope clarification.
 - Alembic migration order accidentally forcing M3 schema before default-off public rollout.
 - Missing 1d benchmark fields in the relative-feature surface.
+- Series listings (preferred/notes/units traded under suffixed symbols) classifying as common stock because the provider serves the parent issuer's profile.
+- Closed-end funds with paraphrased provider descriptions slipping past literal phrase matching, caught only by a full-corpus live-profile sweep.
 
 The point is not theater. In a trading system, silent optimism is the expensive failure.
 
@@ -374,6 +379,7 @@ alpha-capital/
       db/              SQLAlchemy models and engine
       evidence/        Job/run and lineage helpers
       jobs/            Production and scratch jobs
+      ml/              ML training-hygiene artifacts (security-type exclusion artifact + fail-closed loader)
       patterns/        Pure detectors and shared guards
     migrations/        Alembic schema history
     tests/             Python test suite
