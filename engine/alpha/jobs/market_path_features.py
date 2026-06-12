@@ -11,7 +11,7 @@ import json
 import math
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from time import perf_counter
 from typing import Any, Callable, Iterable, Sequence
@@ -33,6 +33,7 @@ from alpha.jobs.historical_m4_signal_selector import (
     normalize_signal_source,
 )
 from alpha.market_calendar import (
+    is_us_equity_session,
     next_us_equity_session,
     nth_us_equity_session,
     resolve_us_equity_session,
@@ -377,6 +378,20 @@ class _SectorResolution:
 
 
 @dataclass
+class _NonSessionBarSkipTracker:
+    count: int = 0
+    samples: list[dict[str, str]] = field(default_factory=list)
+
+    def record(self, *, ticker: str, bar_date: date) -> None:
+        self.count += 1
+        if len(self.samples) < 10:
+            self.samples.append({
+                "ticker": ticker.upper(),
+                "date": bar_date.isoformat(),
+            })
+
+
+@dataclass
 class MarketPathFeatureCollection:
     decision_date: date | None
     signal_start: date | None
@@ -402,6 +417,8 @@ class MarketPathFeatureCollection:
     sector_etf_fetch_count: int = 0
     sector_etf_fetch_error_count: int = 0
     same_day_pattern_strength_key_count: int = 0
+    non_session_bars_skipped: int = 0
+    non_session_bar_skip_sample: list[dict[str, str]] | None = None
     pending_lineages: list[DataLineage] | None = None
     pending_feature_rows: list[dict[str, Any]] | None = None
     fetch_errors: list[dict[str, Any]] | None = None
@@ -450,6 +467,8 @@ class MarketPathFeatureCollection:
             "sector_etf_fetch_count": self.sector_etf_fetch_count,
             "sector_etf_fetch_error_count": self.sector_etf_fetch_error_count,
             "same_day_pattern_strength_key_count": self.same_day_pattern_strength_key_count,
+            "non_session_bars_skipped": self.non_session_bars_skipped,
+            "non_session_bar_skip_sample": self.non_session_bar_skip_sample or [],
             "stage_timing_seconds": self.stage_timings or {},
         }
         if self.no_op_reason:
@@ -644,6 +663,7 @@ class MarketPathFeatureJob(BaseJob):
         fetch_errors: list[dict[str, Any]] = []
         lineages_recorded = 0
         tickers_fetched = 0
+        non_session_tracker = _NonSessionBarSkipTracker()
         pending_lineages: list[DataLineage] = []
         pending_feature_rows: list[dict[str, Any]] = []
         reference_from_date = _fetch_start(signals, self._lookback_calendar_days)
@@ -665,6 +685,7 @@ class MarketPathFeatureJob(BaseJob):
             job_run_id=ctx.job_run_id,
             source_role="market_benchmark",
             pending_lineages=pending_lineages,
+            non_session_tracker=non_session_tracker,
         )
         _record_timing(stage_timings, "benchmark_reference_fetch_seconds", started)
         self._emit_progress(
@@ -704,6 +725,7 @@ class MarketPathFeatureJob(BaseJob):
             job_run_id=ctx.job_run_id,
             source_role="sector_etf",
             pending_lineages=pending_lineages,
+            non_session_tracker=non_session_tracker,
         )
         _record_timing(stage_timings, "sector_reference_fetch_seconds", started)
         self._emit_progress(
@@ -809,7 +831,11 @@ class MarketPathFeatureJob(BaseJob):
                 bar_count=len(resp.data or []),
             )
             started = perf_counter()
-            bars = _clean_bars(resp.data)
+            bars = _clean_bars(
+                resp.data,
+                ticker=ticker,
+                non_session_tracker=non_session_tracker,
+            )
             _record_timing(stage_timings, "ticker_bar_clean_seconds", started)
             started = perf_counter()
             lineage = _build_data_lineage(
@@ -896,6 +922,8 @@ class MarketPathFeatureJob(BaseJob):
             sector_etf_fetch_count=len(sector_etf_series),
             sector_etf_fetch_error_count=_reference_error_count(sector_etf_series),
             same_day_pattern_strength_key_count=len(same_day_pattern_strengths),
+            non_session_bars_skipped=non_session_tracker.count,
+            non_session_bar_skip_sample=list(non_session_tracker.samples),
             pending_lineages=pending_lineages,
             pending_feature_rows=pending_feature_rows,
             fetch_errors=fetch_errors,
@@ -993,6 +1021,7 @@ class MarketPathFeatureJob(BaseJob):
         job_run_id: str,
         source_role: str,
         pending_lineages: list[DataLineage],
+        non_session_tracker: _NonSessionBarSkipTracker | None = None,
     ) -> dict[str, _ReferenceSeries]:
         series: dict[str, _ReferenceSeries] = {}
         for symbol in sorted({item.upper() for item in symbols if item}):
@@ -1024,7 +1053,11 @@ class MarketPathFeatureJob(BaseJob):
                     },
                 )
                 continue
-            bars = tuple(_clean_bars(resp.data))
+            bars = tuple(_clean_bars(
+                resp.data,
+                ticker=symbol,
+                non_session_tracker=non_session_tracker,
+            ))
             lineage = _build_data_lineage(
                 provider="FMP",
                 endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
@@ -1986,12 +2019,20 @@ def _fetch_start(signals: Sequence[SignalRegistry], lookback_calendar_days: int)
     return min(starts) - timedelta(days=lookback_calendar_days)
 
 
-def _clean_bars(bars: Sequence[FmpBar]) -> list[_CleanBar]:
+def _clean_bars(
+    bars: Sequence[FmpBar],
+    *,
+    ticker: str | None = None,
+    non_session_tracker: _NonSessionBarSkipTracker | None = None,
+) -> list[_CleanBar]:
     clean: list[_CleanBar] = []
     for bar in bars:
         try:
             parsed_date = date.fromisoformat(str(bar.date)[:10])
         except ValueError:
+            continue
+        if non_session_tracker is not None and not is_us_equity_session(parsed_date):
+            non_session_tracker.record(ticker=ticker or "UNKNOWN", bar_date=parsed_date)
             continue
         values = (bar.open, bar.high, bar.low, bar.close)
         if any(value is None or not math.isfinite(float(value)) or float(value) <= 0 for value in values):

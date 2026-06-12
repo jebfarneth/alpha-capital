@@ -276,6 +276,8 @@ class MarketPathBulkBackfillJob(BaseJob):
         rows_skipped = 0
         rows_merged = 0
         lineages_recorded = 0
+        non_session_bars_skipped = 0
+        non_session_bar_skip_sample: list[dict[str, str]] = []
         fetch_errors: list[dict[str, Any]] = []
         stage_seconds = 0.0
         merge_seconds = 0.0
@@ -342,6 +344,8 @@ class MarketPathBulkBackfillJob(BaseJob):
                     "ticker_fetch_error_count": collection.ticker_fetch_error_count,
                     "feature_rows_generated": len(collection.pending_feature_rows or []),
                     "fetch_error_count": len(collection.fetch_errors or []),
+                    "non_session_bars_skipped": collection.non_session_bars_skipped,
+                    "non_session_bar_skip_sample": collection.non_session_bar_skip_sample or [],
                     "elapsed_seconds": round(time.perf_counter() - collect_started, 6),
                 },
             )
@@ -363,6 +367,11 @@ class MarketPathBulkBackfillJob(BaseJob):
             rows_unchanged += collection.rows_unchanged
             rows_skipped += collection.rows_skipped
             lineages_recorded += collection.lineages_recorded
+            non_session_bars_skipped += collection.non_session_bars_skipped
+            for sample in collection.non_session_bar_skip_sample or []:
+                if len(non_session_bar_skip_sample) >= 10:
+                    break
+                non_session_bar_skip_sample.append(sample)
 
             rows = collection.pending_feature_rows or []
             lineages = collection.pending_lineages or []
@@ -412,6 +421,8 @@ class MarketPathBulkBackfillJob(BaseJob):
                 "rows_staged": merge_result.rows_staged,
                 "rows_merged": merge_result.rows_merged,
                 "lineages_recorded": collection.lineages_recorded,
+                "non_session_bars_skipped": collection.non_session_bars_skipped,
+                "non_session_bar_skip_sample": collection.non_session_bar_skip_sample or [],
                 "fetch_error_count": len(collection.fetch_errors or []),
                 "fetch_errors": collection.fetch_errors or [],
                 "elapsed_seconds": round(time.perf_counter() - batch_started, 6),
@@ -530,6 +541,8 @@ class MarketPathBulkBackfillJob(BaseJob):
             "rows_unchanged": rows_unchanged,
             "rows_skipped": rows_skipped,
             "rows_merged": rows_merged,
+            "non_session_bars_skipped": non_session_bars_skipped,
+            "non_session_bar_skip_sample": non_session_bar_skip_sample,
             "rank_rows_updated": rank_rows_updated,
             "rank_pass_count": 1 if not fetch_errors else 0,
             "lineages_recorded": lineages_recorded,

@@ -34,6 +34,7 @@ from alpha.jobs.run_market_path_bulk_backfill import (
     plan_bulk_batches,
 )
 from alpha.jobs.runner import run_job
+from alpha.market_calendar import is_us_equity_session
 
 
 RUN_TS = datetime(2026, 6, 5, 21, 0, tzinfo=timezone.utc)
@@ -385,10 +386,40 @@ def _replace_bar(bars: list[FmpBar], day: date, **updates) -> list[FmpBar]:
     return out
 
 
+def _with_weekend_duplicate(
+    bars: list[FmpBar],
+    *,
+    duplicate_date: date,
+    source_date: date,
+) -> list[FmpBar]:
+    by_date = {date.fromisoformat(bar.date): bar for bar in bars}
+    source = by_date[source_date]
+    duplicate = FmpBar(
+        date=duplicate_date.isoformat(),
+        open=source.open,
+        high=source.high,
+        low=source.low,
+        close=source.close,
+        volume=source.volume,
+        split_adjusted_close=source.split_adjusted_close,
+        adj_close=source.adj_close,
+        vwap=getattr(source, "vwap", None),
+    )
+    return sorted([*bars, duplicate], key=lambda bar: bar.date)
+
+
+def _regular_session_only_bars(bars: list[FmpBar]) -> list[FmpBar]:
+    return [
+        bar for bar in bars
+        if is_us_equity_session(date.fromisoformat(bar.date))
+    ]
+
+
 def _split_adjusted_sigma(bars: list[FmpBar], row_day: date) -> float:
     prior = [
         bar for bar in bars
         if date.fromisoformat(bar.date) < row_day
+        and is_us_equity_session(date.fromisoformat(bar.date))
     ][-20:]
     returns = [
         (current.split_adjusted_close or current.close)
@@ -403,6 +434,7 @@ def _expected_rsi(bars: list[FmpBar], row_day: date, sessions: int) -> float:
     prior = [
         bar for bar in bars
         if date.fromisoformat(bar.date) < row_day
+        and is_us_equity_session(date.fromisoformat(bar.date))
     ]
     window = prior[-(sessions + 1):]
     gains = []
@@ -472,6 +504,49 @@ def test_market_path_feature_job_writes_daily_features(db_session):
     assert feature_json["stop_basis"] == "split_adjusted_close_when_available_else_raw_close"
     assert feature_json["rich_eod_status"]["missing_vwap"] is True
     assert feature_json["rich_eod_status"]["insufficient_history"]["prior_52w_high"] is True
+
+
+def test_market_path_skips_provider_non_session_duplicate_bar(db_session):
+    signal = _add_signal(db_session, ticker="AHL")
+    bars = _with_weekend_duplicate(
+        _regular_session_only_bars(_rich_bars()),
+        duplicate_date=date(2026, 2, 22),
+        source_date=date(2026, 2, 23),
+    )
+    adapter = FakeFmpAdapter({
+        "AHL": bars,
+        "SPY": _regular_session_only_bars(_reference_bars(start_price=400.0)),
+        "QQQ": _regular_session_only_bars(_reference_bars(start_price=350.0)),
+        "IWM": _regular_session_only_bars(_reference_bars(start_price=200.0)),
+    })
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=adapter,
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 2),
+        signal_end_date=date(2026, 6, 2),
+        through_date=date(2026, 6, 5),
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    assert result.metrics["non_session_bars_skipped"] == 1
+    assert result.metrics["non_session_bar_skip_sample"] == [
+        {"ticker": "AHL", "date": "2026-02-22"}
+    ]
+    rows = (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id == signal.signal_id)
+        .order_by(MarketPathFeature.feature_session_date)
+        .all()
+    )
+    assert [row.feature_session_date for row in rows] == [
+        "2026-06-03",
+        "2026-06-04",
+        "2026-06-05",
+    ]
 
 
 def test_market_path_historical_m4_signal_source_excludes_unreplayed_live_rows(db_session):
@@ -2089,9 +2164,9 @@ def test_market_path_adx_14_uses_wilder_smoothed_adx_not_single_window_dx(db_ses
         )
         .one()
     )
-    assert row.plus_di_14 == pytest.approx(30.48297680904405)
-    assert row.minus_di_14 == pytest.approx(19.36577366838155)
-    assert row.adx_14 == pytest.approx(36.99635786455282)
+    assert row.plus_di_14 == pytest.approx(31.77182603060645)
+    assert row.minus_di_14 == pytest.approx(19.8645184075919)
+    assert row.adx_14 == pytest.approx(36.95928479597885)
     assert row.adx_14 != pytest.approx(23.86407754815589)
     payload = json.loads(row.feature_json)
     assert payload["classic_technical_features"]["adx_14"] == pytest.approx(row.adx_14)
