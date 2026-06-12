@@ -39,6 +39,8 @@ DIVIDENDS_ENDPOINT = "/stocks/v1/dividends"
 SHORT_INTEREST_ENDPOINT = "/stocks/v1/short-interest"
 SHORT_VOLUME_ENDPOINT = "/stocks/v1/short-volume"
 NEWS_ENDPOINT = "/v2/reference/news"
+FULL_MARKET_SNAPSHOT_ENDPOINT = "/v2/snapshot/locale/us/markets/stocks/tickers"
+GROUPED_DAILY_AGGS_ENDPOINT_PREFIX = "/v2/aggs/grouped/locale/us/market/stocks"
 POLYGON_API_HOSTS = {"api.polygon.io", "api.massive.com"}
 TICKER_EVENT_ALLOWED_TYPES = {"ticker_change"}
 TICKER_EVENT_IDENTIFIER_MAX_LENGTH = 64
@@ -247,6 +249,39 @@ class PolygonBar:
     volume: float
     vwap: Optional[float] = None
     transactions: Optional[int] = None
+
+
+@dataclass
+class PolygonGroupedDailyBar(PolygonBar):
+    """Grouped market daily bar with the row ticker preserved."""
+
+    ticker: str = ""
+
+
+@dataclass
+class PolygonSnapshotTicker:
+    """Normalized delayed full-market snapshot row for one ticker."""
+
+    ticker: str
+    day_open: Optional[float] = None
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+    day_close: Optional[float] = None
+    day_volume: Optional[float] = None
+    prev_day_close: Optional[float] = None
+    prev_day_volume: Optional[float] = None
+    minute_timestamp: Optional[int] = None
+    minute_open: Optional[float] = None
+    minute_high: Optional[float] = None
+    minute_low: Optional[float] = None
+    minute_close: Optional[float] = None
+    minute_volume: Optional[float] = None
+    last_trade_price: Optional[float] = None
+    raw: Optional[Dict[str, Any]] = None
+
+    @property
+    def decision_price(self) -> Optional[float]:
+        return self.last_trade_price or self.minute_close or self.day_close
 
 
 # --- Adapter ---
@@ -1424,6 +1459,231 @@ class PolygonAdapter:
                     message="Polygon daily bars response contains malformed result row",
                 )
             bars.append(parsed)
+        lineage = _polygon_daily_bar_row_lineage(
+            resp.lineage,
+            raw_rows,
+            len(bars),
+            adjusted=adjusted,
+        )
+        return AdapterResponse(data=bars, lineage=lineage)
+
+    def get_today_minute_aggs(
+        self,
+        ticker: str,
+        trading_date: str,
+        limit: int = 50000,
+        *,
+        adjusted: bool = True,
+    ) -> AdapterResponse[List[PolygonBar]]:
+        """Fetch today's minute aggregate bars for one ticker."""
+
+        endpoint_prefix = "/v2/aggs/ticker"
+        normalized_ticker, ticker_error = _normalize_polygon_path_ticker(
+            ticker,
+            endpoint=endpoint_prefix,
+        )
+        if ticker_error is not None:
+            return ticker_error  # type: ignore[return-value]
+        date_error = _validate_iso_date_params(
+            endpoint=endpoint_prefix,
+            date_fields={"trading_date": trading_date},
+            asof=None,
+        )
+        if date_error is not None:
+            return date_error  # type: ignore[return-value]
+
+        date_text = _str_or_none(trading_date) or ""
+        endpoint = (
+            f"/v2/aggs/ticker/{normalized_ticker}/range/1/minute/"
+            f"{date_text}/{date_text}"
+        )
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "sort": "asc",
+            "adjusted": str(bool(adjusted)).lower(),
+        }
+        return self._parse_aggregate_bar_response(
+            endpoint=endpoint,
+            params=params,
+            adjusted=adjusted,
+            feed_label="minute aggs",
+        )
+
+    def get_grouped_daily_aggs(
+        self,
+        trading_date: str,
+        *,
+        adjusted: bool = True,
+    ) -> AdapterResponse[List[PolygonGroupedDailyBar]]:
+        """Fetch grouped daily aggregate bars for all U.S. stocks on one date."""
+
+        endpoint_prefix = GROUPED_DAILY_AGGS_ENDPOINT_PREFIX
+        date_error = _validate_iso_date_params(
+            endpoint=endpoint_prefix,
+            date_fields={"trading_date": trading_date},
+            asof=None,
+        )
+        if date_error is not None:
+            return date_error  # type: ignore[return-value]
+        date_text = _str_or_none(trading_date) or ""
+        endpoint = f"{GROUPED_DAILY_AGGS_ENDPOINT_PREFIX}/{date_text}"
+        params: Dict[str, Any] = {"adjusted": str(bool(adjusted)).lower()}
+        resp = self._request(endpoint, params=params)
+        if not resp.ok:
+            return AdapterResponse(
+                data=resp.data,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                rate_limit=resp.rate_limit,
+                error=resp.error,
+            )  # type: ignore[arg-type]
+        if not isinstance(resp.data, dict):
+            return _parse_error_response(
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                endpoint=endpoint,
+                message="Polygon grouped daily aggs response missing results list",
+            )
+        results_list = resp.data.get("results")
+        if results_list is None and (
+            resp.data.get("resultsCount") == 0 or resp.data.get("queryCount") == 0
+        ):
+            return AdapterResponse(
+                data=[],
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+            )
+        if not isinstance(results_list, list):
+            return _parse_error_response(
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                endpoint=endpoint,
+                message="Polygon grouped daily aggs response missing results list",
+            )
+        bars: List[PolygonGroupedDailyBar] = []
+        raw_rows = 0
+        for row in results_list:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            parsed = _parse_grouped_daily_bar_row(row)
+            if parsed is not None:
+                bars.append(parsed)
+        lineage = _polygon_daily_bar_row_lineage(
+            resp.lineage,
+            raw_rows,
+            len(bars),
+            adjusted=adjusted,
+        )
+        return AdapterResponse(data=bars, lineage=lineage)
+
+    def get_full_market_snapshot(self) -> AdapterResponse[List[PolygonSnapshotTicker]]:
+        """Fetch the delayed full-market snapshot for U.S. stocks."""
+
+        resp = self._request(FULL_MARKET_SNAPSHOT_ENDPOINT)
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        payload = resp.data
+        if not isinstance(payload, dict) or not isinstance(payload.get("tickers"), list):
+            return _parse_error_response(
+                lineage=_corporate_action_row_lineage(resp.lineage, 0, 0),
+                endpoint=FULL_MARKET_SNAPSHOT_ENDPOINT,
+                message="Polygon full-market snapshot response missing tickers list",
+            )
+        rows: List[PolygonSnapshotTicker] = []
+        raw_rows = 0
+        for row in payload["tickers"]:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            parsed = _parse_snapshot_ticker(row)
+            if parsed is not None:
+                rows.append(parsed)
+        lineage = _corporate_action_row_lineage(resp.lineage, raw_rows, len(rows))
+        return AdapterResponse(data=rows, lineage=lineage)
+
+    def _parse_aggregate_bar_response(
+        self,
+        *,
+        endpoint: str,
+        params: Dict[str, Any],
+        adjusted: bool,
+        feed_label: str,
+    ) -> AdapterResponse[List[PolygonBar]]:
+        resp = self._request(endpoint, params=params)
+        if not resp.ok:
+            return AdapterResponse(
+                data=resp.data,
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                rate_limit=resp.rate_limit,
+                error=resp.error,
+            )  # type: ignore[arg-type]
+        if not isinstance(resp.data, dict):
+            return _parse_error_response(
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                endpoint=endpoint,
+                message=f"Polygon {feed_label} response missing results list",
+            )
+        results_list = resp.data.get("results")
+        if results_list is None and (
+            resp.data.get("resultsCount") == 0 or resp.data.get("queryCount") == 0
+        ):
+            return AdapterResponse(
+                data=[],
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+            )
+        if not isinstance(results_list, list):
+            return _parse_error_response(
+                lineage=_polygon_daily_bar_row_lineage(
+                    resp.lineage,
+                    0,
+                    0,
+                    adjusted=adjusted,
+                ),
+                endpoint=endpoint,
+                message=f"Polygon {feed_label} response missing results list",
+            )
+
+        bars: List[PolygonBar] = []
+        raw_rows = 0
+        for row in results_list:
+            raw_rows += 1
+            if not isinstance(row, dict):
+                continue
+            parsed = _parse_daily_bar_row(row)
+            if parsed is not None:
+                bars.append(parsed)
         lineage = _polygon_daily_bar_row_lineage(
             resp.lineage,
             raw_rows,
@@ -2694,6 +2954,52 @@ def _parse_daily_bar_row(row: Dict[str, Any]) -> Optional[PolygonBar]:
         volume=volume,
         vwap=vwap,
         transactions=transactions,
+    )
+
+
+def _parse_grouped_daily_bar_row(row: Dict[str, Any]) -> Optional[PolygonGroupedDailyBar]:
+    ticker = _str_or_none(row.get("T"))
+    parsed = _parse_daily_bar_row(row)
+    if not ticker or parsed is None:
+        return None
+    return PolygonGroupedDailyBar(
+        timestamp=parsed.timestamp,
+        open=parsed.open,
+        high=parsed.high,
+        low=parsed.low,
+        close=parsed.close,
+        volume=parsed.volume,
+        vwap=parsed.vwap,
+        transactions=parsed.transactions,
+        ticker=ticker.upper(),
+    )
+
+
+def _parse_snapshot_ticker(row: Dict[str, Any]) -> Optional[PolygonSnapshotTicker]:
+    ticker = _str_or_none(row.get("ticker"))
+    if not ticker:
+        return None
+    day = row.get("day") if isinstance(row.get("day"), dict) else {}
+    prev_day = row.get("prevDay") if isinstance(row.get("prevDay"), dict) else {}
+    minute = row.get("min") if isinstance(row.get("min"), dict) else {}
+    last_trade = row.get("lastTrade") if isinstance(row.get("lastTrade"), dict) else {}
+    return PolygonSnapshotTicker(
+        ticker=ticker.upper(),
+        day_open=_required_float_or_none(day.get("o")),
+        day_high=_required_float_or_none(day.get("h")),
+        day_low=_required_float_or_none(day.get("l")),
+        day_close=_required_float_or_none(day.get("c")),
+        day_volume=_required_nonnegative_float_or_none(day.get("v")),
+        prev_day_close=_required_float_or_none(prev_day.get("c")),
+        prev_day_volume=_required_nonnegative_float_or_none(prev_day.get("v")),
+        minute_timestamp=_required_nonnegative_int_or_none(minute.get("t")),
+        minute_open=_required_float_or_none(minute.get("o")),
+        minute_high=_required_float_or_none(minute.get("h")),
+        minute_low=_required_float_or_none(minute.get("l")),
+        minute_close=_required_float_or_none(minute.get("c")),
+        minute_volume=_required_nonnegative_float_or_none(minute.get("v")),
+        last_trade_price=_required_float_or_none(last_trade.get("p")),
+        raw=row,
     )
 
 

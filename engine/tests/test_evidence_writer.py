@@ -594,6 +594,7 @@ class TestSchemaCompleteness:
             "m3_validation_metadata",
             "m3_tranche_fills",
             "m3_oco_leg_state",
+            "paper_execution_events",
             "trade_candidates",
             "optimizer_runs",
             "order_events",

@@ -90,6 +90,35 @@ class AlpacaOrder:
     failed_at: Optional[str] = None
 
 
+@dataclass
+class AlpacaPosition:
+    """Normalized Alpaca position payload used for startup reconciliation."""
+
+    asset_id: str
+    symbol: str
+    exchange: Optional[str] = None
+    asset_class: Optional[str] = None
+    qty: Optional[str] = None
+    avg_entry_price: Optional[str] = None
+    side: Optional[str] = None
+    market_value: Optional[str] = None
+    cost_basis: Optional[str] = None
+    unrealized_pl: Optional[str] = None
+    current_price: Optional[str] = None
+    lastday_price: Optional[str] = None
+    change_today: Optional[str] = None
+
+
+@dataclass
+class AlpacaClock:
+    """Normalized Alpaca market clock payload."""
+
+    timestamp: Optional[str]
+    is_open: bool
+    next_open: Optional[str] = None
+    next_close: Optional[str] = None
+
+
 # --- Adapter ---
 
 class AlpacaAdapter:
@@ -392,6 +421,23 @@ class AlpacaAdapter:
             rate_limit=resp.rate_limit,
         )
 
+    def list_orders(self, status: str = "open") -> AdapterResponse[List[AlpacaOrder]]:
+        """List broker orders by status for startup reconciliation."""
+
+        resp = self._request("GET", "/v2/orders", params={"status": status})
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        orders = [
+            _parse_order(row)
+            for row in (resp.data or [])
+            if isinstance(row, dict)
+        ]
+        return AdapterResponse(
+            data=orders,
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
     def cancel_order(self, order_id: str) -> AdapterResponse[bool]:
         """Cancel an open Alpaca order and report whether the request succeeded."""
 
@@ -403,6 +449,67 @@ class AlpacaAdapter:
         return AdapterResponse(
             data=True, lineage=resp.lineage, rate_limit=resp.rate_limit
         )
+
+    # --- Positions / clock ---
+
+    def get_positions(self) -> AdapterResponse[List[AlpacaPosition]]:
+        """Fetch all open Alpaca positions."""
+
+        resp = self._request("GET", "/v2/positions")
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        positions = [
+            _parse_position(row)
+            for row in (resp.data or [])
+            if isinstance(row, dict)
+        ]
+        return AdapterResponse(
+            data=positions,
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
+    def get_position(self, symbol: str) -> AdapterResponse[Optional[AlpacaPosition]]:
+        """Fetch one open Alpaca position by symbol."""
+
+        normalized = symbol.upper().strip()
+        resp = self._request("GET", f"/v2/positions/{normalized}")
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        return AdapterResponse(
+            data=_parse_position(resp.data),
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
+    def close_position(self, symbol: str) -> AdapterResponse[Optional[AlpacaOrder]]:
+        """Submit an Alpaca market close request for one open position."""
+
+        normalized = symbol.upper().strip()
+        resp = self._request("DELETE", f"/v2/positions/{normalized}")
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        data = resp.data if isinstance(resp.data, dict) else None
+        return AdapterResponse(
+            data=_parse_order(data or {}),
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
+    def get_clock(self) -> AdapterResponse[Optional[AlpacaClock]]:
+        """Fetch Alpaca's market clock."""
+
+        resp = self._request("GET", "/v2/clock")
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        row = resp.data or {}
+        clock = AlpacaClock(
+            timestamp=row.get("timestamp"),
+            is_open=bool(row.get("is_open", False)),
+            next_open=row.get("next_open"),
+            next_close=row.get("next_close"),
+        )
+        return AdapterResponse(data=clock, lineage=resp.lineage, rate_limit=resp.rate_limit)
 
 
 # --- helpers ---
@@ -428,6 +535,24 @@ def _parse_order(r: dict) -> AlpacaOrder:
         filled_at=r.get("filled_at"),
         canceled_at=r.get("canceled_at"),
         failed_at=r.get("failed_at"),
+    )
+
+
+def _parse_position(r: dict) -> AlpacaPosition:
+    return AlpacaPosition(
+        asset_id=r.get("asset_id", ""),
+        symbol=r.get("symbol", ""),
+        exchange=r.get("exchange"),
+        asset_class=r.get("asset_class") or r.get("class"),
+        qty=r.get("qty"),
+        avg_entry_price=r.get("avg_entry_price"),
+        side=r.get("side"),
+        market_value=r.get("market_value"),
+        cost_basis=r.get("cost_basis"),
+        unrealized_pl=r.get("unrealized_pl"),
+        current_price=r.get("current_price"),
+        lastday_price=r.get("lastday_price"),
+        change_today=r.get("change_today"),
     )
 
 

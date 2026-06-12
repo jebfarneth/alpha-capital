@@ -2084,6 +2084,53 @@ class ForwardReturnObservationEvent(Base):
 
 
 # ---------------------------------------------------------------------------
+# paper_execution_events (append-only, content-idempotent)
+# ---------------------------------------------------------------------------
+class PaperExecutionEvent(Base):
+    """Paper-trading decision and order telemetry for live-leg experiments."""
+
+    __tablename__ = "paper_execution_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_hash",
+            name="ux_paper_execution_events_content_hash",
+        ),
+        Index(
+            "ix_paper_execution_events_pattern_ticker_time",
+            "pattern_id",
+            "ticker",
+            "wall_timestamp",
+        ),
+        Index(
+            "ix_paper_execution_events_event_type",
+            "event_type",
+        ),
+        Index(
+            "ix_paper_execution_events_client_order",
+            "client_order_id",
+        ),
+    )
+
+    paper_execution_event_id = Column(String, primary_key=True, default=_uuid)
+    ticker = Column(String, nullable=False)
+    pattern_id = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    event_date = Column(Date, nullable=False)
+    gate_values_json = Column(Text, nullable=True)
+    event_payload_json = Column(Text, nullable=True)
+    data_timestamp = Column(DateTime(timezone=True), nullable=True)
+    wall_timestamp = Column(DateTime(timezone=True), nullable=False)
+    decision_price = Column(Float, nullable=True)
+    broker_order_id = Column(String, nullable=True)
+    client_order_id = Column(String, nullable=True)
+    fill_price = Column(Float, nullable=True)
+    fill_qty = Column(Float, nullable=True)
+    lineage_hash = Column(String, nullable=True)
+    content_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
 # trade_candidates
 # ---------------------------------------------------------------------------
 class TradeCandidate(Base):
