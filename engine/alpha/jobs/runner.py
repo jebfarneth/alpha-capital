@@ -80,14 +80,20 @@ def run_job(
         result = job.run(ctx)
     except KeyboardInterrupt as exc:
         session.rollback()
+        partial_metrics = getattr(job, "partial_metrics", None)
+        metrics = partial_metrics if isinstance(partial_metrics, dict) else {}
         result = JobResult(
             status="failed",
+            metrics=metrics,
             errors=[{"exception": str(exc), "traceback": traceback.format_exc()}],
         )
     except Exception as exc:
         session.rollback()
+        partial_metrics = getattr(job, "partial_metrics", None)
+        metrics = partial_metrics if isinstance(partial_metrics, dict) else {}
         result = JobResult(
             status="failed",
+            metrics=metrics,
             errors=[{"exception": str(exc), "traceback": traceback.format_exc()}],
         )
 

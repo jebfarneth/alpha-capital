@@ -12,7 +12,9 @@ from alpha.data.fmp import FmpBar
 from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
     DataLineage,
+    EvidenceJobRun,
     FeatureSnapshot,
+    FmpDelistedCompanyRecord,
     HistoricalUniverseReconstruction,
     IntradayEventDetail,
     SignalRegistry,
@@ -144,7 +146,7 @@ def _daily_bars(
     if include_weekend_duplicate:
         bars.append(_daily_bar(date(2026, 2, 22), prior_close, close=prior_close, volume=100_000))
     bars.append(_daily_bar(DAY, ticker_open, close=ticker_close, volume=volume))
-    next_day = next_us_equity_session(DAY)
+    next_day = next_us_equity_session(DAY + timedelta(days=1))
     bars.append(_daily_bar(next_day, ticker_close + 0.2, close=ticker_close + 0.4, volume=volume))
     return sorted(bars, key=lambda bar: bar.date)
 
@@ -218,7 +220,16 @@ def _minute_bar(
     )
 
 
-def _run_i12(db_session, *, ticker: str = "TEST", daily=None, minutes=None, classifications=None):
+def _run_i12(
+    db_session,
+    *,
+    ticker: str = "TEST",
+    daily=None,
+    minutes=None,
+    classifications=None,
+    run_timestamp=None,
+    progress_callback=None,
+):
     _seed_hur(db_session, ticker)
     if classifications is None:
         classifications = {ticker: _classification()}
@@ -229,6 +240,8 @@ def _run_i12(db_session, *, ticker: str = "TEST", daily=None, minutes=None, clas
         start_date=DAY,
         end_date=DAY,
         classification_records=classifications,
+        run_timestamp=run_timestamp,
+        progress_callback=progress_callback,
     )
     return run_job(db_session, job)
 
@@ -257,6 +270,35 @@ def _run_i12_with_polygon(
     return run_job(db_session, job)
 
 
+def _seed_delisted(db_session, ticker: str, delisted_date: date, *, suffix: str = "") -> None:
+    db_session.add(
+        FmpDelistedCompanyRecord(
+            fmp_delisted_company_id=f"delisted-{ticker}-{delisted_date}{suffix}",
+            symbol=ticker,
+            normalized_symbol=ticker.upper(),
+            company_name=f"{ticker} Inc.",
+            exchange="NASDAQ",
+            exchange_key="NASDAQ",
+            ipo_date=date(2020, 1, 1),
+            delisted_date=delisted_date,
+            delisted_date_key=delisted_date.isoformat(),
+            source="fixture",
+            source_endpoint="/stable/delisted-companies",
+            page_number=0,
+            page_limit=0,
+            page_row_index=0,
+            row_status="active",
+            exchange_relevance_status="us_listed_relevant",
+            raw_payload_hash=stable_hash({
+                "ticker": ticker,
+                "delisted_date": delisted_date.isoformat(),
+                "suffix": suffix,
+            }),
+        )
+    )
+    db_session.flush()
+
+
 def _assert_feature_json_pit_pure(payload, path=()):
     if path and path[0] in {"candidate_screen", "pit_caveats"}:
         return
@@ -278,6 +320,11 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
     assert signal.signal_horizon == "0d"
     assert signal.forward_return_status == "computed"
     assert signal.raw_expected_edge == 0.0
+    assert signal.point_in_time_passed is False
+    assert signal.lookahead_guard_passed is True
+    feature_snapshot = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    assert feature_snapshot.point_in_time_passed is False
+    assert feature_snapshot.lookahead_guard_passed is True
     detail = db_session.query(IntradayEventDetail).filter_by(ticker="TEST").one()
     assert detail.signal_id == signal.signal_id
     assert detail.outcome == OUTCOME_CONFIRMED
@@ -299,6 +346,89 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
     assert second.metrics["reused_details"] == 1
     assert db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").count() == 1
     assert db_session.query(IntradayEventDetail).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+
+
+def test_i12_corpus_ret_next_open_uses_next_session_open(db_session):
+    result = _run_i12(db_session)
+
+    assert result.status == "finished"
+    detail = db_session.query(IntradayEventDetail).one()
+    next_session_open = 11.2
+    assert detail.next_open_price == pytest.approx(next_session_open)
+    assert detail.ret_next_open == pytest.approx((next_session_open / detail.entry_price) - 1.0)
+    assert detail.ret_next_open != pytest.approx(0.0)
+
+
+def test_i12_corpus_final_session_range_fetches_next_open(db_session):
+    result = _run_i12(db_session)
+
+    assert result.status == "finished"
+    detail = db_session.query(IntradayEventDetail).one()
+    assert detail.next_open_price == pytest.approx(11.2)
+    assert detail.ret_next_open is not None
+
+
+def test_i12_corpus_sessions_to_delist_counts_future_weekend_delist(db_session):
+    _seed_delisted(db_session, "TEST", date(2026, 6, 6))
+
+    result = _run_i12(db_session)
+
+    assert result.status == "finished"
+    detail = db_session.query(IntradayEventDetail).one()
+    assert detail.sessions_to_delist == 2
+    labels = json.loads(detail.label_json)
+    assert labels["sessions_to_delist"] == 2
+
+
+def test_i12_corpus_sessions_to_delist_uses_future_reused_ticker_row(db_session):
+    _seed_delisted(db_session, "TEST", date(2024, 1, 5), suffix="-old")
+    _seed_delisted(db_session, "TEST", date(2026, 6, 8), suffix="-future")
+
+    result = _run_i12(db_session)
+
+    assert result.status == "finished"
+    detail = db_session.query(IntradayEventDetail).one()
+    assert detail.sessions_to_delist == 3
+
+
+def test_i12_corpus_lineage_uses_run_timestamp(db_session):
+    run_timestamp = datetime(2026, 6, 12, 8, 0, tzinfo=timezone.utc)
+
+    result = _run_i12(db_session, run_timestamp=run_timestamp)
+
+    assert result.status == "finished"
+    rows = db_session.query(DataLineage).all()
+    assert rows
+    for row in rows:
+        request_timestamp = row.request_timestamp
+        asof_timestamp = row.asof_timestamp
+        if request_timestamp.tzinfo is None:
+            request_timestamp = request_timestamp.replace(tzinfo=timezone.utc)
+        if asof_timestamp.tzinfo is None:
+            asof_timestamp = asof_timestamp.replace(tzinfo=timezone.utc)
+        assert request_timestamp == run_timestamp
+        assert asof_timestamp == run_timestamp
+
+
+def test_i12_corpus_failed_run_records_partial_metrics_and_heartbeat(db_session):
+    events = []
+    result = _run_i12(
+        db_session,
+        classifications={},
+        progress_callback=lambda event, payload: events.append((event, dict(payload))),
+    )
+
+    assert result.status == "failed"
+    assert "not covered by the I12 exclusion artifact" in result.errors[0]["exception"]
+    assert any(event == "ticker_day_progress" for event, _payload in events)
+    run = (
+        db_session.query(EvidenceJobRun)
+        .order_by(EvidenceJobRun.started_at.desc())
+        .first()
+    )
+    metrics = json.loads(run.metric_json)
+    assert metrics["ticker_days_scanned"] == 1
+    assert metrics["trading_date_count"] == 1
 
 
 def test_i12_corpus_non_candidate_does_not_fetch_minutes_or_write_detail(db_session):

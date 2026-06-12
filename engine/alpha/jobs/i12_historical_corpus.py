@@ -7,9 +7,18 @@ lifecycle rows, including non-entry controls, are persisted to
 the forward-return clock. Persisted event rows are conditioned on a daily
 candidate screen, including a full-day volume-ratio floor that is deliberately
 not point-in-time. That keeps the historical control class tractable and
-comparable to the validated research set. Premarket poison gaps that pass this
-same volume floor are retained as daily-only controls without Polygon minute
-fetches. Both caveats are stamped into every feature payload.
+comparable to the validated research set, but confirmed registry rows and
+feature snapshots therefore set ``point_in_time_passed=False`` while retaining
+``lookahead_guard_passed=True`` for the ex-label feature payload itself.
+Premarket poison gaps that pass this same volume floor are retained as
+daily-only controls without Polygon minute fetches. Both caveats are stamped
+into every feature payload.
+
+Security-type classification intentionally reuses the M4-labeled exclusion
+artifact, extended to cover all public HUR-included symbols. This job only
+loads tickers from ``historical_universe_reconstructions`` rows with
+``inclusion_status='included'``; a non-HUR ticker reaching classification is a
+job invariant violation.
 """
 
 from __future__ import annotations
@@ -78,9 +87,11 @@ CANDIDATE_SCREEN_STAMP = {
     "drawdown_max": -0.50,
     "gap_band": [-0.05, 0.05],
     "full_day_vr_floor": CANDIDATE_FULL_DAY_VR_FLOOR,
+    "selection_uses_full_day_volume": True,
     "caveat": "full_day_vr_floor_is_candidate_conditioning_not_pit",
     "poison_gap_controls": "gap_below_-0.05_retained_as_poison_premarket_when_volume_screen_passes",
 }
+PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS = 250
 
 ProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
@@ -272,6 +283,11 @@ class I12HistoricalCorpusJob(BaseJob):
         self._polygon_rate_limit_per_minute = polygon_rate_limit_per_minute
         self._last_polygon_fetch_monotonic: float | None = None
         self._progress_callback = progress_callback
+        self._latest_metrics: dict[str, Any] = {}
+
+    @property
+    def partial_metrics(self) -> dict[str, Any]:
+        return dict(self._latest_metrics)
 
     def run(self, ctx: JobContext) -> JobResult:
         counters = _RunCounters()
@@ -313,10 +329,26 @@ class I12HistoricalCorpusJob(BaseJob):
                 })
                 continue
             for trading_date in batch_dates:
+                hur_members = set(hur_rows[trading_date])
                 for ticker in hur_rows[trading_date]:
                     counters.ticker_days_scanned += 1
+                    if counters.ticker_days_scanned == 1 or (
+                        counters.ticker_days_scanned
+                        % PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS
+                        == 0
+                    ):
+                        self._progress("ticker_day_progress", {
+                            "ticker_days_scanned": counters.ticker_days_scanned,
+                            "trading_date": trading_date.isoformat(),
+                            "ticker": ticker,
+                            "metrics": self._metrics(counters, trading_dates=trading_dates),
+                        })
                     try:
-                        sec = _classification_for(classifications, ticker)
+                        sec = _classification_for_hur_ticker(
+                            classifications,
+                            ticker,
+                            hur_included=ticker in hur_members,
+                        )
                     except ExclusionArtifactError as exc:
                         raise
                     if sec.ml_excluded:
@@ -426,7 +458,7 @@ class I12HistoricalCorpusJob(BaseJob):
     ) -> _DailyTickerInput:
         if ticker not in daily_cache:
             from_date = self._start_date - timedelta(days=460)
-            to_date = next_us_equity_session(self._end_date)
+            to_date = next_us_equity_session(self._end_date + timedelta(days=1))
             resp = self._fmp.get_historical_price(
                 ticker,
                 from_date=from_date,
@@ -450,6 +482,7 @@ class I12HistoricalCorpusJob(BaseJob):
                 trading_date=trading_date,
                 bars=[_daily_payload(bar) for bar in bars],
                 job_run_id=job_run_id,
+                run_timestamp=self._run_timestamp,
             )
             daily_cache[ticker] = (tuple(bars), lineage)
         daily_bars, daily_lineage = daily_cache[ticker]
@@ -515,6 +548,7 @@ class I12HistoricalCorpusJob(BaseJob):
                 trading_date=trading_date,
                 bars=[_minute_payload(bar) for bar in minutes],
                 job_run_id=job_run_id,
+                run_timestamp=self._run_timestamp,
             )
             minute_cache[minute_key] = (tuple(minutes), lineage)
         minute_bars, minute_lineage = minute_cache[minute_key]
@@ -533,16 +567,23 @@ class I12HistoricalCorpusJob(BaseJob):
     def _sessions_to_delist(self, ticker: str, trading_date: date) -> int | None:
         row = (
             self._session.query(FmpDelistedCompanyRecord.delisted_date)
-            .filter(FmpDelistedCompanyRecord.normalized_symbol == ticker.upper())
+            .filter(
+                FmpDelistedCompanyRecord.normalized_symbol == ticker.upper(),
+                FmpDelistedCompanyRecord.delisted_date.isnot(None),
+                FmpDelistedCompanyRecord.delisted_date >= trading_date,
+            )
             .order_by(FmpDelistedCompanyRecord.delisted_date.asc())
             .first()
         )
-        if row is None or row[0] is None or row[0] < trading_date:
+        if row is None or row[0] is None:
+            return None
+        target = _last_us_equity_session_on_or_before(row[0])
+        if target < trading_date:
             return None
         sessions = 0
         cursor = trading_date
-        while cursor < row[0]:
-            cursor = next_us_equity_session(cursor)
+        while cursor < target:
+            cursor = next_us_equity_session(cursor + timedelta(days=1))
             sessions += 1
         return sessions
 
@@ -612,7 +653,7 @@ class I12HistoricalCorpusJob(BaseJob):
                     job_run_id=job_run_id,
                     feature_manifest_version=FEATURE_MANIFEST_VERSION,
                     fidelity_tier="historical_intraday_replay",
-                    point_in_time_passed=True,
+                    point_in_time_passed=False,
                     lookahead_guard_passed=True,
                     input_hashes={"i12_corpus_event_input": event.input_hash},
                 )
@@ -637,7 +678,7 @@ class I12HistoricalCorpusJob(BaseJob):
                     trading_date=event.trading_date.isoformat(),
                     next_execution_session=event.trading_date.isoformat(),
                     detector_version=RECONSTRUCTION_METHOD,
-                    point_in_time_passed=True,
+                    point_in_time_passed=False,
                     lookahead_guard_passed=True,
                     signal_event_sequence=1,
                     signal_identity_hash=event.signal_identity_hash,
@@ -742,6 +783,9 @@ class I12HistoricalCorpusJob(BaseJob):
         }
 
     def _progress(self, event: str, payload: Mapping[str, Any]) -> None:
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            self._latest_metrics = dict(metrics)
         if self._progress_callback is not None:
             self._progress_callback(event, payload)
 
@@ -904,7 +948,7 @@ def _evaluate_i12_poison_premarket(
     day_bar = daily_context.day_bar
     sub_dollar = day_bar.open < 1.0
     full_day_volume_ratio = daily_context.full_day_volume_ratio
-    next_session = next_us_equity_session(inp.trading_date)
+    next_session = next_us_equity_session(inp.trading_date + timedelta(days=1))
     next_open_price = (
         daily_by_date[next_session].open
         if next_session in daily_by_date else None
@@ -1030,9 +1074,10 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
     sub_dollar = day_bar.open < 1.0
     full_day_volume_ratio = daily_context.full_day_volume_ratio
     session_close_price = day_bar.close
+    next_session = next_us_equity_session(inp.trading_date + timedelta(days=1))
     next_open_price = (
-        daily_by_date[next_us_equity_session(inp.trading_date)].open
-        if next_us_equity_session(inp.trading_date) in daily_by_date else None
+        daily_by_date[next_session].open
+        if next_session in daily_by_date else None
     )
     ret_open_close = _safe_return(session_close_price, day_bar.open)
     cumulative_volume = 0.0
@@ -1400,6 +1445,7 @@ def _record_bars_lineage(
     trading_date: date,
     bars: list[dict[str, Any]],
     job_run_id: str,
+    run_timestamp: datetime,
 ) -> DataLineage:
     payload = {
         "ticker": ticker,
@@ -1429,8 +1475,8 @@ def _record_bars_lineage(
         session,
         provider=provider,
         endpoint=endpoint,
-        request_timestamp=utcnow(),
-        asof_timestamp=utcnow(),
+        request_timestamp=run_timestamp,
+        asof_timestamp=run_timestamp,
         raw_payload_hash=raw_payload_hash,
         raw_payload=None,
         data_quality_flags=data_quality_flags,
@@ -1486,6 +1532,27 @@ def _classification_for(
             f"ticker {normalized!r} is not covered by the I12 exclusion artifact"
         )
     return classifications[normalized]
+
+
+def _classification_for_hur_ticker(
+    classifications: Mapping[str, SecurityTypeClassification],
+    ticker: str,
+    *,
+    hur_included: bool,
+) -> SecurityTypeClassification:
+    if not hur_included:
+        raise RuntimeError(
+            "i12_non_hur_ticker_reached_security_type_lookup: "
+            f"ticker={ticker.upper()}"
+        )
+    return _classification_for(classifications, ticker)
+
+
+def _last_us_equity_session_on_or_before(day: date) -> date:
+    cursor = day
+    while not is_us_equity_session(cursor):
+        cursor -= timedelta(days=1)
+    return cursor
 
 
 def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None:
