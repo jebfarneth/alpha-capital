@@ -73,10 +73,12 @@ class TestArtifactIntegrity:
     def test_metadata_documents_pit_caveat_window_and_generator(self):
         meta = ste.load_artifact_metadata()
         assert "retroactively" in meta["pit_caveat"]
-        assert meta["corpus_window"]["pattern_id"] == "M4"
+        assert meta["artifact"] == "m4_corpus_security_types_v8.csv"
+        assert meta["corpus_window"]["pattern_id"] == "M4+HUR"
         assert meta["corpus_window"]["trading_date_min"] == "2024-01-01"
         assert "generate_m4_security_type_artifact" in meta["generator"]
-        assert "signal_registry" in meta["corpus_query"]
+        assert "historical_universe_reconstructions" in meta["corpus_query"]
+        assert "HUR included ticker" in meta["semantics"]["row_coverage"]
 
     def test_metadata_totals_consistent_with_artifact(self):
         meta = ste.load_artifact_metadata()

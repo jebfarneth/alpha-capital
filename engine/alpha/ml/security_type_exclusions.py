@@ -1,12 +1,12 @@
-"""Mark-don't-delete ML exclusion metadata for the M4 historical corpus.
+"""Mark-don't-delete ML exclusion metadata for historical ML corpora.
 
-The 2024-2026 historical M4 corpus was generated through historical universe
-reconstruction, which (unlike the live universe builder) carries no
-security-type exclusion. A read-only quantification with the
-security_type_v7 classifier records, for EVERY ticker with at least one M4
-signal in the corpus window, whether it is a common stock or a non-common
-instrument (SPAC shell, ETF, mutual fund, ADR, preferred, exchange-traded
-debt, warrant/unit/right series, BDC, CEF).
+The 2024-2026 historical M4 corpus and the I12 historical corpus source their
+tickers through historical universe reconstruction, which (unlike the live
+universe builder) carries no security-type exclusion. A read-only
+quantification with the security_type_v7 classifier records, for EVERY ticker
+in the M4 corpus artifact or included by HUR, whether it is a common stock or a
+non-common instrument (SPAC shell, ETF, mutual fund, ADR, preferred,
+exchange-traded debt, warrant/unit/right series, BDC, CEF).
 
 Policy: signal_registry rows are NEVER deleted or mutated for this. The
 classification artifact in alpha/ml/data/ is the durable exclusion record;
@@ -55,8 +55,8 @@ from alpha.jobs.security_type import (
 )
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
-CLASSIFICATION_ARTIFACT_PATH = _DATA_DIR / "m4_corpus_security_types_v7.csv"
-CLASSIFICATION_METADATA_PATH = _DATA_DIR / "m4_corpus_security_types_v7.meta.json"
+CLASSIFICATION_ARTIFACT_PATH = _DATA_DIR / "m4_corpus_security_types_v8.csv"
+CLASSIFICATION_METADATA_PATH = _DATA_DIR / "m4_corpus_security_types_v8.meta.json"
 
 VALID_ARTIFACT_TYPES = frozenset({COMMON_STOCK}) | NON_COMMON_TYPES
 
@@ -184,7 +184,7 @@ def _validate_against_metadata(
 
 @lru_cache(maxsize=1)
 def load_classifications() -> Dict[str, SecurityTypeClassification]:
-    """Ticker -> classification for every ticker in the historical M4 corpus."""
+    """Ticker -> classification for every ticker covered by the corpus artifact."""
     meta = _verify_artifact()
     out: Dict[str, SecurityTypeClassification] = {}
     previous_ticker: str | None = None

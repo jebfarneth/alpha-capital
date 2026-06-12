@@ -585,6 +585,7 @@ class TestSchemaCompleteness:
             "m2_sec_fetch_coverage",
             "fmp_delisted_companies",
             "historical_universe_reconstructions",
+            "intraday_event_details",
             "m2_insider_classifications",
             "m2_cluster_members",
             "firm_sector_assignments_history",

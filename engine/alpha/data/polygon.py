@@ -1477,6 +1477,25 @@ class PolygonAdapter:
     ) -> AdapterResponse[List[PolygonBar]]:
         """Fetch today's minute aggregate bars for one ticker."""
 
+        return self.get_minute_aggs(
+            ticker=ticker,
+            from_date=trading_date,
+            to_date=trading_date,
+            limit=limit,
+            adjusted=adjusted,
+        )
+
+    def get_minute_aggs(
+        self,
+        ticker: str,
+        from_date: str,
+        to_date: str,
+        limit: int = 50000,
+        *,
+        adjusted: bool = True,
+    ) -> AdapterResponse[List[PolygonBar]]:
+        """Fetch minute aggregate bars for one ticker and date range."""
+
         endpoint_prefix = "/v2/aggs/ticker"
         normalized_ticker, ticker_error = _normalize_polygon_path_ticker(
             ticker,
@@ -1486,16 +1505,24 @@ class PolygonAdapter:
             return ticker_error  # type: ignore[return-value]
         date_error = _validate_iso_date_params(
             endpoint=endpoint_prefix,
-            date_fields={"trading_date": trading_date},
+            date_fields={"from_date": from_date, "to_date": to_date},
             asof=None,
         )
         if date_error is not None:
             return date_error  # type: ignore[return-value]
 
-        date_text = _str_or_none(trading_date) or ""
+        from_text = _str_or_none(from_date) or ""
+        to_text = _str_or_none(to_date) or ""
+        if date.fromisoformat(from_text) > date.fromisoformat(to_text):
+            return _provider_error_response(
+                endpoint=endpoint_prefix,
+                error_type="validation",
+                message="Polygon minute aggs from_date must be on or before to_date",
+                retryable=False,
+            )
         endpoint = (
             f"/v2/aggs/ticker/{normalized_ticker}/range/1/minute/"
-            f"{date_text}/{date_text}"
+            f"{from_text}/{to_text}"
         )
         params: Dict[str, Any] = {
             "limit": limit,

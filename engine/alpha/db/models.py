@@ -1390,6 +1390,15 @@ class SignalRegistry(Base):
             "signal_identity_hash",
             unique=True,
         ),
+        Index(
+            "ux_signal_registry_i12_pattern_ticker_trading_date",
+            "pattern_id",
+            "ticker",
+            "trading_date",
+            unique=True,
+            sqlite_where=text("pattern_id = 'I12'"),
+            postgresql_where=text("pattern_id = 'I12'"),
+        ),
     )
 
     signal_id = Column(String, primary_key=True, default=_uuid)
@@ -1445,6 +1454,9 @@ class SignalRegistry(Base):
     )
     market_path_features = relationship(
         "MarketPathFeature", back_populates="signal"
+    )
+    intraday_event_details = relationship(
+        "IntradayEventDetail", back_populates="signal"
     )
 
 
@@ -2128,6 +2140,106 @@ class PaperExecutionEvent(Base):
     lineage_hash = Column(String, nullable=True)
     content_hash = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# intraday_event_details
+# ---------------------------------------------------------------------------
+class IntradayEventDetail(Base):
+    """Durable historical intraday lifecycle rows for I-track corpora."""
+
+    __tablename__ = "intraday_event_details"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_identity_hash",
+            name="ux_intraday_event_details_identity",
+        ),
+        Index(
+            "ix_intraday_event_details_pattern_date",
+            "pattern_id",
+            "trading_date",
+        ),
+        Index(
+            "ix_intraday_event_details_pattern_ticker_date",
+            "pattern_id",
+            "ticker",
+            "trading_date",
+        ),
+        Index(
+            "ix_intraday_event_details_signal_id",
+            "signal_id",
+        ),
+        Index(
+            "ix_intraday_event_details_outcome",
+            "outcome",
+        ),
+    )
+
+    intraday_event_detail_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=True)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    trading_date = Column(Date, nullable=False)
+    outcome = Column(String, nullable=False)
+    event_identity_hash = Column(String, nullable=False)
+    input_hash = Column(String, nullable=False)
+    output_hash = Column(String, nullable=False)
+    data_lineage_ids_json = Column(Text, nullable=True)
+    gate_values_json = Column(Text, nullable=True)
+    feature_json = Column(Text, nullable=True)
+    label_json = Column(Text, nullable=True)
+    artifact_flags_json = Column(Text, nullable=True)
+    quarantine_reason = Column(String, nullable=True)
+
+    confirmation_timestamp = Column(DateTime(timezone=True), nullable=True)
+    entry_timestamp = Column(DateTime(timezone=True), nullable=True)
+    exit_timestamp = Column(DateTime(timezone=True), nullable=True)
+    conf_minute = Column(Integer, nullable=True)
+    entry_minute = Column(Integer, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    session_open_price = Column(Float, nullable=True)
+    session_close_price = Column(Float, nullable=True)
+    next_open_price = Column(Float, nullable=True)
+    projected_vol_at_conf = Column(Float, nullable=True)
+    projected_vol_ratio_at_conf = Column(Float, nullable=True)
+    full_day_volume_ratio = Column(Float, nullable=True)
+    chase_pct = Column(Float, nullable=True)
+    gap_pct = Column(Float, nullable=True)
+    distance_from_max252 = Column(Float, nullable=True)
+    ret_conf = Column(Float, nullable=True)
+    ret_open_close = Column(Float, nullable=True)
+    ret_open_close_leaky_research_only = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    ret_next_open = Column(Float, nullable=True)
+    mae_pct = Column(Float, nullable=True)
+    mfe_pct = Column(Float, nullable=True)
+    halted = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    sub_dollar_at_open = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    split_basis_mismatch = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    is_ml_excluded = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    ml_exclusion_reason = Column(String, nullable=False)
+    security_type = Column(String, nullable=False)
+    sessions_to_delist = Column(Integer, nullable=True)
+    sessions_to_delist_not_pit = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal = relationship("SignalRegistry", back_populates="intraday_event_details")
 
 
 # ---------------------------------------------------------------------------

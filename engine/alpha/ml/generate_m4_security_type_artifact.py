@@ -1,10 +1,10 @@
-"""Generate the M4 corpus security-type classification artifact (read-only).
+"""Generate the historical corpus security-type classification artifact.
 
-Produces alpha/ml/data/m4_corpus_security_types_v7.csv and its sidecar
-metadata for consumption by alpha.ml.security_type_exclusions. The corpus
-database is only ever read (signal counts per ticker/month and the
-fmp_delisted_companies directory); classification inputs come from the live
-FMP profile endpoint. The only writes are the two artifact files.
+Produces alpha/ml/data/m4_corpus_security_types_v8.csv and its sidecar
+metadata for consumption by alpha.ml.security_type_exclusions. The database is
+only ever read (the previous v7 artifact, historical universe reconstruction,
+and the fmp_delisted_companies directory); classification inputs come from the
+live FMP profile endpoint. The only writes are the two v8 artifact files.
 
 Resolution order per ticker:
 1. FMP /stable/profile, classified with the live classifier
@@ -29,6 +29,7 @@ import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from sqlalchemy import create_engine, text
@@ -45,15 +46,21 @@ from alpha.ml.security_type_exclusions import (
 )
 
 CORPUS_WINDOW = {
-    "pattern_id": "M4",
+    "pattern_id": "M4+HUR",
     "trading_date_min": "2024-01-01",
     "trading_date_max": "2026-06-30",
 }
-CORPUS_QUERY = """select left(trading_date,7) as month, ticker, count(*)
-    from signal_registry
-    where pattern_id = :pattern_id
-      and trading_date between :trading_date_min and :trading_date_max
-    group by 1, 2"""
+PRIOR_ARTIFACT_PATH = (
+    Path(__file__).resolve().parent / "data" / "m4_corpus_security_types_v7.csv"
+)
+PRIOR_METADATA_PATH = (
+    Path(__file__).resolve().parent / "data" / "m4_corpus_security_types_v7.meta.json"
+)
+HUR_INCLUDED_QUERY = """select normalized_symbol, count(*)
+    from historical_universe_reconstructions
+    where inclusion_status = 'included'
+      and normalized_symbol is not null
+    group by 1"""
 PROFILE_FETCH_ATTEMPTS = 3
 PROFILE_FETCH_BACKOFF_SECONDS = 2.0
 
@@ -121,31 +128,52 @@ def _classify_from_delisted_directory(
     return out
 
 
+def _load_prior_artifact() -> Tuple[Counter, Dict[str, Tuple[str, str]]]:
+    if not PRIOR_ARTIFACT_PATH.exists():
+        return Counter(), {}
+    counts: Counter = Counter()
+    classified: Dict[str, Tuple[str, str]] = {}
+    with open(PRIOR_ARTIFACT_PATH, "r", newline="") as f:
+        for row in csv.DictReader(f):
+            ticker = (row.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            counts[ticker] += int(row["signals"])
+            classified[ticker] = (
+                (row.get("security_type") or "").strip(),
+                (row.get("reason") or "").strip(),
+            )
+    return counts, classified
+
+
 def generate() -> dict:
     api_key = os.environ["FMP_API_KEY"]
     engine = create_engine(os.environ["DATABASE_URL"])
+    counts, _prior_classified = _load_prior_artifact()
+    prior_artifact_tickers = set(counts)
     with engine.connect() as conn:
-        db_rows = conn.execute(
-            text(CORPUS_QUERY), CORPUS_WINDOW
-        ).fetchall()
-        counts: Counter = Counter()
-        month_totals: Counter = Counter()
-        ticker_months: Dict[str, Counter] = {}
-        for month, ticker, n in db_rows:
-            counts[ticker] += n
-            month_totals[month] += n
-            ticker_months.setdefault(ticker, Counter())[month] += n
+        hur_rows = conn.execute(text(HUR_INCLUDED_QUERY)).fetchall()
+        for ticker, n in hur_rows:
+            normalized = str(ticker).strip().upper()
+            if normalized:
+                counts[normalized] += int(n)
         tickers = sorted(counts)
-        print(f"corpus tickers: {len(tickers)}, signals: {sum(counts.values())}")
+        tickers_to_classify = list(tickers)
+        print(
+            "artifact tickers: "
+            f"{len(tickers)}, coverage rows: {sum(counts.values())}, "
+            f"prior artifact tickers: {len(prior_artifact_tickers)}, "
+            f"classifications needed: {len(tickers_to_classify)}"
+        )
 
         with ThreadPoolExecutor(max_workers=10) as ex:
             profiles = dict(
-                ex.map(lambda t: (t, _fetch_profile(t, api_key)), tickers)
+                ex.map(lambda t: (t, _fetch_profile(t, api_key)), tickers_to_classify)
             )
 
         classified: Dict[str, Tuple[str, str]] = {}
         missing = []
-        for ticker in tickers:
+        for ticker in tickers_to_classify:
             raw = profiles[ticker]
             if raw is None:
                 missing.append(ticker)
@@ -184,11 +212,6 @@ def generate() -> dict:
     sha = hashlib.sha256(CLASSIFICATION_ARTIFACT_PATH.read_bytes()).hexdigest()
 
     excluded = [r for r in rows if r["security_type"] in NON_COMMON_TYPES]
-    excluded_set = {r["ticker"] for r in excluded}
-    month_excluded: Counter = Counter()
-    for ticker in excluded_set:
-        for month, n in ticker_months[ticker].items():
-            month_excluded[month] += n
     total_signals = sum(counts.values())
     excluded_signals = sum(r["signals"] for r in excluded)
     by_type: Counter = Counter()
@@ -205,7 +228,11 @@ def generate() -> dict:
         "classified_asof": date.today().isoformat(),
         "corpus_window": CORPUS_WINDOW,
         "generator": "alpha/ml/generate_m4_security_type_artifact.py",
-        "corpus_query": " ".join(CORPUS_QUERY.split()),
+        "corpus_query": (
+            "prior_artifact="
+            f"{PRIOR_ARTIFACT_PATH.name}; hur_query="
+            f"{' '.join(HUR_INCLUDED_QUERY.split())}"
+        ),
         "resolution": (
             "FMP stable/profile (3 attempts, 2s backoff) -> "
             "fmp_delisted_companies name rules -> fail on unresolved"
@@ -218,9 +245,14 @@ def generate() -> dict:
                 "training-set assembly via alpha.ml.security_type_exclusions"
             ),
             "row_coverage": (
-                "every ticker with >=1 M4 signal in corpus_window; zero "
-                "unresolved/no_profile rows (generation fails otherwise)"
+                "union of the current artifact plus every HUR included ticker; "
+                "zero unresolved/no_profile rows (generation fails otherwise)"
             ),
+        },
+        "prior_artifact": {
+            "path": PRIOR_ARTIFACT_PATH.name,
+            "metadata_path": PRIOR_METADATA_PATH.name,
+            "tickers": len(prior_artifact_tickers),
         },
         "pit_caveat": (
             "Security type is TODAY'S (classified_asof) profile applied "
@@ -240,10 +272,6 @@ def generate() -> dict:
         ),
         "excluded_signals_by_type": dict(by_type.most_common()),
         "excluded_signals_by_reason": dict(by_reason.most_common()),
-        "excluded_signals_by_month": {
-            m: {"excluded": month_excluded[m], "total": month_totals[m]}
-            for m in sorted(month_totals)
-        },
     }
 
     with open(CLASSIFICATION_METADATA_PATH, "w") as f:
