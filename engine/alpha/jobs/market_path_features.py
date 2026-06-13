@@ -2085,6 +2085,7 @@ def _bar_lineage_payload(
     feature_version: str,
     symbol_field: str,
     source_role: str | None = None,
+    reconstruction_method: str | None = None,
 ) -> dict[str, Any]:
     bar_payloads = [_bar_payload(bar) for bar in bars]
     payload: dict[str, Any] = {
@@ -2097,7 +2098,7 @@ def _bar_lineage_payload(
         "bars_payload_hash": stable_hash(bar_payloads),
         "lineage_payload_schema": "compact_bar_digest_v1",
         "feature_version": feature_version,
-        "reconstruction_method": RECONSTRUCTION_METHOD,
+        "reconstruction_method": reconstruction_method or RECONSTRUCTION_METHOD,
     }
     if source_role is not None:
         payload["source_role"] = source_role

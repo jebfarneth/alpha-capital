@@ -20,9 +20,11 @@ from sqlalchemy import (
     DateTime,
     DDL,
     Float,
+    ForeignKeyConstraint,
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -2017,6 +2019,156 @@ class MarketPathFeature(Base):
     )
 
     signal = relationship("SignalRegistry", back_populates="market_path_features")
+
+
+# ---------------------------------------------------------------------------
+# market_path_pre_signal_contexts
+# ---------------------------------------------------------------------------
+class MarketPathPreSignalContext(Base):
+    """Ticker-date keyed setup-path features before a signal fires.
+
+    These rows intentionally live outside ``market_path_features`` so predictor
+    rows cannot enter the forward-path rank population.
+    """
+
+    __tablename__ = "market_path_pre_signal_contexts"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "ticker",
+            "feature_session_date",
+            "feature_role",
+            "feature_version",
+            name="pk_market_path_pre_signal_contexts",
+        ),
+        Index(
+            "ix_market_path_pre_signal_contexts_date_status",
+            "feature_session_date",
+            "row_status",
+        ),
+        Index(
+            "ix_market_path_pre_signal_contexts_role_version",
+            "feature_role",
+            "feature_version",
+        ),
+        Index(
+            "ix_market_path_pre_signal_contexts_job_run",
+            "job_run_id",
+        ),
+    )
+
+    ticker = Column(String, nullable=False)
+    feature_session_date = Column(Date, nullable=False)
+    feature_role = Column(String, nullable=False)
+    feature_version = Column(String, nullable=False)
+    row_status = Column(String, nullable=False)
+    asof_timestamp = Column(DateTime(timezone=True), nullable=False)
+    reconstruction_method = Column(String, nullable=False)
+
+    previous_close = Column(Float, nullable=True)
+    open_price = Column(Float, nullable=True)
+    high_price = Column(Float, nullable=True)
+    low_price = Column(Float, nullable=True)
+    close_price = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    split_adjusted_close = Column(Float, nullable=True)
+    adj_close = Column(Float, nullable=True)
+    dollar_volume = Column(Float, nullable=True)
+    sub_dollar = Column(Boolean, nullable=True)
+
+    median_volume_20d = Column(Float, nullable=True)
+    median_dollar_volume_20d = Column(Float, nullable=True)
+    volume_expansion_20d = Column(Float, nullable=True)
+    return_1d = Column(Float, nullable=True)
+    return_5d = Column(Float, nullable=True)
+    return_20d = Column(Float, nullable=True)
+    sigma_20d = Column(Float, nullable=True)
+    range_contraction_ratio_60d = Column(Float, nullable=True)
+    volume_trend_slope_60d = Column(Float, nullable=True)
+    base_depth_60d = Column(Float, nullable=True)
+    base_length_60d = Column(Integer, nullable=True)
+    off_low252 = Column(Float, nullable=True)
+    dist_hi252 = Column(Float, nullable=True)
+
+    rank_status = Column(String, nullable=False)
+    retroactive_adjustment_caveat = Column(Boolean, nullable=False, default=True)
+    conditional_on_fire = Column(Boolean, nullable=False, default=True)
+    feature_json = Column(Text, nullable=False)
+    status_json = Column(Text, nullable=True)
+    source_provider = Column(String, nullable=False)
+    source_endpoint = Column(String, nullable=False)
+    data_lineage_id = Column(
+        String, ForeignKey("data_lineage.data_lineage_id"), nullable=True
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    input_hash = Column(String, nullable=False)
+    output_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal_links = relationship(
+        "MarketPathPreSignalLink",
+        back_populates="context",
+    )
+
+
+class MarketPathPreSignalLink(Base):
+    """Link fired signals to shared ticker-date pre-signal context rows."""
+
+    __tablename__ = "market_path_pre_signal_links"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "signal_id",
+            "feature_session_date",
+            "feature_role",
+            "feature_version",
+            name="pk_market_path_pre_signal_links",
+        ),
+        ForeignKeyConstraint(
+            ["ticker", "feature_session_date", "feature_role", "feature_version"],
+            [
+                "market_path_pre_signal_contexts.ticker",
+                "market_path_pre_signal_contexts.feature_session_date",
+                "market_path_pre_signal_contexts.feature_role",
+                "market_path_pre_signal_contexts.feature_version",
+            ],
+        ),
+        Index(
+            "ix_market_path_pre_signal_links_pattern_signal_date",
+            "pattern_id",
+            "signal_date",
+        ),
+        Index(
+            "ix_market_path_pre_signal_links_ticker_date",
+            "ticker",
+            "feature_session_date",
+        ),
+    )
+
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=False)
+    ticker = Column(String, nullable=False)
+    pattern_id = Column(String, nullable=False)
+    signal_date = Column(Date, nullable=False)
+    feature_session_date = Column(Date, nullable=False)
+    relative_session_index = Column(Integer, nullable=False)
+    feature_role = Column(String, nullable=False)
+    feature_version = Column(String, nullable=False)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    context = relationship(
+        "MarketPathPreSignalContext",
+        back_populates="signal_links",
+    )
+    signal = relationship("SignalRegistry")
 
 
 # ---------------------------------------------------------------------------

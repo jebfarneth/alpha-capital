@@ -575,6 +575,8 @@ class TestSchemaCompleteness:
             "feature_snapshots",
             "signal_registry",
             "market_path_features",
+            "market_path_pre_signal_contexts",
+            "market_path_pre_signal_links",
             "forward_return_observations",
             "forward_return_path_rows",
             "forward_context_path_rows",
