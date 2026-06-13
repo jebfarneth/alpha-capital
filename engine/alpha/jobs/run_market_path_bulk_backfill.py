@@ -500,6 +500,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             pattern_ids=self._pattern_ids,
             signal_start_date=self._signal_start_date,
             signal_end_date=self._signal_end_date,
+            through_date=self._through_date,
             feature_version=self._feature_version,
         )
         validation_seconds = time.perf_counter() - validation_started
@@ -744,29 +745,36 @@ def validate_market_path_bulk_backfill(
     pattern_ids: Sequence[str],
     signal_start_date: date,
     signal_end_date: date,
+    through_date: date,
     feature_version: str,
 ) -> dict[str, int]:
     params = {
         "patterns": tuple(pattern_ids),
         "signal_start": signal_start_date.isoformat(),
         "signal_end": signal_end_date.isoformat(),
+        "feature_start": signal_start_date.isoformat(),
+        "feature_through": through_date.isoformat(),
         "feature_version": feature_version,
     }
     scoped_filter = (
         "pattern_id IN :patterns "
         "AND signal_date >= :signal_start "
         "AND signal_date <= :signal_end "
+        "AND feature_session_date >= :feature_start "
+        "AND feature_session_date <= :feature_through "
         "AND feature_version = :feature_version"
     )
     duplicate_groups = session.execute(
         text(
             "SELECT COUNT(*) FROM ("
             "SELECT signal_id, feature_session_date, feature_version, COUNT(*) "
-            "FROM market_path_features "
+            "FROM market_path_features WHERE "
+            f"{scoped_filter} "
             "GROUP BY signal_id, feature_session_date, feature_version "
             "HAVING COUNT(*) > 1"
             ") d"
-        )
+        ).bindparams(bindparam("patterns", expanding=True)),
+        params,
     ).scalar()
     row = session.execute(
         text(
@@ -792,6 +800,8 @@ def validate_market_path_bulk_backfill(
             "WHERE pattern_id IN :patterns "
             "AND signal_date >= :signal_start "
             "AND signal_date <= :signal_end "
+            "AND feature_session_date >= :feature_start "
+            "AND feature_session_date <= :feature_through "
             "AND feature_version <> :feature_version"
         ).bindparams(bindparam("patterns", expanding=True)),
         params,

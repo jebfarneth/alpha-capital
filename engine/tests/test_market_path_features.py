@@ -32,6 +32,7 @@ from alpha.jobs.run_market_path_bulk_backfill import (
     _TimeoutRequestsSession,
     _validate_write_target,
     plan_bulk_batches,
+    validate_market_path_bulk_backfill,
 )
 from alpha.jobs.runner import run_job
 from alpha.market_calendar import is_us_equity_session
@@ -1378,6 +1379,61 @@ def test_market_path_bulk_backfill_plans_pattern_date_batches():
         ("M1", "2026-06-03", "2026-06-04"),
         ("M1", "2026-06-05", "2026-06-05"),
     ]
+
+
+def test_market_path_bulk_validation_queries_are_feature_session_range_scoped():
+    class _Result:
+        def __init__(self, *, scalar_value=0, row=None):
+            self._scalar_value = scalar_value
+            self._row = row
+
+        def scalar(self):
+            return self._scalar_value
+
+        def mappings(self):
+            return self
+
+        def one(self):
+            return self._row
+
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.calls.append((sql, dict(params or {})))
+            if "COUNT(*) AS scoped_feature_rows" in sql:
+                return _Result(row={
+                    "scoped_feature_rows": 0,
+                    "missing_lineage_hash_rows": 0,
+                    "prior_52w_high_rows": 0,
+                    "rank_populated_rows": 0,
+                    "pre_entry_leakage_rows": 0,
+                })
+            return _Result(scalar_value=0)
+
+    session = _Session()
+
+    metrics = validate_market_path_bulk_backfill(
+        session,
+        pattern_ids=("M4",),
+        signal_start_date=date(2024, 1, 1),
+        signal_end_date=date(2025, 12, 31),
+        through_date=date(2026, 1, 31),
+        feature_version="market_path_daily_v3",
+    )
+
+    assert metrics["duplicate_groups"] == 0
+    assert len(session.calls) == 3
+    for sql, params in session.calls:
+        assert "FROM market_path_features" in sql
+        assert "feature_session_date >= :feature_start" in sql
+        assert "feature_session_date <= :feature_through" in sql
+        assert params["feature_start"] == "2024-01-01"
+        assert params["feature_through"] == "2026-01-31"
+    duplicate_sql = session.calls[0][0]
+    assert "GROUP BY signal_id, feature_session_date, feature_version" in duplicate_sql
 
 
 def test_market_path_bulk_backfill_stage_merge_idempotent_and_deferred_rank(
