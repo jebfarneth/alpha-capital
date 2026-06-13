@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Guarded I12 historical corpus runner.
+"""Guarded I11 historical corpus runner.
 
-This runner is scratch-first. Writing to the public/default schema requires
-``--confirm-live-write`` and is intentionally deferred until external audit.
+This runner is scratch-first. Public/default writes are hard-refused until
+I12 public corpus completion plus external I11 pilot audit clears the
+sequencing gate; ``--confirm-live-write`` is intentionally inert for public.
 """
 
 from __future__ import annotations
@@ -25,13 +26,13 @@ from alpha.db.engine import (
     prepare_writable_schema_target,
     reset_globals,
 )
-from alpha.jobs.i12_historical_corpus import I12HistoricalCorpusJob, JOB_NAME
+from alpha.jobs.i11_historical_corpus import I11HistoricalCorpusJob, JOB_NAME
 from alpha.jobs.run_market_path_backfill import CachedHistoricalPriceFmpAdapter
 from alpha.jobs.runner import run_job
 from alpha.runtime_env import load_runtime_env
 
 
-I12_CORPUS_REQUIRED_TABLES = [
+I11_CORPUS_REQUIRED_TABLES = [
     "evidence_jobs",
     "evidence_job_runs",
     "data_lineage",
@@ -66,7 +67,7 @@ def _run_live(args: argparse.Namespace) -> int:
             prepare_writable_schema_target(
                 schema=target_schema,
                 create_tables=args.create_tables,
-                required_tables=I12_CORPUS_REQUIRED_TABLES,
+                required_tables=I11_CORPUS_REQUIRED_TABLES,
             )
         except (SchemaTargetError, ValueError) as exc:
             print(f"ERROR: {exc}")
@@ -109,7 +110,7 @@ def _run_live(args: argparse.Namespace) -> int:
             progress_artifact.write_text(json.dumps(artifact, indent=2, default=str))
 
     session = get_session()
-    job = I12HistoricalCorpusJob(
+    job = I11HistoricalCorpusJob(
         session=session,
         fmp_adapter=fmp_adapter,
         polygon_adapter=polygon_adapter,
@@ -120,6 +121,7 @@ def _run_live(args: argparse.Namespace) -> int:
         minute_cache_dir=args.polygon_cache_dir,
         polygon_rate_limit_per_minute=args.polygon_rate_limit_per_minute,
         progress_callback=progress,
+        catalyst_tags_by_ticker_date=_load_catalyst_tags_artifact(args.catalyst_tags_artifact),
     )
     try:
         result = run_job(
@@ -135,6 +137,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "polygon_cache_dir": args.polygon_cache_dir,
                 "polygon_rate_limit_per_minute": args.polygon_rate_limit_per_minute,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
+                "catalyst_tags_artifact": args.catalyst_tags_artifact,
             },
         )
     finally:
@@ -153,9 +156,9 @@ def _run_live(args: argparse.Namespace) -> int:
 
 def _validate_write_target(*, schema: str | None, confirm_live_write: bool) -> None:
     normalized = (schema or "").strip().lower()
-    if (schema is None or normalized == "public") and not confirm_live_write:
+    if schema is None or normalized == "public":
         raise ValueError(
-            "Refusing public/default I12 corpus write without --confirm-live-write"
+            "Refusing public/default I11 corpus write until pilot audit and public sequencing gates clear"
         )
 
 
@@ -169,8 +172,58 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _load_catalyst_tags_artifact(
+    path: str | None,
+) -> dict[tuple[str, date], list[str]]:
+    if not path:
+        return {}
+    with Path(path).open("r") as f:
+        raw = json.load(f)
+    out: dict[tuple[str, date], list[str]] = {}
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                raise ValueError("catalyst tag rows must be objects")
+            ticker = str(row.get("ticker") or row.get("symbol") or "").upper()
+            day_raw = row.get("trading_date") or row.get("date")
+            tags = row.get("tags") or row.get("catalyst_tags") or []
+            _add_catalyst_tags(out, ticker=ticker, day_raw=day_raw, tags=tags)
+        return out
+    if isinstance(raw, dict):
+        for ticker, by_date in raw.items():
+            if not isinstance(by_date, dict):
+                raise ValueError("dict catalyst artifact values must be date maps")
+            for day_raw, tags in by_date.items():
+                _add_catalyst_tags(out, ticker=str(ticker).upper(), day_raw=day_raw, tags=tags)
+        return out
+    raise ValueError("catalyst tag artifact must be a list or dict")
+
+
+def _add_catalyst_tags(
+    out: dict[tuple[str, date], list[str]],
+    *,
+    ticker: str,
+    day_raw: Any,
+    tags: Any,
+) -> None:
+    if not ticker:
+        raise ValueError("catalyst tag artifact row missing ticker")
+    day = _parse_date(str(day_raw))
+    if isinstance(tags, str):
+        normalized = [tags]
+    elif isinstance(tags, list):
+        normalized = [str(tag) for tag in tags]
+    else:
+        raise ValueError("catalyst tags must be a string or list")
+    out[(ticker.upper(), day)] = sorted({
+        tag.strip()
+        for tag in normalized
+        if tag.strip()
+    })
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the durable historical I12 corpus build.")
+    parser = argparse.ArgumentParser(description="Run the durable historical I11 corpus build.")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true")
     parser.add_argument("--database-url")
@@ -183,7 +236,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--batch-days", type=int, default=10)
     parser.add_argument(
         "--polygon-cache-dir",
-        default=".cache/i12_polygon_minute_aggs",
+        default=".cache/i11_polygon_minute_aggs",
         help="Disk cache directory for Polygon adjusted minute bars.",
     )
     parser.add_argument(
@@ -193,6 +246,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Maximum uncached Polygon minute fetches per minute.",
     )
     parser.add_argument("--progress-artifact")
+    parser.add_argument(
+        "--catalyst-tags-artifact",
+        help=(
+            "Optional JSON artifact mapping ticker/date to premarket catalyst tags "
+            "such as offering or NT-late-filer."
+        ),
+    )
     return parser.parse_args(argv)
 
 
