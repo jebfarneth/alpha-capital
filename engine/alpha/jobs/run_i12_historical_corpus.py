@@ -41,6 +41,7 @@ I12_CORPUS_REQUIRED_TABLES = [
     "fmp_delisted_companies",
     "intraday_event_details",
 ]
+DEFAULT_MINUTE_CACHE_DIR = Path.home() / ".cache" / "alpha-capital" / "i12_polygon_minute_aggs"
 
 
 def _run_live(args: argparse.Namespace) -> int:
@@ -117,8 +118,11 @@ def _run_live(args: argparse.Namespace) -> int:
         end_date=_parse_date(args.end_date),
         run_timestamp=_parse_timestamp(args.run_timestamp),
         batch_days=args.batch_days,
-        minute_cache_dir=args.polygon_cache_dir,
+        minute_cache_dir=args.minute_cache_dir,
         polygon_rate_limit_per_minute=args.polygon_rate_limit_per_minute,
+        skip_existing=args.skip_existing,
+        max_db_retries=args.max_db_retries,
+        db_retry_backoff_seconds=args.db_retry_backoff_seconds,
         progress_callback=progress,
     )
     try:
@@ -132,8 +136,12 @@ def _run_live(args: argparse.Namespace) -> int:
                 "schema": target_schema,
                 "confirm_live_write": args.confirm_live_write,
                 "batch_days": args.batch_days,
-                "polygon_cache_dir": args.polygon_cache_dir,
+                "minute_cache_dir": args.minute_cache_dir,
+                "polygon_cache_dir": args.minute_cache_dir,
                 "polygon_rate_limit_per_minute": args.polygon_rate_limit_per_minute,
+                "skip_existing": args.skip_existing,
+                "max_db_retries": args.max_db_retries,
+                "db_retry_backoff_seconds": args.db_retry_backoff_seconds,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
             },
         )
@@ -182,8 +190,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-timestamp")
     parser.add_argument("--batch-days", type=int, default=10)
     parser.add_argument(
+        "--minute-cache-dir",
         "--polygon-cache-dir",
-        default=".cache/i12_polygon_minute_aggs",
+        dest="minute_cache_dir",
+        default=str(DEFAULT_MINUTE_CACHE_DIR),
         help="Disk cache directory for Polygon adjusted minute bars.",
     )
     parser.add_argument(
@@ -192,6 +202,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=300,
         help="Maximum uncached Polygon minute fetches per minute.",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip ticker-days that already have an I12 intraday_event_details row.",
+    )
+    parser.add_argument("--max-db-retries", type=int, default=3)
+    parser.add_argument("--db-retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--progress-artifact")
     return parser.parse_args(argv)
 

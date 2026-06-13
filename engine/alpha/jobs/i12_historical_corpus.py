@@ -26,12 +26,14 @@ from __future__ import annotations
 import json
 import math
 import time as time_module
+from copy import deepcopy
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import AdapterResponse, stable_hash, utcnow
@@ -226,6 +228,8 @@ class _RunCounters:
     reused_signals: int = 0
     minute_cache_hits: int = 0
     minute_cache_misses: int = 0
+    skipped_existing: int = 0
+    db_reconnect_retries: int = 0
     batches: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
     non_session_bar_samples: list[dict[str, str]] = field(default_factory=list)
@@ -239,6 +243,38 @@ class _RunCounters:
                 "ticker": ticker.upper(),
                 "date": day.isoformat(),
             })
+
+    def merge(self, other: "_RunCounters") -> None:
+        self.ticker_days_scanned += other.ticker_days_scanned
+        self.candidates += other.candidates
+        self.candidates_screened_out += other.candidates_screened_out
+        self.confirmed += other.confirmed
+        self.never_confirmed += other.never_confirmed
+        self.poison_blocked += other.poison_blocked
+        self.poison_premarket += other.poison_premarket
+        self.parabolic_blocked += other.parabolic_blocked
+        self.halted_unfillable += other.halted_unfillable
+        self.excluded_by_type += other.excluded_by_type
+        self.artifact_excluded += other.artifact_excluded
+        self.sub_dollar_included += other.sub_dollar_included
+        self.non_session_bars_skipped += other.non_session_bars_skipped
+        self.fetch_errors += other.fetch_errors
+        self.quarantined += other.quarantined
+        self.inserted_details += other.inserted_details
+        self.reused_details += other.reused_details
+        self.inserted_signals += other.inserted_signals
+        self.reused_signals += other.reused_signals
+        self.minute_cache_hits += other.minute_cache_hits
+        self.minute_cache_misses += other.minute_cache_misses
+        self.skipped_existing += other.skipped_existing
+        self.db_reconnect_retries += other.db_reconnect_retries
+        self.batches += other.batches
+        self.errors.extend(other.errors)
+        self.non_session_bar_samples.extend(
+            other.non_session_bar_samples[: max(0, 10 - len(self.non_session_bar_samples))]
+        )
+        self.candidate_screen_fail_reasons.update(other.candidate_screen_fail_reasons)
+        self.outcomes.update(other.outcomes)
 
 
 class I12HistoricalCorpusJob(BaseJob):
@@ -265,12 +301,19 @@ class I12HistoricalCorpusJob(BaseJob):
         classification_records: Mapping[str, SecurityTypeClassification] | None = None,
         minute_cache_dir: str | Path | None = None,
         polygon_rate_limit_per_minute: int | None = None,
+        skip_existing: bool = False,
+        max_db_retries: int = 3,
+        db_retry_backoff_seconds: float = 5.0,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must be on or after start_date")
         if batch_days < 1:
             raise ValueError("batch_days must be >= 1")
+        if max_db_retries < 0:
+            raise ValueError("max_db_retries must be >= 0")
+        if db_retry_backoff_seconds < 0:
+            raise ValueError("db_retry_backoff_seconds must be >= 0")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -281,6 +324,9 @@ class I12HistoricalCorpusJob(BaseJob):
         self._classification_records = classification_records
         self._minute_cache_dir = Path(minute_cache_dir) if minute_cache_dir else None
         self._polygon_rate_limit_per_minute = polygon_rate_limit_per_minute
+        self._skip_existing = skip_existing
+        self._max_db_retries = max_db_retries
+        self._db_retry_backoff_seconds = db_retry_backoff_seconds
         self._last_polygon_fetch_monotonic: float | None = None
         self._progress_callback = progress_callback
         self._latest_metrics: dict[str, Any] = {}
@@ -309,121 +355,177 @@ class I12HistoricalCorpusJob(BaseJob):
         minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], DataLineage]] = {}
 
         for batch_index, batch_dates in enumerate(_chunks(trading_dates, self._batch_days), start=1):
-            counters.batches += 1
-            self._progress("batch_start", {
-                "batch_index": batch_index,
-                "date_start": batch_dates[0].isoformat(),
-                "date_end": batch_dates[-1].isoformat(),
-            })
-            hur_rows = self._load_hur_rows(batch_dates)
-            missing_hur_dates = [
-                day.isoformat()
-                for day in batch_dates
-                if day not in hur_rows
-            ]
-            if missing_hur_dates:
-                counters.quarantined += len(missing_hur_dates)
-                counters.errors.append({
-                    "error": "missing_hur_rows",
-                    "dates": missing_hur_dates[:20],
-                })
-                continue
-            for trading_date in batch_dates:
-                hur_members = set(hur_rows[trading_date])
-                for ticker in hur_rows[trading_date]:
-                    counters.ticker_days_scanned += 1
-                    if counters.ticker_days_scanned == 1 or (
-                        counters.ticker_days_scanned
-                        % PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS
-                        == 0
-                    ):
-                        self._progress("ticker_day_progress", {
-                            "ticker_days_scanned": counters.ticker_days_scanned,
-                            "trading_date": trading_date.isoformat(),
-                            "ticker": ticker,
-                            "metrics": self._metrics(counters, trading_dates=trading_dates),
-                        })
-                    try:
-                        sec = _classification_for_hur_ticker(
-                            classifications,
-                            ticker,
-                            hur_included=ticker in hur_members,
-                        )
-                    except ExclusionArtifactError as exc:
+            attempt = 0
+            while True:
+                try:
+                    batch_counters = self._run_batch_once(
+                        ctx,
+                        batch_index=batch_index,
+                        batch_dates=batch_dates,
+                        classifications=classifications,
+                        trading_dates=trading_dates,
+                        daily_cache=daily_cache,
+                        minute_cache=minute_cache,
+                        cumulative_counters=counters,
+                    )
+                    counters.merge(batch_counters)
+                    self._progress("batch_finish", {
+                        "batch_index": batch_index,
+                        "metrics": self._metrics(counters, trading_dates=trading_dates),
+                    })
+                    break
+                except Exception as exc:
+                    if not _is_transient_db_error(exc) or attempt >= self._max_db_retries:
                         raise
-                    if sec.ml_excluded:
-                        counters.excluded_by_type += 1
-                    try:
-                        daily_input = self._load_daily_ticker_input(
-                            ticker=ticker,
-                            trading_date=trading_date,
-                            security_type=sec,
-                            daily_cache=daily_cache,
-                            counters=counters,
-                            job_run_id=ctx.job_run_id,
-                        )
-                        screen = _screen_daily_candidate(daily_input)
-                        if screen.control_outcome == OUTCOME_POISON_PREMARKET:
-                            event = _evaluate_i12_poison_premarket(daily_input, screen.daily_context)
-                            counters.outcomes[event.outcome] += 1
-                            counters.poison_premarket += 1
-                            if event.split_basis_mismatch:
-                                counters.artifact_excluded += 1
-                            if event.sub_dollar_at_open:
-                                counters.sub_dollar_included += 1
-                            persisted = self._persist_event(event, ctx.job_run_id)
-                            counters.inserted_details += int(persisted["inserted_detail"])
-                            counters.reused_details += int(not persisted["inserted_detail"])
-                            counters.inserted_signals += int(persisted["inserted_signal"])
-                            counters.reused_signals += int(persisted["reused_signal"])
-                            continue
-                        if not screen.passed:
-                            counters.candidates_screened_out += 1
-                            counters.candidate_screen_fail_reasons[screen.reason or "unknown"] += 1
-                            continue
-                        counters.candidates += 1
-                        inp = self._load_ticker_day_input(
-                            daily_input=daily_input,
-                            minute_cache=minute_cache,
-                            counters=counters,
-                            job_run_id=ctx.job_run_id,
-                        )
-                    except _Quarantine as exc:
-                        counters.quarantined += 1
-                        counters.errors.append(exc.payload)
-                        continue
-                    event = _evaluate_i12_event(inp)
-                    counters.outcomes[event.outcome] += 1
-                    if event.outcome == OUTCOME_CONFIRMED:
-                        counters.confirmed += 1
-                    elif event.outcome == OUTCOME_NEVER_CONFIRMED:
-                        counters.never_confirmed += 1
-                    elif event.outcome == OUTCOME_POISON:
-                        counters.poison_blocked += 1
-                    elif event.outcome == OUTCOME_PARABOLIC:
-                        counters.parabolic_blocked += 1
-                    elif event.outcome == OUTCOME_HALTED_UNFILLABLE:
-                        counters.halted_unfillable += 1
-                    if event.split_basis_mismatch:
-                        counters.artifact_excluded += 1
-                    if event.sub_dollar_at_open:
-                        counters.sub_dollar_included += 1
-                    persisted = self._persist_event(event, ctx.job_run_id)
-                    counters.inserted_details += int(persisted["inserted_detail"])
-                    counters.reused_details += int(not persisted["inserted_detail"])
-                    counters.inserted_signals += int(persisted["inserted_signal"])
-                    counters.reused_signals += int(persisted["reused_signal"])
-            self._session.commit()
-            self._progress("batch_finish", {
-                "batch_index": batch_index,
-                "metrics": self._metrics(counters, trading_dates=trading_dates),
-            })
+                    attempt += 1
+                    counters.db_reconnect_retries += 1
+                    counters.errors.append({
+                        "error": "transient_db_disconnect_retry",
+                        "batch_index": batch_index,
+                        "attempt": attempt,
+                        "exception": _transient_error_summary(exc),
+                    })
+                    self._recover_after_transient_db_error()
+                    daily_cache.clear()
+                    minute_cache.clear()
+                    self._progress("batch_retry", {
+                        "batch_index": batch_index,
+                        "attempt": attempt,
+                        "max_attempts": self._max_db_retries,
+                        "date_start": batch_dates[0].isoformat(),
+                        "date_end": batch_dates[-1].isoformat(),
+                        "metrics": self._metrics(counters, trading_dates=trading_dates),
+                    })
+                    if self._db_retry_backoff_seconds > 0:
+                        time_module.sleep(self._db_retry_backoff_seconds * attempt)
 
         return JobResult(
             status="finished",
             metrics=self._metrics(counters, trading_dates=trading_dates),
             errors=counters.errors,
         )
+
+    def _run_batch_once(
+        self,
+        ctx: JobContext,
+        *,
+        batch_index: int,
+        batch_dates: Sequence[date],
+        classifications: Mapping[str, SecurityTypeClassification],
+        trading_dates: Sequence[date],
+        daily_cache: dict[str, tuple[tuple[_DailyBar, ...], DataLineage]],
+        minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], DataLineage]],
+        cumulative_counters: _RunCounters,
+    ) -> _RunCounters:
+        counters = _RunCounters(batches=1)
+        self._progress("batch_start", {
+            "batch_index": batch_index,
+            "date_start": batch_dates[0].isoformat(),
+            "date_end": batch_dates[-1].isoformat(),
+        })
+        hur_rows = self._load_hur_rows(batch_dates)
+        missing_hur_dates = [
+            day.isoformat()
+            for day in batch_dates
+            if day not in hur_rows
+        ]
+        if missing_hur_dates:
+            counters.quarantined += len(missing_hur_dates)
+            counters.errors.append({
+                "error": "missing_hur_rows",
+                "dates": missing_hur_dates[:20],
+            })
+            self._session.commit()
+            return counters
+        for trading_date in batch_dates:
+            hur_members = set(hur_rows[trading_date])
+            for ticker in hur_rows[trading_date]:
+                counters.ticker_days_scanned += 1
+                scanned_total = cumulative_counters.ticker_days_scanned + counters.ticker_days_scanned
+                if scanned_total == 1 or scanned_total % PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS == 0:
+                    progress_counters = deepcopy(cumulative_counters)
+                    progress_counters.merge(counters)
+                    self._progress("ticker_day_progress", {
+                        "ticker_days_scanned": scanned_total,
+                        "trading_date": trading_date.isoformat(),
+                        "ticker": ticker,
+                        "metrics": self._metrics(progress_counters, trading_dates=trading_dates),
+                    })
+                if self._skip_existing and self._has_existing_event(ticker, trading_date):
+                    counters.skipped_existing += 1
+                    continue
+                try:
+                    sec = _classification_for_hur_ticker(
+                        classifications,
+                        ticker,
+                        hur_included=ticker in hur_members,
+                    )
+                except ExclusionArtifactError:
+                    raise
+                if sec.ml_excluded:
+                    counters.excluded_by_type += 1
+                try:
+                    daily_input = self._load_daily_ticker_input(
+                        ticker=ticker,
+                        trading_date=trading_date,
+                        security_type=sec,
+                        daily_cache=daily_cache,
+                        counters=counters,
+                        job_run_id=ctx.job_run_id,
+                    )
+                    screen = _screen_daily_candidate(daily_input)
+                    if screen.control_outcome == OUTCOME_POISON_PREMARKET:
+                        event = _evaluate_i12_poison_premarket(daily_input, screen.daily_context)
+                        counters.outcomes[event.outcome] += 1
+                        counters.poison_premarket += 1
+                        if event.split_basis_mismatch:
+                            counters.artifact_excluded += 1
+                        if event.sub_dollar_at_open:
+                            counters.sub_dollar_included += 1
+                        persisted = self._persist_event(event, ctx.job_run_id)
+                        counters.inserted_details += int(persisted["inserted_detail"])
+                        counters.reused_details += int(not persisted["inserted_detail"])
+                        counters.inserted_signals += int(persisted["inserted_signal"])
+                        counters.reused_signals += int(persisted["reused_signal"])
+                        continue
+                    if not screen.passed:
+                        counters.candidates_screened_out += 1
+                        counters.candidate_screen_fail_reasons[screen.reason or "unknown"] += 1
+                        continue
+                    counters.candidates += 1
+                    inp = self._load_ticker_day_input(
+                        daily_input=daily_input,
+                        minute_cache=minute_cache,
+                        counters=counters,
+                        job_run_id=ctx.job_run_id,
+                    )
+                except _Quarantine as exc:
+                    counters.quarantined += 1
+                    counters.errors.append(exc.payload)
+                    continue
+                event = _evaluate_i12_event(inp)
+                counters.outcomes[event.outcome] += 1
+                if event.outcome == OUTCOME_CONFIRMED:
+                    counters.confirmed += 1
+                elif event.outcome == OUTCOME_NEVER_CONFIRMED:
+                    counters.never_confirmed += 1
+                elif event.outcome == OUTCOME_POISON:
+                    counters.poison_blocked += 1
+                elif event.outcome == OUTCOME_PARABOLIC:
+                    counters.parabolic_blocked += 1
+                elif event.outcome == OUTCOME_HALTED_UNFILLABLE:
+                    counters.halted_unfillable += 1
+                if event.split_basis_mismatch:
+                    counters.artifact_excluded += 1
+                if event.sub_dollar_at_open:
+                    counters.sub_dollar_included += 1
+                persisted = self._persist_event(event, ctx.job_run_id)
+                counters.inserted_details += int(persisted["inserted_detail"])
+                counters.reused_details += int(not persisted["inserted_detail"])
+                counters.inserted_signals += int(persisted["inserted_signal"])
+                counters.reused_signals += int(persisted["reused_signal"])
+        self._session.commit()
+        return counters
 
     def _load_hur_rows(self, trading_dates: Sequence[date]) -> dict[date, list[str]]:
         rows = (
@@ -445,6 +547,32 @@ class I12HistoricalCorpusJob(BaseJob):
         for replay_date, ticker in rows:
             out.setdefault(replay_date, []).append(str(ticker).upper())
         return {day: sorted(set(tickers)) for day, tickers in out.items() if tickers}
+
+    def _has_existing_event(self, ticker: str, trading_date: date) -> bool:
+        return (
+            self._session.query(IntradayEventDetail.event_identity_hash)
+            .filter(
+                IntradayEventDetail.pattern_id == I12_PATTERN_ID,
+                IntradayEventDetail.ticker == ticker.upper(),
+                IntradayEventDetail.trading_date == trading_date,
+            )
+            .first()
+            is not None
+        )
+
+    def _recover_after_transient_db_error(self) -> None:
+        try:
+            self._session.rollback()
+        except Exception:
+            pass
+        bind = self._session.get_bind()
+        try:
+            self._session.close()
+        finally:
+            dispose = getattr(bind, "dispose", None)
+            dialect_name = getattr(getattr(bind, "dialect", None), "name", None)
+            if dialect_name == "postgresql" and callable(dispose):
+                dispose()
 
     def _load_daily_ticker_input(
         self,
@@ -779,6 +907,8 @@ class I12HistoricalCorpusJob(BaseJob):
             "reused_signals": counters.reused_signals,
             "minute_cache_hits": counters.minute_cache_hits,
             "minute_cache_misses": counters.minute_cache_misses,
+            "skipped_existing": counters.skipped_existing,
+            "db_reconnect_retries": counters.db_reconnect_retries,
             "error_sample": counters.errors[:20],
         }
 
@@ -1566,6 +1696,42 @@ def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None
         "message": resp.error.message,
         "retryable": resp.error.retryable,
     }
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    if isinstance(exc, DBAPIError) and getattr(exc, "connection_invalidated", False):
+        return True
+    if isinstance(exc, OperationalError):
+        return _looks_like_transient_disconnect(exc)
+    return _looks_like_transient_disconnect(exc)
+
+
+def _looks_like_transient_disconnect(exc: BaseException) -> bool:
+    parts = [str(exc), exc.__class__.__name__]
+    original = getattr(exc, "orig", None)
+    if original is not None:
+        parts.extend([str(original), original.__class__.__name__])
+    text = " ".join(parts).lower()
+    return any(
+        marker in text
+        for marker in (
+            "adminshutdown",
+            "administrator command",
+            "server closed the connection",
+            "connection is closed",
+            "terminating connection",
+            "connection not open",
+            "connection already closed",
+            "ssl connection has been closed",
+        )
+    )
+
+
+def _transient_error_summary(exc: BaseException) -> str:
+    original = getattr(exc, "orig", None)
+    if original is not None:
+        return f"{original.__class__.__name__}: {original}"
+    return f"{exc.__class__.__name__}: {exc}"
 
 
 def _basis_mismatch(fmp_open: float, polygon_open: float) -> bool:

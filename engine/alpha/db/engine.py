@@ -63,6 +63,7 @@ def get_engine(url: str | None = None, schema: str | None = None):
         _engine = create_engine(
             url,
             echo=False,
+            pool_pre_ping=True,
             **schema_connect_args(url, schema),
         )
     return _engine

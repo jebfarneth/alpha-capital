@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpBar
@@ -26,7 +27,7 @@ from alpha.jobs.i12_historical_corpus import (
     OUTCOME_NEVER_CONFIRMED,
     OUTCOME_POISON_PREMARKET,
 )
-from alpha.jobs.run_i12_historical_corpus import _validate_write_target
+from alpha.jobs.run_i12_historical_corpus import _parse_args, _validate_write_target
 from alpha.jobs.runner import run_job
 from alpha.jobs.paper_execution import EASTERN
 from alpha.market_calendar import next_us_equity_session, previous_us_equity_session
@@ -254,6 +255,7 @@ def _run_i12_with_polygon(
     daily=None,
     classifications=None,
     minute_cache_dir=None,
+    skip_existing=False,
 ):
     _seed_hur(db_session, ticker)
     if classifications is None:
@@ -266,6 +268,7 @@ def _run_i12_with_polygon(
         end_date=DAY,
         classification_records=classifications,
         minute_cache_dir=minute_cache_dir,
+        skip_existing=skip_existing,
     )
     return run_job(db_session, job)
 
@@ -510,6 +513,73 @@ def test_i12_corpus_uses_disk_cached_polygon_minutes(db_session, tmp_path):
     assert second.metrics["minute_cache_misses"] == 0
     assert second.metrics["reused_details"] == 1
     assert second_polygon.calls == Counter()
+
+
+def test_i12_corpus_skip_existing_avoids_refetching_processed_ticker_day(db_session):
+    first_polygon = FakePolygon({("TEST", DAY): _minute_bars()})
+    first = _run_i12_with_polygon(
+        db_session,
+        polygon=first_polygon,
+    )
+
+    assert first.status == "finished"
+    assert first.metrics["inserted_details"] == 1
+
+    second_polygon = FakePolygon({})
+    second = _run_i12_with_polygon(
+        db_session,
+        polygon=second_polygon,
+        skip_existing=True,
+    )
+
+    assert second.status == "finished"
+    assert second.metrics["skipped_existing"] == 1
+    assert second.metrics["candidates"] == 0
+    assert second.metrics["inserted_details"] == 0
+    assert second.metrics["reused_details"] == 0
+    assert second.metrics["minute_cache_hits"] == 0
+    assert second.metrics["minute_cache_misses"] == 0
+    assert second_polygon.calls == Counter()
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+
+
+def test_i12_corpus_retries_transient_db_disconnect_once(db_session):
+    _seed_hur(db_session, "TEST")
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({"TEST": _daily_bars()}),
+        polygon_adapter=FakePolygon({("TEST", DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={"TEST": _classification()},
+        max_db_retries=1,
+        db_retry_backoff_seconds=0,
+    )
+    original_load_hur_rows = job._load_hur_rows
+    calls = {"count": 0}
+
+    def _flaky_load_hur_rows(trading_dates):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OperationalError(
+                "SELECT historical_universe_reconstructions",
+                {},
+                Exception("terminating connection due to administrator command"),
+            )
+        return original_load_hur_rows(trading_dates)
+
+    job._load_hur_rows = _flaky_load_hur_rows
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    assert calls["count"] == 2
+    assert result.metrics["db_reconnect_retries"] == 1
+    assert result.metrics["inserted_details"] == 1
+    assert result.metrics["inserted_signals"] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").count() == 1
 
 
 def test_i12_corpus_never_confirmed_control_has_no_signal(db_session):
@@ -798,3 +868,35 @@ def test_i12_corpus_runner_refuses_public_without_confirmation():
         _validate_write_target(schema="public", confirm_live_write=False)
 
     _validate_write_target(schema="scratch_i12", confirm_live_write=False)
+
+
+def test_i12_runner_minute_cache_alias_and_skip_existing_args():
+    args = _parse_args([
+        "--live",
+        "--confirm-live-write",
+        "--start-date",
+        "2024-01-02",
+        "--end-date",
+        "2024-01-03",
+        "--minute-cache-dir",
+        "/var/tmp/i12_minutes",
+        "--skip-existing",
+        "--max-db-retries",
+        "5",
+    ])
+
+    assert args.minute_cache_dir == "/var/tmp/i12_minutes"
+    assert args.skip_existing is True
+    assert args.max_db_retries == 5
+
+    alias = _parse_args([
+        "--live",
+        "--confirm-live-write",
+        "--start-date",
+        "2024-01-02",
+        "--end-date",
+        "2024-01-03",
+        "--polygon-cache-dir",
+        "/var/tmp/i12_polygon_alias",
+    ])
+    assert alias.minute_cache_dir == "/var/tmp/i12_polygon_alias"
