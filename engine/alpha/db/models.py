@@ -2082,12 +2082,6 @@ class MarketPathPreSignalContext(Base):
     return_5d = Column(Float, nullable=True)
     return_20d = Column(Float, nullable=True)
     sigma_20d = Column(Float, nullable=True)
-    range_contraction_ratio_60d = Column(Float, nullable=True)
-    volume_trend_slope_60d = Column(Float, nullable=True)
-    base_depth_60d = Column(Float, nullable=True)
-    base_length_60d = Column(Integer, nullable=True)
-    off_low252 = Column(Float, nullable=True)
-    dist_hi252 = Column(Float, nullable=True)
 
     rank_status = Column(String, nullable=False)
     retroactive_adjustment_caveat = Column(Boolean, nullable=False, default=True)

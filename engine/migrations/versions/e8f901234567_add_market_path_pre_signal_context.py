@@ -44,12 +44,6 @@ def upgrade() -> None:
         sa.Column("return_5d", sa.Float(), nullable=True),
         sa.Column("return_20d", sa.Float(), nullable=True),
         sa.Column("sigma_20d", sa.Float(), nullable=True),
-        sa.Column("range_contraction_ratio_60d", sa.Float(), nullable=True),
-        sa.Column("volume_trend_slope_60d", sa.Float(), nullable=True),
-        sa.Column("base_depth_60d", sa.Float(), nullable=True),
-        sa.Column("base_length_60d", sa.Integer(), nullable=True),
-        sa.Column("off_low252", sa.Float(), nullable=True),
-        sa.Column("dist_hi252", sa.Float(), nullable=True),
         sa.Column("rank_status", sa.String(), nullable=False),
         sa.Column(
             "retroactive_adjustment_caveat",

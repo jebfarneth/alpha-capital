@@ -100,10 +100,12 @@ def _run_live(args: argparse.Namespace) -> int:
         return 1
 
     progress_artifact = Path(args.progress_artifact) if args.progress_artifact else None
+    runner_artifact = _runner_artifact_path(progress_artifact)
     artifact: dict[str, Any] = {
         "job": JOB_NAME,
         "started_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "events": [],
+        "job_progress_artifact": str(progress_artifact) if progress_artifact else None,
     }
 
     def progress(event: str, payload: Mapping[str, Any]) -> None:
@@ -122,9 +124,6 @@ def _run_live(args: argparse.Namespace) -> int:
         )
         artifact["events"].append(record)
         artifact["last_event"] = record
-        if progress_artifact is not None:
-            progress_artifact.parent.mkdir(parents=True, exist_ok=True)
-            progress_artifact.write_text(json.dumps(artifact, indent=2, default=str))
 
     session = get_session()
     job = MarketPathPreSignalContextJob(
@@ -172,8 +171,9 @@ def _run_live(args: argparse.Namespace) -> int:
         "metrics": result.metrics,
         "errors": result.errors,
     }
-    if progress_artifact is not None:
-        progress_artifact.write_text(json.dumps(artifact, indent=2, default=str))
+    if runner_artifact is not None:
+        runner_artifact.parent.mkdir(parents=True, exist_ok=True)
+        runner_artifact.write_text(json.dumps(artifact, indent=2, default=str))
     print(json.dumps(result.metrics, indent=2, sort_keys=True, default=str))
     return 0 if result.ok else 1
 
@@ -184,6 +184,12 @@ def _validate_write_target(*, schema: str | None, confirm_live_write: bool) -> N
         raise ValueError(
             "Refusing public/default pre-signal context write until scratch rehearsal and audit gates clear"
         )
+
+
+def _runner_artifact_path(progress_artifact: Path | None) -> Path | None:
+    if progress_artifact is None:
+        return None
+    return progress_artifact.with_name(progress_artifact.name + ".runner.json")
 
 
 def _parse_date(value: str) -> date:

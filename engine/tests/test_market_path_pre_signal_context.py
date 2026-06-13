@@ -25,6 +25,7 @@ from alpha.jobs.market_path_features import MarketPathFeatureJob
 from alpha.jobs.historical_m4_signal_selector import (
     HISTORICAL_M4_REPLAY_RECONSTRUCTION_METHOD,
 )
+from alpha.jobs import run_market_path_pre_signal_context as pre_signal_runner
 from alpha.jobs.market_path_pre_signal_context import (
     FEATURE_VERSION,
     ROW_STATUS_COMPUTED,
@@ -410,18 +411,18 @@ def test_pre_signal_context_stamps_rank_and_split_caveats(db_session):
     assert "dollar_volume" in payload["split_adjustment_caveats"]["affected_price_level_fields"]
 
 
-def test_pre_signal_context_nulls_long_aggregates_when_history_window_is_short(db_session):
+def test_pre_signal_context_happy_path_populates_within_window_features(db_session):
     signal_day = date(2026, 6, 5)
-    _add_replay_signal(db_session, ticker="SHRT", signal_day=signal_day)
+    _add_replay_signal(db_session, ticker="FULL", signal_day=signal_day)
     feature_dates = _pre_signal_dates(signal_day, 1)
-    bars = _session_bars(ticker="SHRT", through=signal_day, sessions=32)
-    _seed_hur(db_session, "SHRT", _bar_dates_through(bars, feature_dates[0]))
+    bars = _session_bars(ticker="FULL", through=signal_day, sessions=90)
+    _seed_hur(db_session, "FULL", _bar_dates_through(bars, feature_dates[0]))
 
     result = run_job(
         db_session,
         MarketPathPreSignalContextJob(
             session=db_session,
-            fmp_adapter=FakeFmpAdapter({"SHRT": bars}),
+            fmp_adapter=FakeFmpAdapter({"FULL": bars}),
             signal_start_date=signal_day,
             signal_end_date=signal_day,
             run_timestamp=RUN_TS,
@@ -432,27 +433,29 @@ def test_pre_signal_context_nulls_long_aggregates_when_history_window_is_short(d
     assert result.status == "finished"
     row = db_session.get(
         MarketPathPreSignalContext,
-        ("SHRT", feature_dates[0], "pre_signal_context", FEATURE_VERSION),
+        ("FULL", feature_dates[0], "pre_signal_context", FEATURE_VERSION),
     )
     assert row.row_status == ROW_STATUS_COMPUTED
-    assert row.range_contraction_ratio_60d is None
-    assert row.volume_trend_slope_60d is None
-    assert row.base_depth_60d is None
-    assert row.base_length_60d is None
-    assert row.off_low252 is None
-    assert row.dist_hi252 is None
+    assert row.previous_close is not None
+    assert row.median_volume_20d is not None
+    assert row.median_dollar_volume_20d is not None
+    assert row.volume_expansion_20d is not None
+    assert row.return_1d is not None
+    assert row.return_5d is not None
+    assert row.return_20d is not None
+    assert row.sigma_20d is not None
     status = json.loads(row.status_json)
-    assert status["insufficient_history"]["prior60"] is True
-    assert status["insufficient_history"]["prior252"] is True
+    assert "window_identity_boundary" not in status
+    assert status["insufficient_history"]["prior20"] is False
 
 
-def test_pre_signal_context_nulls_long_aggregates_across_hur_identity_boundary(db_session):
+def test_pre_signal_context_nulls_within_window_features_across_hur_identity_boundary(db_session):
     signal_day = date(2026, 6, 5)
     _add_replay_signal(db_session, ticker="BNDY", signal_day=signal_day)
     feature_dates = _pre_signal_dates(signal_day, 1)
-    bars = _session_bars(ticker="BNDY", through=signal_day, sessions=270)
+    bars = _session_bars(ticker="BNDY", through=signal_day, sessions=90)
     bar_dates = _bar_dates_through(bars, feature_dates[0])
-    excluded_day = bar_dates[-30]
+    excluded_day = bar_dates[-2]
     _seed_hur(db_session, "BNDY", [day for day in bar_dates if day != excluded_day])
 
     result = run_job(
@@ -473,17 +476,32 @@ def test_pre_signal_context_nulls_long_aggregates_across_hur_identity_boundary(d
         ("BNDY", feature_dates[0], "pre_signal_context", FEATURE_VERSION),
     )
     assert row.row_status == ROW_STATUS_COMPUTED
-    assert row.range_contraction_ratio_60d is None
-    assert row.volume_trend_slope_60d is None
-    assert row.base_depth_60d is None
-    assert row.base_length_60d is None
-    assert row.off_low252 is None
-    assert row.dist_hi252 is None
+    assert row.open_price is not None
+    assert row.close_price is not None
+    assert row.previous_close is None
+    assert row.median_volume_20d is None
+    assert row.median_dollar_volume_20d is None
+    assert row.volume_expansion_20d is None
+    assert row.return_1d is None
+    assert row.return_5d is None
+    assert row.return_20d is None
+    assert row.sigma_20d is None
     status = json.loads(row.status_json)
-    assert status["insufficient_history"]["prior60"] is False
-    assert status["insufficient_history"]["prior252"] is False
-    assert status["long_window_identity_boundary"]["first_excluded_date"] == excluded_day.isoformat()
-    assert status["long_window_identity_boundary"]["excluded_count"] == 1
+    assert status["insufficient_history"]["prior20"] is False
+    boundary = status["window_identity_boundary"]
+    assert boundary["first_excluded_date"] == excluded_day.isoformat()
+    assert boundary["excluded_count"] == 1
+    assert boundary["excluded_dates"] == [excluded_day.isoformat()]
+    assert set(boundary["fields"]) == {
+        "previous_close",
+        "return_1d",
+        "return_5d",
+        "return_20d",
+        "sigma_20d",
+        "median_volume_20d",
+        "median_dollar_volume_20d",
+        "volume_expansion_20d",
+    }
 
 
 def test_pre_signal_context_rerun_is_content_idempotent(db_session):
@@ -624,3 +642,61 @@ def test_pre_signal_runner_requires_explicit_signal_source():
             "--signal-end-date",
             "2026-06-05",
         ])
+
+
+def test_pre_signal_runner_preserves_job_progress_artifact(db_session, tmp_path, monkeypatch):
+    signal_day = date(2026, 6, 5)
+    _add_replay_signal(db_session, ticker="ARTI", signal_day=signal_day)
+    feature_dates = _pre_signal_dates(signal_day, 1)
+    _seed_hur(db_session, "ARTI", feature_dates)
+    fake_adapter = FakeFmpAdapter({"ARTI": _session_bars(ticker="ARTI", through=signal_day)})
+    progress_artifact = tmp_path / "pre_signal_progress.json"
+
+    monkeypatch.setattr(pre_signal_runner, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(pre_signal_runner, "reset_globals", lambda: None)
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "prepare_writable_schema_target",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(pre_signal_runner, "get_session", lambda: db_session)
+    monkeypatch.setattr(pre_signal_runner.FmpConfig, "from_env", staticmethod(lambda: object()))
+    monkeypatch.setattr(pre_signal_runner, "FmpAdapter", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "CachedHistoricalPriceFmpAdapter",
+        lambda adapter: fake_adapter,
+    )
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "RetryingHistoricalPriceFmpAdapter",
+        lambda adapter, **kwargs: adapter,
+    )
+
+    rc = pre_signal_runner.main([
+        "--live",
+        "--schema",
+        "m4_pre_signal_scratch",
+        "--signal-start-date",
+        signal_day.isoformat(),
+        "--signal-end-date",
+        signal_day.isoformat(),
+        "--signal-source",
+        "historical-m4-replay",
+        "--pre-signal-window",
+        "1",
+        "--progress-artifact",
+        str(progress_artifact),
+    ])
+
+    assert rc == 0
+    job_payload = json.loads(progress_artifact.read_text())
+    assert "batches" in job_payload
+    assert job_payload["batches"][0]["status"] == "finished"
+    assert job_payload["summary"]["context_rows_inserted"] == 1
+    assert "events" not in job_payload
+    runner_artifact = pre_signal_runner._runner_artifact_path(progress_artifact)
+    runner_payload = json.loads(runner_artifact.read_text())
+    assert runner_payload["job_progress_artifact"] == str(progress_artifact)
+    assert runner_payload["events"]
+    assert runner_payload["result"]["status"] == "finished"

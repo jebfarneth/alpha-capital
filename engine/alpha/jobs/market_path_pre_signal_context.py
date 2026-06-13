@@ -9,8 +9,6 @@ signal-link row.
 from __future__ import annotations
 
 import json
-import math
-import statistics
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -62,7 +60,7 @@ FEATURE_ROLE = "pre_signal_context"
 FEATURE_VERSION = "market_path_pre_signal_v1"
 RECONSTRUCTION_METHOD = "m4_pre_signal_context_fmp_eod_v1"
 DEFAULT_PRE_SIGNAL_WINDOW = 20
-DEFAULT_LOOKBACK_CALENDAR_DAYS = 520
+DEFAULT_LOOKBACK_CALENDAR_DAYS = 50
 ROW_STATUS_COMPUTED = "computed"
 ROW_STATUS_INSUFFICIENT_HISTORY = "insufficient_history"
 ROW_STATUS_OUTSIDE_UNIVERSE = "outside_universe_coverage"
@@ -864,30 +862,36 @@ def _context_row(
         close_basis = _price_basis(bar)
         prev_close = _price_basis(previous) if previous is not None else None
         prior20 = prior[-20:]
-        prior252_plus_current = [*prior[-251:], bar]
-        trailing60_plus_current = [*prior[-59:], bar]
-        range20 = _range_pct([*prior[-19:], bar])
-        has_prior60 = len(trailing60_plus_current) >= 60
-        has_prior252 = len(prior252_plus_current) >= 252
-        boundary60 = (
-            _long_window_identity_boundary(trailing60_plus_current, hur_included_dates)
-            if has_prior60 else None
+        prior5 = prior[-5:]
+        row_input_bars = [*prior20, bar]
+        previous_boundary = _window_identity_boundary(
+            [previous] if previous is not None else [],
+            hur_included_dates,
         )
-        boundary252 = (
-            _long_window_identity_boundary(prior252_plus_current, hur_included_dates)
-            if has_prior252 else None
+        prior5_boundary = _window_identity_boundary(prior5, hur_included_dates)
+        prior20_boundary = _window_identity_boundary(prior20, hur_included_dates)
+        field_boundaries = _field_window_boundaries(
+            {
+                "previous_close": previous_boundary,
+                "return_1d": previous_boundary,
+                "return_5d": prior5_boundary,
+                "return_20d": prior20_boundary,
+                "sigma_20d": prior20_boundary,
+                "median_volume_20d": prior20_boundary,
+                "median_dollar_volume_20d": prior20_boundary,
+                "volume_expansion_20d": prior20_boundary,
+            }
         )
-        range60 = _range_pct(trailing60_plus_current) if has_prior60 and boundary60 is None else None
-        low252 = (
-            min((_price_basis(item) for item in prior252_plus_current), default=None)
-            if has_prior252 and boundary252 is None else None
+        median_volume_20d = (
+            _median([item.volume for item in prior20])
+            if prior20_boundary is None else None
         )
-        high252 = (
-            max((_price_basis(item) for item in prior252_plus_current), default=None)
-            if has_prior252 and boundary252 is None else None
+        median_dollar_volume_20d = (
+            _median([item.dollar_volume for item in prior20])
+            if prior20_boundary is None else None
         )
         features.update({
-            "previous_close": prev_close,
+            "previous_close": prev_close if previous_boundary is None else None,
             "open_price": bar.open,
             "high_price": bar.high,
             "low_price": bar.low,
@@ -897,43 +901,37 @@ def _context_row(
             "adj_close": bar.adj_close,
             "dollar_volume": bar.dollar_volume,
             "sub_dollar": close_basis < 1.0,
-            "median_volume_20d": _median([item.volume for item in prior20]),
-            "median_dollar_volume_20d": _median([item.dollar_volume for item in prior20]),
-            "return_1d": _safe_return(close_basis, prev_close),
-            "return_5d": _safe_return(close_basis, _price_basis(prior[-5]) if len(prior) >= 5 else None),
-            "return_20d": _safe_return(close_basis, _price_basis(prior[-20]) if len(prior) >= 20 else None),
-            "sigma_20d": _sigma_close_to_close(prior20),
-            "range_contraction_ratio_60d": _safe_ratio(range20, range60),
-            "volume_trend_slope_60d": (
-                _volume_trend_slope(trailing60_plus_current)
-                if has_prior60 and boundary60 is None else None
+            "median_volume_20d": median_volume_20d,
+            "median_dollar_volume_20d": median_dollar_volume_20d,
+            "return_1d": (
+                _safe_return(close_basis, prev_close)
+                if previous_boundary is None else None
             ),
-            "base_depth_60d": (
-                _base_depth(trailing60_plus_current)
-                if has_prior60 and boundary60 is None else None
+            "return_5d": (
+                _safe_return(close_basis, _price_basis(prior[-5]) if len(prior) >= 5 else None)
+                if prior5_boundary is None else None
             ),
-            "base_length_60d": (
-                _base_length(trailing60_plus_current)
-                if has_prior60 and boundary60 is None else None
+            "return_20d": (
+                _safe_return(close_basis, _price_basis(prior[-20]) if len(prior) >= 20 else None)
+                if prior20_boundary is None else None
             ),
-            "off_low252": _safe_return(close_basis, low252),
-            "dist_hi252": _safe_return(close_basis, high252),
+            "sigma_20d": (
+                _sigma_close_to_close(prior20)
+                if prior20_boundary is None else None
+            ),
         })
         features["volume_expansion_20d"] = _safe_ratio(
             features["volume"],
             features["median_volume_20d"],
         )
         status["prior_session_count"] = len(prior)
-        status["prior252_available_count"] = len(prior252_plus_current)
-        status["prior60_available_count"] = len(trailing60_plus_current)
+        status["prior20_available_count"] = len(prior20)
         status["insufficient_history"] = {
             "prior20": len(prior) < 20,
-            "prior60": not has_prior60,
-            "prior252": not has_prior252,
         }
-        boundary = _merge_identity_boundaries(boundary60, boundary252)
+        boundary = _combined_window_identity_boundary(field_boundaries)
         if boundary is not None:
-            status["long_window_identity_boundary"] = boundary
+            status["window_identity_boundary"] = boundary
     else:
         status["prior_session_count"] = len(prior)
 
@@ -984,18 +982,8 @@ def _context_row(
                 "close_price",
                 "dollar_volume",
                 "sub_dollar",
-                "off_low252",
-                "dist_hi252",
             ],
             "returns_and_sigma_are_split_invariant": True,
-        },
-        "long_window_aggregates": {
-            "range_contraction_ratio_60d": features["range_contraction_ratio_60d"],
-            "volume_trend_slope_60d": features["volume_trend_slope_60d"],
-            "base_depth_60d": features["base_depth_60d"],
-            "base_length_60d": features["base_length_60d"],
-            "off_low252": features["off_low252"],
-            "dist_hi252": features["dist_hi252"],
         },
         "status": status,
     }
@@ -1076,12 +1064,6 @@ def _empty_feature_values() -> dict[str, Any]:
         "return_5d": None,
         "return_20d": None,
         "sigma_20d": None,
-        "range_contraction_ratio_60d": None,
-        "volume_trend_slope_60d": None,
-        "base_depth_60d": None,
-        "base_length_60d": None,
-        "off_low252": None,
-        "dist_hi252": None,
     }
 
 
@@ -1097,64 +1079,13 @@ def _context_materially_changed(
     )
 
 
-def _range_pct(bars: Sequence[Any]) -> float | None:
-    if len(bars) < 2:
-        return None
-    last_close = _price_basis(bars[-1])
-    if last_close <= 0:
-        return None
-    return (max(bar.high for bar in bars) - min(bar.low for bar in bars)) / last_close
-
-
-def _volume_trend_slope(bars: Sequence[Any]) -> float | None:
-    if len(bars) < 2:
-        return None
-    values = [math.log(max(float(bar.volume), 1.0)) for bar in bars]
-    return _linear_slope(values)
-
-
-def _linear_slope(values: Sequence[float]) -> float | None:
-    if len(values) < 2:
-        return None
-    xs = list(range(len(values)))
-    x_mean = statistics.mean(xs)
-    y_mean = statistics.mean(values)
-    denom = sum((x - x_mean) ** 2 for x in xs)
-    if denom <= 0:
-        return None
-    return float(sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, values)) / denom)
-
-
-def _base_depth(bars: Sequence[Any]) -> float | None:
-    if len(bars) < 2:
-        return None
-    peak: float | None = None
-    max_drawdown = 0.0
-    for bar in bars:
-        close = _price_basis(bar)
-        if peak is None or close > peak:
-            peak = close
-        if peak and peak > 0:
-            max_drawdown = max(max_drawdown, 1.0 - close / peak)
-    return max_drawdown
-
-
-def _base_length(bars: Sequence[Any]) -> int | None:
-    if len(bars) < 2:
-        return None
-    closes = [_price_basis(bar) for bar in bars]
-    high = max(closes)
-    high_index = max(index for index, value in enumerate(closes) if value == high)
-    return len(closes) - high_index
-
-
 def _safe_ratio(value: float | None, basis: float | None) -> float | None:
     if value is None or basis is None or basis == 0:
         return None
     return float(value) / float(basis)
 
 
-def _long_window_identity_boundary(
+def _window_identity_boundary(
     bars: Sequence[Any],
     hur_included_dates: set[date],
 ) -> dict[str, Any] | None:
@@ -1168,11 +1099,20 @@ def _long_window_identity_boundary(
     }
 
 
-def _merge_identity_boundaries(
-    boundary60: dict[str, Any] | None,
-    boundary252: dict[str, Any] | None,
+def _field_window_boundaries(
+    boundaries_by_field: dict[str, dict[str, Any] | None],
+) -> dict[str, dict[str, Any]]:
+    return {
+        field: boundary
+        for field, boundary in boundaries_by_field.items()
+        if boundary is not None
+    }
+
+
+def _combined_window_identity_boundary(
+    boundaries_by_field: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    boundaries = [boundary for boundary in (boundary60, boundary252) if boundary is not None]
+    boundaries = list(boundaries_by_field.values())
     if not boundaries:
         return None
     excluded_dates = sorted({
@@ -1189,11 +1129,7 @@ def _merge_identity_boundaries(
             int(boundary["excluded_count"]) for boundary in boundaries
         ),
         "excluded_dates": excluded_dates,
-        "windows": {
-            key: boundary
-            for key, boundary in (("prior60", boundary60), ("prior252", boundary252))
-            if boundary is not None
-        },
+        "fields": boundaries_by_field,
     }
 
 
