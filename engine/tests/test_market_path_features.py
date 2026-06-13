@@ -28,6 +28,7 @@ from alpha.jobs.run_market_path_backfill import (
 )
 from alpha.jobs.run_market_path_bulk_backfill import (
     MarketPathBulkBackfillJob,
+    MarketPathRankOnlyBackfillJob,
     RetryingHistoricalPriceFmpAdapter,
     _TimeoutRequestsSession,
     _validate_write_target,
@@ -104,6 +105,18 @@ class FakeFmpAdapter:
         )
 
 
+class NoFetchFmpAdapter:
+    cache_hits = 0
+    cache_misses = 0
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def get_historical_price(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("rank-only tests must not fetch historical prices")
+
+
 def _add_signal(
     db_session,
     *,
@@ -158,6 +171,100 @@ def _stamp_signal_historical_m4_replay(db_session, signal_id: str) -> None:
     }
     feature.feature_json = json.dumps(payload, sort_keys=True)
     db_session.flush()
+
+
+def _seed_market_path_feature_row(
+    db_session,
+    signal,
+    *,
+    ticker: str,
+    feature_date: date,
+    feature_version: str = "market_path_daily_v3",
+    pattern_id: str = "M4",
+    feature_role: str = "forward_path_day",
+    dollar_volume: float | None = None,
+    volume_expansion_20d: float | None = None,
+    volume_expansion_60d: float | None = None,
+    dollar_volume_expansion_20d: float | None = None,
+    dollar_volume_expansion_60d: float | None = None,
+    liquidity_proxy_score: float | None = None,
+) -> MarketPathFeature:
+    lineage = record_data_lineage(
+        db_session,
+        provider="fixture",
+        endpoint="/fixture/market-path",
+        asof_timestamp=RUN_TS,
+        raw_payload={
+            "ticker": ticker,
+            "feature_date": feature_date.isoformat(),
+            "feature_version": feature_version,
+        },
+    )
+    feature_json = json.dumps({
+        "ticker": ticker,
+        "feature_session_date": feature_date.isoformat(),
+        "feature_version": feature_version,
+        "fixture": True,
+    }, sort_keys=True)
+    input_hash = stable_hash({
+        "ticker": ticker,
+        "feature_date": feature_date.isoformat(),
+        "feature_version": feature_version,
+        "input": True,
+    })
+    row = MarketPathFeature(
+        signal_id=signal.signal_id,
+        pattern_id=pattern_id,
+        ticker=ticker,
+        signal_horizon=signal.signal_horizon,
+        signal_date=signal.signal_timestamp.date().isoformat(),
+        entry_session_date=feature_date.isoformat(),
+        feature_session_date=feature_date.isoformat(),
+        path_sequence=1,
+        feature_role=feature_role,
+        feature_version=feature_version,
+        asof_timestamp=RUN_TS,
+        reconstruction_method="fixture",
+        dollar_volume=dollar_volume,
+        volume_expansion_20d=volume_expansion_20d,
+        volume_expansion_60d=volume_expansion_60d,
+        dollar_volume_expansion_20d=dollar_volume_expansion_20d,
+        dollar_volume_expansion_60d=dollar_volume_expansion_60d,
+        liquidity_proxy_score=liquidity_proxy_score,
+        feature_json=feature_json,
+        source_provider="fixture",
+        source_endpoint="/fixture/market-path",
+        data_lineage_id=lineage.data_lineage_id,
+        input_hash=input_hash,
+        output_hash=stable_hash({
+            "ticker": ticker,
+            "feature_date": feature_date.isoformat(),
+            "feature_version": feature_version,
+            "ranked": False,
+        }),
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def _rank_state(row: MarketPathFeature) -> dict[str, object]:
+    return {
+        "dollar_volume_rank": row.dollar_volume_rank,
+        "dollar_volume_percentile": row.dollar_volume_percentile,
+        "volume_expansion_20d_rank": row.volume_expansion_20d_rank,
+        "volume_expansion_20d_percentile": row.volume_expansion_20d_percentile,
+        "volume_expansion_60d_rank": row.volume_expansion_60d_rank,
+        "volume_expansion_60d_percentile": row.volume_expansion_60d_percentile,
+        "dollar_volume_expansion_20d_rank": row.dollar_volume_expansion_20d_rank,
+        "dollar_volume_expansion_20d_percentile": row.dollar_volume_expansion_20d_percentile,
+        "dollar_volume_expansion_60d_rank": row.dollar_volume_expansion_60d_rank,
+        "dollar_volume_expansion_60d_percentile": row.dollar_volume_expansion_60d_percentile,
+        "liquidity_proxy_rank": row.liquidity_proxy_rank,
+        "liquidity_proxy_percentile": row.liquidity_proxy_percentile,
+        "cohort_feature_row_count": row.cohort_feature_row_count,
+        "cohort_pattern_row_count": row.cohort_pattern_row_count,
+    }
 
 
 def _bars() -> list[FmpBar]:
@@ -1585,6 +1692,275 @@ def test_market_path_bulk_backfill_stage_merge_idempotent_and_deferred_rank(
         for row in db_session.query(MarketPathFeature).all()
         if (key := (row.signal_id, row.feature_session_date)) in first_hashes
     )
+
+
+def test_market_path_rank_only_job_populates_existing_rows_without_fetching_and_is_idempotent(
+    db_session,
+    tmp_path,
+):
+    jan_a = _add_signal(db_session, ticker="RJAA", signal_day=date(2026, 1, 14), entry_day=date(2026, 1, 15))
+    jan_b = _add_signal(db_session, ticker="RJBB", signal_day=date(2026, 1, 14), entry_day=date(2026, 1, 15))
+    feb_a = _add_signal(db_session, ticker="RFAA", signal_day=date(2026, 2, 2), entry_day=date(2026, 2, 3))
+    feb_b = _add_signal(db_session, ticker="RFBB", signal_day=date(2026, 2, 2), entry_day=date(2026, 2, 3))
+    outside_date = _add_signal(db_session, ticker="ROUT", signal_day=date(2025, 12, 30), entry_day=date(2025, 12, 31))
+    other_pattern = _add_signal(db_session, pattern_id="M1", ticker="RONE", signal_day=date(2026, 1, 14), entry_day=date(2026, 1, 15))
+    other_version = _add_signal(db_session, ticker="RVVV", signal_day=date(2026, 1, 14), entry_day=date(2026, 1, 15))
+
+    target_rows = [
+        _seed_market_path_feature_row(
+            db_session,
+            jan_a,
+            ticker="RJAA",
+            feature_date=date(2026, 1, 15),
+            dollar_volume=1_000_000.0,
+            volume_expansion_20d=5.0,
+            volume_expansion_60d=4.0,
+            dollar_volume_expansion_20d=3.0,
+            dollar_volume_expansion_60d=2.0,
+            liquidity_proxy_score=1.0,
+        ),
+        _seed_market_path_feature_row(
+            db_session,
+            jan_b,
+            ticker="RJBB",
+            feature_date=date(2026, 1, 15),
+            dollar_volume=500_000.0,
+            volume_expansion_20d=2.0,
+            volume_expansion_60d=1.0,
+            dollar_volume_expansion_20d=1.5,
+            dollar_volume_expansion_60d=1.2,
+            liquidity_proxy_score=0.5,
+        ),
+        _seed_market_path_feature_row(
+            db_session,
+            feb_a,
+            ticker="RFAA",
+            feature_date=date(2026, 2, 3),
+            dollar_volume=200_000.0,
+            volume_expansion_20d=1.0,
+            volume_expansion_60d=1.0,
+            dollar_volume_expansion_20d=1.0,
+            dollar_volume_expansion_60d=1.0,
+            liquidity_proxy_score=0.4,
+        ),
+        _seed_market_path_feature_row(
+            db_session,
+            feb_b,
+            ticker="RFBB",
+            feature_date=date(2026, 2, 3),
+            dollar_volume=900_000.0,
+            volume_expansion_20d=4.0,
+            volume_expansion_60d=2.5,
+            dollar_volume_expansion_20d=2.5,
+            dollar_volume_expansion_60d=2.0,
+            liquidity_proxy_score=0.8,
+        ),
+    ]
+    untouched_rows = [
+        _seed_market_path_feature_row(
+            db_session,
+            outside_date,
+            ticker="ROUT",
+            feature_date=date(2025, 12, 31),
+            dollar_volume=9_000_000.0,
+        ),
+        _seed_market_path_feature_row(
+            db_session,
+            other_pattern,
+            ticker="RONE",
+            pattern_id="M1",
+            feature_date=date(2026, 1, 15),
+            dollar_volume=9_000_000.0,
+        ),
+        _seed_market_path_feature_row(
+            db_session,
+            other_version,
+            ticker="RVVV",
+            feature_date=date(2026, 1, 15),
+            feature_version="market_path_daily_v2",
+            dollar_volume=9_000_000.0,
+        ),
+    ]
+    untouched_before = {
+        row.market_path_feature_id: (row.output_hash, row.feature_json, _rank_state(row))
+        for row in untouched_rows
+    }
+    adapter = NoFetchFmpAdapter()
+    job_kwargs = dict(
+        session=db_session,
+        fmp_adapter=adapter,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 1, 1),
+        signal_end_date=date(2026, 2, 28),
+        run_timestamp=RUN_TS,
+        progress_artifact=tmp_path / "rank_only.json",
+        schema="scratch_test",
+        progress_every=1,
+    )
+
+    first = run_job(db_session, MarketPathRankOnlyBackfillJob(**job_kwargs))
+    db_session.expire_all()
+
+    assert first.status == "finished"
+    assert first.metrics["source"] == "market_path_rank_only_backfill"
+    assert first.metrics["rank_rows_updated"] == 4
+    assert first.metrics["rank_month_count"] == 2
+    assert first.metrics["rank_populated_count"] == 4
+    assert first.metrics["rank_null_count"] == 0
+    assert first.metrics["fmp_fetch_count"] == 0
+    assert adapter.calls == []
+    jan_a_row = db_session.get(MarketPathFeature, target_rows[0].market_path_feature_id)
+    jan_b_row = db_session.get(MarketPathFeature, target_rows[1].market_path_feature_id)
+    feb_a_row = db_session.get(MarketPathFeature, target_rows[2].market_path_feature_id)
+    feb_b_row = db_session.get(MarketPathFeature, target_rows[3].market_path_feature_id)
+    assert jan_a_row.dollar_volume_rank == 1
+    assert jan_b_row.dollar_volume_rank == 2
+    assert feb_b_row.dollar_volume_rank == 1
+    assert feb_a_row.dollar_volume_rank == 2
+    assert jan_a_row.cohort_pattern_row_count == 2
+    assert jan_a_row.cohort_feature_row_count == 2
+    assert "cross_sectional_features" in json.loads(jan_a_row.feature_json)
+    artifact = json.loads((tmp_path / "rank_only.json").read_text())
+    assert artifact["job"] == "market_path_rank_only_backfill"
+    assert artifact["mode"] == "rank_only"
+    assert {event["event"] for event in artifact["progress_events"]} >= {
+        "rank_only_start",
+        "rank_month_start",
+        "rank_group_progress",
+        "rank_month_finish",
+        "rank_only_finish",
+        "validation_finish",
+    }
+    assert {
+        row.market_path_feature_id: (row.output_hash, row.feature_json, _rank_state(row))
+        for row in untouched_rows
+    } == untouched_before
+    target_hashes = {
+        row.market_path_feature_id: (row.output_hash, row.feature_json, _rank_state(row))
+        for row in (jan_a_row, jan_b_row, feb_a_row, feb_b_row)
+    }
+
+    second = run_job(db_session, MarketPathRankOnlyBackfillJob(**job_kwargs))
+    db_session.expire_all()
+
+    assert second.status == "finished"
+    assert second.metrics["rank_rows_updated"] == 0
+    assert adapter.calls == []
+    assert {
+        row.market_path_feature_id: (row.output_hash, row.feature_json, _rank_state(row))
+        for row in (
+            db_session.get(MarketPathFeature, target_rows[0].market_path_feature_id),
+            db_session.get(MarketPathFeature, target_rows[1].market_path_feature_id),
+            db_session.get(MarketPathFeature, target_rows[2].market_path_feature_id),
+            db_session.get(MarketPathFeature, target_rows[3].market_path_feature_id),
+        )
+    } == target_hashes
+
+
+def test_market_path_rank_only_month_chunks_match_single_range_rank_call(db_session):
+    signals = {
+        ticker: _add_signal(
+            db_session,
+            ticker=ticker,
+            signal_day=signal_day,
+            entry_day=feature_day,
+        )
+        for ticker, signal_day, feature_day in (
+            ("SJA", date(2026, 1, 14), date(2026, 1, 15)),
+            ("SJB", date(2026, 1, 14), date(2026, 1, 15)),
+            ("SFA", date(2026, 2, 2), date(2026, 2, 3)),
+            ("SFB", date(2026, 2, 2), date(2026, 2, 3)),
+        )
+    }
+    fixture = (
+        ("SJA", date(2026, 1, 15), 1_000_000.0),
+        ("SJB", date(2026, 1, 15), 500_000.0),
+        ("SFA", date(2026, 2, 3), 200_000.0),
+        ("SFB", date(2026, 2, 3), 900_000.0),
+    )
+    for ticker, feature_day, dollar_volume in fixture:
+        _seed_market_path_feature_row(
+            db_session,
+            signals[ticker],
+            ticker=ticker,
+            feature_date=feature_day,
+            feature_version="market_path_daily_single",
+            dollar_volume=dollar_volume,
+            volume_expansion_20d=dollar_volume / 100_000.0,
+            volume_expansion_60d=dollar_volume / 200_000.0,
+            dollar_volume_expansion_20d=dollar_volume / 300_000.0,
+            dollar_volume_expansion_60d=dollar_volume / 400_000.0,
+            liquidity_proxy_score=dollar_volume / 1_000_000.0,
+        )
+        _seed_market_path_feature_row(
+            db_session,
+            signals[ticker],
+            ticker=ticker,
+            feature_date=feature_day,
+            feature_version="market_path_daily_chunked",
+            dollar_volume=dollar_volume,
+            volume_expansion_20d=dollar_volume / 100_000.0,
+            volume_expansion_60d=dollar_volume / 200_000.0,
+            dollar_volume_expansion_20d=dollar_volume / 300_000.0,
+            dollar_volume_expansion_60d=dollar_volume / 400_000.0,
+            liquidity_proxy_score=dollar_volume / 1_000_000.0,
+        )
+
+    single_adapter = NoFetchFmpAdapter()
+    single_job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=single_adapter,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 1, 1),
+        signal_end_date=date(2026, 2, 28),
+        through_date=date(2026, 2, 28),
+        feature_version="market_path_daily_single",
+    )
+    single_updated = single_job._populate_cross_sectional_ranks(
+        start_date=date(2026, 1, 1),
+        through_date=date(2026, 2, 28),
+    )
+    db_session.commit()
+    chunk_adapter = NoFetchFmpAdapter()
+    chunk_result = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=chunk_adapter,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 1, 1),
+        signal_end_date=date(2026, 2, 28),
+        through_date=date(2026, 2, 28),
+        feature_version="market_path_daily_chunked",
+    ).populate_ranks_only(
+        start_date=date(2026, 1, 1),
+        through_date=date(2026, 2, 28),
+    )
+    db_session.expire_all()
+
+    assert single_updated == 4
+    assert chunk_result["rank_rows_updated"] == 4
+    assert chunk_result["rank_month_count"] == 2
+    assert single_adapter.calls == []
+    assert chunk_adapter.calls == []
+    for ticker, feature_day, _ in fixture:
+        single_row = (
+            db_session.query(MarketPathFeature)
+            .filter(
+                MarketPathFeature.ticker == ticker,
+                MarketPathFeature.feature_session_date == feature_day.isoformat(),
+                MarketPathFeature.feature_version == "market_path_daily_single",
+            )
+            .one()
+        )
+        chunk_row = (
+            db_session.query(MarketPathFeature)
+            .filter(
+                MarketPathFeature.ticker == ticker,
+                MarketPathFeature.feature_session_date == feature_day.isoformat(),
+                MarketPathFeature.feature_version == "market_path_daily_chunked",
+            )
+            .one()
+        )
+        assert _rank_state(chunk_row) == _rank_state(single_row)
 
 
 def test_market_path_bulk_failed_fetch_artifact_preserves_retry_metadata(

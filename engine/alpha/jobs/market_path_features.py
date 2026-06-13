@@ -1608,6 +1608,57 @@ class MarketPathFeatureJob(BaseJob):
             )
         return updated
 
+    def populate_ranks_only(
+        self,
+        *,
+        start_date: date,
+        through_date: date,
+        progress_callback: ProgressCallback | None = None,
+        progress_every: int | None = None,
+    ) -> dict[str, Any]:
+        """Populate cross-sectional ranks month-by-month without fetching bars."""
+
+        if start_date > through_date:
+            raise ValueError("start_date must be on or before through_date")
+        started = perf_counter()
+        total_updated = 0
+        month_records: list[dict[str, Any]] = []
+        for month_start, month_end in _month_ranges(start_date, through_date):
+            month_started = perf_counter()
+            _safe_progress(
+                progress_callback,
+                "rank_month_start",
+                {
+                    "month_start": month_start.isoformat(),
+                    "month_end": month_end.isoformat(),
+                    "feature_version": self._feature_version,
+                },
+            )
+            rows_updated = self._populate_cross_sectional_ranks(
+                start_date=month_start,
+                through_date=month_end,
+                progress_callback=progress_callback,
+                progress_every=progress_every or self._progress_every,
+            )
+            if rows_updated:
+                self._session.flush()
+            self._session.commit()
+            total_updated += rows_updated
+            record = {
+                "month_start": month_start.isoformat(),
+                "month_end": month_end.isoformat(),
+                "rank_rows_updated": rows_updated,
+                "elapsed_seconds": _elapsed_since(month_started),
+            }
+            month_records.append(record)
+            _safe_progress(progress_callback, "rank_month_finish", record)
+        return {
+            "rank_rows_updated": total_updated,
+            "rank_month_count": len(month_records),
+            "rank_months": month_records,
+            "elapsed_seconds": _elapsed_since(started),
+        }
+
 
 def _assign_row(
     row: MarketPathFeature,
@@ -1795,6 +1846,36 @@ def _safe_rank_progress(
         callback("rank_group_progress", payload)
     except Exception:
         return
+
+
+def _safe_progress(
+    callback: ProgressCallback | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event, payload)
+    except Exception:
+        return
+
+
+def _month_ranges(start_date: date, through_date: date) -> Iterable[tuple[date, date]]:
+    cursor = start_date.replace(day=1)
+    while cursor <= through_date:
+        next_month = _first_day_next_month(cursor)
+        month_start = max(start_date, cursor)
+        month_end = min(through_date, next_month - timedelta(days=1))
+        if month_start <= month_end:
+            yield month_start, month_end
+        cursor = next_month
+
+
+def _first_day_next_month(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
 
 
 def _retry_metadata_from_lineage(response: Any) -> dict[str, Any]:

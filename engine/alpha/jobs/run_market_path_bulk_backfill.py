@@ -58,6 +58,7 @@ from alpha.runtime_env import load_runtime_env
 
 
 JOB_NAME = "market_path_bulk_backfill"
+RANK_ONLY_JOB_NAME = "market_path_rank_only_backfill"
 DEFAULT_REQUEST_RETRIES = 2
 
 PrintFn = Callable[[str], None]
@@ -179,6 +180,192 @@ class RetryingHistoricalPriceFmpAdapter:
             max_retries=self._max_retries,
             request_timeout_seconds=self._request_timeout_seconds,
         )
+
+
+class NoopHistoricalPriceFmpAdapter:
+    """Adapter used by rank-only mode to fail fast on accidental fetches."""
+
+    cache_hits = 0
+    cache_misses = 0
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def get_historical_price(self, *args: Any, **kwargs: Any) -> AdapterResponse[Any]:
+        self.calls.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("rank-only mode must not fetch historical prices")
+
+
+class MarketPathRankOnlyBackfillJob(BaseJob):
+    """Populate existing market-path cross-sectional ranks without fetching bars."""
+
+    def __init__(
+        self,
+        *,
+        session: Session,
+        fmp_adapter: Any,
+        pattern_ids: Sequence[str],
+        signal_start_date: date,
+        signal_end_date: date,
+        run_timestamp: datetime | None = None,
+        feature_version: str = FEATURE_VERSION,
+        progress_artifact: str | Path | None = None,
+        schema: str | None = None,
+        progress_every: int = 10,
+        print_fn: PrintFn = print,
+    ) -> None:
+        if progress_every < 1:
+            raise ValueError("progress_every must be >= 1")
+        self._session = session
+        self._fmp = fmp_adapter
+        self._pattern_ids = tuple(_unique_patterns(pattern_ids))
+        self._signal_start_date = signal_start_date
+        self._signal_end_date = signal_end_date
+        self._run_timestamp = run_timestamp
+        self._feature_version = feature_version
+        self._progress_artifact = Path(progress_artifact) if progress_artifact else None
+        self._schema = schema
+        self._progress_every = progress_every
+        self._print_fn = print_fn
+
+    @property
+    def job_name(self) -> str:
+        return RANK_ONLY_JOB_NAME
+
+    @property
+    def job_type(self) -> str:
+        return "feature_enrichment"
+
+    def run(self, ctx: JobContext) -> JobResult:
+        started = time.perf_counter()
+        if self._signal_start_date > self._signal_end_date:
+            return JobResult(
+                status="failed",
+                errors=[{"message": "signal_start_date must be on or before signal_end_date"}],
+            )
+        artifact: dict[str, Any] = {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "job": RANK_ONLY_JOB_NAME,
+            "mode": "rank_only",
+            "schema": self._schema,
+            "pattern_ids": list(self._pattern_ids),
+            "feature_version": self._feature_version,
+            "signal_start_date": self._signal_start_date.isoformat(),
+            "signal_end_date": self._signal_end_date.isoformat(),
+            "progress_events": [],
+            "summary": {},
+        }
+        _write_artifact(self._progress_artifact, artifact)
+
+        def progress(event: str, payload: dict[str, Any]) -> None:
+            self._append_run_event(artifact, event, payload)
+
+        self._append_run_event(
+            artifact,
+            "rank_only_start",
+            {
+                "signal_start_date": self._signal_start_date.isoformat(),
+                "signal_end_date": self._signal_end_date.isoformat(),
+                "pattern_ids": list(self._pattern_ids),
+                "feature_version": self._feature_version,
+            },
+        )
+        rank_job = MarketPathFeatureJob(
+            session=self._session,
+            fmp_adapter=self._fmp,
+            run_timestamp=self._run_timestamp,
+            pattern_ids=self._pattern_ids,
+            signal_start_date=self._signal_start_date,
+            signal_end_date=self._signal_end_date,
+            through_date=self._signal_end_date,
+            feature_version=self._feature_version,
+        )
+        rank_result = rank_job.populate_ranks_only(
+            start_date=self._signal_start_date,
+            through_date=self._signal_end_date,
+            progress_callback=progress,
+            progress_every=self._progress_every,
+        )
+        self._append_run_event(
+            artifact,
+            "rank_only_finish",
+            {
+                "rank_rows_updated": rank_result["rank_rows_updated"],
+                "rank_month_count": rank_result["rank_month_count"],
+                "elapsed_seconds": rank_result["elapsed_seconds"],
+            },
+        )
+
+        self._append_run_event(artifact, "validation_start", {})
+        validation = validate_market_path_rank_only(
+            self._session,
+            pattern_ids=self._pattern_ids,
+            feature_start_date=self._signal_start_date,
+            feature_through_date=self._signal_end_date,
+            feature_version=self._feature_version,
+        )
+        self._append_run_event(artifact, "validation_finish", validation)
+        cache_stats = _adapter_cache_stats(self._fmp)
+        metrics = {
+            "mode": "rank_only",
+            "source": RANK_ONLY_JOB_NAME,
+            "pattern_ids": list(self._pattern_ids),
+            "signal_start_date": self._signal_start_date.isoformat(),
+            "signal_end_date": self._signal_end_date.isoformat(),
+            "feature_version": self._feature_version,
+            "rank_rows_updated": int(rank_result["rank_rows_updated"]),
+            "rank_month_count": int(rank_result["rank_month_count"]),
+            "rank_months": rank_result["rank_months"],
+            "rank_pass_count": 1,
+            "fmp_fetch_count": int(cache_stats.get("cache_misses", 0)),
+            "fmp_cache_hit_count": int(cache_stats.get("cache_hits", 0)),
+            "fmp_cache_miss_count": int(cache_stats.get("cache_misses", 0)),
+            "ticker_fetch_started_count": 0,
+            "ticker_fetch_finished_count": 0,
+            "ticker_fetch_error_count": 0,
+            "elapsed_seconds": round(time.perf_counter() - started, 6),
+            **validation,
+        }
+        artifact["summary"] = metrics
+        artifact["ended_at"] = datetime.now(timezone.utc).isoformat()
+        _write_artifact(self._progress_artifact, artifact)
+        return JobResult(status="finished", metrics=metrics)
+
+    def _append_run_event(
+        self,
+        artifact: dict[str, Any],
+        event: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event_record = {
+            "event": event,
+            "at": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        artifact.setdefault("progress_events", []).append(event_record)
+        artifact["last_progress_event"] = event
+        _write_artifact(self._progress_artifact, artifact)
+        self._print_progress(event_record)
+
+    def _print_progress(self, event_record: dict[str, Any]) -> None:
+        event = event_record.get("event")
+        pieces = [f"PROGRESS event={event}"]
+        for key in (
+            "month_start",
+            "month_end",
+            "rank_group_processed",
+            "rank_group_total",
+            "feature_session_date",
+            "feature_version",
+            "rank_rows_updated",
+            "rank_month_count",
+            "scoped_feature_row_count",
+            "rank_null_count",
+            "elapsed_seconds",
+        ):
+            if key in event_record:
+                pieces.append(f"{key}={event_record[key]}")
+        self._print_fn(" ".join(pieces))
 
 
 class MarketPathBulkBackfillJob(BaseJob):
@@ -817,6 +1004,57 @@ def validate_market_path_bulk_backfill(
     }
 
 
+def validate_market_path_rank_only(
+    session: Session,
+    *,
+    pattern_ids: Sequence[str],
+    feature_start_date: date,
+    feature_through_date: date,
+    feature_version: str,
+) -> dict[str, int]:
+    params = {
+        "patterns": tuple(pattern_ids),
+        "feature_start": feature_start_date.isoformat(),
+        "feature_through": feature_through_date.isoformat(),
+        "feature_version": feature_version,
+    }
+    scoped_filter = (
+        "pattern_id IN :patterns "
+        "AND feature_session_date >= :feature_start "
+        "AND feature_session_date <= :feature_through "
+        "AND feature_version = :feature_version"
+    )
+    duplicate_groups = session.execute(
+        text(
+            "SELECT COUNT(*) FROM ("
+            "SELECT signal_id, feature_session_date, feature_version, COUNT(*) "
+            "FROM market_path_features WHERE "
+            f"{scoped_filter} "
+            "GROUP BY signal_id, feature_session_date, feature_version "
+            "HAVING COUNT(*) > 1"
+            ") d"
+        ).bindparams(bindparam("patterns", expanding=True)),
+        params,
+    ).scalar()
+    row = session.execute(
+        text(
+            "SELECT "
+            "COUNT(*) AS scoped_feature_rows, "
+            "COUNT(*) FILTER (WHERE dollar_volume_rank IS NOT NULL) AS rank_populated_rows, "
+            "COUNT(*) FILTER (WHERE dollar_volume_rank IS NULL) AS rank_null_rows "
+            "FROM market_path_features WHERE "
+            f"{scoped_filter}"
+        ).bindparams(bindparam("patterns", expanding=True)),
+        params,
+    ).mappings().one()
+    return {
+        "duplicate_groups": int(duplicate_groups or 0),
+        "scoped_feature_row_count": int(row["scoped_feature_rows"] or 0),
+        "rank_populated_count": int(row["rank_populated_rows"] or 0),
+        "rank_null_count": int(row["rank_null_rows"] or 0),
+    }
+
+
 def _stage_table(stage_name: str) -> Table:
     metadata = MetaData()
     return Table(
@@ -868,52 +1106,77 @@ def _run_live(args: argparse.Namespace) -> int:
     elif args.create_tables:
         create_all_tables()
 
-    try:
-        fmp_adapter = RetryingHistoricalPriceFmpAdapter(
-            CachedHistoricalPriceFmpAdapter(
-                FmpAdapter(
-                    FmpConfig.from_env(),
-                    session=_TimeoutRequestsSession(args.request_timeout_seconds),
-                )
-            ),
-            max_retries=DEFAULT_REQUEST_RETRIES,
-            request_timeout_seconds=args.request_timeout_seconds,
-        )
-    except ConfigError as exc:
-        print(f"ERROR: {exc}")
-        return 1
-
     artifact_path = args.progress_artifact or _default_artifact_path()
-    job = MarketPathBulkBackfillJob(
-        session=get_session(),
-        fmp_adapter=fmp_adapter,
-        pattern_ids=args.pattern_id or ["M4"],
-        signal_start_date=_parse_date(args.signal_start_date),
-        signal_end_date=_parse_date(args.signal_end_date),
-        through_date=_parse_date(args.through_date),
-        run_timestamp=_parse_timestamp(args.run_timestamp),
-        batch_days=args.batch_days,
-        include_signal_session=args.include_signal_session,
-        lookback_calendar_days=args.lookback_calendar_days,
-        progress_artifact=artifact_path,
-        schema=target_schema,
-        progress_every=args.progress_every,
-        request_timeout_seconds=args.request_timeout_seconds,
-        max_fetch_concurrency=args.max_fetch_concurrency,
-        signal_source=args.signal_source,
-    )
+    signal_start_date = _parse_date(args.signal_start_date)
+    signal_end_date = _parse_date(args.signal_end_date)
+    through_date = _parse_date(args.through_date) if args.through_date else signal_end_date
+    if not args.rank_only and args.through_date is None:
+        print("ERROR: --through-date is required unless --rank-only is used")
+        return 1
+    if args.rank_only:
+        job = MarketPathRankOnlyBackfillJob(
+            session=get_session(),
+            fmp_adapter=NoopHistoricalPriceFmpAdapter(),
+            pattern_ids=args.pattern_id or ["M4"],
+            signal_start_date=signal_start_date,
+            signal_end_date=signal_end_date,
+            run_timestamp=_parse_timestamp(args.run_timestamp),
+            feature_version=args.feature_version,
+            progress_artifact=artifact_path,
+            schema=target_schema,
+            progress_every=args.progress_every,
+        )
+        source = RANK_ONLY_JOB_NAME
+    else:
+        try:
+            fmp_adapter = RetryingHistoricalPriceFmpAdapter(
+                CachedHistoricalPriceFmpAdapter(
+                    FmpAdapter(
+                        FmpConfig.from_env(),
+                        session=_TimeoutRequestsSession(args.request_timeout_seconds),
+                    )
+                ),
+                max_retries=DEFAULT_REQUEST_RETRIES,
+                request_timeout_seconds=args.request_timeout_seconds,
+            )
+        except ConfigError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+
+        job = MarketPathBulkBackfillJob(
+            session=get_session(),
+            fmp_adapter=fmp_adapter,
+            pattern_ids=args.pattern_id or ["M4"],
+            signal_start_date=signal_start_date,
+            signal_end_date=signal_end_date,
+            through_date=through_date,
+            run_timestamp=_parse_timestamp(args.run_timestamp),
+            batch_days=args.batch_days,
+            include_signal_session=args.include_signal_session,
+            lookback_calendar_days=args.lookback_calendar_days,
+            feature_version=args.feature_version,
+            progress_artifact=artifact_path,
+            schema=target_schema,
+            progress_every=args.progress_every,
+            request_timeout_seconds=args.request_timeout_seconds,
+            max_fetch_concurrency=args.max_fetch_concurrency,
+            signal_source=args.signal_source,
+        )
+        source = JOB_NAME
     try:
         result = run_job(
             job._session,
             job,
             params={
-                "source": "market_path_bulk_backfill",
+                "source": source,
+                "rank_only": args.rank_only,
                 "pattern_id": args.pattern_id or ["M4"],
                 "signal_start_date": args.signal_start_date,
                 "signal_end_date": args.signal_end_date,
-                "through_date": args.through_date,
+                "through_date": through_date.isoformat(),
                 "include_signal_session": args.include_signal_session,
                 "batch_days": args.batch_days,
+                "feature_version": args.feature_version,
                 "schema": target_schema,
                 "confirm_live_write": args.confirm_live_write,
                 "progress_artifact": str(artifact_path),
@@ -935,6 +1198,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--live", action="store_true", help="Run live bulk backfill")
+    mode.add_argument("--rank-only", action="store_true", help="Run only the existing-row rank pass")
     parser.add_argument("--database-url", help="Override DATABASE_URL")
     parser.add_argument("--schema", help="Optional PostgreSQL schema/search_path target")
     parser.add_argument("--create-tables", action="store_true")
@@ -948,7 +1212,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--signal-start-date", required=True)
     parser.add_argument("--signal-end-date", required=True)
-    parser.add_argument("--through-date", required=True)
+    parser.add_argument("--through-date")
     parser.add_argument("--include-signal-session", action="store_true")
     parser.add_argument("--batch-days", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=10)
@@ -964,6 +1228,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--progress-artifact")
+    parser.add_argument("--feature-version", default=FEATURE_VERSION)
     parser.add_argument(
         "--lookback-calendar-days",
         type=int,
@@ -979,7 +1244,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         args = _parse_args(argv or sys.argv[1:])
-        if args.live:
+        if args.live or args.rank_only:
             return _run_live(args)
         return 1
     finally:
