@@ -23,19 +23,22 @@ As of June 2026, Alpha Capital has moved beyond a single-pattern prototype into 
 | Area | Current state |
 |---|---|
 | Runtime | Python 3.9+ engine with SQLAlchemy, Alembic, pytest, Postgres/Supabase, and provider adapters. |
-| Production DB | Supabase/Postgres canonical database with Alembic-managed schema. |
-| Production compute | Google Compute Engine VM scheduled after the market close, monitored by Healthchecks.io. |
+| Production DB | Supabase Postgres 17 (Pro plan, `us-east-2`) with Alembic-managed schema. The corpus is ~29 GB (~2.7 GB of indexes) on auto-expanding provisioned storage; database compute is being scaled up from the 1 GB Micro tier as the ML-read/backfill workload grows. |
+| Production compute | Always-on Google Compute Engine `e2-standard-2` VM (2 vCPU / 8 GB, `us-east4`, on-demand) scheduled after the market close and monitored by Healthchecks.io. Heavy historical backfills temporarily scale it to a 32 GB high-memory instance, and bursty ML training runs on a separate spun-up/torn-down box rather than fattening the always-on engine. |
 | Universe | Live FMP/Polygon-built operating universe widened from microcap-only to `$30M-$5B`; latest proven wide build included 2,621 names. |
 | Live accumulation | M4 live since June 1; M1 enabled June 4 (first real fire the same week); M2 live June 5 in SEC-only mode. All three run under one canonical nightly orchestrator. |
 | Historical corpus | Survivorship-correct M4 replay executed on production: ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), every month independently audited for exact trading calendars, zero duplicates, and PIT flags. |
+| Forward labels | Full-corpus forward-return backfill executed on production: ~94% of historical M4 signals labeled, with per-signal 15-session forward paths (~1.04M path rows); the remainder is honest residue (immature 2026 windows, survivorship-review states), not silent gaps. |
 | ML training hygiene | Security-type exclusion artifact + fail-closed loader: every corpus ticker classified (common stock vs. SPAC/ETF/fund/preferred/listed debt/CEF), ~22% of historical signals marked non-common and excluded from training without deleting a single registry row. |
+| Paper execution | Pattern-agnostic three-layer paper-trading leg built and dual-audited (execution core, snapshot data leg, per-pattern gate plug-ins): own evidence table, fail-closed paper-URL guard, data-clock entries, never writes the signal registry. Multi-day dry-run is the next operational step. |
+| Pattern research | Every bars-testable pattern swept through survivorship-aware corpus sims (June 10-12): two intraday candidates validated with leakage-free minute-bar entries and out-of-time + survivorship + cost kill-tests (I12, I11); three patterns chopped with evidence archived (M5, I3, I9); one parked-reframed (M3). |
 | M2 | SEC Form 4 backfill/warm-start path built; production runs SEC-only (FMP enrichment skipped) while the widened-universe seed is staged as a resumable job. |
 | M3 | Sector-rotation detector and PIT sector-history pipeline built, default-off until coverage and governance gates are met. |
-| Market-path features | Durable per-signal/per-day feature store built for base EOD, rich EOD technicals, relative features, ML context fields, lineage, hashes, and null/status auditability. Bulk backfill runner proven idempotent and self-healing. |
-| Testing | Current full-suite baseline is over 2,200 passing Python tests with scratch-schema and real-provider integration probes. |
+| Market-path features | Durable per-signal/per-day feature store built for base EOD, rich EOD technicals, relative features, ML context fields, lineage, hashes, and null/status auditability. Bulk backfill runner proven idempotent and self-healing; historical EOD enrichment now spans the full 29-month corpus, with the deferred cross-sectional rank-population pass finishing the 2024-2025 window. |
+| Testing | Current full-suite baseline is over 2,280 passing Python tests with scratch-schema and real-provider integration probes. |
 | Safety posture | Public writes are guarded; scratch schemas are isolated; M3 remains default-off; market-path failures are observability-only; M4/M1/M2 producer behavior is protected by regression tests. |
 
-The project has completed historical replay and is now in label/feature backfill and ML corpus assembly, with paper-trading execution wiring as the next operational track. It is not yet live broker execution.
+The project has completed historical replay and forward-return labeling, is finishing feature backfill and ML corpus assembly (the pre-signal setup-context store is now built and dual-audited, with its scratch pilot the next gate), and has the paper-trading execution leg built and audited (multi-day dry-run next). It is not yet live broker execution.
 
 ---
 
@@ -115,13 +118,13 @@ The platform treats nulls as first-class evidence. A null with `missing_intraday
 
 ## Market-Path Feature Store
 
-`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The current public proof covers M4 and M1 signal-day plus forward-path rows for early June 2026; the next planned runs are bulk enrichment of the full 29-month historical M4 corpus, then pre-signal setup context so models can learn what strong winners looked like before the signal fired.
+`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The full 29-month historical M4 corpus is now enriched with signal-day plus forward-path rows, and a dedicated pre-signal setup-context store has been built and dual-audited so models can learn what strong winners looked like before the signal fired; its scratch pilot is the remaining gate.
 
 The intended ML corpus has three separate zones:
 
 | Zone | Purpose | Leakage rule |
 |---|---|---|
-| Pre-signal setup | T-60 through T-1 context before a signal fires. | Predictors only; no signal-day or forward-path values. |
+| Pre-signal setup | T-20 (configurable) raw daily-bar sequence before a signal fires, in a dedicated ticker-date-keyed table. | Predictors only; no signal-day or forward-path values, and no cross-sectional ranks (the fired-cohort denominator is circular). |
 | Signal-day anatomy | T0 close/candle/volume/context and day-zero behavior. | Usable only when the decision clock could have known it. |
 | Forward outcome path | T+1 through horizon returns, MFE/MAE, barrier/exit labels. | Labels and diagnostics only; never same-row predictors. |
 
@@ -156,19 +159,20 @@ Alpha Capital uses a pattern roster rather than a single monolithic signal. Each
 
 | Pattern | Thesis | Current status |
 |---|---|---|
-| M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Producer/assembler/detector built; integrated into measurement spine; early evidence suggests signal-day/intraday timing matters more than next-session entry. |
-| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Producer/assembler/detector built; source-gating fixed; live in production in SEC-only mode since June 5. |
+| M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Live since June 4; corpus sim produced a binding research overlay (cap ceiling, hold length, avoid-filters) now part of the spec. |
+| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Live in production in SEC-only mode since June 5; corpus sim overlay vaulted, including an EDGAR acceptance-minute intraday entry fork. |
 | M2U - Insider Cluster Upside | M2 variant focused on upside cluster behavior. | Built with M2 path. |
-| M3 - Sector Rotation | PIT sector-relative return and cross-sectional sector rank. | Detector and sector-history pipeline built; default-off pending coverage gates. |
-| M4 - 52-Week High | EOD close breaks prior 52-week high. | Original live signal-accumulation lane. |
-| M5 - Failed Breakdown Reversal | Failed downside break with reversal dynamics. | Detector built. |
-| M6 - Volatility Compression Breakout | Low-volatility compression followed by expansion. | Detector built. |
-| M7 - Pure Technical ML | ML-recognized multi-day technical setups under Reality-Check governance. | Detector scaffold built. |
-| I1 - Gap and Go | Gap continuation with intraday confirmation. | Detector built; intraday data remains a blocker for production. |
+| M3 - Sector Rotation | PIT sector-relative return and cross-sectional sector rank. | Detector and sector-history pipeline built, default-off. Research parked-reframed: the spec form failed on proxy; a hot-industry-pullback variant survives and awaits out-of-time validation. |
+| M4 - 52-Week High | EOD close breaks prior 52-week high. | Original live signal-accumulation lane; full 29-month survivorship-correct historical corpus with forward labels. |
+| M5 - Failed Breakdown Reversal | Failed downside break with reversal dynamics. | Chopped after daily-corpus and minute-bar re-attack sims both failed (no entry-knowable separator; volume anti-predictive on reclaims). Detector remains in code; evidence archived. |
+| M6 - Volatility Compression Breakout | Low-volatility compression followed by expansion. | Detector built; last unsimmed M-track pattern — corpus sim queued. |
+| M7 - Pure Technical ML | ML-recognized multi-day technical setups under Reality-Check governance. | Detector scaffold built; effectively the ML layer, blocked on mature labels. |
+| I1 - Gap and Go | Gap continuation with intraday confirmation. | Spec overnight form failed in sims, but the day-0 form (large gap + volume flood, open-to-close) validated and is part of the intraday book research. |
 | I8 - Opening Range Breakout | Opening range breakout behavior. | Detector built; intraday data remains a blocker for production. |
-| I11 - 52-Week High Breakout | Intraday twin of M4: cross prior high live, volume-confirmed, day-0 capture. | Spec/prospective; strong daily-proxy research, but blocked on true intraday bars and execution ordering proof. |
+| I11 - 52-Week High Breakout | Intraday twin of M4: cross prior high live, volume-confirmed, day-0 capture. | Validated on real minute bars with leakage-free confirmed entries (heavy haircut vs. daily-proxy numbers); best exit is overnight carry to next open; durable corpus build is specced and gated on the I12 pilot. |
+| I12 - Capitulation Volume Bounce | Day-0 reversal in deeply crushed names on extreme volume floods. | Discovered June 11 via cross-ablation; passed out-of-time, survivorship, and leakage-free minute-bar kill-tests plus a 2021-23 regime stress; the book's correction-regime diversifier. Durable corpus build in progress. |
 
-Additional event and intraday overlays are specified in the vault but intentionally not promoted until their data sources, PIT proof, and execution assumptions are validated.
+Additional event and intraday overlays are specified in the vault but intentionally not promoted until their data sources, PIT proof, and execution assumptions are validated. Two intraday patterns (I3 Short Squeeze, I9 ATR Expansion) were chopped in the June research sweep with evidence archived.
 
 ---
 
@@ -181,7 +185,7 @@ M4 and I11 are intentionally related but not the same.
 | M4 | End-of-day | Next session after a confirmed close above the prior 52-week high. | Gives up day-0 surge. |
 | I11 | Intraday | Enter when price crosses the prior 52-week high live, volume-confirmed. | Requires real intraday ordering, spreads, and executable fills. |
 
-M4 is the stable accumulation lane. I11 is the prospective edge candidate that may capture the move M4 structurally misses. The current research view is that I11 looks promising, but daily OHLC proxy is not enough; the deciding proof must come from real intraday bars and executable spread/fill assumptions.
+M4 is the stable accumulation lane. I11 captures the day-0 move M4 structurally misses. The minute-bar proof has now been run: leakage-free volume-confirmed entries retain a real but much smaller edge than the daily proxy implied, the optimal exit is overnight carry to the next open, and a faster-trigger fork remains open (the breakout pop concentrates at the cross, before volume confirmation can fire). Book-level sims combine I11 with I12 under position caps and pattern-priority ranking rather than first-come fills.
 
 ---
 
@@ -230,7 +234,7 @@ Alpha Capital separates data convenience from data authority.
 | Benzinga | Catalyst/news calendars, WIIMs, earnings, ratings, offerings, insider/news context. |
 | SEC EDGAR | Official filing authority for Form 4s, Form 25/25-NSE, acceptance-time PIT handling. |
 | Nasdaq | Listing/halt/archive authority pipeline. |
-| Alpaca | Broker/execution adapter scaffold; production execution is intentionally not live yet. |
+| Alpaca | Paper-trading account wired into the paper-execution leg; live broker execution intentionally not enabled. Real-time entitlement is IEX-only, so volume gates run on Polygon delayed snapshots by design. |
 
 Provider errors are observable states. The engine records attempts and distinguishes `no_data`, `provider_error`, `parse_error`, `validation_error`, and PIT exclusion states.
 
@@ -307,7 +311,7 @@ Target path:
 
 For bounded replay windows, the FMP delisted-company ingest supports a date cutoff such as `--stop-after-delisted-before 2026-01-01`. The cohort runner accepts that bounded source only when the recorded cutoff covers the requested replay start date; otherwise public replay fails closed.
 
-This plan has been executed on production: the full M4 historical corpus now covers ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), with every month independently audited for exact trading calendars, zero duplicates, and PIT provenance flags. The immediate operational targets are now full-corpus forward-return labels and post-signal market-path enrichment for all reconstructed signals, then pre-signal context rows for the same corpus.
+This plan has been executed on production: the full M4 historical corpus now covers ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), with every month independently audited for exact trading calendars, zero duplicates, and PIT provenance flags. Full-corpus forward-return labels are computed (~94%, with the remainder being immature windows and explicit survivorship-review states rather than silent gaps), and post-signal market-path enrichment is on its final cross-sectional rank-population pass. The pre-signal setup-context store is built and dual-audited (scratch pilot pending), and a frozen ML manifest follows the end-to-end corpus join audit.
 
 ---
 
