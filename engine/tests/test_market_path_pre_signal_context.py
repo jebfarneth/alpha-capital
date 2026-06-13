@@ -569,12 +569,82 @@ def test_pre_signal_context_rerun_is_content_idempotent(db_session):
     assert first.metrics["context_rows_inserted"] == 2
     assert second.metrics["context_rows_material_updates"] == 0
     assert second.metrics["context_rows_unchanged"] == 2
+    assert second.metrics["context_rows_merged"] == 0
+    assert second.metrics["link_rows_inserted"] == 0
+    assert second.metrics["link_rows_updated"] == 0
+    assert second.metrics["link_rows_merged"] == 0
     assert db_session.query(MarketPathPreSignalContext).count() == 2
     assert db_session.query(MarketPathPreSignalLink).count() == 2
     assert {
         (row.ticker, row.feature_session_date): row.output_hash
         for row in db_session.query(MarketPathPreSignalContext).all()
     } == hashes
+
+
+def test_pre_signal_context_overlapping_batches_are_idempotent(db_session):
+    first_signal_day = date(2026, 6, 5)
+    second_signal_day = date(2026, 6, 8)
+    _add_replay_signal(db_session, ticker="OVLP", signal_day=first_signal_day)
+    _add_replay_signal(db_session, ticker="OVLP", signal_day=second_signal_day)
+    feature_dates = sorted({
+        *_pre_signal_dates(first_signal_day, 2),
+        *_pre_signal_dates(second_signal_day, 2),
+    })
+    _seed_hur(db_session, "OVLP", feature_dates)
+    adapter = FakeFmpAdapter({"OVLP": _session_bars(ticker="OVLP", through=second_signal_day)})
+
+    first = run_job(
+        db_session,
+        MarketPathPreSignalContextJob(
+            session=db_session,
+            fmp_adapter=adapter,
+            signal_start_date=first_signal_day,
+            signal_end_date=second_signal_day,
+            run_timestamp=RUN_TS,
+            pre_signal_window=2,
+            batch_days=1,
+        ),
+    )
+    hashes = {
+        (row.ticker, row.feature_session_date): row.output_hash
+        for row in db_session.query(MarketPathPreSignalContext).all()
+    }
+    statuses = {
+        (row.ticker, row.feature_session_date): json.loads(row.status_json)
+        for row in db_session.query(MarketPathPreSignalContext).all()
+    }
+    second = run_job(
+        db_session,
+        MarketPathPreSignalContextJob(
+            session=db_session,
+            fmp_adapter=adapter,
+            signal_start_date=first_signal_day,
+            signal_end_date=second_signal_day,
+            run_timestamp=RUN_TS + timedelta(hours=1),
+            pre_signal_window=2,
+            batch_days=1,
+        ),
+    )
+
+    assert first.metrics["context_rows_inserted"] == 3
+    assert first.metrics["context_rows_material_updates"] == 0
+    assert first.metrics["link_rows_inserted"] == 4
+    assert second.metrics["context_rows_material_updates"] == 0
+    assert second.metrics["context_rows_unchanged"] == 4
+    assert second.metrics["context_rows_merged"] == 0
+    assert second.metrics["link_rows_inserted"] == 0
+    assert second.metrics["link_rows_updated"] == 0
+    assert second.metrics["link_rows_merged"] == 0
+    assert db_session.query(MarketPathPreSignalContext).count() == 3
+    assert db_session.query(MarketPathPreSignalLink).count() == 4
+    assert {
+        (row.ticker, row.feature_session_date): row.output_hash
+        for row in db_session.query(MarketPathPreSignalContext).all()
+    } == hashes
+    assert {
+        (row.ticker, row.feature_session_date): json.loads(row.status_json)
+        for row in db_session.query(MarketPathPreSignalContext).all()
+    } == statuses
 
 
 def test_pre_signal_context_rows_do_not_enter_forward_rank_pass(db_session):

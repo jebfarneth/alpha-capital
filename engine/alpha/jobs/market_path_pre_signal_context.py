@@ -465,11 +465,13 @@ class MarketPathPreSignalContextJob(BaseJob):
                         self._feature_role,
                         self._feature_version,
                     )
-                    if key in existing_links:
-                        link_updated += 1
-                    else:
+                    existing_link = existing_links.get(key)
+                    if existing_link is None:
                         link_inserted += 1
-                    link_rows.append(link)
+                        link_rows.append(link)
+                    elif _link_materially_changed(existing_link, link):
+                        link_updated += 1
+                        link_rows.append(link)
 
             if ticker_fetch_finished and ticker_fetch_finished % self._progress_every == 0:
                 self._emit(
@@ -591,16 +593,11 @@ class MarketPathPreSignalContextJob(BaseJob):
     def _existing_links(
         self,
         signal_ids: Sequence[str],
-    ) -> set[tuple[str, date, str, str]]:
+    ) -> dict[tuple[str, date, str, str], MarketPathPreSignalLink]:
         if not signal_ids:
-            return set()
+            return {}
         rows = (
-            self._session.query(
-                MarketPathPreSignalLink.signal_id,
-                MarketPathPreSignalLink.feature_session_date,
-                MarketPathPreSignalLink.feature_role,
-                MarketPathPreSignalLink.feature_version,
-            )
+            self._session.query(MarketPathPreSignalLink)
             .filter(
                 MarketPathPreSignalLink.signal_id.in_(tuple(signal_ids)),
                 MarketPathPreSignalLink.feature_role == self._feature_role,
@@ -608,7 +605,10 @@ class MarketPathPreSignalContextJob(BaseJob):
             )
             .all()
         )
-        return {(signal_id, feature_date, role, version) for signal_id, feature_date, role, version in rows}
+        return {
+            (row.signal_id, row.feature_session_date, row.feature_role, row.feature_version): row
+            for row in rows
+        }
 
     def _emit(
         self,
@@ -925,7 +925,7 @@ def _context_row(
             features["volume"],
             features["median_volume_20d"],
         )
-        status["prior_session_count"] = len(prior)
+        status["prior_session_count"] = len(prior20)
         status["prior20_available_count"] = len(prior20)
         status["insufficient_history"] = {
             "prior20": len(prior) < 20,
@@ -1077,6 +1077,18 @@ def _context_materially_changed(
         or existing.input_hash != row.get("input_hash")
         or existing.row_status != row.get("row_status")
         or existing.feature_json != row.get("feature_json")
+    )
+
+
+def _link_materially_changed(
+    existing: MarketPathPreSignalLink,
+    row: dict[str, Any],
+) -> bool:
+    return (
+        existing.ticker != row.get("ticker")
+        or existing.pattern_id != row.get("pattern_id")
+        or existing.signal_date != row.get("signal_date")
+        or existing.relative_session_index != row.get("relative_session_index")
     )
 
 
