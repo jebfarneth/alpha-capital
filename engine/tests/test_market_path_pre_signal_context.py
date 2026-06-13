@@ -661,14 +661,68 @@ def test_pre_signal_context_rows_do_not_enter_forward_rank_pass(db_session):
 
 def test_pre_signal_runner_hard_refuses_public_default_writes():
     with pytest.raises(ValueError, match="Refusing public/default"):
-        _validate_write_target(schema=None, confirm_live_write=True)
-    with pytest.raises(ValueError, match="Refusing public/default"):
-        _validate_write_target(schema="public", confirm_live_write=True)
-    with pytest.raises(ValueError, match="Refusing public/default"):
-        _validate_write_target(schema="", confirm_live_write=True)
-    with pytest.raises(ValueError, match="Refusing public/default"):
-        _validate_write_target(schema="   ", confirm_live_write=True)
-    _validate_write_target(schema="m4_pre_signal_scratch", confirm_live_write=False)
+        _validate_write_target(
+            schema=None,
+            confirm_live_write=True,
+            confirm_public_write=False,
+            database_url="postgresql://example/db",
+        )
+    with pytest.raises(ValueError, match="schema public"):
+        _validate_write_target(
+            schema="public",
+            confirm_live_write=True,
+            confirm_public_write=True,
+            database_url="postgresql://example/db",
+        )
+    with pytest.raises(ValueError, match="empty --schema"):
+        _validate_write_target(
+            schema="",
+            confirm_live_write=True,
+            confirm_public_write=True,
+            database_url="postgresql://example/db",
+        )
+    with pytest.raises(ValueError, match="empty --schema"):
+        _validate_write_target(
+            schema="   ",
+            confirm_live_write=True,
+            confirm_public_write=True,
+            database_url="postgresql://example/db",
+        )
+    _validate_write_target(
+        schema="m4_pre_signal_scratch",
+        confirm_live_write=False,
+        confirm_public_write=False,
+    )
+
+
+def test_pre_signal_runner_public_write_requires_postgres_and_matched_head():
+    def _raise_head_mismatch(url: str):
+        raise ValueError("head mismatch")
+
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        _validate_write_target(
+            schema=None,
+            confirm_live_write=False,
+            confirm_public_write=True,
+            database_url="sqlite:///local.db",
+        )
+    with pytest.raises(ValueError, match="head mismatch"):
+        _validate_write_target(
+            schema=None,
+            confirm_live_write=False,
+            confirm_public_write=True,
+            database_url="postgresql://example/db",
+            revision_checker=_raise_head_mismatch,
+        )
+    calls: list[str] = []
+    _validate_write_target(
+        schema=None,
+        confirm_live_write=False,
+        confirm_public_write=True,
+        database_url="postgresql://example/db",
+        revision_checker=lambda url: calls.append(url) or {"at_head": True},
+    )
+    assert calls == ["postgresql://example/db"]
 
 
 def test_pre_signal_runner_requires_explicit_signal_source():
@@ -739,4 +793,68 @@ def test_pre_signal_runner_preserves_job_progress_artifact(db_session, tmp_path,
     runner_payload = json.loads(runner_artifact.read_text())
     assert runner_payload["job_progress_artifact"] == str(progress_artifact)
     assert runner_payload["events"]
+    assert runner_payload["result"]["status"] == "finished"
+
+
+def test_pre_signal_runner_allows_confirmed_public_default_when_guards_pass(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    signal_day = date(2026, 6, 5)
+    _add_replay_signal(db_session, ticker="PUBW", signal_day=signal_day)
+    feature_dates = _pre_signal_dates(signal_day, 1)
+    _seed_hur(db_session, "PUBW", feature_dates)
+    fake_adapter = FakeFmpAdapter({"PUBW": _session_bars(ticker="PUBW", through=signal_day)})
+    progress_artifact = tmp_path / "pre_signal_public_progress.json"
+    verified_urls: list[str] = []
+
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
+    monkeypatch.setattr(pre_signal_runner, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(pre_signal_runner, "reset_globals", lambda: None)
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "_verify_public_alembic_head",
+        lambda url: verified_urls.append(url) or {"at_head": True},
+    )
+
+    def _unexpected_create_all_tables():
+        raise AssertionError("public/default path must not call create_all_tables")
+
+    monkeypatch.setattr(pre_signal_runner, "create_all_tables", _unexpected_create_all_tables)
+    monkeypatch.setattr(pre_signal_runner, "get_session", lambda: db_session)
+    monkeypatch.setattr(pre_signal_runner.FmpConfig, "from_env", staticmethod(lambda: object()))
+    monkeypatch.setattr(pre_signal_runner, "FmpAdapter", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "CachedHistoricalPriceFmpAdapter",
+        lambda adapter: fake_adapter,
+    )
+    monkeypatch.setattr(
+        pre_signal_runner,
+        "RetryingHistoricalPriceFmpAdapter",
+        lambda adapter, **kwargs: adapter,
+    )
+
+    rc = pre_signal_runner.main([
+        "--live",
+        "--database-url",
+        "postgresql://example/db",
+        "--confirm-public-write",
+        "--signal-start-date",
+        signal_day.isoformat(),
+        "--signal-end-date",
+        signal_day.isoformat(),
+        "--signal-source",
+        "historical-m4-replay",
+        "--pre-signal-window",
+        "1",
+        "--progress-artifact",
+        str(progress_artifact),
+    ])
+
+    assert rc == 0
+    assert verified_urls == ["postgresql://example/db"]
+    assert db_session.query(MarketPathPreSignalContext).filter_by(ticker="PUBW").count() == 1
+    runner_payload = json.loads(pre_signal_runner._runner_artifact_path(progress_artifact).read_text())
     assert runner_payload["result"]["status"] == "finished"

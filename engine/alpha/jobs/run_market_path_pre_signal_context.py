@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Guarded M4 pre-signal context backfill runner.
 
-This runner is scratch-first. Public/default writes are hard-refused until the
-scratch pilot, monthly cost rehearsal, and dual audit gates clear.
+Scratch schemas remain the default development path. Public/default writes are
+allowed only with ``--confirm-public-write`` after PostgreSQL and Alembic-head
+guards pass.
 """
 
 from __future__ import annotations
@@ -13,8 +14,13 @@ import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from sqlalchemy import create_engine
+
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from alpha.data.config import ConfigError, FmpConfig
 from alpha.data.fmp import FmpAdapter
 from alpha.db.engine import (
@@ -64,9 +70,15 @@ def _run_live(args: argparse.Namespace) -> int:
     if args.schema:
         os.environ["ALPHA_DB_SCHEMA"] = args.schema
         reset_globals()
-    target_schema = args.schema or os.environ.get("ALPHA_DB_SCHEMA")
+    target_schema = args.schema if args.schema is not None else os.environ.get("ALPHA_DB_SCHEMA")
     try:
-        _validate_write_target(schema=target_schema, confirm_live_write=args.confirm_live_write)
+        _validate_write_target(
+            schema=target_schema,
+            confirm_live_write=args.confirm_live_write,
+            confirm_public_write=args.confirm_public_write,
+            database_url=os.environ.get("DATABASE_URL"),
+            create_tables=args.create_tables,
+        )
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 1
@@ -153,6 +165,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "signal_end_date": args.signal_end_date,
                 "schema": target_schema,
                 "confirm_live_write": args.confirm_live_write,
+                "confirm_public_write": args.confirm_public_write,
                 "pre_signal_window": args.pre_signal_window,
                 "batch_days": args.batch_days,
                 "lookback_calendar_days": args.lookback_calendar_days,
@@ -178,12 +191,57 @@ def _run_live(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
-def _validate_write_target(*, schema: str | None, confirm_live_write: bool) -> None:
-    normalized = (schema or "").strip().lower()
-    if not normalized or normalized == "public":
+def _validate_write_target(
+    *,
+    schema: str | None,
+    confirm_live_write: bool,
+    confirm_public_write: bool,
+    database_url: str | None = None,
+    create_tables: bool = False,
+    revision_checker: Callable[[str], dict[str, Any]] | None = None,
+) -> None:
+    if schema is not None:
+        normalized = schema.strip().lower()
+        if not normalized:
+            raise ValueError("Refusing empty --schema target; omit --schema for public/default writes")
+        if normalized == "public":
+            raise ValueError(
+                "Refusing --schema public; omit --schema and pass --confirm-public-write "
+                "for public/default writes"
+            )
+        return
+    if not confirm_public_write:
         raise ValueError(
-            "Refusing public/default pre-signal context write until scratch rehearsal and audit gates clear"
+            "Refusing public/default pre-signal context write without --confirm-public-write"
         )
+    if create_tables:
+        raise ValueError("--create-tables is only valid with non-public scratch --schema")
+    url = database_url or os.environ.get("DATABASE_URL")
+    if not url:
+        raise ValueError("DATABASE_URL is required for public/default pre-signal context writes")
+    if not url.startswith("postgresql"):
+        raise ValueError("public/default pre-signal context writes require a PostgreSQL DATABASE_URL")
+    checker = revision_checker or _verify_public_alembic_head
+    checker(url)
+
+
+def _verify_public_alembic_head(url: str) -> dict[str, Any]:
+    config = Config("alembic.ini")
+    script = ScriptDirectory.from_config(config)
+    heads = set(script.get_heads())
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            context = MigrationContext.configure(conn)
+            current = set(context.get_current_heads())
+    finally:
+        engine.dispose()
+    if current != heads or not heads:
+        raise ValueError(
+            "public/default pre-signal context writes require database Alembic "
+            f"head to match code head (current={sorted(current)}, heads={sorted(heads)})"
+        )
+    return {"current": sorted(current), "heads": sorted(heads), "at_head": True}
 
 
 def _runner_artifact_path(progress_artifact: Path | None) -> Path | None:
@@ -210,6 +268,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--schema")
     parser.add_argument("--create-tables", action="store_true")
     parser.add_argument("--confirm-live-write", action="store_true")
+    parser.add_argument("--confirm-public-write", action="store_true")
     parser.add_argument("--run-timestamp")
     parser.add_argument(
         "--pattern-id",
