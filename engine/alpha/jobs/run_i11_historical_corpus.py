@@ -120,6 +120,9 @@ def _run_live(args: argparse.Namespace) -> int:
         batch_days=args.batch_days,
         minute_cache_dir=args.polygon_cache_dir,
         polygon_rate_limit_per_minute=args.polygon_rate_limit_per_minute,
+        skip_existing=args.skip_existing,
+        max_db_retries=args.max_db_retries,
+        db_retry_backoff_seconds=args.db_retry_backoff_seconds,
         progress_callback=progress,
         catalyst_tags_by_ticker_date=_load_catalyst_tags_artifact(args.catalyst_tags_artifact),
     )
@@ -136,6 +139,9 @@ def _run_live(args: argparse.Namespace) -> int:
                 "batch_days": args.batch_days,
                 "polygon_cache_dir": args.polygon_cache_dir,
                 "polygon_rate_limit_per_minute": args.polygon_rate_limit_per_minute,
+                "skip_existing": args.skip_existing,
+                "max_db_retries": args.max_db_retries,
+                "db_retry_backoff_seconds": args.db_retry_backoff_seconds,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
                 "catalyst_tags_artifact": args.catalyst_tags_artifact,
             },
@@ -245,6 +251,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=300,
         help="Maximum uncached Polygon minute fetches per minute.",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip ticker-days that already have an I11 intraday_event_details row.",
+    )
+    parser.add_argument("--max-db-retries", type=int, default=3)
+    parser.add_argument("--db-retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--progress-artifact")
     parser.add_argument(
         "--catalyst-tags-artifact",

@@ -288,6 +288,10 @@ class I12HistoricalCorpusJob(BaseJob):
     def job_type(self) -> str:
         return "historical_replay"
 
+    @property
+    def event_pattern_id(self) -> str:
+        return I12_PATTERN_ID
+
     def __init__(
         self,
         *,
@@ -354,11 +358,38 @@ class I12HistoricalCorpusJob(BaseJob):
         daily_cache: dict[str, tuple[tuple[_DailyBar, ...], DataLineage]] = {}
         minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], DataLineage]] = {}
 
+        self._run_batches_with_retry(
+            ctx,
+            counters=counters,
+            trading_dates=trading_dates,
+            classifications=classifications,
+            daily_cache=daily_cache,
+            minute_cache=minute_cache,
+            process_batch=self._run_batch_once,
+        )
+
+        return JobResult(
+            status="finished",
+            metrics=self._metrics(counters, trading_dates=trading_dates),
+            errors=counters.errors,
+        )
+
+    def _run_batches_with_retry(
+        self,
+        ctx: JobContext,
+        *,
+        counters: Any,
+        trading_dates: Sequence[date],
+        classifications: Mapping[str, SecurityTypeClassification],
+        daily_cache: dict[str, tuple[tuple[_DailyBar, ...], DataLineage]],
+        minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], DataLineage]],
+        process_batch: Callable[..., Any],
+    ) -> None:
         for batch_index, batch_dates in enumerate(_chunks(trading_dates, self._batch_days), start=1):
             attempt = 0
             while True:
                 try:
-                    batch_counters = self._run_batch_once(
+                    batch_counters = process_batch(
                         ctx,
                         batch_index=batch_index,
                         batch_dates=batch_dates,
@@ -398,12 +429,6 @@ class I12HistoricalCorpusJob(BaseJob):
                     })
                     if self._db_retry_backoff_seconds > 0:
                         time_module.sleep(self._db_retry_backoff_seconds * attempt)
-
-        return JobResult(
-            status="finished",
-            metrics=self._metrics(counters, trading_dates=trading_dates),
-            errors=counters.errors,
-        )
 
     def _run_batch_once(
         self,
@@ -552,7 +577,7 @@ class I12HistoricalCorpusJob(BaseJob):
         return (
             self._session.query(IntradayEventDetail.event_identity_hash)
             .filter(
-                IntradayEventDetail.pattern_id == I12_PATTERN_ID,
+                IntradayEventDetail.pattern_id == self.event_pattern_id,
                 IntradayEventDetail.ticker == ticker.upper(),
                 IntradayEventDetail.trading_date == trading_date,
             )

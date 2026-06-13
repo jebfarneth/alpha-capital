@@ -19,6 +19,7 @@ contract. A non-HUR ticker reaching classification is a job invariant failure.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -109,6 +110,8 @@ class _RunCounters:
     reused_signals: int = 0
     minute_cache_hits: int = 0
     minute_cache_misses: int = 0
+    skipped_existing: int = 0
+    db_reconnect_retries: int = 0
     batches: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
     non_session_bar_samples: list[dict[str, str]] = field(default_factory=list)
@@ -122,6 +125,37 @@ class _RunCounters:
                 "ticker": ticker.upper(),
                 "date": day.isoformat(),
             })
+
+    def merge(self, other: "_RunCounters") -> None:
+        self.ticker_days_scanned += other.ticker_days_scanned
+        self.candidates += other.candidates
+        self.candidates_screened_out += other.candidates_screened_out
+        self.confirmed += other.confirmed
+        self.never_confirmed += other.never_confirmed
+        self.failed_test += other.failed_test
+        self.halted_unfillable += other.halted_unfillable
+        self.excluded_by_type += other.excluded_by_type
+        self.artifact_excluded += other.artifact_excluded
+        self.sub_dollar_included += other.sub_dollar_included
+        self.primary_label_unavailable += other.primary_label_unavailable
+        self.non_session_bars_skipped += other.non_session_bars_skipped
+        self.fetch_errors += other.fetch_errors
+        self.quarantined += other.quarantined
+        self.inserted_details += other.inserted_details
+        self.reused_details += other.reused_details
+        self.inserted_signals += other.inserted_signals
+        self.reused_signals += other.reused_signals
+        self.minute_cache_hits += other.minute_cache_hits
+        self.minute_cache_misses += other.minute_cache_misses
+        self.skipped_existing += other.skipped_existing
+        self.db_reconnect_retries += other.db_reconnect_retries
+        self.batches += other.batches
+        self.errors.extend(other.errors)
+        self.non_session_bar_samples.extend(
+            other.non_session_bar_samples[: max(0, 10 - len(self.non_session_bar_samples))]
+        )
+        self.candidate_screen_fail_reasons.update(other.candidate_screen_fail_reasons)
+        self.outcomes.update(other.outcomes)
 
 
 @dataclass(frozen=True)
@@ -151,6 +185,9 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         classification_records: Mapping[str, SecurityTypeClassification] | None = None,
         minute_cache_dir: str | Path | None = None,
         polygon_rate_limit_per_minute: int | None = None,
+        skip_existing: bool = False,
+        max_db_retries: int = 3,
+        db_retry_backoff_seconds: float = 5.0,
         progress_callback: Any | None = None,
         catalyst_tags_by_ticker_date: Mapping[tuple[str, date], Sequence[str]] | None = None,
     ) -> None:
@@ -165,12 +202,19 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             classification_records=classification_records,
             minute_cache_dir=minute_cache_dir,
             polygon_rate_limit_per_minute=polygon_rate_limit_per_minute,
+            skip_existing=skip_existing,
+            max_db_retries=max_db_retries,
+            db_retry_backoff_seconds=db_retry_backoff_seconds,
             progress_callback=progress_callback,
         )
         self._catalyst_tags_by_ticker_date = {
             (ticker.upper(), day): tuple(sorted(set(tags)))
             for (ticker, day), tags in (catalyst_tags_by_ticker_date or {}).items()
         }
+
+    @property
+    def event_pattern_id(self) -> str:
+        return I11_PATTERN_ID
 
     def run(self, ctx: JobContext) -> JobResult:
         counters = _RunCounters()
@@ -191,111 +235,132 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         daily_cache: dict[str, tuple[tuple[_DailyBar, ...], Any]] = {}
         minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], Any]] = {}
 
-        for batch_index, batch_dates in enumerate(_chunks(trading_dates, self._batch_days), start=1):
-            counters.batches += 1
-            self._progress("batch_start", {
-                "batch_index": batch_index,
-                "date_start": batch_dates[0].isoformat(),
-                "date_end": batch_dates[-1].isoformat(),
-            })
-            hur_rows = self._load_hur_rows(batch_dates)
-            missing_hur_dates = [
-                day.isoformat()
-                for day in batch_dates
-                if day not in hur_rows
-            ]
-            if missing_hur_dates:
-                counters.quarantined += len(missing_hur_dates)
-                counters.errors.append({
-                    "error": "missing_hur_rows",
-                    "dates": missing_hur_dates[:20],
-                })
-                continue
-
-            for trading_date in batch_dates:
-                hur_members = set(hur_rows[trading_date])
-                for ticker in hur_rows[trading_date]:
-                    counters.ticker_days_scanned += 1
-                    if counters.ticker_days_scanned == 1 or (
-                        counters.ticker_days_scanned
-                        % PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS
-                        == 0
-                    ):
-                        self._progress("ticker_day_progress", {
-                            "ticker_days_scanned": counters.ticker_days_scanned,
-                            "trading_date": trading_date.isoformat(),
-                            "ticker": ticker,
-                            "metrics": self._metrics(counters, trading_dates=trading_dates),
-                        })
-                    try:
-                        sec = _classification_for_hur_ticker(
-                            classifications,
-                            ticker,
-                            hur_included=ticker in hur_members,
-                        )
-                    except ExclusionArtifactError:
-                        raise
-                    if sec.ml_excluded:
-                        counters.excluded_by_type += 1
-                    try:
-                        daily_input = self._load_daily_ticker_input(
-                            ticker=ticker,
-                            trading_date=trading_date,
-                            security_type=sec,
-                            daily_cache=daily_cache,
-                            counters=counters,
-                            job_run_id=ctx.job_run_id,
-                        )
-                        screen = _screen_i11_daily_candidate(daily_input)
-                        if not screen.passed:
-                            counters.candidates_screened_out += 1
-                            counters.candidate_screen_fail_reasons[screen.reason or "unknown"] += 1
-                            continue
-                        counters.candidates += 1
-                        inp = self._load_ticker_day_input(
-                            daily_input=daily_input,
-                            minute_cache=minute_cache,
-                            counters=counters,
-                            job_run_id=ctx.job_run_id,
-                        )
-                    except _Quarantine as exc:
-                        counters.quarantined += 1
-                        counters.errors.append(exc.payload)
-                        continue
-
-                    event = self._evaluate_i11_event(inp, screen.daily_context)
-                    counters.outcomes[event.outcome] += 1
-                    if event.outcome == OUTCOME_CONFIRMED:
-                        counters.confirmed += 1
-                    elif event.outcome == OUTCOME_NEVER_CONFIRMED:
-                        counters.never_confirmed += 1
-                    elif event.outcome == OUTCOME_FAILED_TEST:
-                        counters.failed_test += 1
-                    elif event.outcome == OUTCOME_HALTED_UNFILLABLE:
-                        counters.halted_unfillable += 1
-                    if event.split_basis_mismatch:
-                        counters.artifact_excluded += 1
-                    if event.sub_dollar_at_open:
-                        counters.sub_dollar_included += 1
-                    if event.outcome == OUTCOME_CONFIRMED and event.ret_next_open is None:
-                        counters.primary_label_unavailable += 1
-                    persisted = self._persist_i11_event(event, ctx.job_run_id)
-                    counters.inserted_details += int(persisted["inserted_detail"])
-                    counters.reused_details += int(not persisted["inserted_detail"])
-                    counters.inserted_signals += int(persisted["inserted_signal"])
-                    counters.reused_signals += int(persisted["reused_signal"])
-
-            self._session.commit()
-            self._progress("batch_finish", {
-                "batch_index": batch_index,
-                "metrics": self._metrics(counters, trading_dates=trading_dates),
-            })
+        self._run_batches_with_retry(
+            ctx,
+            counters=counters,
+            trading_dates=trading_dates,
+            classifications=classifications,
+            daily_cache=daily_cache,
+            minute_cache=minute_cache,
+            process_batch=self._run_batch_once,
+        )
 
         return JobResult(
             status="finished",
             metrics=self._metrics(counters, trading_dates=trading_dates),
             errors=counters.errors,
         )
+
+    def _run_batch_once(
+        self,
+        ctx: JobContext,
+        *,
+        batch_index: int,
+        batch_dates: Sequence[date],
+        classifications: Mapping[str, SecurityTypeClassification],
+        trading_dates: Sequence[date],
+        daily_cache: dict[str, tuple[tuple[_DailyBar, ...], Any]],
+        minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], Any]],
+        cumulative_counters: _RunCounters,
+    ) -> _RunCounters:
+        counters = _RunCounters(batches=1)
+        self._progress("batch_start", {
+            "batch_index": batch_index,
+            "date_start": batch_dates[0].isoformat(),
+            "date_end": batch_dates[-1].isoformat(),
+        })
+        hur_rows = self._load_hur_rows(batch_dates)
+        missing_hur_dates = [
+            day.isoformat()
+            for day in batch_dates
+            if day not in hur_rows
+        ]
+        if missing_hur_dates:
+            counters.quarantined += len(missing_hur_dates)
+            counters.errors.append({
+                "error": "missing_hur_rows",
+                "dates": missing_hur_dates[:20],
+            })
+            self._session.commit()
+            return counters
+
+        for trading_date in batch_dates:
+            hur_members = set(hur_rows[trading_date])
+            for ticker in hur_rows[trading_date]:
+                counters.ticker_days_scanned += 1
+                scanned_total = cumulative_counters.ticker_days_scanned + counters.ticker_days_scanned
+                if scanned_total == 1 or scanned_total % PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS == 0:
+                    progress_counters = deepcopy(cumulative_counters)
+                    progress_counters.merge(counters)
+                    self._progress("ticker_day_progress", {
+                        "ticker_days_scanned": scanned_total,
+                        "trading_date": trading_date.isoformat(),
+                        "ticker": ticker,
+                        "metrics": self._metrics(progress_counters, trading_dates=trading_dates),
+                    })
+                if self._skip_existing and self._has_existing_event(ticker, trading_date):
+                    counters.skipped_existing += 1
+                    continue
+                try:
+                    sec = _classification_for_hur_ticker(
+                        classifications,
+                        ticker,
+                        hur_included=ticker in hur_members,
+                    )
+                except ExclusionArtifactError:
+                    raise
+                if sec.ml_excluded:
+                    counters.excluded_by_type += 1
+                try:
+                    daily_input = self._load_daily_ticker_input(
+                        ticker=ticker,
+                        trading_date=trading_date,
+                        security_type=sec,
+                        daily_cache=daily_cache,
+                        counters=counters,
+                        job_run_id=ctx.job_run_id,
+                    )
+                    screen = _screen_i11_daily_candidate(daily_input)
+                    if not screen.passed:
+                        counters.candidates_screened_out += 1
+                        counters.candidate_screen_fail_reasons[screen.reason or "unknown"] += 1
+                        continue
+                    counters.candidates += 1
+                    inp = self._load_ticker_day_input(
+                        daily_input=daily_input,
+                        minute_cache=minute_cache,
+                        counters=counters,
+                        job_run_id=ctx.job_run_id,
+                    )
+                except _Quarantine as exc:
+                    counters.quarantined += 1
+                    counters.errors.append(exc.payload)
+                    continue
+
+                event = self._evaluate_i11_event(inp, screen.daily_context)
+                counters.outcomes[event.outcome] += 1
+                if event.outcome == OUTCOME_CONFIRMED:
+                    counters.confirmed += 1
+                elif event.outcome == OUTCOME_NEVER_CONFIRMED:
+                    counters.never_confirmed += 1
+                elif event.outcome == OUTCOME_FAILED_TEST:
+                    counters.failed_test += 1
+                elif event.outcome == OUTCOME_HALTED_UNFILLABLE:
+                    counters.halted_unfillable += 1
+                if event.split_basis_mismatch:
+                    counters.artifact_excluded += 1
+                if event.sub_dollar_at_open:
+                    counters.sub_dollar_included += 1
+                if event.outcome == OUTCOME_CONFIRMED and event.ret_next_open is None:
+                    counters.primary_label_unavailable += 1
+                persisted = self._persist_i11_event(event, ctx.job_run_id)
+                counters.inserted_details += int(persisted["inserted_detail"])
+                counters.reused_details += int(not persisted["inserted_detail"])
+                counters.inserted_signals += int(persisted["inserted_signal"])
+                counters.reused_signals += int(persisted["reused_signal"])
+
+        self._session.commit()
+        return counters
 
     def _evaluate_i11_event(
         self,
@@ -818,6 +883,8 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             "reused_signals": counters.reused_signals,
             "minute_cache_hits": counters.minute_cache_hits,
             "minute_cache_misses": counters.minute_cache_misses,
+            "skipped_existing": counters.skipped_existing,
+            "db_reconnect_retries": counters.db_reconnect_retries,
             "error_sample": counters.errors[:20],
         }
 

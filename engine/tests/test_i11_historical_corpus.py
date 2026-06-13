@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, stable_hash
 from alpha.data.fmp import FmpBar
@@ -27,6 +28,7 @@ from alpha.jobs.paper_execution import EASTERN, I11_PATTERN_ID
 from alpha.jobs.run_i11_historical_corpus import (
     I11_CORPUS_REQUIRED_TABLES,
     _load_catalyst_tags_artifact,
+    _parse_args,
     _validate_write_target,
 )
 from alpha.jobs.run_i12_historical_corpus import I12_CORPUS_REQUIRED_TABLES
@@ -252,6 +254,10 @@ def _run_i11(
     minutes=None,
     classifications=None,
     polygon=None,
+    minute_cache_dir=None,
+    skip_existing=False,
+    max_db_retries=3,
+    db_retry_backoff_seconds=5.0,
     catalyst_tags_by_ticker_date=None,
 ):
     _seed_hur(db_session, ticker)
@@ -266,6 +272,10 @@ def _run_i11(
         start_date=DAY,
         end_date=DAY,
         classification_records=classifications,
+        minute_cache_dir=minute_cache_dir,
+        skip_existing=skip_existing,
+        max_db_retries=max_db_retries,
+        db_retry_backoff_seconds=db_retry_backoff_seconds,
         catalyst_tags_by_ticker_date=catalyst_tags_by_ticker_date,
     )
     return run_job(db_session, job), polygon
@@ -383,6 +393,95 @@ def test_i11_corpus_is_idempotent_on_rerun(db_session):
     assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID).count() == 1
 
 
+def test_i11_corpus_uses_disk_cached_polygon_minutes(db_session, tmp_path):
+    first_polygon = FakePolygon({("TEST", DAY): _minute_bars_confirmed()})
+    first, _polygon = _run_i11(
+        db_session,
+        polygon=first_polygon,
+        minute_cache_dir=tmp_path,
+    )
+
+    assert first.status == "finished"
+    assert first.metrics["minute_cache_misses"] == 1
+    assert first_polygon.calls[("TEST", DAY)] == 1
+
+    second_polygon = FakePolygon({})
+    second, _polygon = _run_i11(
+        db_session,
+        polygon=second_polygon,
+        minute_cache_dir=tmp_path,
+    )
+
+    assert second.status == "finished"
+    assert second.metrics["minute_cache_hits"] == 1
+    assert second.metrics["minute_cache_misses"] == 0
+    assert second_polygon.calls == Counter()
+
+
+def test_i11_corpus_skip_existing_avoids_refetching_processed_ticker_day(db_session):
+    first_polygon = FakePolygon({("TEST", DAY): _minute_bars_confirmed()})
+    first, _polygon = _run_i11(db_session, polygon=first_polygon)
+
+    assert first.status == "finished"
+    assert first.metrics["inserted_details"] == 1
+
+    second_polygon = FakePolygon({})
+    second, _polygon = _run_i11(
+        db_session,
+        polygon=second_polygon,
+        skip_existing=True,
+    )
+
+    assert second.status == "finished"
+    assert second.metrics["skipped_existing"] == 1
+    assert second.metrics["candidates"] == 0
+    assert second.metrics["inserted_details"] == 0
+    assert second.metrics["reused_details"] == 0
+    assert second.metrics["minute_cache_hits"] == 0
+    assert second.metrics["minute_cache_misses"] == 0
+    assert second_polygon.calls == Counter()
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").count() == 1
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").count() == 1
+
+
+def test_i11_corpus_retries_transient_db_disconnect_once(db_session):
+    _seed_hur(db_session, "TEST")
+    job = I11HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({"TEST": _daily_bars()}),
+        polygon_adapter=FakePolygon({("TEST", DAY): _minute_bars_confirmed()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={"TEST": _classification()},
+        max_db_retries=1,
+        db_retry_backoff_seconds=0,
+    )
+    original_load_hur_rows = job._load_hur_rows
+    calls = {"count": 0}
+
+    def _flaky_load_hur_rows(trading_dates):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OperationalError(
+                "SELECT historical_universe_reconstructions",
+                {},
+                Exception("terminating connection due to administrator command"),
+            )
+        return original_load_hur_rows(trading_dates)
+
+    job._load_hur_rows = _flaky_load_hur_rows
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    assert calls["count"] == 2
+    assert result.metrics["db_reconnect_retries"] == 1
+    assert result.metrics["inserted_details"] == 1
+    assert result.metrics["inserted_signals"] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").count() == 1
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").count() == 1
+
+
 def test_i11_never_confirmed_control_keeps_cross_anatomy_without_signal(db_session):
     result, _polygon = _run_i11(db_session, minutes=_minute_bars_never_confirmed())
 
@@ -463,6 +562,30 @@ def test_i11_validate_write_target_refuses_public_default_without_confirmation()
     with pytest.raises(ValueError, match="sequencing gates"):
         _validate_write_target(schema="public", confirm_live_write=True)
     _validate_write_target(schema="i11_pilot_20260612", confirm_live_write=False)
+
+
+def test_i11_runner_skip_existing_and_retry_args():
+    args = _parse_args([
+        "--live",
+        "--schema",
+        "i11_pilot_20260612",
+        "--start-date",
+        "2024-01-02",
+        "--end-date",
+        "2024-01-03",
+        "--polygon-cache-dir",
+        "/var/tmp/i11_polygon_cache",
+        "--skip-existing",
+        "--max-db-retries",
+        "5",
+        "--db-retry-backoff-seconds",
+        "0.25",
+    ])
+
+    assert args.polygon_cache_dir == "/var/tmp/i11_polygon_cache"
+    assert args.skip_existing is True
+    assert args.max_db_retries == 5
+    assert args.db_retry_backoff_seconds == 0.25
 
 
 def test_i11_and_i12_required_tables_include_delisted_source():
