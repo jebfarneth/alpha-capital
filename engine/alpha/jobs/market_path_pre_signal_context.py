@@ -57,7 +57,7 @@ from alpha.market_calendar import (
 
 JOB_NAME = "market_path_pre_signal_context_backfill"
 FEATURE_ROLE = "pre_signal_context"
-FEATURE_VERSION = "market_path_pre_signal_v1"
+FEATURE_VERSION = "market_path_pre_signal_v2"
 RECONSTRUCTION_METHOD = "m4_pre_signal_context_fmp_eod_v1"
 DEFAULT_PRE_SIGNAL_WINDOW = 20
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 50
@@ -863,6 +863,7 @@ def _context_row(
         prev_close = _price_basis(previous) if previous is not None else None
         prior20 = prior[-20:]
         prior5 = prior[-5:]
+        has_prior20 = len(prior) >= 20
         row_input_bars = [*prior20, bar]
         previous_boundary = _window_identity_boundary(
             [previous] if previous is not None else [],
@@ -884,11 +885,11 @@ def _context_row(
         )
         median_volume_20d = (
             _median([item.volume for item in prior20])
-            if prior20_boundary is None else None
+            if has_prior20 and prior20_boundary is None else None
         )
         median_dollar_volume_20d = (
             _median([item.dollar_volume for item in prior20])
-            if prior20_boundary is None else None
+            if has_prior20 and prior20_boundary is None else None
         )
         features.update({
             "previous_close": prev_close if previous_boundary is None else None,
@@ -917,7 +918,7 @@ def _context_row(
             ),
             "sigma_20d": (
                 _sigma_close_to_close(prior20)
-                if prior20_boundary is None else None
+                if has_prior20 and prior20_boundary is None else None
             ),
         })
         features["volume_expansion_20d"] = _safe_ratio(

@@ -29,6 +29,7 @@ from alpha.jobs import run_market_path_pre_signal_context as pre_signal_runner
 from alpha.jobs.market_path_pre_signal_context import (
     FEATURE_VERSION,
     ROW_STATUS_COMPUTED,
+    ROW_STATUS_INSUFFICIENT_HISTORY,
     ROW_STATUS_OUTSIDE_UNIVERSE,
     MarketPathPreSignalContextJob,
 )
@@ -447,6 +448,45 @@ def test_pre_signal_context_happy_path_populates_within_window_features(db_sessi
     status = json.loads(row.status_json)
     assert "window_identity_boundary" not in status
     assert status["insufficient_history"]["prior20"] is False
+    assert json.loads(row.feature_json)["schema_version"] == "market_path_pre_signal_v2"
+
+
+def test_pre_signal_context_insufficient_history_nulls_full_window_features(db_session):
+    signal_day = date(2026, 6, 5)
+    _add_replay_signal(db_session, ticker="THIN", signal_day=signal_day)
+    feature_dates = _pre_signal_dates(signal_day, 1)
+    bars = _session_bars(ticker="THIN", through=signal_day, sessions=7)
+    _seed_hur(db_session, "THIN", _bar_dates_through(bars, feature_dates[0]))
+
+    result = run_job(
+        db_session,
+        MarketPathPreSignalContextJob(
+            session=db_session,
+            fmp_adapter=FakeFmpAdapter({"THIN": bars}),
+            signal_start_date=signal_day,
+            signal_end_date=signal_day,
+            run_timestamp=RUN_TS,
+            pre_signal_window=1,
+        ),
+    )
+
+    assert result.status == "finished"
+    row = db_session.get(
+        MarketPathPreSignalContext,
+        ("THIN", feature_dates[0], "pre_signal_context", FEATURE_VERSION),
+    )
+    assert row.row_status == ROW_STATUS_INSUFFICIENT_HISTORY
+    assert row.previous_close is not None
+    assert row.return_1d is not None
+    assert row.return_5d is not None
+    assert row.return_20d is None
+    assert row.sigma_20d is None
+    assert row.median_volume_20d is None
+    assert row.median_dollar_volume_20d is None
+    assert row.volume_expansion_20d is None
+    payload = json.loads(row.feature_json)
+    assert payload["schema_version"] == "market_path_pre_signal_v2"
+    assert payload["status"]["insufficient_history"]["prior20"] is True
 
 
 def test_pre_signal_context_nulls_within_window_features_across_hur_identity_boundary(db_session):
