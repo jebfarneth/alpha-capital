@@ -147,15 +147,6 @@ def _as_float(value: Any) -> float:
     return result if math.isfinite(result) else math.nan
 
 
-def _is_non_finite_raw_value(value: Any) -> bool:
-    if value is None or isinstance(value, bool):
-        return False
-    try:
-        return not math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
 def _transform(value: float, transform: str | None) -> float:
     if transform in (None, "", "identity"):
         return value
@@ -458,15 +449,14 @@ def select_features(
         if not name:
             raise FeatureSelectionError("feature_schema field missing name")
         raw_value, status = source.value_for_field(field)
-        non_finite_raw_value = _is_non_finite_raw_value(raw_value)
         value = _transform(_as_float(raw_value), field.get("transform"))
         names.append(name)
         values.append(value)
         if math.isnan(value):
-            if non_finite_raw_value:
-                statuses[name] = "non_finite_stored_value"
-            else:
+            if raw_value is None:
                 statuses[name] = status or "stored_null"
+            else:
+                statuses[name] = "non_finite_stored_value"
     schema_hash = feature_schema_hash(feature_schema)
     vector_hash = feature_vector_hash(names, values)
     return SelectedFeatureVector(

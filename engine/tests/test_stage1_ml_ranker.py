@@ -1200,6 +1200,121 @@ def test_non_finite_stored_value_overrides_truthy_status_path(db_session, tmp_pa
     ).count() == 0
 
 
+@pytest.mark.parametrize(
+    ("idx", "raw_value", "transform"),
+    [
+        (27, "not-a-number", None),
+        (28, {}, None),
+        (29, [], None),
+        (30, -2.0, "log1p"),
+    ],
+)
+def test_present_values_that_become_nan_fall_back(
+    db_session,
+    tmp_path,
+    idx,
+    raw_value,
+    transform,
+):
+    signal_id = _seed_signal(db_session, idx=idx, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, f"fs-{idx}")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"]["mom20"] = raw_value
+    feature_json["statuses"]["mom20"] = "computed"
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    field = {
+        "name": "mom20",
+        "source": "feature_snapshot_json",
+        "path": "signal_context.mom20",
+        "status_path": "statuses.mom20",
+    }
+    if transform is not None:
+        field["transform"] = transform
+    schema = {
+        "schema_version": f"present_nan_status_v{idx}",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [field],
+    }
+    artifact_path = tmp_path / f"present-nan-{idx}.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id=f"model-present-nan-{idx}",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id=f"model-present-nan-{idx}",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id=f"model-present-nan-{idx}",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["mom20"] == "non_finite_stored_value"
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "out_of_training_distribution"
+    assert db_session.query(SignalMLScore).filter(
+        SignalMLScore.score_source == "model_shadow"
+    ).count() == 0
+
+
+def test_absent_value_stays_typed_missing_and_scores_shadow(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=31, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-31")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"].pop("mom20")
+    feature_json["statuses"].pop("mom20", None)
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    schema = {
+        "schema_version": "absent_value_status_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.mom20",
+                "status_path": "statuses.mom20",
+            }
+        ],
+    }
+    artifact_path = tmp_path / "absent-value.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-absent-value",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-absent-value",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-absent-value",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["mom20"] == "stored_null"
+    assert score.score_source == "model_shadow"
+    assert score.fallback_reason is None
+
+
 def test_training_feature_range_filter_excludes_infinities():
     assert _finite([math.nan, float("inf"), float("-inf"), 1.25]) == [1.25]
 
