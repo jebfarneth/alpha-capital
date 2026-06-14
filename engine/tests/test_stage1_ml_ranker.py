@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timedelta, timezone
+import pickle
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,19 +12,32 @@ from alpha.db.models import (
     FeatureSnapshot,
     ForwardReturnObservation,
     MLModelRegistry,
+    MarketPathFeature,
     SignalMLScore,
     SignalRegistry,
 )
+from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
-from alpha.jobs.train_model import Stage1TrainModelJob
+from alpha.jobs.train_model import MODEL_FAMILY, Stage1TrainModelJob
 from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
 from alpha.ml.inference import score_signal_shadow
 from alpha.ml.manifest_loader import load_manifest, manifest_payload_hash
 from alpha.ml.model_features import (
     FeatureSelectionError,
     audit_feature_schema_no_leakage,
+    feature_schema_hash,
     select_features,
 )
+
+
+class ConstantModel:
+    def predict(self, rows):
+        return [0.123 for _ in rows]
+
+
+class ExplodingModel:
+    def predict(self, rows):
+        raise RuntimeError("predict exploded")
 
 
 def _feature_schema() -> dict:
@@ -93,10 +107,12 @@ def _seed_signal(
     idx: int,
     ticker: str | None = None,
     gap: float | None = -0.01,
+    signal_date: date | None = None,
 ) -> str:
     signal_id = f"sig-{idx}"
     ticker = ticker or f"T{idx % 3}"
-    ts = datetime(2025, 1, 2, tzinfo=timezone.utc) + timedelta(days=idx)
+    ts_date = signal_date or (datetime(2025, 1, 2).date() + timedelta(days=idx))
+    ts = datetime.combine(ts_date, datetime.min.time(), timezone.utc)
     feature_snapshot_id = f"fs-{idx}"
     feature_json = {
         "signal_context": {
@@ -150,6 +166,62 @@ def _seed_signal(
     return signal_id
 
 
+def _add_model_registry(
+    db_session,
+    *,
+    model_id: str,
+    artifact_uri: str,
+    schema_hash: str | None = None,
+    manifest_sha256: str = "manifest-sha",
+) -> MLModelRegistry:
+    schema = _feature_schema()
+    row = MLModelRegistry(
+        model_id=model_id,
+        pattern_id="M4",
+        model_family=MODEL_FAMILY,
+        training_window_start=date(2025, 1, 1),
+        training_window_end=date(2025, 1, 31),
+        manifest_version="test_manifest",
+        manifest_sha256=manifest_sha256,
+        feature_schema_hash=schema_hash or feature_schema_hash(schema),
+        feature_code_git_sha="test",
+        cv_metrics_json=json.dumps({"per_pattern": {"M4": {}}}),
+        feature_schema_json=json.dumps(schema, sort_keys=True),
+        artifact_uri=artifact_uri,
+        status="shadow",
+    )
+    db_session.add(row)
+    return row
+
+
+def _write_artifact(
+    path: Path,
+    *,
+    model_id: str,
+    model=ConstantModel(),
+    schema: dict | None = None,
+    schema_hash: str | None = None,
+    manifest_sha256: str = "manifest-sha",
+) -> None:
+    schema = schema or _feature_schema()
+    payload = {
+        "model_id": model_id,
+        "model_family": MODEL_FAMILY,
+        "pattern_id": "M4",
+        "manifest_version": "test_manifest",
+        "manifest_sha256": manifest_sha256,
+        "feature_schema": schema,
+        "feature_schema_hash": schema_hash or feature_schema_hash(schema),
+        "feature_names": [field["name"] for field in schema["fields"]],
+        "training_feature_ranges": [
+            {"min": -999.0, "max": 999.0} for _ in schema["fields"]
+        ],
+        "model": model,
+    }
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+
+
 def _seed_training_corpus(db_session, *, count: int = 14) -> list[str]:
     signal_ids = []
     for idx in range(count):
@@ -201,6 +273,22 @@ def test_leakage_audit_raises_on_forward_path_feature():
                 "name": "forward_return",
                 "source": "feature_snapshot_json",
                 "path": "forward_return",
+            }
+        ]
+    }
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+def test_leakage_audit_rejects_forward_market_path_feature_role():
+    schema = {
+        "fields": [
+            {
+                "name": "win",
+                "source": "market_path_feature_column",
+                "feature_role": "forward_path_day",
+                "feature_version": "market_path_daily_v3",
+                "column": "close_price",
             }
         ]
     }
@@ -270,18 +358,136 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     assert json.loads(score.score_metadata_json)["acts_on_book"] is False
 
 
-def test_missing_model_degrades_to_hand_discriminant_fallback(db_session):
+def test_training_rejects_many_rows_on_too_few_graded_cohorts(db_session, tmp_path):
+    signal_ids = []
+    dates = [date(2025, 1, 2), date(2025, 1, 3)]
+    for idx in range(8):
+        signal_ids.append(
+            _seed_signal(
+                db_session,
+                idx=idx,
+                ticker=f"T{idx}",
+                gap=-0.01,
+                signal_date=dates[idx % 2],
+            )
+        )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, signal_ids))
+    job = Stage1TrainModelJob(
+        session=db_session,
+        manifest=manifest,
+        pattern_id="M4",
+        artifact_dir=tmp_path / "artifacts",
+        n_splits=2,
+        max_iter=3,
+    )
+
+    with pytest.raises(RuntimeError, match="2 graded cohorts across 8 rows"):
+        job.run(
+            JobContext(
+                job_id="job",
+                job_run_id="run",
+                started_at=datetime.now(timezone.utc),
+            )
+        )
+
+
+def test_missing_model_degrades_to_raw_strength_fallback_and_is_idempotent(db_session):
     signal_id = _seed_signal(db_session, idx=2, gap=-0.01)
     db_session.commit()
 
-    score = score_signal_shadow(
+    first = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="missing-model",
+    )
+    second = score_signal_shadow(
         db_session,
         signal_id=signal_id,
         model_id="missing-model",
     )
     db_session.flush()
 
-    assert score.score_source == "fallback_hand_discriminant"
-    assert score.fallback_reason == "model_missing"
-    assert score.score == pytest.approx(3.0)
+    assert first.score_id == second.score_id
+    assert first.score_source == "fallback_raw_strength"
+    assert first.fallback_reason == "model_missing"
+    assert first.score == pytest.approx(3.0)
+    assert db_session.query(SignalMLScore).count() == 1
+
+
+def test_artifact_load_error_persists_fallback_without_raising(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=3, gap=-0.01)
+    missing_path = tmp_path / "missing.pkl"
+    _add_model_registry(
+        db_session,
+        model_id="model-missing-artifact",
+        artifact_uri=str(missing_path),
+    )
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-missing-artifact",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "artifact_load_error"
+    assert json.loads(score.score_metadata_json)["acts_on_book"] is False
+
+
+def test_artifact_identity_mismatch_falls_back(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=4, gap=-0.01)
+    artifact_path = tmp_path / "swapped.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-identity",
+        schema_hash="artifact-schema-hash",
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-identity",
+        artifact_uri=str(artifact_path),
+        schema_hash="registry-schema-hash",
+    )
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-identity",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "artifact_identity_mismatch"
+    metadata = json.loads(score.score_metadata_json)
+    assert "feature_schema_hash" in metadata["identity_mismatches"]
+
+
+def test_predict_error_persists_fallback_without_raising(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=5, gap=-0.01)
+    artifact_path = tmp_path / "predict-error.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-predict-error",
+        model=ExplodingModel(),
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-predict-error",
+        artifact_uri=str(artifact_path),
+    )
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-predict-error",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "predict_error"
     assert db_session.query(SignalMLScore).count() == 1

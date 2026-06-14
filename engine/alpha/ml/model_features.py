@@ -35,6 +35,35 @@ FORWARD_FEATURE_TOKENS = (
     "mfe",
     "exit_",
     "path_return",
+    "realized_pl",
+)
+FORWARD_FEATURE_EXACT_TOKENS = frozenset(
+    {"win", "pnl", "target", "y", "q", "profit", "gain", "realized"}
+)
+ALLOWED_FEATURE_SOURCES = frozenset(
+    {
+        "feature_snapshot_json",
+        "signal_registry",
+        "market_path_feature_column",
+        "market_path_feature_json",
+    }
+)
+ALLOWED_MARKET_PATH_FEATURE_ROLES = frozenset(
+    {
+        "signal_session",
+        "signal_day",
+        "signal_day_t0",
+        "t0_signal_context",
+    }
+)
+FORBIDDEN_ZONE_TOKENS = (
+    "forward",
+    "post_signal",
+    "post-signal",
+    "outcome",
+    "label",
+    "future",
+    "exit",
 )
 
 
@@ -110,6 +139,20 @@ def feature_vector_hash(names: list[str], values: list[float]) -> str:
     return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
+def _tokenize(value: str) -> set[str]:
+    out: list[str] = []
+    current: list[str] = []
+    for char in value.lower():
+        if char.isalnum() or char == "_":
+            current.append(char)
+        elif current:
+            out.append("".join(current))
+            current = []
+    if current:
+        out.append("".join(current))
+    return set(out)
+
+
 def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
     """Fail closed if the feature schema references forward-path predictors."""
 
@@ -119,11 +162,43 @@ def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
     for field in fields:
         if not isinstance(field, dict):
             raise FeatureSelectionError("feature_schema fields must be objects")
+        source = str(field.get("source") or "feature_snapshot_json")
+        if source not in ALLOWED_FEATURE_SOURCES:
+            raise FeatureSelectionError(
+                f"feature source {source!r} is not allowed for Stage-1 predictors"
+            )
+        feature_role = str(field.get("feature_role") or "").strip()
+        if source.startswith("market_path_feature"):
+            if not feature_role:
+                raise FeatureSelectionError(
+                    "market_path_feature fields must declare an allowed signal-day "
+                    "feature_role"
+                )
+            if feature_role not in ALLOWED_MARKET_PATH_FEATURE_ROLES:
+                raise FeatureSelectionError(
+                    "market_path_feature field references a non-signal-day zone: "
+                    f"{field!r}"
+                )
+        elif feature_role and any(token in feature_role.lower() for token in FORBIDDEN_ZONE_TOKENS):
+            raise FeatureSelectionError(
+                "feature field references a forbidden forward/outcome zone: "
+                f"{field!r}"
+            )
         haystack = " ".join(
             str(field.get(key) or "")
-            for key in ("name", "source", "path", "column", "status_path")
+            for key in (
+                "name",
+                "source",
+                "path",
+                "column",
+                "status_path",
+                "feature_role",
+            )
         ).lower()
-        if any(token in haystack for token in FORWARD_FEATURE_TOKENS):
+        tokens = _tokenize(haystack)
+        if any(token in haystack for token in FORWARD_FEATURE_TOKENS) or (
+            tokens & FORWARD_FEATURE_EXACT_TOKENS
+        ):
             raise FeatureSelectionError(
                 "forward-path or label field entered the Stage-1 feature schema: "
                 f"{field!r}"

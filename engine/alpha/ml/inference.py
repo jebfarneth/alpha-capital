@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +27,12 @@ def _load_artifact(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def _hand_discriminant(signal: SignalRegistry) -> float:
-    """Frozen safe fallback rank when no shadow model can score."""
+def _raw_strength_fallback_score(signal: SignalRegistry) -> float:
+    """Temporary raw-strength fallback until the frozen live discriminant is wired."""
 
+    # TODO: before canary/live, replace this with the production frozen
+    # recovery-context discriminant. Shadow fallback is logged explicitly as
+    # raw strength so it cannot be mistaken for the final live fallback.
     if signal.raw_signal_strength is not None:
         return float(signal.raw_signal_strength)
     if signal.raw_expected_edge is not None:
@@ -54,17 +58,23 @@ def _out_of_training_distribution(
 
 
 def _upsert_score(session: Session, row: SignalMLScore) -> SignalMLScore:
-    existing = None
-    if row.model_id is not None:
-        existing = (
-            session.query(SignalMLScore)
-            .filter(
-                SignalMLScore.signal_id == row.signal_id,
-                SignalMLScore.model_id == row.model_id,
-                SignalMLScore.score_status == row.score_status,
+    if row.scored_at is None:
+        row.scored_at = datetime.now(timezone.utc)
+    query = session.query(SignalMLScore).filter(
+        SignalMLScore.signal_id == row.signal_id,
+        SignalMLScore.score_status == row.score_status,
+    )
+    if row.model_id is None:
+        query = query.filter(SignalMLScore.model_id.is_(None))
+        if row.requested_model_id is None:
+            query = query.filter(SignalMLScore.requested_model_id.is_(None))
+        else:
+            query = query.filter(
+                SignalMLScore.requested_model_id == row.requested_model_id
             )
-            .one_or_none()
-        )
+    else:
+        query = query.filter(SignalMLScore.model_id == row.model_id)
+    existing = query.one_or_none()
     if existing is None:
         session.add(row)
         return row
@@ -78,6 +88,74 @@ def _upsert_score(session: Session, row: SignalMLScore) -> SignalMLScore:
     existing.score_metadata_json = row.score_metadata_json
     existing.scored_at = row.scored_at
     return existing
+
+
+def _fallback_row(
+    session: Session,
+    *,
+    signal: SignalRegistry,
+    requested_model_id: str | None,
+    model_row: MLModelRegistry | None,
+    reason: str,
+    score_status: str,
+    vector: SelectedFeatureVector | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> SignalMLScore:
+    fallback_score = _raw_strength_fallback_score(signal)
+    payload: dict[str, Any] = {"acts_on_book": False}
+    if metadata:
+        payload.update(metadata)
+    row = SignalMLScore(
+        signal_id=signal.signal_id,
+        model_id=model_row.model_id if model_row is not None else None,
+        requested_model_id=requested_model_id,
+        pattern_id=signal.pattern_id,
+        ticker=signal.ticker,
+        score=fallback_score,
+        fallback_score=fallback_score,
+        score_source="fallback_raw_strength",
+        fallback_reason=reason,
+        score_status=score_status,
+        feature_schema_hash=vector.feature_schema_hash if vector is not None else None,
+        feature_vector_hash=vector.feature_vector_hash if vector is not None else None,
+        score_metadata_json=json.dumps(payload, sort_keys=True),
+        scored_at=datetime.now(timezone.utc),
+    )
+    return _upsert_score(session, row)
+
+
+def _artifact_identity_mismatch(
+    artifact: dict[str, Any],
+    model_row: MLModelRegistry,
+) -> dict[str, Any] | None:
+    checks = {
+        "model_id": (artifact.get("model_id"), model_row.model_id),
+        "pattern_id": (artifact.get("pattern_id"), model_row.pattern_id),
+        "feature_schema_hash": (
+            artifact.get("feature_schema_hash"),
+            model_row.feature_schema_hash,
+        ),
+        "manifest_sha256": (artifact.get("manifest_sha256"), model_row.manifest_sha256),
+        "model_family": (artifact.get("model_family"), model_row.model_family),
+    }
+    mismatches = {
+        key: {"artifact": actual, "registry": expected}
+        for key, (actual, expected) in checks.items()
+        if actual != expected
+    }
+    return mismatches or None
+
+
+def _safe_error_metadata(exc: Exception) -> dict[str, str]:
+    return {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc)[:300],
+    }
+
+
+def _model_predict(model: Any, values: list[float]) -> float:
+    prediction = model.predict([values])
+    return float(prediction[0])
 
 
 def score_signal_shadow(
@@ -99,52 +177,95 @@ def score_signal_shadow(
     if model_row is not None:
         artifact_uri = model_row.artifact_uri
 
-    fallback_score = _hand_discriminant(signal)
     if model_row is None and not artifact_uri:
-        row = SignalMLScore(
-            signal_id=signal.signal_id,
-            model_id=None,
+        return _fallback_row(
+            session,
+            signal=signal,
             requested_model_id=requested_model_id,
-            pattern_id=signal.pattern_id,
-            ticker=signal.ticker,
-            score=fallback_score,
-            fallback_score=fallback_score,
-            score_source="fallback_hand_discriminant",
-            fallback_reason="model_missing",
+            model_row=None,
+            reason="model_missing",
             score_status=score_status,
-            score_metadata_json=json.dumps({"acts_on_book": False}, sort_keys=True),
         )
-        return _upsert_score(session, row)
 
-    artifact = _load_artifact(str(artifact_uri))
-    vector = select_features(session, signal_id, artifact["feature_schema"])
+    try:
+        artifact = _load_artifact(str(artifact_uri))
+    except Exception as exc:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="artifact_load_error",
+            score_status=score_status,
+            metadata=_safe_error_metadata(exc),
+        )
+
+    if model_row is not None:
+        mismatches = _artifact_identity_mismatch(artifact, model_row)
+        if mismatches:
+            return _fallback_row(
+                session,
+                signal=signal,
+                requested_model_id=requested_model_id,
+                model_row=model_row,
+                reason="artifact_identity_mismatch",
+                score_status=score_status,
+                metadata={"identity_mismatches": mismatches},
+            )
+
+    try:
+        vector = select_features(session, signal_id, artifact["feature_schema"])
+    except Exception as exc:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="feature_selection_error",
+            score_status=score_status,
+            metadata=_safe_error_metadata(exc),
+        )
+
     otd_fields = _out_of_training_distribution(
         vector, list(artifact.get("training_feature_ranges") or [])
     )
     if otd_fields:
-        row = SignalMLScore(
-            signal_id=signal.signal_id,
-            model_id=model_row.model_id if model_row is not None else None,
+        return _fallback_row(
+            session,
+            signal=signal,
             requested_model_id=requested_model_id,
-            pattern_id=signal.pattern_id,
-            ticker=signal.ticker,
-            score=fallback_score,
-            fallback_score=fallback_score,
-            score_source="fallback_hand_discriminant",
-            fallback_reason="out_of_training_distribution",
+            model_row=model_row,
+            reason="out_of_training_distribution",
             score_status=score_status,
-            feature_schema_hash=vector.feature_schema_hash,
-            feature_vector_hash=vector.feature_vector_hash,
-            score_metadata_json=json.dumps(
-                {"acts_on_book": False, "otd_fields": otd_fields}, sort_keys=True
-            ),
+            vector=vector,
+            metadata={"otd_fields": otd_fields},
         )
-        return _upsert_score(session, row)
 
     model = artifact.get("model")
     if model is None:
-        raise Stage1InferenceError("model artifact missing model object")
-    score = float(model.predict([vector.values])[0])
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="artifact_load_error",
+            score_status=score_status,
+            vector=vector,
+            metadata={"error_type": "MissingModelObject"},
+        )
+    try:
+        score = _model_predict(model, vector.values)
+    except Exception as exc:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="predict_error",
+            score_status=score_status,
+            vector=vector,
+            metadata=_safe_error_metadata(exc),
+        )
     row = SignalMLScore(
         signal_id=signal.signal_id,
         model_id=model_row.model_id if model_row is not None else None,
@@ -166,5 +287,6 @@ def score_signal_shadow(
             },
             sort_keys=True,
         ),
+        scored_at=datetime.now(timezone.utc),
     )
     return _upsert_score(session, row)

@@ -291,9 +291,11 @@ class Stage1TrainModelJob(BaseJob):
     def run(self, ctx: JobContext) -> JobResult:
         pattern = self.manifest.pattern(self.pattern_id)
         examples = _load_training_examples(self.session, pattern=pattern)
-        if len(examples) < pattern.min_graded_cohorts:
+        graded_cohorts = {row.signal_date for row in examples}
+        if len(graded_cohorts) < pattern.min_graded_cohorts:
             raise RuntimeError(
-                f"pattern {self.pattern_id} has {len(examples)} graded cohorts; "
+                f"pattern {self.pattern_id} has {len(graded_cohorts)} graded cohorts "
+                f"across {len(examples)} rows; "
                 f"minimum is {pattern.min_graded_cohorts}"
             )
         feature_schema = dict(pattern.feature_schema)
