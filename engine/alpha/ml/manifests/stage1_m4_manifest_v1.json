@@ -1,6 +1,6 @@
 {
   "manifest_version": "stage1_m4_manifest_v1",
-  "manifest_sha256": "1d3da2083925f6b17735901ce0fad896636a1e65043f16c5a9340d2d659b518b",
+  "manifest_sha256": "86e6d561ac67d0035f161421ad62fc4767e6085505e9feff2cc18993b85f3825",
   "description": "Stage-1 GBRT M4 manifest template. Production training is gated on the frozen M4 manifest audit; this file pins the current reader/selector contract.",
   "patterns": {
     "M4": {
@@ -22,6 +22,7 @@
       "feature_schema": {
         "schema_version": "stage1_m4_features_v1",
         "pattern_id": "M4",
+        "pattern_clock": "eod",
         "fields": [
           {
             "name": "mom20",

@@ -2234,6 +2234,15 @@ class SignalMLScore(Base):
             "score_source",
             "score_status",
         ),
+        Index(
+            "ux_signal_ml_scores_fallback_null_model",
+            "signal_id",
+            text("coalesce(requested_model_id, '')"),
+            "score_status",
+            unique=True,
+            sqlite_where=text("model_id IS NULL"),
+            postgresql_where=text("model_id IS NULL"),
+        ),
     )
 
     score_id = Column(String, primary_key=True, default=_uuid)

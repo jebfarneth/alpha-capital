@@ -12,7 +12,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from alpha.db.models import MLModelRegistry, SignalMLScore, SignalRegistry
-from alpha.ml.model_features import SelectedFeatureVector, select_features
+from alpha.ml.model_features import (
+    SelectedFeatureVector,
+    feature_schema_hash,
+    select_features,
+)
 
 
 class Stage1InferenceError(RuntimeError):
@@ -42,10 +46,20 @@ def _raw_strength_fallback_score(signal: SignalRegistry) -> float:
 
 def _out_of_training_distribution(
     vector: SelectedFeatureVector,
-    ranges: list[dict[str, float | None]],
+    ranges: Any,
 ) -> list[str]:
+    if not isinstance(ranges, list):
+        raise Stage1InferenceError("training_feature_ranges must be a list")
+    if len(ranges) != len(vector.feature_names):
+        raise Stage1InferenceError(
+            "training_feature_ranges length does not match feature vector length"
+        )
     out: list[str] = []
     for name, value, bounds in zip(vector.feature_names, vector.values, ranges):
+        if not isinstance(bounds, dict):
+            raise Stage1InferenceError(
+                f"training_feature_ranges entry for {name!r} must be an object"
+            )
         if math.isnan(value):
             continue
         lower = bounds.get("min")
@@ -74,10 +88,13 @@ def _upsert_score(session: Session, row: SignalMLScore) -> SignalMLScore:
             )
     else:
         query = query.filter(SignalMLScore.model_id == row.model_id)
-    existing = query.one_or_none()
+    matches = query.order_by(SignalMLScore.scored_at.desc()).all()
+    existing = matches[0] if matches else None
     if existing is None:
         session.add(row)
         return row
+    for duplicate in matches[1:]:
+        session.delete(duplicate)
     existing.requested_model_id = row.requested_model_id
     existing.score = row.score
     existing.fallback_score = row.fallback_score
@@ -128,12 +145,26 @@ def _artifact_identity_mismatch(
     artifact: dict[str, Any],
     model_row: MLModelRegistry,
 ) -> dict[str, Any] | None:
+    actual_schema_hash = None
+    schema_error = None
+    try:
+        actual_schema_hash = feature_schema_hash(artifact["feature_schema"])
+    except Exception as exc:
+        schema_error = f"{type(exc).__name__}: {str(exc)[:200]}"
     checks = {
         "model_id": (artifact.get("model_id"), model_row.model_id),
         "pattern_id": (artifact.get("pattern_id"), model_row.pattern_id),
         "feature_schema_hash": (
             artifact.get("feature_schema_hash"),
             model_row.feature_schema_hash,
+        ),
+        "actual_feature_schema_hash": (
+            actual_schema_hash,
+            model_row.feature_schema_hash,
+        ),
+        "declared_vs_actual_feature_schema_hash": (
+            artifact.get("feature_schema_hash"),
+            actual_schema_hash,
         ),
         "manifest_sha256": (artifact.get("manifest_sha256"), model_row.manifest_sha256),
         "model_family": (artifact.get("model_family"), model_row.model_family),
@@ -143,6 +174,11 @@ def _artifact_identity_mismatch(
         for key, (actual, expected) in checks.items()
         if actual != expected
     }
+    if schema_error is not None:
+        mismatches["feature_schema_hash_error"] = {
+            "artifact": schema_error,
+            "registry": model_row.feature_schema_hash,
+        }
     return mismatches or None
 
 
@@ -203,12 +239,17 @@ def score_signal_shadow(
     if model_row is not None:
         mismatches = _artifact_identity_mismatch(artifact, model_row)
         if mismatches:
+            reason = (
+                "artifact_schema_hash_mismatch"
+                if any("feature_schema_hash" in key for key in mismatches)
+                else "artifact_identity_mismatch"
+            )
             return _fallback_row(
                 session,
                 signal=signal,
                 requested_model_id=requested_model_id,
                 model_row=model_row,
-                reason="artifact_identity_mismatch",
+                reason=reason,
                 score_status=score_status,
                 metadata={"identity_mismatches": mismatches},
             )
@@ -226,9 +267,21 @@ def score_signal_shadow(
             metadata=_safe_error_metadata(exc),
         )
 
-    otd_fields = _out_of_training_distribution(
-        vector, list(artifact.get("training_feature_ranges") or [])
-    )
+    try:
+        otd_fields = _out_of_training_distribution(
+            vector, artifact.get("training_feature_ranges")
+        )
+    except Exception as exc:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="otd_check_error",
+            score_status=score_status,
+            vector=vector,
+            metadata=_safe_error_metadata(exc),
+        )
     if otd_fields:
         return _fallback_row(
             session,
@@ -265,6 +318,17 @@ def score_signal_shadow(
             score_status=score_status,
             vector=vector,
             metadata=_safe_error_metadata(exc),
+        )
+    if not math.isfinite(score):
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="non_finite_score",
+            score_status=score_status,
+            vector=vector,
+            metadata={"score": str(score)},
         )
     row = SignalMLScore(
         signal_id=signal.signal_id,
