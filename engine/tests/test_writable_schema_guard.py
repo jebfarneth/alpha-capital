@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from alpha.db import engine as db_engine
 from alpha.db.engine import (
@@ -133,12 +136,66 @@ def test_open_writable_session_closes_session_on_schema_guard_failure(monkeypatc
         dialect_name="postgresql",
         search_path='"$user", public',
     )
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://user:pass@example.com:5432/db",
+    )
     monkeypatch.setattr(db_engine, "get_session", lambda **kwargs: session)
 
     with pytest.raises(SchemaTargetError, match="Refusing to write"):
         db_engine.open_writable_session(schema="i11_pilot_x")
 
     assert session.closed is True
+
+
+def test_open_writable_session_refuses_supabase_transaction_pooler():
+    with pytest.raises(SchemaTargetError, match="transaction pooler"):
+        db_engine.open_writable_session(
+            url=(
+                "postgresql+psycopg://postgres.project:secret@"
+                "aws-1-us-east-2.pooler.supabase.com:6543/postgres"
+            ),
+            schema="i11_pilot_x",
+        )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL DATABASE_URL",
+)
+def test_postgres_schema_search_path_is_bound_on_each_connection(monkeypatch):
+    url = os.environ["DATABASE_URL"]
+    if db_engine._is_supabase_transaction_pooler(url):
+        pytest.skip("transaction pooler intentionally refused for writable schemas")
+    schema = f"scratch_search_path_{uuid4().hex[:8]}"
+    admin_engine = create_engine(url, echo=False)
+    engine = None
+    try:
+        with admin_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+        db_engine.reset_globals()
+        monkeypatch.setenv("ALPHA_DB_SCHEMA", schema)
+        engine = db_engine.get_engine(url=url)
+        for _ in range(2):
+            with engine.connect() as conn:
+                search_path = conn.execute(text("SHOW search_path")).scalar() or ""
+                parts = [part.strip().strip('"') for part in search_path.split(",")]
+                assert parts == [schema]
+
+        session = open_writable_session(url=url, schema=schema)
+        try:
+            assert_session_targets_schema(session, schema)
+        finally:
+            session.close()
+    finally:
+        db_engine.reset_globals()
+        if engine is not None:
+            engine.dispose()
+        with admin_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        admin_engine.dispose()
 
 
 @pytest.mark.parametrize(

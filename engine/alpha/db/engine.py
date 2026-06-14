@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import re
 from typing import Optional, Sequence
+from urllib.parse import urlparse
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, Session
 
 from alpha.db.models import Base
@@ -51,6 +52,31 @@ def schema_connect_args(url: str, schema: str | None = None) -> dict:
     return {"connect_args": {"options": f"-csearch_path={schema}"}}
 
 
+def _bind_schema_search_path(engine, url: str, schema: str | None) -> None:
+    if not schema or not url.startswith("postgresql"):
+        return
+    schema = _validate_schema_name(schema)
+
+    @event.listens_for(engine, "connect")
+    def _set_search_path(dbapi_conn, _record):  # noqa: ANN001
+        cursor = dbapi_conn.cursor()
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+        finally:
+            cursor.close()
+        if not getattr(dbapi_conn, "autocommit", False):
+            dbapi_conn.commit()
+
+
+def _is_supabase_transaction_pooler(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.hostname is not None
+        and parsed.hostname.endswith("pooler.supabase.com")
+        and parsed.port == 6543
+    )
+
+
 def get_engine(url: str | None = None, schema: str | None = None):
     """Return the process-global SQLAlchemy engine for the configured database."""
 
@@ -66,6 +92,7 @@ def get_engine(url: str | None = None, schema: str | None = None):
             pool_pre_ping=True,
             **schema_connect_args(url, schema),
         )
+        _bind_schema_search_path(_engine, url, schema)
     return _engine
 
 
@@ -102,6 +129,14 @@ def open_writable_session(
 ) -> Session:
     """Open a writable session guaranteed not to reuse a stale global bind."""
 
+    schema = schema or os.environ.get("ALPHA_DB_SCHEMA")
+    url = url or os.environ.get("DATABASE_URL", "sqlite:///alpha_capital.db")
+    if schema and _is_supabase_transaction_pooler(url):
+        raise SchemaTargetError(
+            "transaction pooler does not persist scratch-schema search_path; "
+            "use the Supabase session pooler on port 5432 or a direct "
+            "PostgreSQL connection for writable jobs"
+        )
     reset_globals()
     session = get_session(url=url, schema=schema)
     try:
