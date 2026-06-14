@@ -1460,6 +1460,7 @@ class SignalRegistry(Base):
     intraday_event_details = relationship(
         "IntradayEventDetail", back_populates="signal"
     )
+    ml_scores = relationship("SignalMLScore", back_populates="signal")
 
 
 # ---------------------------------------------------------------------------
@@ -2163,6 +2164,100 @@ class MarketPathPreSignalLink(Base):
         back_populates="signal_links",
     )
     signal = relationship("SignalRegistry")
+
+
+# ---------------------------------------------------------------------------
+# ml_model_registry
+# ---------------------------------------------------------------------------
+class MLModelRegistry(Base):
+    """Versioned Stage-1 ML model artifacts registered for shadow scoring."""
+
+    __tablename__ = "ml_model_registry"
+    __table_args__ = (
+        Index(
+            "ix_ml_model_registry_pattern_status",
+            "pattern_id",
+            "status",
+        ),
+        Index(
+            "ix_ml_model_registry_schema_hash",
+            "feature_schema_hash",
+        ),
+    )
+
+    model_id = Column(String, primary_key=True, default=_uuid)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    pattern_id = Column(String, nullable=False)
+    model_family = Column(String, nullable=False)
+    training_window_start = Column(Date, nullable=True)
+    training_window_end = Column(Date, nullable=True)
+    manifest_version = Column(String, nullable=False)
+    manifest_sha256 = Column(String, nullable=False)
+    feature_schema_hash = Column(String, nullable=False)
+    feature_code_git_sha = Column(String, nullable=True)
+    training_params_json = Column(Text, nullable=True)
+    cv_metrics_json = Column(Text, nullable=False)
+    feature_schema_json = Column(Text, nullable=False)
+    artifact_uri = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="shadow")
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    scores = relationship("SignalMLScore", back_populates="model")
+
+
+# ---------------------------------------------------------------------------
+# signal_ml_scores
+# ---------------------------------------------------------------------------
+class SignalMLScore(Base):
+    """Shadow Stage-1 score persisted for a fired signal."""
+
+    __tablename__ = "signal_ml_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_id",
+            "model_id",
+            "score_status",
+            name="ux_signal_ml_scores_signal_model_status",
+        ),
+        Index(
+            "ix_signal_ml_scores_pattern_scored_at",
+            "pattern_id",
+            "scored_at",
+        ),
+        Index(
+            "ix_signal_ml_scores_source",
+            "score_source",
+            "score_status",
+        ),
+    )
+
+    score_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=False)
+    model_id = Column(String, ForeignKey("ml_model_registry.model_id"), nullable=True)
+    requested_model_id = Column(String, nullable=True)
+    pattern_id = Column(String, nullable=False)
+    ticker = Column(String, nullable=False)
+    score = Column(Float, nullable=True)
+    fallback_score = Column(Float, nullable=True)
+    score_source = Column(String, nullable=False)
+    fallback_reason = Column(String, nullable=True)
+    score_status = Column(String, nullable=False, default="shadow")
+    feature_schema_hash = Column(String, nullable=True)
+    feature_vector_hash = Column(String, nullable=True)
+    score_metadata_json = Column(Text, nullable=True)
+    scored_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    signal = relationship("SignalRegistry", back_populates="ml_scores")
+    model = relationship("MLModelRegistry", back_populates="scores")
 
 
 # ---------------------------------------------------------------------------

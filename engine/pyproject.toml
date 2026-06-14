@@ -8,6 +8,7 @@ dependencies = [
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
     "requests>=2.31",
+    "scikit-learn>=1.4",
     # macOS system Python 3.9 is linked against LibreSSL; urllib3 v2 warns on every test run.
     "urllib3<2",
 ]

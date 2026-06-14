@@ -1,0 +1,79 @@
+{
+  "manifest_version": "stage1_m4_manifest_v1",
+  "manifest_sha256": "1d3da2083925f6b17735901ce0fad896636a1e65043f16c5a9340d2d659b518b",
+  "description": "Stage-1 GBRT M4 manifest template. Production training is gated on the frozen M4 manifest audit; this file pins the current reader/selector contract.",
+  "patterns": {
+    "M4": {
+      "signal_horizon": "15d",
+      "min_graded_cohorts": 80,
+      "embargo_sessions": 15,
+      "selection": {
+        "source": "forward_return_observations",
+        "statuses": [
+          "computed"
+        ],
+        "horizon_sessions": 15
+      },
+      "label": {
+        "field": "forward_return",
+        "kind": "graded_forward_outcome",
+        "forward_path_fields_are_labels_not_predictors": true
+      },
+      "feature_schema": {
+        "schema_version": "stage1_m4_features_v1",
+        "pattern_id": "M4",
+        "fields": [
+          {
+            "name": "mom20",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.mom20"
+          },
+          {
+            "name": "off_low252",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.off_low252"
+          },
+          {
+            "name": "gap",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.gap"
+          },
+          {
+            "name": "volume_ratio",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.volume_ratio"
+          },
+          {
+            "name": "proj_mult",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.proj_mult"
+          },
+          {
+            "name": "chase",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.chase"
+          },
+          {
+            "name": "sigma20",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.sigma20"
+          },
+          {
+            "name": "dist_hi252",
+            "source": "feature_snapshot_json",
+            "path": "signal_context.dist_hi252"
+          },
+          {
+            "name": "raw_signal_strength",
+            "source": "signal_registry",
+            "column": "raw_signal_strength"
+          }
+        ]
+      },
+      "diagnostics": {
+        "pooled_metrics_diagnostic_only": true,
+        "score_orders_book": false
+      }
+    }
+  }
+}

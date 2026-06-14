@@ -577,6 +577,8 @@ class TestSchemaCompleteness:
             "market_path_features",
             "market_path_pre_signal_contexts",
             "market_path_pre_signal_links",
+            "ml_model_registry",
+            "signal_ml_scores",
             "forward_return_observations",
             "forward_return_path_rows",
             "forward_context_path_rows",
