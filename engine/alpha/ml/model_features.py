@@ -196,18 +196,41 @@ def _tokenize(value: str) -> set[str]:
     return set(out)
 
 
-def _field_terminal_name(field: dict[str, Any]) -> str:
-    parts = _field_reference_parts(field)
-    return parts[-1] if parts else ""
+def _read_locator_parts(field: dict[str, Any]) -> list[str]:
+    """Return the field locator parts for the value this source actually reads."""
 
-
-def _field_reference_parts(field: dict[str, Any]) -> list[str]:
-    for key in ("column", "path", "name"):
-        value = field.get(key)
-        parts = _path_parts(value) if key == "path" else [str(value)] if value else []
-        if parts:
-            return parts
-    return []
+    source = str(field.get("source") or "feature_snapshot_json")
+    has_column = field.get("column") not in (None, "")
+    has_path = field.get("path") not in (None, "")
+    if source in {"feature_snapshot_json", "market_path_feature_json"}:
+        if has_column:
+            raise FeatureSelectionError(
+                f"{source} fields must not carry an ignored column locator: "
+                f"{field!r}"
+            )
+        parts = _path_parts(field.get("path"))
+    elif source == "market_path_feature_column":
+        if has_path:
+            raise FeatureSelectionError(
+                "market_path_feature_column fields must not carry an ignored "
+                f"path locator: {field!r}"
+            )
+        parts = [str(field["column"])] if has_column else []
+    elif source == "signal_registry":
+        if has_column and has_path:
+            raise FeatureSelectionError(
+                "signal_registry fields must declare either column or path, "
+                f"not both: {field!r}"
+            )
+        parts = _path_parts(field.get("column") or field.get("path"))
+    else:
+        return []
+    if not parts:
+        raise FeatureSelectionError(
+            f"feature field is missing a readable locator for source {source!r}: "
+            f"{field!r}"
+        )
+    return parts
 
 
 def _audit_feature_field_no_leakage(
@@ -221,8 +244,8 @@ def _audit_feature_field_no_leakage(
             f"feature source {source!r} is not allowed for Stage-1 predictors"
         )
     feature_role = str(field.get("feature_role") or "").strip()
-    reference_parts = _field_reference_parts(field)
-    terminal_name = _field_terminal_name(field)
+    reference_parts = _read_locator_parts(field)
+    terminal_name = reference_parts[-1] if reference_parts else ""
     if source.startswith("market_path_feature"):
         if not feature_role:
             raise FeatureSelectionError(
@@ -235,6 +258,12 @@ def _audit_feature_field_no_leakage(
                 f"{field!r}"
             )
         if pattern_clock == "intraday":
+            if source == "market_path_feature_json" and len(reference_parts) != 1:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 market-path JSON fields must use flat "
+                    "as-of-signal-time top-level paths: "
+                    f"{field!r}"
+                )
             if terminal_name not in INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS:
                 raise FeatureSelectionError(
                     "intraday Stage-1 predictors can read only explicitly "
@@ -372,14 +401,15 @@ class _StoredFeatureSource:
     def value_for_field(self, field: dict[str, Any]) -> tuple[Any, Any]:
         _audit_feature_field_no_leakage(self.feature_schema, field)
         source = str(field.get("source") or "feature_snapshot_json")
+        locator_parts = _read_locator_parts(field)
         if source == "feature_snapshot_json":
             payload = self.feature_snapshot_payload
             status_path = field.get("status_path")
-            return _get_path(payload, field.get("path")), (
+            return _get_path(payload, locator_parts), (
                 _get_path(payload, status_path) if status_path else None
             )
         if source == "signal_registry":
-            attr = str(field.get("column") or field.get("path") or "")
+            attr = ".".join(locator_parts)
             return getattr(self.signal, attr, None), None
         if source in {"market_path_feature_column", "market_path_feature_json"}:
             feature_version = str(field.get("feature_version") or "")
@@ -397,8 +427,8 @@ class _StoredFeatureSource:
             if row is None:
                 return None, "missing_market_path_feature"
             if source == "market_path_feature_column":
-                return getattr(row, str(field.get("column") or ""), None), None
-            return _get_path(_json_loads_or_empty(row.feature_json), field.get("path")), None
+                return getattr(row, locator_parts[0], None), None
+            return _get_path(_json_loads_or_empty(row.feature_json), locator_parts), None
         raise FeatureSelectionError(f"unsupported stored feature source {source!r}")
 
 
@@ -433,9 +463,10 @@ def select_features(
         names.append(name)
         values.append(value)
         if math.isnan(value):
-            statuses[name] = status or (
-                "non_finite_stored_value" if non_finite_raw_value else "stored_null"
-            )
+            if non_finite_raw_value:
+                statuses[name] = "non_finite_stored_value"
+            else:
+                statuses[name] = status or "stored_null"
     schema_hash = feature_schema_hash(feature_schema)
     vector_hash = feature_vector_hash(names, values)
     return SelectedFeatureVector(

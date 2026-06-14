@@ -518,6 +518,79 @@ def test_intraday_snapshot_rejects_nested_allowlisted_terminal_paths(path):
         audit_feature_schema_no_leakage(schema)
 
 
+def test_intraday_snapshot_audit_uses_the_read_path_not_decoy_column():
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "decoy_gap",
+                "source": "feature_snapshot_json",
+                "column": "gap",
+                "path": "research_only_leaky.dollar_volume",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+def test_intraday_market_path_json_audit_uses_path_locator():
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "nested_open",
+                "source": "market_path_feature_json",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "path": "research_only_leaky.open_price",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+def test_intraday_market_path_json_allows_flat_prior_window_paths():
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "median_volume_20d",
+                "source": "market_path_feature_json",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "path": "median_volume_20d",
+            }
+        ],
+    }
+
+    audit_feature_schema_no_leakage(schema)
+
+
+def test_eod_market_path_json_keeps_nested_payloads_allowed():
+    schema = {
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "nested_open",
+                "source": "market_path_feature_json",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "path": "research_only_leaky.open_price",
+            }
+        ],
+    }
+
+    audit_feature_schema_no_leakage(schema)
+
+
 @pytest.mark.parametrize(
     "feature_role",
     ["signal_day", "signal_day_t0", "t0_signal_context"],
@@ -1069,6 +1142,59 @@ def test_open_bound_infinite_feature_value_falls_back(db_session, tmp_path):
 
     assert score.score_source == "fallback_raw_strength"
     assert score.fallback_reason == "out_of_training_distribution"
+    assert db_session.query(SignalMLScore).filter(
+        SignalMLScore.score_source == "model_shadow"
+    ).count() == 0
+
+
+def test_non_finite_stored_value_overrides_truthy_status_path(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=26, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-26")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"]["mom20"] = "1e400"
+    feature_json["statuses"]["mom20"] = "computed"
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    schema = {
+        "schema_version": "non_finite_status_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.mom20",
+                "status_path": "statuses.mom20",
+            }
+        ],
+    }
+    artifact_path = tmp_path / "non-finite-status.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-non-finite-status",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-non-finite-status",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-non-finite-status",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["mom20"] == "non_finite_stored_value"
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "out_of_training_distribution"
+    metadata = json.loads(score.score_metadata_json)
+    assert metadata["reason"] == "non_finite_stored_value"
     assert db_session.query(SignalMLScore).filter(
         SignalMLScore.score_source == "model_shadow"
     ).count() == 0
