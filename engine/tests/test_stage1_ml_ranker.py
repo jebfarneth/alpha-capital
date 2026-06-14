@@ -1350,6 +1350,44 @@ def test_absent_value_stays_typed_missing_and_scores_shadow(db_session, tmp_path
     assert score.fallback_reason is None
 
 
+def test_malformed_status_path_is_not_stored_in_missing_statuses(db_session):
+    signal_id = _seed_signal(db_session, idx=36, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-36")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"].pop("mom20")
+    feature_json["statuses"] = []
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    schema = {
+        "schema_version": "malformed_status_path_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.mom20",
+                "status_path": "statuses.mom20",
+            }
+        ],
+    }
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+
+    assert vector.missing_statuses == {"mom20": "stored_null"}
+    assert all(isinstance(value, str) for value in vector.missing_statuses.values())
+    assert json.dumps(vector.missing_statuses)
+
+
+def test_string_status_path_value_is_preserved(db_session):
+    signal_id = _seed_signal(db_session, idx=37, gap=None)
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, _feature_schema())
+
+    assert vector.missing_statuses["gap"] == "not_available"
+
+
 def test_malformed_parent_path_falls_back(db_session, tmp_path):
     signal_id = _seed_signal(db_session, idx=34, gap=-0.01)
     snapshot = db_session.get(FeatureSnapshot, "fs-34")

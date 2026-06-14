@@ -399,8 +399,9 @@ class _StoredFeatureSource:
         if source == "feature_snapshot_json":
             payload = self.feature_snapshot_payload
             status_path = field.get("status_path")
+            status_value = _get_path(payload, status_path) if status_path else None
             return _get_path(payload, locator_parts), (
-                _get_path(payload, status_path) if status_path else None
+                status_value if isinstance(status_value, str) else None
             )
         if source == "signal_registry":
             attr = ".".join(locator_parts)
