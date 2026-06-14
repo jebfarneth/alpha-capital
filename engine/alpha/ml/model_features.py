@@ -40,7 +40,7 @@ FORWARD_FEATURE_TOKENS = (
     "realized_pnl",
 )
 FORWARD_FEATURE_EXACT_TOKENS = frozenset(
-    {"win", "pnl", "target", "y", "q", "profit", "gain", "realized"}
+    {"win", "pnl", "target", "y", "q", "profit", "gain", "realized", "exit"}
 )
 ALLOWED_FEATURE_SOURCES = frozenset(
     {
@@ -197,12 +197,17 @@ def _tokenize(value: str) -> set[str]:
 
 
 def _field_terminal_name(field: dict[str, Any]) -> str:
+    parts = _field_reference_parts(field)
+    return parts[-1] if parts else ""
+
+
+def _field_reference_parts(field: dict[str, Any]) -> list[str]:
     for key in ("column", "path", "name"):
         value = field.get(key)
         parts = _path_parts(value) if key == "path" else [str(value)] if value else []
         if parts:
-            return parts[-1]
-    return ""
+            return parts
+    return []
 
 
 def _audit_feature_field_no_leakage(
@@ -216,6 +221,7 @@ def _audit_feature_field_no_leakage(
             f"feature source {source!r} is not allowed for Stage-1 predictors"
         )
     feature_role = str(field.get("feature_role") or "").strip()
+    reference_parts = _field_reference_parts(field)
     terminal_name = _field_terminal_name(field)
     if source.startswith("market_path_feature"):
         if not feature_role:
@@ -244,6 +250,12 @@ def _audit_feature_field_no_leakage(
                 f"{field!r}"
             )
         if pattern_clock == "intraday" and source == "feature_snapshot_json":
+            if len(reference_parts) != 1:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 feature snapshots must use flat "
+                    "as-of-signal-time top-level paths: "
+                    f"{field!r}"
+                )
             if terminal_name not in INTRADAY_ALLOWED_SNAPSHOT_PATHS:
                 raise FeatureSelectionError(
                     "intraday Stage-1 feature snapshots can read only explicitly "
@@ -251,6 +263,11 @@ def _audit_feature_field_no_leakage(
                     f"{field!r}"
                 )
         if pattern_clock == "intraday" and source == "signal_registry":
+            if len(reference_parts) != 1:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 signal_registry fields must use flat "
+                    f"top-level column names: {field!r}"
+                )
             if terminal_name not in INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS:
                 raise FeatureSelectionError(
                     "intraday Stage-1 signal_registry fields are denied by "

@@ -484,12 +484,38 @@ def test_intraday_snapshot_allows_only_signal_time_fields(field_name):
             {
                 "name": field_name,
                 "source": "feature_snapshot_json",
-                "path": f"signal_context.{field_name}",
+                "path": field_name,
             }
         ],
     }
 
     audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "research_only_leaky.gap",
+        "research_only_leaky.mom20",
+        "exit.off_low252",
+        "research_only_leaky.dollar_volume",
+    ],
+)
+def test_intraday_snapshot_rejects_nested_allowlisted_terminal_paths(path):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": path.replace(".", "_"),
+                "source": "feature_snapshot_json",
+                "path": path,
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
 
 
 @pytest.mark.parametrize(

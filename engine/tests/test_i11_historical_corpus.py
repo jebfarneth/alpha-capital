@@ -282,10 +282,12 @@ def _run_i11(
 
 
 def _assert_feature_json_pit_pure(payload, path=()):
-    if path and path[0] in {"candidate_screen", "pit_caveats"}:
+    if path and path[0] in {"candidate_screen", "pit_caveats", "research_only_leaky"}:
         return
     if isinstance(payload, dict):
         for key, value in payload.items():
+            if not path and key in {"candidate_screen", "pit_caveats", "research_only_leaky"}:
+                continue
             assert not LEAKY_FEATURE_KEY_RE.search(key), ".".join(path + (key,))
             _assert_feature_json_pit_pure(value, path + (key,))
     elif isinstance(payload, list):
@@ -320,6 +322,12 @@ def test_i11_corpus_persists_confirmed_entry_with_next_open_primary_label(db_ses
     assert feature_json["catalyst_tags"] == ["offering"]
     assert feature_json["mom20"] is not None
     assert feature_json["off_low252"] is not None
+    assert "avg20_volume" not in feature_json
+    assert "price" not in feature_json
+    assert set(feature_json["research_only_leaky"]) == {
+        "avg20_volume",
+        "price",
+    }
     assert "cross_minute" not in feature_json["gate_values"]
     assert "day_high" not in feature_json["gate_values"]
     _assert_feature_json_pit_pure(feature_json)
