@@ -78,6 +78,40 @@ def get_session(url: str | None = None, schema: str | None = None) -> Session:
     return _SessionLocal()
 
 
+def assert_session_targets_schema(session: Session, schema: str | None) -> None:
+    """Fail closed if a scratch-targeted PostgreSQL session can write to public."""
+
+    if not schema:
+        return
+    bind = session.get_bind()
+    if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+        return
+    search_path = session.execute(text("SHOW search_path")).scalar() or ""
+    parts = [part.strip().strip('"') for part in search_path.split(",")]
+    if schema not in parts or "public" in parts:
+        raise SchemaTargetError(
+            f"Refusing to write: requested schema {schema!r} but the live session "
+            f"search_path is {search_path!r} (schema absent or public present). "
+            "Aborting to protect canonical data."
+        )
+
+
+def open_writable_session(
+    url: str | None = None,
+    schema: str | None = None,
+) -> Session:
+    """Open a writable session guaranteed not to reuse a stale global bind."""
+
+    reset_globals()
+    session = get_session(url=url, schema=schema)
+    try:
+        assert_session_targets_schema(session, schema)
+    except Exception:
+        session.close()
+        raise
+    return session
+
+
 def create_all_tables(engine=None, schema: str | None = None):
     """Create ORM tables for local smoke databases and isolated scratch schemas."""
 

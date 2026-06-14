@@ -10,12 +10,17 @@ from alpha.db import engine as db_engine
 from alpha.db.engine import (
     SchemaTargetError,
     _validate_schema_name,
+    assert_session_targets_schema,
+    open_writable_session,
     prepare_writable_schema_target,
     schema_connect_args,
 )
+from alpha.jobs.contracts import JobResult
 from alpha.jobs import (
     run_forward_context,
     run_forward_return,
+    run_i11_historical_corpus,
+    run_i12_historical_corpus,
     run_m1_daily,
     run_m4_daily,
     run_market_path_features,
@@ -30,6 +35,221 @@ class _FakeEngine:
 
     def dispose(self):
         self.disposed = True
+
+
+class _FakeDialect:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _FakeBind:
+    def __init__(self, dialect_name: str):
+        self.dialect = _FakeDialect(dialect_name)
+
+
+class _FakeScalarResult:
+    def __init__(self, value: str):
+        self.value = value
+
+    def scalar(self):
+        return self.value
+
+
+class _FakeSession:
+    def __init__(self, *, dialect_name: str, search_path: str):
+        self.bind = _FakeBind(dialect_name)
+        self.search_path = search_path
+        self.statements = []
+        self.closed = False
+
+    def get_bind(self):
+        return self.bind
+
+    def execute(self, statement):
+        self.statements.append(statement)
+        return _FakeScalarResult(self.search_path)
+
+    def close(self):
+        self.closed = True
+
+
+def test_assert_session_targets_schema_accepts_exact_scratch_search_path():
+    session = _FakeSession(
+        dialect_name="postgresql",
+        search_path="i11_pilot_x",
+    )
+
+    assert_session_targets_schema(session, "i11_pilot_x")
+
+    assert len(session.statements) == 1
+
+
+@pytest.mark.parametrize(
+    "search_path",
+    [
+        '"$user", public, extensions',
+        "i11_pilot_x, public",
+        "other_scratch",
+    ],
+)
+def test_assert_session_targets_schema_rejects_public_or_absent_schema(search_path):
+    session = _FakeSession(
+        dialect_name="postgresql",
+        search_path=search_path,
+    )
+
+    with pytest.raises(SchemaTargetError, match="Refusing to write"):
+        assert_session_targets_schema(session, "i11_pilot_x")
+
+
+def test_assert_session_targets_schema_noops_for_public_build_or_non_postgres():
+    public_session = _FakeSession(
+        dialect_name="postgresql",
+        search_path='"$user", public',
+    )
+    sqlite_session = _FakeSession(
+        dialect_name="sqlite",
+        search_path="i11_pilot_x, public",
+    )
+
+    assert_session_targets_schema(public_session, None)
+    assert_session_targets_schema(sqlite_session, "i11_pilot_x")
+
+    assert public_session.statements == []
+    assert sqlite_session.statements == []
+
+
+def test_open_writable_session_public_build_path_does_not_raise():
+    session = open_writable_session(url="sqlite:///:memory:", schema=None)
+    try:
+        assert session.get_bind().dialect.name == "sqlite"
+    finally:
+        session.close()
+        db_engine.reset_globals()
+
+
+def test_open_writable_session_closes_session_on_schema_guard_failure(monkeypatch):
+    session = _FakeSession(
+        dialect_name="postgresql",
+        search_path='"$user", public',
+    )
+    monkeypatch.setattr(db_engine, "get_session", lambda **kwargs: session)
+
+    with pytest.raises(SchemaTargetError, match="Refusing to write"):
+        db_engine.open_writable_session(schema="i11_pilot_x")
+
+    assert session.closed is True
+
+
+@pytest.mark.parametrize(
+    ("module", "argv"),
+    [
+        (
+            run_i11_historical_corpus,
+            [
+                "--live",
+                "--schema",
+                "scratch_missing",
+                "--start-date",
+                "2026-06-03",
+                "--end-date",
+                "2026-06-03",
+            ],
+        ),
+        (
+            run_i12_historical_corpus,
+            [
+                "--live",
+                "--schema",
+                "scratch_missing",
+                "--start-date",
+                "2026-06-03",
+                "--end-date",
+                "2026-06-03",
+            ],
+        ),
+    ],
+)
+def test_intraday_corpus_runners_preflight_before_open_writable_session(
+    module,
+    argv,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(module, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "prepare_writable_schema_target",
+        lambda **kwargs: (_ for _ in ()).throw(
+            SchemaTargetError("schema 'scratch_missing' does not exist")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "open_writable_session",
+        lambda *args, **kwargs: pytest.fail(
+            "session opened before schema preflight"
+        ),
+    )
+
+    rc = module.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "schema 'scratch_missing' does not exist" in captured.out
+
+
+def test_i12_confirm_live_public_path_opens_guarded_session_with_no_schema(
+    monkeypatch,
+):
+    opened = []
+    session = _FakeSession(dialect_name="sqlite", search_path="")
+
+    monkeypatch.setattr(run_i12_historical_corpus, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        run_i12_historical_corpus.FmpConfig,
+        "from_env",
+        staticmethod(lambda: object()),
+    )
+    monkeypatch.setattr(
+        run_i12_historical_corpus.PolygonConfig,
+        "from_env",
+        staticmethod(lambda: object()),
+    )
+    monkeypatch.setattr(run_i12_historical_corpus, "FmpAdapter", lambda config: object())
+    monkeypatch.setattr(
+        run_i12_historical_corpus,
+        "CachedHistoricalPriceFmpAdapter",
+        lambda adapter: object(),
+    )
+    monkeypatch.setattr(
+        run_i12_historical_corpus,
+        "PolygonAdapter",
+        lambda config: object(),
+    )
+    monkeypatch.setattr(
+        run_i12_historical_corpus,
+        "open_writable_session",
+        lambda *, schema: opened.append(schema) or session,
+    )
+    monkeypatch.setattr(
+        run_i12_historical_corpus,
+        "run_job",
+        lambda *args, **kwargs: JobResult(status="finished", metrics={}),
+    )
+
+    rc = run_i12_historical_corpus.main([
+        "--live",
+        "--confirm-live-write",
+        "--start-date",
+        "2026-06-03",
+        "--end-date",
+        "2026-06-03",
+    ])
+
+    assert rc == 0
+    assert opened == [None]
+    assert session.closed is True
 
 
 def test_prepare_writable_schema_target_refuses_missing_schema(monkeypatch):

@@ -22,7 +22,7 @@ from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
     SchemaTargetError,
     create_all_tables,
-    get_session,
+    open_writable_session,
     prepare_writable_schema_target,
     reset_globals,
 )
@@ -109,7 +109,7 @@ def _run_live(args: argparse.Namespace) -> int:
             progress_artifact.parent.mkdir(parents=True, exist_ok=True)
             progress_artifact.write_text(json.dumps(artifact, indent=2, default=str))
 
-    session = get_session()
+    session = open_writable_session(schema=target_schema)
     job = I11HistoricalCorpusJob(
         session=session,
         fmp_adapter=fmp_adapter,
