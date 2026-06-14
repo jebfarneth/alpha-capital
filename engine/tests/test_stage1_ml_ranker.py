@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import math
 import pickle
+from importlib import import_module
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import text
 
 from alpha.db.models import (
     FeatureSnapshot,
     ForwardReturnObservation,
     MLModelRegistry,
-    MarketPathFeature,
     SignalMLScore,
     SignalRegistry,
 )
@@ -20,7 +23,7 @@ from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
 from alpha.jobs.train_model import MODEL_FAMILY, Stage1TrainModelJob
 from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
-from alpha.ml.inference import score_signal_shadow
+from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
 from alpha.ml.manifest_loader import load_manifest, manifest_payload_hash
 from alpha.ml.model_features import (
     FeatureSelectionError,
@@ -278,6 +281,7 @@ def test_feature_reader_uses_stored_fields_and_preserves_typed_missing(db_sessio
 
 def test_leakage_audit_raises_on_forward_path_feature():
     schema = {
+        "pattern_clock": "eod",
         "fields": [
             {
                 "name": "forward_return",
@@ -292,6 +296,7 @@ def test_leakage_audit_raises_on_forward_path_feature():
 
 def test_leakage_audit_rejects_forward_market_path_feature_role():
     schema = {
+        "pattern_clock": "eod",
         "fields": [
             {
                 "name": "win",
@@ -328,6 +333,80 @@ def test_leakage_audit_is_pattern_clock_aware_for_signal_session_fields():
     with pytest.raises(FeatureSelectionError):
         audit_feature_schema_no_leakage(intraday_schema)
     audit_feature_schema_no_leakage(eod_schema)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "volume",
+        "dollar_volume",
+        "volume_expansion_20d",
+        "volume_expansion_60d",
+        "dollar_volume_expansion_20d",
+        "dollar_volume_expansion_60d",
+        "sigma_20d",
+        "first_60m_return",
+        "held_above_breakout_after_first_hour",
+        "t1_before_stop",
+        "advanced_features",
+    ],
+)
+def test_intraday_signal_session_fields_are_deny_by_default(field_name):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": field_name,
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize("field_name", ["open_price", "previous_close", "gap_pct"])
+def test_intraday_signal_session_allows_only_asof_signal_time_fields(field_name):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": field_name,
+            }
+        ],
+    }
+    audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["volume", "dollar_volume", "volume_expansion_20d", "t1_before_stop"],
+)
+def test_eod_signal_session_keeps_session_fields_allowed(field_name):
+    schema = {
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": field_name,
+            }
+        ],
+    }
+    audit_feature_schema_no_leakage(schema)
 
 
 @pytest.mark.parametrize(
@@ -473,6 +552,48 @@ def test_missing_model_degrades_to_raw_strength_fallback_and_is_idempotent(db_se
     }
 
 
+def test_null_model_fallback_index_migration_dedupes_existing_rows(
+    db_session, monkeypatch
+):
+    signal_id = _seed_signal(db_session, idx=9, gap=-0.01)
+    db_session.flush()
+    db_session.execute(text("DROP INDEX ux_signal_ml_scores_fallback_null_model"))
+    for score_id, score in (("dup-old", 1.0), ("dup-new", 2.0)):
+        db_session.add(
+            SignalMLScore(
+                score_id=score_id,
+                signal_id=signal_id,
+                model_id=None,
+                requested_model_id="missing-model",
+                pattern_id="M4",
+                ticker="T0",
+                score=score,
+                fallback_score=score,
+                score_source="fallback_raw_strength",
+                fallback_reason="model_missing",
+                score_status="shadow",
+                score_metadata_json=json.dumps({"acts_on_book": False}),
+                scored_at=datetime.now(timezone.utc)
+                + timedelta(seconds=score),
+            )
+        )
+    db_session.flush()
+
+    migration = import_module(
+        "migrations.versions.fa0123456789_add_null_safe_ml_score_fallback_index"
+    )
+    ops = Operations(MigrationContext.configure(db_session.connection()))
+    monkeypatch.setattr(migration, "op", ops)
+    migration.upgrade()
+
+    rows = db_session.query(SignalMLScore).filter(
+        SignalMLScore.signal_id == signal_id,
+        SignalMLScore.model_id.is_(None),
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].score == pytest.approx(2.0)
+
+
 def test_artifact_load_error_persists_fallback_without_raising(db_session, tmp_path):
     signal_id = _seed_signal(db_session, idx=3, gap=-0.01)
     missing_path = tmp_path / "missing.pkl"
@@ -493,6 +614,29 @@ def test_artifact_load_error_persists_fallback_without_raising(db_session, tmp_p
     assert score.score_source == "fallback_raw_strength"
     assert score.fallback_reason == "artifact_load_error"
     assert json.loads(score.score_metadata_json)["acts_on_book"] is False
+
+
+def test_direct_artifact_uri_without_registry_never_persists_model_shadow(
+    db_session, tmp_path
+):
+    signal_id = _seed_signal(db_session, idx=10, gap=-0.01)
+    artifact_path = tmp_path / "direct.pkl"
+    _write_artifact(artifact_path, model_id="unregistered-model")
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        artifact_uri=str(artifact_path),
+    )
+    db_session.flush()
+
+    assert score.model_id is None
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "model_registry_missing"
+    assert db_session.query(SignalMLScore).filter(
+        SignalMLScore.score_source == "model_shadow"
+    ).count() == 0
 
 
 def test_artifact_identity_mismatch_falls_back(db_session, tmp_path):
@@ -602,6 +746,42 @@ def test_malformed_or_short_otd_ranges_fall_back(db_session, tmp_path, ranges):
     assert score.fallback_reason == "otd_check_error"
 
 
+@pytest.mark.parametrize(
+    "bad_range",
+    [
+        {"min": float("nan"), "max": 999.0},
+        {"min": -999.0, "max": float("inf")},
+        {"min": 10.0, "max": 1.0},
+    ],
+)
+def test_nonfinite_or_inverted_otd_bounds_fall_back(db_session, tmp_path, bad_range):
+    signal_id = _seed_signal(db_session, idx=11, gap=-0.01)
+    ranges = [{"min": -999.0, "max": 999.0} for _ in _feature_schema()["fields"]]
+    ranges[0] = bad_range
+    artifact_path = tmp_path / "bad-bound.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-bad-bound",
+        training_feature_ranges=ranges,
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-bad-bound",
+        artifact_uri=str(artifact_path),
+    )
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-bad-bound",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "otd_check_error"
+
+
 def test_predict_error_persists_fallback_without_raising(db_session, tmp_path):
     signal_id = _seed_signal(db_session, idx=5, gap=-0.01)
     artifact_path = tmp_path / "predict-error.pkl"
@@ -654,3 +834,42 @@ def test_non_finite_prediction_falls_back(db_session, tmp_path, value):
 
     assert score.score_source == "fallback_raw_strength"
     assert score.fallback_reason == "non_finite_score"
+
+
+def test_non_finite_raw_strength_fallback_uses_safe_default():
+    signal = SignalRegistry(
+        signal_id="nan-raw",
+        pattern_id="M4",
+        ticker="NAN",
+        direction="long",
+        signal_timestamp=datetime.now(timezone.utc),
+        raw_signal_strength=float("nan"),
+        raw_expected_edge=float("inf"),
+        feature_snapshot_id="unused",
+        signal_identity_hash="nan-raw",
+    )
+
+    score = _raw_strength_fallback_score(signal)
+
+    assert math.isfinite(score)
+    assert score == pytest.approx(0.0)
+
+
+def test_infinite_raw_strength_fallback_uses_safe_default(db_session):
+    signal_id = _seed_signal(db_session, idx=12, gap=-0.01)
+    signal = db_session.get(SignalRegistry, signal_id)
+    signal.raw_signal_strength = float("inf")
+    signal.raw_expected_edge = float("inf")
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="missing-model",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "model_missing"
+    assert math.isfinite(score.score)
+    assert score.score == pytest.approx(0.0)

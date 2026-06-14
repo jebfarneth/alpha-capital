@@ -38,9 +38,13 @@ def _raw_strength_fallback_score(signal: SignalRegistry) -> float:
     # recovery-context discriminant. Shadow fallback is logged explicitly as
     # raw strength so it cannot be mistaken for the final live fallback.
     if signal.raw_signal_strength is not None:
-        return float(signal.raw_signal_strength)
+        value = float(signal.raw_signal_strength)
+        if math.isfinite(value):
+            return value
     if signal.raw_expected_edge is not None:
-        return float(signal.raw_expected_edge)
+        value = float(signal.raw_expected_edge)
+        if math.isfinite(value):
+            return value
     return 0.0
 
 
@@ -60,10 +64,21 @@ def _out_of_training_distribution(
             raise Stage1InferenceError(
                 f"training_feature_ranges entry for {name!r} must be an object"
             )
-        if math.isnan(value):
-            continue
         lower = bounds.get("min")
         upper = bounds.get("max")
+        for bound_name, bound in (("min", lower), ("max", upper)):
+            if bound is not None:
+                if not isinstance(bound, (int, float)) or not math.isfinite(float(bound)):
+                    raise Stage1InferenceError(
+                        f"training_feature_ranges {bound_name} for {name!r} "
+                        "must be finite or null"
+                    )
+        if lower is not None and upper is not None and float(lower) > float(upper):
+            raise Stage1InferenceError(
+                f"training_feature_ranges min exceeds max for {name!r}"
+            )
+        if math.isnan(value):
+            continue
         if lower is not None and value < lower:
             out.append(name)
         elif upper is not None and value > upper:
@@ -221,6 +236,16 @@ def score_signal_shadow(
             model_row=None,
             reason="model_missing",
             score_status=score_status,
+        )
+    if model_row is None and artifact_uri:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=None,
+            reason="model_registry_missing",
+            score_status=score_status,
+            metadata={"artifact_uri_present": True},
         )
 
     try:

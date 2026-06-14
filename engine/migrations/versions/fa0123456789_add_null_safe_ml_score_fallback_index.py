@@ -21,6 +21,24 @@ INDEX_NAME = "ux_signal_ml_scores_fallback_null_model"
 
 def upgrade() -> None:
     op.execute(
+        """
+        WITH ranked AS (
+            SELECT
+                score_id,
+                row_number() OVER (
+                    PARTITION BY signal_id, COALESCE(requested_model_id, ''), score_status
+                    ORDER BY scored_at DESC, created_at DESC, score_id DESC
+                ) AS rn
+            FROM signal_ml_scores
+            WHERE model_id IS NULL
+        )
+        DELETE FROM signal_ml_scores
+        WHERE score_id IN (
+            SELECT score_id FROM ranked WHERE rn > 1
+        )
+        """
+    )
+    op.execute(
         f"""
         CREATE UNIQUE INDEX {INDEX_NAME}
         ON signal_ml_scores (

@@ -65,14 +65,19 @@ FORBIDDEN_ZONE_TOKENS = (
     "future",
     "exit",
 )
-INTRADAY_FORBIDDEN_SIGNAL_SESSION_TOKENS = (
-    "close",
-    "high",
-    "low",
-    "open_to_close",
-    "session_",
-    "day_",
-    "aggregate",
+INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS = frozenset(
+    {
+        "open_price",
+        "previous_close",
+        "gap_pct",
+        # These market_path_features columns are prior-window baselines produced
+        # from sessions before the signal day; current-day expansion fields are
+        # intentionally excluded.
+        "median_volume_20d",
+        "median_volume_60d",
+        "median_dollar_volume_20d",
+        "median_dollar_volume_60d",
+    }
 )
 
 
@@ -162,6 +167,15 @@ def _tokenize(value: str) -> set[str]:
     return set(out)
 
 
+def _field_terminal_name(field: dict[str, Any]) -> str:
+    for key in ("column", "path", "name"):
+        value = field.get(key)
+        parts = _path_parts(value) if key == "path" else [str(value)] if value else []
+        if parts:
+            return parts[-1]
+    return ""
+
+
 def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
     """Fail closed if the feature schema references forward-path predictors."""
 
@@ -193,18 +207,13 @@ def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
                     "market_path_feature field references a non-signal-day zone: "
                     f"{field!r}"
                 )
-            role_payload = " ".join(
-                str(field.get(key) or "")
-                for key in ("name", "path", "column", "status_path")
-            ).lower()
             if pattern_clock == "intraday" and feature_role == "signal_session":
-                if any(
-                    token in role_payload
-                    for token in INTRADAY_FORBIDDEN_SIGNAL_SESSION_TOKENS
-                ):
+                terminal_name = _field_terminal_name(field)
+                if terminal_name not in INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS:
                     raise FeatureSelectionError(
-                        "intraday Stage-1 predictors cannot read end-of-session "
-                        f"signal_session fields: {field!r}"
+                        "intraday Stage-1 predictors can read only explicitly "
+                        "allowlisted as-of-signal-time signal_session fields: "
+                        f"{field!r}"
                     )
         elif feature_role and any(token in feature_role.lower() for token in FORBIDDEN_ZONE_TOKENS):
             raise FeatureSelectionError(
