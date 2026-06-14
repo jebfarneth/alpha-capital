@@ -98,6 +98,7 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
     }
 )
 INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()
+_MALFORMED_PATH = object()
 
 
 def _canonical_json(payload: Any) -> str:
@@ -129,9 +130,11 @@ def _get_path(payload: Any, path: str | list[str] | tuple[str, ...] | None) -> A
     current = payload
     for part in _path_parts(path):
         if isinstance(current, dict):
-            current = current.get(part)
+            if part not in current:
+                return None
+            current = current[part]
         else:
-            return None
+            return _MALFORMED_PATH
     return current
 
 

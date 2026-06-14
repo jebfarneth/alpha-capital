@@ -851,6 +851,41 @@ def test_training_loader_picks_latest_canonical_observation(db_session, tmp_path
     assert examples[0].label == pytest.approx(0.42)
 
 
+def test_training_loader_drops_corrupt_vectors_but_keeps_stored_null(
+    db_session,
+    tmp_path,
+):
+    corrupt_signal_id = _seed_signal(db_session, idx=32, gap=-0.01)
+    missing_signal_id = _seed_signal(db_session, idx=33, gap=-0.01)
+    corrupt_snapshot = db_session.get(FeatureSnapshot, "fs-32")
+    corrupt_json = json.loads(corrupt_snapshot.feature_json)
+    corrupt_json["signal_context"]["mom20"] = "not-a-number"
+    corrupt_json["statuses"]["mom20"] = "computed"
+    corrupt_snapshot.feature_json = json.dumps(corrupt_json, sort_keys=True)
+    missing_snapshot = db_session.get(FeatureSnapshot, "fs-33")
+    missing_json = json.loads(missing_snapshot.feature_json)
+    missing_json["signal_context"].pop("mom20")
+    missing_json["statuses"].pop("mom20", None)
+    missing_snapshot.feature_json = json.dumps(missing_json, sort_keys=True)
+    db_session.commit()
+    manifest = load_manifest(
+        _write_manifest(tmp_path, [corrupt_signal_id, missing_signal_id])
+    )
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [missing_signal_id]
+    assert examples[0].vector.missing_statuses["mom20"] == "stored_null"
+    assert metrics == {
+        "dropped_non_finite": 1,
+        "dropped_non_finite_by_feature": {"mom20": 1},
+    }
+
+
 def test_missing_model_degrades_to_raw_strength_fallback_and_is_idempotent(db_session):
     signal_id = _seed_signal(db_session, idx=2, gap=-0.01)
     db_session.commit()
@@ -1307,6 +1342,99 @@ def test_absent_value_stays_typed_missing_and_scores_shadow(db_session, tmp_path
         db_session,
         signal_id=signal_id,
         model_id="model-absent-value",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["mom20"] == "stored_null"
+    assert score.score_source == "model_shadow"
+    assert score.fallback_reason is None
+
+
+def test_malformed_parent_path_falls_back(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=34, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-34")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"] = []
+    feature_json["statuses"]["mom20"] = "computed"
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    schema = {
+        "schema_version": "malformed_parent_status_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.mom20",
+                "status_path": "statuses.mom20",
+            }
+        ],
+    }
+    artifact_path = tmp_path / "malformed-parent.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-malformed-parent",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-malformed-parent",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-malformed-parent",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["mom20"] == "non_finite_stored_value"
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "out_of_training_distribution"
+    assert db_session.query(SignalMLScore).filter(
+        SignalMLScore.score_source == "model_shadow"
+    ).count() == 0
+
+
+def test_flat_absent_key_stays_typed_missing_and_scores_shadow(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=35, gap=-0.01)
+    schema = {
+        "schema_version": "flat_absent_status_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "mom20",
+            }
+        ],
+    }
+    artifact_path = tmp_path / "flat-absent.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-flat-absent",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-flat-absent",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-flat-absent",
     )
     db_session.flush()
 

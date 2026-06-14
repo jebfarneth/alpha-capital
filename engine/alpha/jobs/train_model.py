@@ -185,7 +185,8 @@ def _load_training_examples(
     session: Session,
     *,
     pattern: PatternManifest,
-) -> list[TrainingExample]:
+    return_metrics: bool = False,
+) -> list[TrainingExample] | tuple[list[TrainingExample], dict[str, Any]]:
     selection = pattern.selection
     if selection.get("source") != "forward_return_observations":
         raise RuntimeError(
@@ -234,12 +235,26 @@ def _load_training_examples(
     )
     rows = sorted(rows, key=lambda row: row.signal_timestamp)
     out: list[TrainingExample] = []
+    dropped_non_finite = 0
+    dropped_non_finite_by_feature: dict[str, int] = {}
     for obs in rows:
         label_value = getattr(obs, label_field, None)
         if label_value is None:
             continue
         signal = obs.signal
         vector = select_features(session, obs.signal_id, feature_schema)
+        corrupt_features = [
+            name
+            for name, status in vector.missing_statuses.items()
+            if status == "non_finite_stored_value"
+        ]
+        if corrupt_features:
+            dropped_non_finite += 1
+            for name in corrupt_features:
+                dropped_non_finite_by_feature[name] = (
+                    dropped_non_finite_by_feature.get(name, 0) + 1
+                )
+            continue
         out.append(
             TrainingExample(
                 signal_id=obs.signal_id,
@@ -249,6 +264,18 @@ def _load_training_examples(
                 vector=vector,
             )
         )
+    if dropped_non_finite:
+        LOGGER.warning(
+            "Stage-1 trainer dropped %s rows with non_finite_stored_value "
+            "features: %s",
+            dropped_non_finite,
+            json.dumps(dropped_non_finite_by_feature, sort_keys=True),
+        )
+    if return_metrics:
+        return out, {
+            "dropped_non_finite": dropped_non_finite,
+            "dropped_non_finite_by_feature": dropped_non_finite_by_feature,
+        }
     return out
 
 
