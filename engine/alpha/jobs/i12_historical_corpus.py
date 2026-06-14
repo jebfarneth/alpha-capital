@@ -1502,9 +1502,6 @@ def _feature_payload(
         "mom20": context.mom20,
         "off_low252": context.off_low252,
         "sigma20": _sigma(prior20),
-        "avg20_volume": context.avg20_volume,
-        "dollar_volume": day_bar.close * day_bar.volume,
-        "price": day_bar.open,
         "sub_dollar_at_open": sub_dollar,
         "halt_state": "unobserved_or_no_halt",
         "catalyst_tags": [],
@@ -1514,10 +1511,17 @@ def _feature_payload(
         "is_ml_excluded": inp.security_type.ml_excluded,
         "ml_exclusion_reason": inp.security_type.reason,
         "gate_values": _without_none(_feature_gate_values(gate_values)),
+        "research_only_leaky": _without_none(
+            {
+                "avg20_volume": context.avg20_volume,
+                "dollar_volume": day_bar.close * day_bar.volume,
+                "price": day_bar.open,
+            }
+        ),
         "source_lineage": source_lineage,
         "pit_caveats": {
             "security_type": "classified_asof_profile_applied_retroactively",
-            "full_day_volume_ratio": "leaky_research_only",
+            "research_only_leaky": "excluded_from_stage1_feature_allowlists",
         },
     }
     if minute_lineage is not None:

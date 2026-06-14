@@ -303,10 +303,12 @@ def _seed_delisted(db_session, ticker: str, delisted_date: date, *, suffix: str 
 
 
 def _assert_feature_json_pit_pure(payload, path=()):
-    if path and path[0] in {"candidate_screen", "pit_caveats"}:
+    if path and path[0] in {"candidate_screen", "pit_caveats", "research_only_leaky"}:
         return
     if isinstance(payload, dict):
         for key, value in payload.items():
+            if not path and key in {"candidate_screen", "pit_caveats", "research_only_leaky"}:
+                continue
             assert not LEAKY_FEATURE_KEY_RE.search(key), ".".join(path + (key,))
             _assert_feature_json_pit_pure(value, path + (key,))
     elif isinstance(payload, list):
@@ -336,6 +338,14 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
     assert "ret_conf" not in feature_json
     assert "outcome" not in feature_json
     assert "sessions_to_delist" not in feature_json
+    assert "avg20_volume" not in feature_json
+    assert "dollar_volume" not in feature_json
+    assert "price" not in feature_json
+    assert set(feature_json["research_only_leaky"]) == {
+        "avg20_volume",
+        "dollar_volume",
+        "price",
+    }
     assert feature_json["candidate_screen"] == CANDIDATE_SCREEN_STAMP
     _assert_feature_json_pit_pure(feature_json)
     labels = json.loads(detail.label_json)
@@ -663,6 +673,14 @@ def test_i12_corpus_poison_gap_writes_daily_only_control_without_minute_fetch(db
     assert detail.ret_open_close == pytest.approx((9.0 / 9.3) - 1.0)
     assert detail.ret_next_open is not None
     feature_json = json.loads(detail.feature_json)
+    assert "avg20_volume" not in feature_json
+    assert "dollar_volume" not in feature_json
+    assert "price" not in feature_json
+    assert set(feature_json["research_only_leaky"]) == {
+        "avg20_volume",
+        "dollar_volume",
+        "price",
+    }
     _assert_feature_json_pit_pure(feature_json)
     assert feature_json.get("minute_price_basis") is None
     labels = json.loads(detail.label_json)

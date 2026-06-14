@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from alpha.ml.model_features import audit_feature_schema_no_leakage
+
 
 class MLManifestError(RuntimeError):
     """The ML manifest is missing, malformed, or drifted from its hash."""
+
+
+_SIGNAL_HORIZON_RE = re.compile(r"^([1-9][0-9]*)d$")
 
 
 def _canonical_json(payload: Any) -> str:
@@ -28,6 +34,15 @@ def manifest_payload_hash(payload: dict[str, Any]) -> str:
     normalized = dict(payload)
     normalized.pop("manifest_sha256", None)
     return hashlib.sha256(_canonical_json(normalized).encode()).hexdigest()
+
+
+def _signal_horizon_sessions(signal_horizon: str) -> int:
+    match = _SIGNAL_HORIZON_RE.fullmatch(signal_horizon)
+    if match is None:
+        raise MLManifestError(
+            f"signal_horizon must be canonical '<positive integer>d', got {signal_horizon!r}"
+        )
+    return int(match.group(1))
 
 
 @dataclass(frozen=True)
@@ -94,12 +109,38 @@ def load_manifest(path: str | Path) -> FrozenMLManifest:
             raise MLManifestError(
                 f"pattern {pattern_id!r} feature_schema must define fields"
             )
+        try:
+            audit_feature_schema_no_leakage(feature_schema)
+        except Exception as exc:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} feature_schema failed leakage audit: {exc}"
+            ) from exc
         label = raw.get("label")
         if not isinstance(label, dict):
             raise MLManifestError(f"pattern {pattern_id!r} missing label contract")
         selection = raw.get("selection")
         if not isinstance(selection, dict):
             raise MLManifestError(f"pattern {pattern_id!r} missing selection contract")
+        signal_horizon = str(raw.get("signal_horizon") or "").strip()
+        horizon_sessions = selection.get("horizon_sessions")
+        if horizon_sessions is None:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} selection missing horizon_sessions"
+            )
+        try:
+            parsed_horizon_sessions = _signal_horizon_sessions(signal_horizon)
+            selected_horizon_sessions = int(horizon_sessions)
+        except MLManifestError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} horizon_sessions must be an integer"
+            ) from exc
+        if parsed_horizon_sessions != selected_horizon_sessions:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} signal_horizon {signal_horizon!r} "
+                f"does not match horizon_sessions={selected_horizon_sessions}"
+            )
         min_cohorts = int(raw.get("min_graded_cohorts", 0))
         if min_cohorts <= 0:
             raise MLManifestError(
@@ -112,7 +153,7 @@ def load_manifest(path: str | Path) -> FrozenMLManifest:
             )
         patterns[str(pattern_id)] = PatternManifest(
             pattern_id=str(pattern_id),
-            signal_horizon=str(raw.get("signal_horizon") or ""),
+            signal_horizon=signal_horizon,
             min_graded_cohorts=min_cohorts,
             embargo_sessions=embargo,
             feature_schema=feature_schema,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import pickle
 import sys
@@ -45,6 +46,7 @@ from alpha.ml.model_features import (
 
 MODEL_FAMILY = "sklearn_hist_gradient_boosting_gbrt"
 DEFAULT_STATUS = "shadow"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,7 @@ def _signal_date(signal: SignalRegistry) -> date:
 
 
 def _finite(values: list[float]) -> list[float]:
-    return [value for value in values if not math.isnan(value)]
+    return [value for value in values if math.isfinite(value)]
 
 
 def _feature_ranges(matrix: list[list[float]]) -> list[dict[str, float | None]]:
@@ -140,6 +142,45 @@ def _cv_examples(examples: list[TrainingExample]) -> list[CVExample]:
     ]
 
 
+def _assert_single_observation_horizon(
+    rows: list[ForwardReturnObservation],
+    *,
+    expected_horizon: str,
+) -> None:
+    horizons = {str(row.signal_horizon) for row in rows if row.signal_horizon}
+    if len(horizons) > 1:
+        raise RuntimeError(
+            "Stage-1 training examples contain mixed signal_horizon values: "
+            f"{sorted(horizons)}"
+        )
+    if expected_horizon and horizons and horizons != {expected_horizon}:
+        raise RuntimeError(
+            "Stage-1 training examples do not match manifest signal_horizon "
+            f"{expected_horizon!r}: {sorted(horizons)}"
+        )
+
+
+def _canonical_observation_rows(
+    rows: list[ForwardReturnObservation],
+) -> list[ForwardReturnObservation]:
+    out: list[ForwardReturnObservation] = []
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for row in rows:
+        if row.signal_id in seen:
+            duplicates.add(row.signal_id)
+            continue
+        seen.add(row.signal_id)
+        out.append(row)
+    if duplicates:
+        LOGGER.warning(
+            "Stage-1 trainer selected latest canonical forward-return rows for "
+            "%s signals with duplicate observations",
+            len(duplicates),
+        )
+    return out
+
+
 def _load_training_examples(
     session: Session,
     *,
@@ -176,7 +217,22 @@ def _load_training_examples(
     signal_ids = [raw_signal_ids] if isinstance(raw_signal_ids, str) else raw_signal_ids
     if signal_ids:
         query = query.filter(ForwardReturnObservation.signal_id.in_(list(signal_ids)))
-    rows = query.order_by(ForwardReturnObservation.signal_timestamp.asc()).all()
+    if pattern.signal_horizon:
+        query = query.filter(
+            ForwardReturnObservation.signal_horizon == pattern.signal_horizon
+        )
+    rows = query.order_by(
+        ForwardReturnObservation.signal_id.asc(),
+        ForwardReturnObservation.updated_at.desc(),
+        ForwardReturnObservation.created_at.desc(),
+        ForwardReturnObservation.forward_return_observation_id.desc(),
+    ).all()
+    rows = _canonical_observation_rows(rows)
+    _assert_single_observation_horizon(
+        rows,
+        expected_horizon=pattern.signal_horizon,
+    )
+    rows = sorted(rows, key=lambda row: row.signal_timestamp)
     out: list[TrainingExample] = []
     for obs in rows:
         label_value = getattr(obs, label_field, None)
@@ -196,6 +252,13 @@ def _load_training_examples(
     return out
 
 
+def _fold_train_weights(
+    cv_rows: list[CVExample],
+    train_indices: list[int],
+) -> list[float]:
+    return unique_name_weights([cv_rows[i] for i in train_indices])
+
+
 def _cross_validate(
     examples: list[TrainingExample],
     *,
@@ -212,7 +275,6 @@ def _cross_validate(
         horizon_sessions=horizon_sessions,
         embargo_sessions=embargo_sessions,
     )
-    weights = unique_name_weights(cv_rows)
     fold_metrics: list[dict[str, Any]] = []
     all_true: list[float] = []
     all_pred: list[float] = []
@@ -220,15 +282,16 @@ def _cross_validate(
     for idx, fold in enumerate(folds):
         train = [examples[i] for i in fold.train_indices]
         test = [examples[i] for i in fold.test_indices]
+        train_weights = _fold_train_weights(cv_rows, fold.train_indices)
+        test_weights = unique_name_weights([cv_rows[i] for i in fold.test_indices])
         model = _new_gbrt_model(max_iter=max_iter, random_state=random_state + idx)
         model.fit(
             _matrix(train),
             _labels(train),
-            sample_weight=[weights[i] for i in fold.train_indices],
+            sample_weight=train_weights,
         )
         preds = [float(value) for value in model.predict(_matrix(test))]
         labels = _labels(test)
-        test_weights = [weights[i] for i in fold.test_indices]
         all_true.extend(labels)
         all_pred.extend(preds)
         all_weights.extend(test_weights)

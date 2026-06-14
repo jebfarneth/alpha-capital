@@ -79,6 +79,9 @@ def _out_of_training_distribution(
             )
         if math.isnan(value):
             continue
+        if math.isinf(value):
+            out.append(name)
+            continue
         if lower is not None and value < lower:
             out.append(name)
         elif upper is not None and value > upper:
@@ -306,6 +309,25 @@ def score_signal_shadow(
             score_status=score_status,
             vector=vector,
             metadata=_safe_error_metadata(exc),
+        )
+    non_finite_fields = [
+        name
+        for name, status in vector.missing_statuses.items()
+        if status == "non_finite_stored_value"
+    ]
+    if non_finite_fields:
+        return _fallback_row(
+            session,
+            signal=signal,
+            requested_model_id=requested_model_id,
+            model_row=model_row,
+            reason="out_of_training_distribution",
+            score_status=score_status,
+            vector=vector,
+            metadata={
+                "otd_fields": non_finite_fields,
+                "reason": "non_finite_stored_value",
+            },
         )
     if otd_fields:
         return _fallback_row(

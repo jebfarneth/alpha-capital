@@ -34,7 +34,9 @@ FORWARD_FEATURE_TOKENS = (
     "mae",
     "mfe",
     "exit_",
+    "entry",
     "path_return",
+    "return_from_entry",
     "realized_pnl",
 )
 FORWARD_FEATURE_EXACT_TOKENS = frozenset(
@@ -79,6 +81,23 @@ INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS = frozenset(
         "median_dollar_volume_60d",
     }
 )
+INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
+    {
+        "gap",
+        "prev_day_return",
+        "prev_day_green",
+        "mom20",
+        "off_low252",
+        "sigma20",
+        "distance_from_max252",
+        "drawdown_from_max252",
+        "projected_volume_ratio_at_confirmation",
+        "projected_volume_at_confirmation",
+        "chase_pct",
+        "spy_prior_day_return",
+    }
+)
+INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()
 
 
 def _canonical_json(payload: Any) -> str:
@@ -122,9 +141,19 @@ def _as_float(value: Any) -> float:
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return math.nan
+    return result if math.isfinite(result) else math.nan
+
+
+def _is_non_finite_raw_value(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return not math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _transform(value: float, transform: str | None) -> float:
@@ -176,6 +205,78 @@ def _field_terminal_name(field: dict[str, Any]) -> str:
     return ""
 
 
+def _audit_feature_field_no_leakage(
+    feature_schema: dict[str, Any],
+    field: dict[str, Any],
+) -> None:
+    pattern_clock = str(feature_schema.get("pattern_clock") or "").lower()
+    source = str(field.get("source") or "feature_snapshot_json")
+    if source not in ALLOWED_FEATURE_SOURCES:
+        raise FeatureSelectionError(
+            f"feature source {source!r} is not allowed for Stage-1 predictors"
+        )
+    feature_role = str(field.get("feature_role") or "").strip()
+    terminal_name = _field_terminal_name(field)
+    if source.startswith("market_path_feature"):
+        if not feature_role:
+            raise FeatureSelectionError(
+                "market_path_feature fields must declare an allowed signal-day "
+                "feature_role"
+            )
+        if feature_role not in ALLOWED_MARKET_PATH_FEATURE_ROLES:
+            raise FeatureSelectionError(
+                "market_path_feature field references a non-signal-day zone: "
+                f"{field!r}"
+            )
+        if pattern_clock == "intraday":
+            if terminal_name not in INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 predictors can read only explicitly "
+                    "allowlisted as-of-signal-time market-path fields: "
+                    f"{field!r}"
+                )
+    else:
+        if feature_role and any(
+            token in feature_role.lower() for token in FORBIDDEN_ZONE_TOKENS
+        ):
+            raise FeatureSelectionError(
+                "feature field references a forbidden forward/outcome zone: "
+                f"{field!r}"
+            )
+        if pattern_clock == "intraday" and source == "feature_snapshot_json":
+            if terminal_name not in INTRADAY_ALLOWED_SNAPSHOT_PATHS:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 feature snapshots can read only explicitly "
+                    "allowlisted as-of-signal-time fields: "
+                    f"{field!r}"
+                )
+        if pattern_clock == "intraday" and source == "signal_registry":
+            if terminal_name not in INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS:
+                raise FeatureSelectionError(
+                    "intraday Stage-1 signal_registry fields are denied by "
+                    f"default: {field!r}"
+                )
+    haystack = " ".join(
+        str(field.get(key) or "")
+        for key in (
+            "name",
+            "source",
+            "path",
+            "column",
+            "status_path",
+            "feature_role",
+        )
+    ).lower()
+    tokens = _tokenize(haystack)
+    if any(token in haystack for token in FORWARD_FEATURE_TOKENS) or (
+        tokens & FORWARD_FEATURE_EXACT_TOKENS
+    ):
+        raise FeatureSelectionError(
+            "forward-path or label field entered the Stage-1 feature schema: "
+            f"{field!r}"
+        )
+
+
 def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
     """Fail closed if the feature schema references forward-path predictors."""
 
@@ -190,55 +291,7 @@ def audit_feature_schema_no_leakage(feature_schema: dict[str, Any]) -> None:
     for field in fields:
         if not isinstance(field, dict):
             raise FeatureSelectionError("feature_schema fields must be objects")
-        source = str(field.get("source") or "feature_snapshot_json")
-        if source not in ALLOWED_FEATURE_SOURCES:
-            raise FeatureSelectionError(
-                f"feature source {source!r} is not allowed for Stage-1 predictors"
-            )
-        feature_role = str(field.get("feature_role") or "").strip()
-        if source.startswith("market_path_feature"):
-            if not feature_role:
-                raise FeatureSelectionError(
-                    "market_path_feature fields must declare an allowed signal-day "
-                    "feature_role"
-                )
-            if feature_role not in ALLOWED_MARKET_PATH_FEATURE_ROLES:
-                raise FeatureSelectionError(
-                    "market_path_feature field references a non-signal-day zone: "
-                    f"{field!r}"
-                )
-            if pattern_clock == "intraday" and feature_role == "signal_session":
-                terminal_name = _field_terminal_name(field)
-                if terminal_name not in INTRADAY_ALLOWED_SIGNAL_SESSION_FIELDS:
-                    raise FeatureSelectionError(
-                        "intraday Stage-1 predictors can read only explicitly "
-                        "allowlisted as-of-signal-time signal_session fields: "
-                        f"{field!r}"
-                    )
-        elif feature_role and any(token in feature_role.lower() for token in FORBIDDEN_ZONE_TOKENS):
-            raise FeatureSelectionError(
-                "feature field references a forbidden forward/outcome zone: "
-                f"{field!r}"
-            )
-        haystack = " ".join(
-            str(field.get(key) or "")
-            for key in (
-                "name",
-                "source",
-                "path",
-                "column",
-                "status_path",
-                "feature_role",
-            )
-        ).lower()
-        tokens = _tokenize(haystack)
-        if any(token in haystack for token in FORWARD_FEATURE_TOKENS) or (
-            tokens & FORWARD_FEATURE_EXACT_TOKENS
-        ):
-            raise FeatureSelectionError(
-                "forward-path or label field entered the Stage-1 feature schema: "
-                f"{field!r}"
-            )
+        _audit_feature_field_no_leakage(feature_schema, field)
 
 
 @dataclass(frozen=True)
@@ -253,9 +306,15 @@ class SelectedFeatureVector:
 
 
 class _StoredFeatureSource:
-    def __init__(self, session: Session, signal: SignalRegistry) -> None:
+    def __init__(
+        self,
+        session: Session,
+        signal: SignalRegistry,
+        feature_schema: dict[str, Any],
+    ) -> None:
         self.session = session
         self.signal = signal
+        self.feature_schema = feature_schema
         self._feature_snapshot_payload: dict[str, Any] | None = None
         self._market_path_rows: dict[tuple[str, str | None, int | None], MarketPathFeature | None] = {}
 
@@ -294,11 +353,13 @@ class _StoredFeatureSource:
         return self._market_path_rows[key]
 
     def value_for_field(self, field: dict[str, Any]) -> tuple[Any, Any]:
+        _audit_feature_field_no_leakage(self.feature_schema, field)
         source = str(field.get("source") or "feature_snapshot_json")
         if source == "feature_snapshot_json":
             payload = self.feature_snapshot_payload
-            return _get_path(payload, field.get("path")), _get_path(
-                payload, field.get("status_path")
+            status_path = field.get("status_path")
+            return _get_path(payload, field.get("path")), (
+                _get_path(payload, status_path) if status_path else None
             )
         if source == "signal_registry":
             attr = str(field.get("column") or field.get("path") or "")
@@ -341,7 +402,7 @@ def select_features(
             f"feature schema pattern {expected_pattern!r} does not match signal "
             f"pattern {signal.pattern_id!r}"
         )
-    source = _StoredFeatureSource(session, signal)
+    source = _StoredFeatureSource(session, signal, feature_schema)
     names: list[str] = []
     values: list[float] = []
     statuses: dict[str, Any] = {}
@@ -350,11 +411,14 @@ def select_features(
         if not name:
             raise FeatureSelectionError("feature_schema field missing name")
         raw_value, status = source.value_for_field(field)
+        non_finite_raw_value = _is_non_finite_raw_value(raw_value)
         value = _transform(_as_float(raw_value), field.get("transform"))
         names.append(name)
         values.append(value)
         if math.isnan(value):
-            statuses[name] = status or "stored_null"
+            statuses[name] = status or (
+                "non_finite_stored_value" if non_finite_raw_value else "stored_null"
+            )
     schema_hash = feature_schema_hash(feature_schema)
     vector_hash = feature_vector_hash(names, values)
     return SelectedFeatureVector(

@@ -21,12 +21,19 @@ from alpha.db.models import (
 )
 from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
-from alpha.jobs.train_model import MODEL_FAMILY, Stage1TrainModelJob
+from alpha.jobs.train_model import (
+    MODEL_FAMILY,
+    Stage1TrainModelJob,
+    _finite,
+    _fold_train_weights,
+    _load_training_examples,
+)
 from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
 from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
-from alpha.ml.manifest_loader import load_manifest, manifest_payload_hash
+from alpha.ml.manifest_loader import PatternManifest, load_manifest, manifest_payload_hash
 from alpha.ml.model_features import (
     FeatureSelectionError,
+    _as_float,
     audit_feature_schema_no_leakage,
     feature_schema_hash,
     select_features,
@@ -82,23 +89,29 @@ def _feature_schema() -> dict:
     }
 
 
-def _manifest_payload(signal_ids: list[str] | None = None) -> dict:
+def _manifest_payload(
+    signal_ids: list[str] | None = None,
+    *,
+    feature_schema: dict | None = None,
+    signal_horizon: str = "2d",
+    horizon_sessions: int = 2,
+) -> dict:
     payload = {
         "manifest_version": "test_stage1_manifest_v1",
         "manifest_sha256": "",
         "patterns": {
             "M4": {
-                "signal_horizon": "2d",
+                "signal_horizon": signal_horizon,
                 "min_graded_cohorts": 8,
                 "embargo_sessions": 2,
                 "selection": {
                     "source": "forward_return_observations",
                     "statuses": ["computed"],
-                    "horizon_sessions": 2,
+                    "horizon_sessions": horizon_sessions,
                     "signal_ids": signal_ids or [],
                 },
                 "label": {"field": "forward_return"},
-                "feature_schema": _feature_schema(),
+                "feature_schema": feature_schema or _feature_schema(),
                 "diagnostics": {"pooled_metrics_diagnostic_only": True},
             }
         },
@@ -120,6 +133,8 @@ def _seed_signal(
     ticker: str | None = None,
     gap: float | None = -0.01,
     signal_date: date | None = None,
+    signal_horizon: str = "2d",
+    forward_return: float | None = None,
 ) -> str:
     signal_id = f"sig-{idx}"
     ticker = ticker or f"T{idx % 3}"
@@ -153,7 +168,7 @@ def _seed_signal(
         signal_timestamp=ts,
         raw_signal_strength=1.0 + idx,
         raw_expected_edge=0.0,
-        signal_horizon="2d",
+        signal_horizon=signal_horizon,
         feature_snapshot_id=feature_snapshot_id,
         signal_status="active",
         trading_date=ts.date().isoformat(),
@@ -168,8 +183,10 @@ def _seed_signal(
             ticker=ticker,
             direction="long",
             signal_timestamp=ts,
-            signal_horizon="2d",
-            forward_return=(idx - 4) / 100.0,
+            signal_horizon=signal_horizon,
+            forward_return=forward_return
+            if forward_return is not None
+            else (idx - 4) / 100.0,
             status="computed",
             input_hash=f"input-{idx}",
             outcome_hash=f"outcome-{idx}",
@@ -430,6 +447,107 @@ def test_leakage_audit_rejects_snake_case_label_names(field_name):
         audit_feature_schema_no_leakage(schema)
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "dollar_volume",
+        "avg20_volume",
+        "close",
+        "high",
+        "session_volume",
+        "first_60m_return",
+    ],
+)
+def test_intraday_snapshot_fields_are_deny_by_default(field_name):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "feature_snapshot_json",
+                "path": f"signal_context.{field_name}",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize("field_name", ["gap", "mom20", "off_low252"])
+def test_intraday_snapshot_allows_only_signal_time_fields(field_name):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "feature_snapshot_json",
+                "path": f"signal_context.{field_name}",
+            }
+        ],
+    }
+
+    audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize(
+    "feature_role",
+    ["signal_day", "signal_day_t0", "t0_signal_context"],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    ["return_from_entry_close", "close_price", "dollar_volume"],
+)
+def test_intraday_signal_day_roles_share_the_signal_time_allowlist(
+    feature_role,
+    field_name,
+):
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "market_path_feature_column",
+                "feature_role": feature_role,
+                "feature_version": "market_path_daily_v3",
+                "column": field_name,
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+def test_manifest_loader_runs_leakage_audit_for_intraday_schema(tmp_path):
+    schema = {
+        "schema_version": "leaky_intraday_v1",
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "dollar_volume",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.dollar_volume",
+            }
+        ],
+    }
+    payload = _manifest_payload(
+        ["sig-1"],
+        feature_schema=schema,
+        signal_horizon="2d",
+        horizon_sessions=2,
+    )
+    path = tmp_path / "leaky_manifest.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+
+    with pytest.raises(Exception, match="leakage audit"):
+        load_manifest(path)
+
+
 def test_purged_embargoed_cv_excludes_nearby_training_dates():
     start = datetime(2025, 1, 1).date()
     examples = [
@@ -450,6 +568,23 @@ def test_purged_embargoed_cv_excludes_nearby_training_dates():
             date_positions[examples[idx].signal_date] < test_start - 2
             for idx in fold.train_indices
         )
+
+
+def test_fold_train_weights_are_recomputed_inside_each_fold():
+    start = date(2025, 1, 1)
+    rows = [
+        CVExample(signal_id="a0", ticker="AAA", signal_date=start),
+        CVExample(signal_id="a1", ticker="AAA", signal_date=start + timedelta(days=1)),
+        CVExample(signal_id="b0", ticker="BBB", signal_date=start + timedelta(days=2)),
+        CVExample(signal_id="b1", ticker="BBB", signal_date=start + timedelta(days=3)),
+        CVExample(signal_id="a2", ticker="AAA", signal_date=start + timedelta(days=4)),
+        CVExample(signal_id="a3", ticker="AAA", signal_date=start + timedelta(days=5)),
+    ]
+
+    weights = _fold_train_weights(rows, [0, 1, 2, 3])
+
+    assert sum(weight for row, weight in zip(rows[:4], weights) if row.ticker == "AAA") == pytest.approx(1.0)
+    assert sum(weight for row, weight in zip(rows[:4], weights) if row.ticker == "BBB") == pytest.approx(1.0)
 
 
 def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
@@ -524,6 +659,97 @@ def test_training_rejects_many_rows_on_too_few_graded_cohorts(db_session, tmp_pa
                 started_at=datetime.now(timezone.utc),
             )
         )
+
+
+def test_manifest_loader_rejects_noncanonical_or_mismatched_signal_horizon(tmp_path):
+    mismatch = _manifest_payload(
+        ["sig-1"],
+        signal_horizon="15d",
+        horizon_sessions=5,
+    )
+    mismatch_path = tmp_path / "mismatch.json"
+    mismatch_path.write_text(json.dumps(mismatch, sort_keys=True))
+    with pytest.raises(Exception, match="does not match horizon_sessions"):
+        load_manifest(mismatch_path)
+
+    noncanonical = _manifest_payload(
+        ["sig-1"],
+        signal_horizon="15",
+        horizon_sessions=15,
+    )
+    noncanonical_path = tmp_path / "noncanonical.json"
+    noncanonical_path.write_text(json.dumps(noncanonical, sort_keys=True))
+    with pytest.raises(Exception, match="signal_horizon must be canonical"):
+        load_manifest(noncanonical_path)
+
+
+def test_training_loader_filters_to_manifest_signal_horizon(db_session, tmp_path):
+    sig_2d = _seed_signal(db_session, idx=20, signal_horizon="2d")
+    sig_5d = _seed_signal(db_session, idx=21, signal_horizon="5d")
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [sig_2d, sig_5d]))
+
+    examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+    assert [row.signal_id for row in examples] == [sig_2d]
+
+
+def test_training_loader_rejects_mixed_loaded_horizons(db_session):
+    sig_2d = _seed_signal(db_session, idx=22, signal_horizon="2d")
+    sig_5d = _seed_signal(db_session, idx=23, signal_horizon="5d")
+    db_session.commit()
+    pattern = PatternManifest(
+        pattern_id="M4",
+        signal_horizon="",
+        min_graded_cohorts=1,
+        embargo_sessions=2,
+        feature_schema=_feature_schema(),
+        label={"field": "forward_return"},
+        selection={
+            "source": "forward_return_observations",
+            "statuses": ["computed"],
+            "horizon_sessions": 2,
+            "signal_ids": [sig_2d, sig_5d],
+        },
+        diagnostics={},
+    )
+
+    with pytest.raises(RuntimeError, match="mixed signal_horizon"):
+        _load_training_examples(db_session, pattern=pattern)
+
+
+def test_training_loader_picks_latest_canonical_observation(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=24, forward_return=-0.50)
+    old = db_session.query(ForwardReturnObservation).filter(
+        ForwardReturnObservation.signal_id == signal_id
+    ).one()
+    old.created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    old.updated_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    signal = db_session.get(SignalRegistry, signal_id)
+    db_session.add(
+        ForwardReturnObservation(
+            forward_return_observation_id="fro-24-fresh",
+            signal_id=signal_id,
+            pattern_id="M4",
+            ticker=signal.ticker,
+            direction="long",
+            signal_timestamp=signal.signal_timestamp,
+            signal_horizon="2d",
+            forward_return=0.42,
+            status="computed",
+            input_hash="input-24-fresh",
+            outcome_hash="outcome-24-fresh",
+            created_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+            updated_at=datetime(2025, 1, 3, tzinfo=timezone.utc),
+        )
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+    assert len(examples) == 1
+    assert examples[0].label == pytest.approx(0.42)
 
 
 def test_missing_model_degrades_to_raw_strength_fallback_and_is_idempotent(db_session):
@@ -780,6 +1006,50 @@ def test_nonfinite_or_inverted_otd_bounds_fall_back(db_session, tmp_path, bad_ra
 
     assert score.score_source == "fallback_raw_strength"
     assert score.fallback_reason == "otd_check_error"
+
+
+@pytest.mark.parametrize("raw_value", [float("inf"), "Infinity", "1e400"])
+def test_feature_reader_treats_infinite_values_as_typed_missing(raw_value):
+    assert math.isnan(_as_float(raw_value))
+
+
+def test_open_bound_infinite_feature_value_falls_back(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=25, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-25")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"]["mom20"] = "1e400"
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    artifact_path = tmp_path / "open-bound-inf.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-open-bound-inf",
+        training_feature_ranges=[
+            {"min": None, "max": None} for _ in _feature_schema()["fields"]
+        ],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-open-bound-inf",
+        artifact_uri=str(artifact_path),
+    )
+    db_session.commit()
+
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-open-bound-inf",
+    )
+    db_session.flush()
+
+    assert score.score_source == "fallback_raw_strength"
+    assert score.fallback_reason == "out_of_training_distribution"
+    assert db_session.query(SignalMLScore).filter(
+        SignalMLScore.score_source == "model_shadow"
+    ).count() == 0
+
+
+def test_training_feature_range_filter_excludes_infinities():
+    assert _finite([math.nan, float("inf"), float("-inf"), 1.25]) == [1.25]
 
 
 def test_predict_error_persists_fallback_without_raising(db_session, tmp_path):
