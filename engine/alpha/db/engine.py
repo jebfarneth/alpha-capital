@@ -37,12 +37,9 @@ def _validate_schema_name(schema: str) -> str:
 def schema_connect_args(url: str, schema: str | None = None) -> dict:
     """Return SQLAlchemy kwargs that route PostgreSQL connections to schema.
 
-    Schema-routed sessions intentionally use only the target schema. Keeping
-    ``public`` in the search path lets a scratch typo or partial schema resolve
-    unqualified ORM tables to canonical public tables, which can mutate the
-    production corpus. PostgreSQL still searches ``pg_catalog`` implicitly;
-    any legitimate non-table object outside the target schema must be
-    schema-qualified by the caller.
+    The startup option intentionally names only the target schema. Some
+    poolers ignore startup options, so ``get_engine`` also binds the live
+    session search path with ``SET`` on connect.
     """
     if not schema:
         return {}
@@ -61,7 +58,7 @@ def _bind_schema_search_path(engine, url: str, schema: str | None) -> None:
     def _set_search_path(dbapi_conn, _record):  # noqa: ANN001
         cursor = dbapi_conn.cursor()
         try:
-            cursor.execute(f'SET search_path TO "{schema}"')
+            cursor.execute(f'SET search_path TO "{schema}", public')
         finally:
             cursor.close()
         if not getattr(dbapi_conn, "autocommit", False):
@@ -106,7 +103,7 @@ def get_session(url: str | None = None, schema: str | None = None) -> Session:
 
 
 def assert_session_targets_schema(session: Session, schema: str | None) -> None:
-    """Fail closed if a scratch-targeted PostgreSQL session can write to public."""
+    """Fail closed unless scratch is the first PostgreSQL search_path entry."""
 
     if not schema:
         return
@@ -115,10 +112,10 @@ def assert_session_targets_schema(session: Session, schema: str | None) -> None:
         return
     search_path = session.execute(text("SHOW search_path")).scalar() or ""
     parts = [part.strip().strip('"') for part in search_path.split(",")]
-    if schema not in parts or "public" in parts:
+    if not parts or parts[0] != schema:
         raise SchemaTargetError(
             f"Refusing to write: requested schema {schema!r} but the live session "
-            f"search_path is {search_path!r} (schema absent or public present). "
+            f"search_path is {search_path!r} (scratch schema is not first). "
             "Aborting to protect canonical data."
         )
 
@@ -147,21 +144,40 @@ def open_writable_session(
     return session
 
 
-def create_all_tables(engine=None, schema: str | None = None):
+def create_all_tables(
+    engine=None,
+    schema: str | None = None,
+    table_names: Optional[Sequence[str]] = None,
+):
     """Create ORM tables for local smoke databases and isolated scratch schemas."""
 
     engine = engine or get_engine()
     schema = schema or os.environ.get("ALPHA_DB_SCHEMA")
+    tables = None
+    if table_names is not None:
+        missing = sorted(set(table_names) - set(Base.metadata.tables))
+        if missing:
+            raise SchemaTargetError(
+                "unknown ORM tables requested for scratch schema creation: "
+                f"{', '.join(missing)}"
+            )
+        tables = [Base.metadata.tables[name] for name in table_names]
     if schema and engine.dialect.name == "postgresql":
         schema = _validate_schema_name(schema)
         with engine.begin() as conn:
             # Restrict checkfirst to the scratch schema; otherwise SQLAlchemy
             # can see stale public tables and skip creating the scratch-local
             # table.
-            conn.execute(text(f'SET search_path TO "{schema}"'))
-            Base.metadata.create_all(conn)
+            conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+            if tables is None:
+                Base.metadata.create_all(conn)
+            else:
+                Base.metadata.create_all(conn, tables=tables)
         return
-    Base.metadata.create_all(engine)
+    if tables is None:
+        Base.metadata.create_all(engine)
+    else:
+        Base.metadata.create_all(engine, tables=tables)
 
 
 def create_schema_if_missing(engine=None, schema: str | None = None) -> None:
@@ -215,7 +231,11 @@ def prepare_writable_schema_target(
                 **schema_connect_args(url, schema),
             )
             try:
-                create_all_tables(engine=target_engine, schema=schema)
+                create_all_tables(
+                    engine=target_engine,
+                    schema=schema,
+                    table_names=required,
+                )
             finally:
                 target_engine.dispose()
         elif not _schema_exists(admin_engine, schema):

@@ -37,8 +37,6 @@ I12_CORPUS_REQUIRED_TABLES = [
     "data_lineage",
     "feature_snapshots",
     "signal_registry",
-    "historical_universe_reconstructions",
-    "fmp_delisted_companies",
     "intraday_event_details",
 ]
 DEFAULT_MINUTE_CACHE_DIR = Path.home() / ".cache" / "alpha-capital" / "i12_polygon_minute_aggs"

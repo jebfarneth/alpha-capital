@@ -596,9 +596,16 @@ def test_i11_runner_skip_existing_and_retry_args():
     assert args.db_retry_backoff_seconds == 0.25
 
 
-def test_i11_and_i12_required_tables_include_delisted_source():
-    assert "fmp_delisted_companies" in I11_CORPUS_REQUIRED_TABLES
-    assert "fmp_delisted_companies" in I12_CORPUS_REQUIRED_TABLES
+def test_i11_and_i12_required_tables_are_output_only():
+    reference_tables = {
+        "fmp_delisted_companies",
+        "historical_universe_reconstructions",
+        "market_path_features",
+        "security_type_classifications",
+    }
+
+    assert set(I11_CORPUS_REQUIRED_TABLES).isdisjoint(reference_tables)
+    assert set(I12_CORPUS_REQUIRED_TABLES).isdisjoint(reference_tables)
 
 
 def test_i11_runner_loads_catalyst_tag_artifact(tmp_path):

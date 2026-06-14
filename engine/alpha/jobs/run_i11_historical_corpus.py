@@ -38,8 +38,6 @@ I11_CORPUS_REQUIRED_TABLES = [
     "data_lineage",
     "feature_snapshots",
     "signal_registry",
-    "historical_universe_reconstructions",
-    "fmp_delisted_companies",
     "intraday_event_details",
 ]
 

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from alpha.db import engine as db_engine
 from alpha.db.engine import (
@@ -87,15 +88,26 @@ def test_assert_session_targets_schema_accepts_exact_scratch_search_path():
     assert len(session.statements) == 1
 
 
+def test_assert_session_targets_schema_accepts_scratch_first_public_fallback():
+    session = _FakeSession(
+        dialect_name="postgresql",
+        search_path="i11_pilot_x, public",
+    )
+
+    assert_session_targets_schema(session, "i11_pilot_x")
+
+    assert len(session.statements) == 1
+
+
 @pytest.mark.parametrize(
     "search_path",
     [
         '"$user", public, extensions',
-        "i11_pilot_x, public",
+        "public, i11_pilot_x",
         "other_scratch",
     ],
 )
-def test_assert_session_targets_schema_rejects_public_or_absent_schema(search_path):
+def test_assert_session_targets_schema_rejects_absent_or_nonfirst_schema(search_path):
     session = _FakeSession(
         dialect_name="postgresql",
         search_path=search_path,
@@ -182,7 +194,7 @@ def test_postgres_schema_search_path_is_bound_on_each_connection(monkeypatch):
             with engine.connect() as conn:
                 search_path = conn.execute(text("SHOW search_path")).scalar() or ""
                 parts = [part.strip().strip('"') for part in search_path.split(",")]
-                assert parts == [schema]
+                assert parts == [schema, "public"]
 
         session = open_writable_session(url=url, schema=schema)
         try:
@@ -195,6 +207,94 @@ def test_postgres_schema_search_path_is_bound_on_each_connection(monkeypatch):
             engine.dispose()
         with admin_engine.begin() as conn:
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DATABASE_URL", "").startswith("postgresql"),
+    reason="requires PostgreSQL DATABASE_URL",
+)
+def test_postgres_scratch_reads_public_references_but_writes_outputs(monkeypatch):
+    url = os.environ["DATABASE_URL"]
+    if db_engine._is_supabase_transaction_pooler(url):
+        pytest.skip("transaction pooler intentionally refused for writable schemas")
+    schema = f"scratch_reference_{uuid4().hex[:8]}"
+    marker_job_id = f"scratch-output-{uuid4().hex}"
+    admin_engine = create_engine(url, echo=False)
+    engine = None
+    try:
+        try:
+            with admin_engine.connect() as conn:
+                public_hur_count = conn.execute(
+                    text("SELECT count(*) FROM public.historical_universe_reconstructions")
+                ).scalar()
+        except SQLAlchemyError as exc:
+            pytest.skip(
+                "public historical_universe_reconstructions unavailable: "
+                f"{type(exc).__name__}"
+            )
+        if not public_hur_count:
+            pytest.skip("public historical_universe_reconstructions has no rows")
+
+        with admin_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        db_engine.create_all_tables(
+            engine=admin_engine,
+            schema=schema,
+            table_names=("evidence_jobs",),
+        )
+
+        db_engine.reset_globals()
+        monkeypatch.setenv("ALPHA_DB_SCHEMA", schema)
+        engine = db_engine.get_engine(url=url)
+        with engine.begin() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT to_regclass(:regclass_name)"
+                ),
+                {
+                    "regclass_name": (
+                        f"{schema}.historical_universe_reconstructions"
+                    )
+                },
+            ).scalar() is None
+            assert conn.execute(
+                text("SELECT count(*) FROM historical_universe_reconstructions")
+            ).scalar() == public_hur_count
+            conn.execute(
+                text(
+                    "INSERT INTO evidence_jobs "
+                    "(job_id, job_name, job_type, owner_component) "
+                    "VALUES (:job_id, 'scratch_write_probe', 'test', 'test')"
+                ),
+                {"job_id": marker_job_id},
+            )
+
+        with admin_engine.connect() as conn:
+            scratch_count = conn.execute(
+                text(f'SELECT count(*) FROM "{schema}".evidence_jobs WHERE job_id = :job_id'),
+                {"job_id": marker_job_id},
+            ).scalar()
+            public_count = conn.execute(
+                text("SELECT count(*) FROM public.evidence_jobs WHERE job_id = :job_id"),
+                {"job_id": marker_job_id},
+            ).scalar()
+        assert scratch_count == 1
+        assert public_count == 0
+    finally:
+        db_engine.reset_globals()
+        if engine is not None:
+            engine.dispose()
+        try:
+            with admin_engine.begin() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+                conn.execute(
+                    text("DELETE FROM public.evidence_jobs WHERE job_id = :job_id"),
+                    {"job_id": marker_job_id},
+                )
+        except SQLAlchemyError:
+            pass
         admin_engine.dispose()
 
 
@@ -419,7 +519,9 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
     monkeypatch.setattr(
         db_engine,
         "create_all_tables",
-        lambda *, engine, schema: create_all_calls.append((engine, schema)),
+        lambda *, engine, schema, table_names=None: create_all_calls.append(
+            (engine, schema, tuple(table_names or ()))
+        ),
     )
     monkeypatch.setattr(
         db_engine,
@@ -434,12 +536,76 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
     )
 
     assert create_schema_calls == [(engines[0], "scratch_ready")]
-    assert create_all_calls == [(engines[1], "scratch_ready")]
+    assert create_all_calls == [
+        (engines[1], "scratch_ready", tuple(db_engine.Base.metadata.tables.keys()))
+    ]
     assert create_engine_calls[1][1]["connect_args"]["options"] == (
         "-csearch_path=scratch_ready"
     )
     assert engines[0].disposed is True
     assert engines[1].disposed is True
+
+
+def test_prepare_writable_schema_target_create_tables_uses_required_subset(
+    monkeypatch,
+):
+    engines = [_FakeEngine(), _FakeEngine()]
+    create_engine_calls = []
+    create_all_calls = []
+
+    def fake_create_engine(*args, **kwargs):
+        create_engine_calls.append((args, kwargs))
+        return engines[len(create_engine_calls) - 1]
+
+    monkeypatch.setattr(db_engine, "create_engine", fake_create_engine)
+    monkeypatch.setattr(db_engine, "create_schema_if_missing", lambda **kwargs: None)
+    monkeypatch.setattr(
+        db_engine,
+        "create_all_tables",
+        lambda *, engine, schema, table_names=None: create_all_calls.append(
+            (engine, schema, tuple(table_names or ()))
+        ),
+    )
+    monkeypatch.setattr(
+        db_engine,
+        "_missing_schema_tables",
+        lambda engine, schema, required: [],
+    )
+
+    prepare_writable_schema_target(
+        url="postgresql+psycopg://user:pass@example.com/db",
+        schema="scratch_subset",
+        create_tables=True,
+        required_tables=("evidence_jobs", "signal_registry"),
+    )
+
+    assert create_all_calls == [
+        (engines[1], "scratch_subset", ("evidence_jobs", "signal_registry"))
+    ]
+
+
+def test_intraday_corpus_required_tables_are_output_only():
+    reference_tables = {
+        "historical_universe_reconstructions",
+        "fmp_delisted_companies",
+        "security_type_classifications",
+        "market_path_features",
+    }
+    required_output_tables = {
+        "evidence_jobs",
+        "evidence_job_runs",
+        "data_lineage",
+        "feature_snapshots",
+        "signal_registry",
+        "intraday_event_details",
+    }
+
+    for tables in (
+        set(run_i11_historical_corpus.I11_CORPUS_REQUIRED_TABLES),
+        set(run_i12_historical_corpus.I12_CORPUS_REQUIRED_TABLES),
+    ):
+        assert required_output_tables <= tables
+        assert tables.isdisjoint(reference_tables)
 
 
 @pytest.mark.parametrize(

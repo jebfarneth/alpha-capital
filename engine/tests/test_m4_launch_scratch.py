@@ -103,6 +103,6 @@ def test_create_all_tables_restricts_checkfirst_to_scratch_schema(monkeypatch):
     create_all_tables(fake_engine)
 
     assert fake_engine.connection.statements == [
-        'SET search_path TO "m4_live_scratch_20260529_020000"'
+        'SET LOCAL search_path TO "m4_live_scratch_20260529_020000"'
     ]
     assert create_calls == [fake_engine.connection]
