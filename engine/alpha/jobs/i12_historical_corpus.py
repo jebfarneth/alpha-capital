@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import json
 import math
+import queue
+import threading
 import time as time_module
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from copy import deepcopy
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -766,22 +768,21 @@ class I12HistoricalCorpusJob(BaseJob):
                 adjusted=True,
             )
 
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="polygon-minute-fetch")
-        future = executor.submit(_fetch)
         try:
-            return future.result(timeout=self._fetch_deadline_seconds)
+            return _call_with_daemon_deadline(
+                _fetch,
+                timeout_seconds=self._fetch_deadline_seconds,
+                thread_name="polygon-minute-fetch",
+            )
         except FuturesTimeoutError as exc:
             counters.fetch_errors += 1
             counters.watchdog_timeouts += 1
-            future.cancel()
             raise _Quarantine({
                 "ticker": ticker,
                 "trading_date": trading_date.isoformat(),
-                "error": "minute_fetch_watchdog_timeout",
+                "error": "fetch_watchdog_timeout",
                 "deadline_seconds": self._fetch_deadline_seconds,
             }) from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def _sessions_to_delist(self, ticker: str, trading_date: date) -> int | None:
         row = (
@@ -1199,6 +1200,31 @@ class _Quarantine(RuntimeError):
 
 def _utc_progress_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _call_with_daemon_deadline(
+    func: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    thread_name: str,
+) -> Any:
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            results.put_nowait((True, func()))
+        except Exception as exc:
+            results.put_nowait((False, exc))
+
+    thread = threading.Thread(target=_target, name=thread_name, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise FuturesTimeoutError()
+    ok, value = results.get_nowait()
+    if ok:
+        return value
+    raise value
 
 
 def _daily_context_from_bars(

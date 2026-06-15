@@ -518,7 +518,7 @@ def test_i11_minute_fetch_watchdog_quarantines_and_surfaces_error(db_session):
     assert result.errors == [{
         "ticker": "TEST",
         "trading_date": DAY.isoformat(),
-        "error": "minute_fetch_watchdog_timeout",
+        "error": "fetch_watchdog_timeout",
         "deadline_seconds": 0.05,
     }]
     assert polygon.calls[("TEST", DAY)] == 1

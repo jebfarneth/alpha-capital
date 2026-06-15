@@ -864,7 +864,7 @@ def test_i12_minute_fetch_watchdog_quarantines_and_continues(db_session):
     assert result.errors == [{
         "ticker": slow_ticker,
         "trading_date": DAY.isoformat(),
-        "error": "minute_fetch_watchdog_timeout",
+        "error": "fetch_watchdog_timeout",
         "deadline_seconds": 0.05,
     }]
     assert polygon.calls[(slow_ticker, DAY)] == 1

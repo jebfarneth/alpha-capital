@@ -39,6 +39,7 @@ from alpha.db.engine import (
 from alpha.db.models import MarketPathFeature
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.market_path_features import (
+    DEFAULT_FETCH_DEADLINE_SECONDS,
     DEFAULT_LOOKBACK_CALENDAR_DAYS,
     FEATURE_VERSION,
     MarketPathFeatureJob,
@@ -508,6 +509,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         schema: str | None = None,
         progress_every: int = 10,
         request_timeout_seconds: float = 30.0,
+        fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
         polygon_minute_adapter: Any | None = None,
@@ -522,6 +524,8 @@ class MarketPathBulkBackfillJob(BaseJob):
             raise ValueError("progress_every must be >= 1")
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be > 0")
+        if fetch_deadline_seconds <= 0:
+            raise ValueError("fetch_deadline_seconds must be > 0")
         if max_fetch_concurrency < 1:
             raise ValueError("max_fetch_concurrency must be >= 1")
         self._session = session
@@ -540,6 +544,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._schema = schema
         self._progress_every = progress_every
         self._request_timeout_seconds = request_timeout_seconds
+        self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
         self._polygon_minute_adapter = polygon_minute_adapter
@@ -588,6 +593,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "schema": self._schema,
             "feature_version": self._feature_version,
             "request_timeout_seconds": self._request_timeout_seconds,
+            "fetch_deadline_seconds": self._fetch_deadline_seconds,
             "signal_source": self._signal_source,
             "skip_existing": self._skip_existing,
             "minute_cache_dir": str(self._minute_cache_dir) if self._minute_cache_dir else None,
@@ -618,6 +624,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         ticker_fetch_started_total = 0
         ticker_fetch_finished_total = 0
         ticker_fetch_error_total = 0
+        watchdog_timeouts = 0
         max_stage_batch_size = 0
         stage_tables: list[str] = []
 
@@ -660,6 +667,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 feature_version=self._feature_version,
                 include_signal_session=self._include_signal_session,
                 polygon_minute_adapter=self._polygon_minute_adapter,
+                fetch_deadline_seconds=self._fetch_deadline_seconds,
                 skip_existing=self._skip_existing,
                 progress_callback=batch_progress,
                 progress_every=self._progress_every,
@@ -679,6 +687,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                     "ticker_fetch_error_count": collection.ticker_fetch_error_count,
                     "feature_rows_generated": len(collection.pending_feature_rows or []),
                     "fetch_error_count": len(collection.fetch_errors or []),
+                    "watchdog_timeouts": collection.watchdog_timeouts,
                     "non_session_bars_skipped": collection.non_session_bars_skipped,
                     "non_session_bar_skip_sample": collection.non_session_bar_skip_sample or [],
                     "elapsed_seconds": round(time.perf_counter() - collect_started, 6),
@@ -697,6 +706,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             ticker_fetch_started_total += collection.ticker_fetch_started_count
             ticker_fetch_finished_total += collection.ticker_fetch_finished_count
             ticker_fetch_error_total += collection.ticker_fetch_error_count
+            watchdog_timeouts += collection.watchdog_timeouts
             rows_inserted += collection.rows_inserted
             rows_updated += max(0, collection.rows_updated - collection.rows_unchanged)
             rows_unchanged += collection.rows_unchanged
@@ -759,6 +769,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 "non_session_bars_skipped": collection.non_session_bars_skipped,
                 "non_session_bar_skip_sample": collection.non_session_bar_skip_sample or [],
                 "fetch_error_count": len(collection.fetch_errors or []),
+                "watchdog_timeouts": collection.watchdog_timeouts,
                 "fetch_errors": collection.fetch_errors or [],
                 "elapsed_seconds": round(time.perf_counter() - batch_started, 6),
                 "stage_timing_seconds": collection.stage_timings or {},
@@ -804,6 +815,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 feature_version=self._feature_version,
                 include_signal_session=self._include_signal_session,
                 polygon_minute_adapter=self._polygon_minute_adapter,
+                fetch_deadline_seconds=self._fetch_deadline_seconds,
                 skip_existing=self._skip_existing,
                 signal_source=self._signal_source,
             )
@@ -871,6 +883,8 @@ class MarketPathBulkBackfillJob(BaseJob):
             "ticker_fetch_finished_count": ticker_fetch_finished_total,
             "ticker_fetch_error_count": ticker_fetch_error_total,
             "request_timeout_seconds": self._request_timeout_seconds,
+            "fetch_deadline_seconds": self._fetch_deadline_seconds,
+            "watchdog_timeouts": watchdog_timeouts,
             "signal_source": self._signal_source,
             "skip_existing": self._skip_existing,
             "minute_cache_dir": str(self._minute_cache_dir) if self._minute_cache_dir else None,
@@ -1316,6 +1330,7 @@ def _run_live(args: argparse.Namespace) -> int:
             schema=target_schema,
             progress_every=args.progress_every,
             request_timeout_seconds=args.request_timeout_seconds,
+            fetch_deadline_seconds=args.fetch_deadline_seconds,
             max_fetch_concurrency=args.max_fetch_concurrency,
             signal_source=args.signal_source,
             polygon_minute_adapter=polygon_minute_adapter,
@@ -1345,6 +1360,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "progress_artifact": str(artifact_path),
                 "progress_every": args.progress_every,
                 "request_timeout_seconds": args.request_timeout_seconds,
+                "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "max_fetch_concurrency": args.max_fetch_concurrency,
                 "signal_source": args.signal_source,
                 "minute_cache_dir": args.minute_cache_dir,
@@ -1455,6 +1471,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--batch-days", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--fetch-deadline-seconds",
+        type=float,
+        default=DEFAULT_FETCH_DEADLINE_SECONDS,
+        help="Wall-clock deadline for one Polygon minute fetch.",
+    )
     parser.add_argument("--max-fetch-concurrency", type=int, default=1)
     parser.add_argument("--minute-cache-dir")
     parser.add_argument("--polygon-rate-limit-per-minute", type=int)

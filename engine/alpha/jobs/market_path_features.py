@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import re
 import statistics
+import threading
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from time import perf_counter
@@ -50,6 +53,7 @@ PRICE_BASIS_SPLIT_ADJUSTED_OR_RAW = "split_adjusted_close_when_available_else_ra
 PRIOR_52W_SESSION_COUNT = 252
 TOUCH_TOLERANCE_PCT = 0.005
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 420
+DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
 BENCHMARK_SYMBOLS = ("SPY", "QQQ", "IWM")
 BENCHMARK_RETURN_WINDOWS = (1, 5, 20, 60)
 SECTOR_RELATIVE_RETURN_WINDOWS = (5, 20, 60)
@@ -494,6 +498,7 @@ class MarketPathFeatureCollection:
     rows_unchanged: int = 0
     rows_skipped: int = 0
     missing_entry_rows: int = 0
+    watchdog_timeouts: int = 0
     benchmark_fetch_count: int = 0
     benchmark_fetch_error_count: int = 0
     sector_etf_fetch_count: int = 0
@@ -548,6 +553,7 @@ class MarketPathFeatureCollection:
             "rows_skipped": self.rows_skipped,
             "missing_entry_row_count": self.missing_entry_rows,
             "fetch_error_count": len(self.fetch_errors or []),
+            "watchdog_timeouts": self.watchdog_timeouts,
             "benchmark_fetch_count": self.benchmark_fetch_count,
             "benchmark_fetch_error_count": self.benchmark_fetch_error_count,
             "sector_etf_fetch_count": self.sector_etf_fetch_count,
@@ -586,12 +592,15 @@ class MarketPathFeatureJob(BaseJob):
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
         polygon_minute_adapter: Any | None = None,
+        fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         skip_existing: bool = False,
     ) -> None:
         if progress_every < 1:
             raise ValueError("progress_every must be >= 1")
         if max_fetch_concurrency < 1:
             raise ValueError("max_fetch_concurrency must be >= 1")
+        if fetch_deadline_seconds <= 0:
+            raise ValueError("fetch_deadline_seconds must be > 0")
         self._session = session
         self._fmp = fmp_adapter
         self._run_timestamp = run_timestamp
@@ -610,6 +619,7 @@ class MarketPathFeatureJob(BaseJob):
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
         self._polygon_minute_adapter = polygon_minute_adapter
+        self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._skip_existing = skip_existing
 
     @property
@@ -756,6 +766,7 @@ class MarketPathFeatureJob(BaseJob):
         rows_unchanged = 0
         rows_skipped = 0
         missing_entry_rows = 0
+        watchdog_timeouts = 0
         fetch_errors: list[dict[str, Any]] = []
         lineages_recorded = 0
         tickers_fetched = 0
@@ -959,14 +970,16 @@ class MarketPathFeatureJob(BaseJob):
             _record_timing(stage_timings, "ticker_lineage_record_seconds", started)
             lineages_recorded += 1
             started = perf_counter()
-            minute_bars_by_date = self._fetch_ticker_signal_minutes(
+            minute_bars_by_date, minute_watchdog_timeouts = self._fetch_ticker_signal_minutes(
                 ticker,
                 signal_dates=sorted({
                     signal.signal_timestamp.date()
                     for signal in ticker_signals
                     if self._include_signal_session
                 }),
+                fetch_errors=fetch_errors,
             )
+            watchdog_timeouts += minute_watchdog_timeouts
             for signal in ticker_signals:
                 result = self._persist_signal_rows(
                     signal,
@@ -1024,6 +1037,7 @@ class MarketPathFeatureJob(BaseJob):
             rows_unchanged=rows_unchanged,
             rows_skipped=rows_skipped,
             missing_entry_rows=missing_entry_rows,
+            watchdog_timeouts=watchdog_timeouts,
             benchmark_fetch_count=len(BENCHMARK_SYMBOLS),
             benchmark_fetch_error_count=_reference_error_count(benchmark_series),
             sector_etf_fetch_count=len(sector_etf_series),
@@ -1040,6 +1054,8 @@ class MarketPathFeatureJob(BaseJob):
     def _emit_progress(self, event: str, payload: dict[str, Any]) -> None:
         if self._progress_callback is None:
             return
+        payload = dict(payload)
+        payload.setdefault("wall_clock_utc", _utc_progress_timestamp())
         try:
             self._progress_callback(event, payload)
         except Exception:
@@ -1123,28 +1139,72 @@ class MarketPathFeatureJob(BaseJob):
         ticker: str,
         *,
         signal_dates: Sequence[date],
-    ) -> dict[date, tuple[_MinuteBar, ...]]:
+        fetch_errors: list[dict[str, Any]],
+    ) -> tuple[dict[date, tuple[_MinuteBar, ...]], int]:
         if self._polygon_minute_adapter is None or not signal_dates:
-            return {}
+            return {}, 0
         out: dict[date, tuple[_MinuteBar, ...]] = {}
+        watchdog_timeouts = 0
         for trading_date in signal_dates:
-            try:
-                resp = self._polygon_minute_adapter.get_minute_aggs(
+            self._emit_progress(
+                "minute_fetch_start",
+                {
+                    "ticker": ticker,
+                    "trading_date": trading_date.isoformat(),
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                    "cache_status": "unknown",
+                },
+            )
+
+            def _fetch() -> Any:
+                return self._polygon_minute_adapter.get_minute_aggs(
                     ticker,
                     from_date=trading_date.isoformat(),
                     to_date=trading_date.isoformat(),
                     adjusted=True,
                 )
+
+            try:
+                resp = _call_with_daemon_deadline(
+                    _fetch,
+                    timeout_seconds=self._fetch_deadline_seconds,
+                    thread_name="market-path-polygon-minute-fetch",
+                )
+            except FuturesTimeoutError:
+                watchdog_timeouts += 1
+                fetch_error = {
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "stage": "polygon_minute_fetch",
+                    "error": "fetch_watchdog_timeout",
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                }
+                fetch_errors.append(fetch_error)
+                self._emit_progress("fetch_watchdog_timeout", fetch_error)
+                out[trading_date] = ()
+                continue
             except Exception:
+                fetch_errors.append({
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "stage": "polygon_minute_fetch",
+                    "error": "minute_fetch_exception",
+                })
                 out[trading_date] = ()
                 continue
             if not getattr(resp, "ok", False) or getattr(resp, "data", None) is None:
+                fetch_errors.append({
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "stage": "polygon_minute_fetch",
+                    "error": "minute_fetch_error",
+                })
                 out[trading_date] = ()
                 continue
             out[trading_date] = tuple(
                 _clean_minute_bars(trading_date, getattr(resp, "data") or ())
             )
-        return out
+        return out, watchdog_timeouts
 
     def _fetch_reference_series(
         self,
@@ -2064,6 +2124,38 @@ def _record_timing(timings: dict[str, float], key: str, started: float) -> None:
 
 def _elapsed_since(started: float) -> float:
     return round(perf_counter() - started, 6)
+
+
+def _utc_progress_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
+
+
+def _call_with_daemon_deadline(
+    func: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    thread_name: str,
+) -> Any:
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            results.put_nowait((True, func()))
+        except Exception as exc:
+            results.put_nowait((False, exc))
+
+    thread = threading.Thread(target=_target, name=thread_name, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise FuturesTimeoutError()
+    ok, value = results.get_nowait()
+    if ok:
+        return value
+    raise value
 
 
 def _safe_rank_progress(

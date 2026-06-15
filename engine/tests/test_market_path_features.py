@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+import time as time_module
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -119,6 +120,26 @@ class EmptyMinuteAdapter:
                 raw_payload_hash=stable_hash({"minute_bars": []}),
             ),
         )
+
+
+class SleepyMinuteAdapter(EmptyMinuteAdapter):
+    def __init__(
+        self,
+        delay_seconds: float,
+        *,
+        observed_events: list[tuple[str, dict]] | None = None,
+    ) -> None:
+        self.delay_seconds = delay_seconds
+        self.observed_events = observed_events
+        self.events_seen_at_fetch: list[list[tuple[str, dict]]] = []
+        self.calls = 0
+
+    def get_minute_aggs(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.observed_events is not None:
+            self.events_seen_at_fetch.append(list(self.observed_events))
+        time_module.sleep(self.delay_seconds)
+        return super().get_minute_aggs(*_args, **_kwargs)
 
 
 class NoFetchFmpAdapter:
@@ -3132,6 +3153,8 @@ def _run_signal_session_backfill(
     bars: list[FmpBar] | None = None,
     skip_existing: bool = False,
     polygon_minute_adapter=None,
+    fetch_deadline_seconds: float = 120.0,
+    progress_callback=None,
 ):
     signal = _add_signal(
         db_session,
@@ -3151,6 +3174,8 @@ def _run_signal_session_backfill(
         include_signal_session=True,
         skip_existing=skip_existing,
         polygon_minute_adapter=polygon_minute_adapter,
+        fetch_deadline_seconds=fetch_deadline_seconds,
+        progress_callback=progress_callback,
     )
     result = run_job(db_session, job)
     row = (
@@ -3287,6 +3312,56 @@ def test_m4_day0_delisted_fixture_writes_row_and_marks_missing_intraday(db_sessi
     assert row.intraday_structure_status == "minute_bars_missing"
 
 
+def test_m4_day0_polygon_minute_watchdog_counts_timeout_and_persists_row(db_session):
+    adapter = SleepyMinuteAdapter(delay_seconds=0.5)
+
+    started = time_module.monotonic()
+    _signal, row, result = _run_signal_session_backfill(
+        db_session,
+        polygon_minute_adapter=adapter,
+        fetch_deadline_seconds=0.05,
+    )
+    elapsed = time_module.monotonic() - started
+
+    assert elapsed < 0.4
+    assert result.status == "partial_failed"
+    assert result.metrics["watchdog_timeouts"] == 1
+    assert result.errors == [{
+        "ticker": "LCUT",
+        "trading_date": "2026-06-05",
+        "stage": "polygon_minute_fetch",
+        "error": "fetch_watchdog_timeout",
+        "deadline_seconds": 0.05,
+    }]
+    assert adapter.calls == 1
+    assert row.feature_role == "signal_session"
+    assert row.missing_intraday_bars is True
+    assert row.intraday_structure_status == "minute_bars_missing"
+
+
+def test_m4_day0_polygon_minute_heartbeat_written_before_fetch(db_session):
+    events: list[tuple[str, dict]] = []
+    adapter = SleepyMinuteAdapter(delay_seconds=0.0, observed_events=events)
+
+    _signal, _row, result = _run_signal_session_backfill(
+        db_session,
+        polygon_minute_adapter=adapter,
+        progress_callback=lambda event, payload: events.append((event, dict(payload))),
+    )
+
+    assert result.status == "finished"
+    fetch_payload = next(payload for event, payload in events if event == "minute_fetch_start")
+    assert fetch_payload["ticker"] == "LCUT"
+    assert fetch_payload["trading_date"] == "2026-06-05"
+    assert fetch_payload["deadline_seconds"] == 120.0
+    assert fetch_payload["wall_clock_utc"].endswith("Z")
+    datetime.fromisoformat(fetch_payload["wall_clock_utc"].replace("Z", "+00:00"))
+    assert any(
+        event == "minute_fetch_start"
+        for event, _payload in adapter.events_seen_at_fetch[0]
+    )
+
+
 def test_market_path_bulk_runner_single_shard_prints_audit_sample(
     db_session,
     tmp_path,
@@ -3329,6 +3404,7 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
         "--skip-existing",
         "--minute-cache-dir", str(tmp_path / "minutes"),
         "--polygon-rate-limit-per-minute", "120",
+        "--fetch-deadline-seconds", "9.5",
         "--disable-polygon-minute-layer",
         "--progress-artifact", str(tmp_path / "progress.json"),
     ])
@@ -3338,3 +3414,4 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
     assert "AUDIT_SAMPLE " in out
     assert '"feature_role": "signal_session"' in out
     assert '"predictor_features"' in out
+    assert '"fetch_deadline_seconds": 9.5' in out
