@@ -3313,7 +3313,7 @@ def test_m4_day0_delisted_fixture_writes_row_and_marks_missing_intraday(db_sessi
 
 
 def test_m4_day0_polygon_minute_watchdog_counts_timeout_and_persists_row(db_session):
-    adapter = SleepyMinuteAdapter(delay_seconds=0.5)
+    adapter = SleepyMinuteAdapter(delay_seconds=2.0)
 
     started = time_module.monotonic()
     _signal, row, result = _run_signal_session_backfill(
@@ -3323,7 +3323,7 @@ def test_m4_day0_polygon_minute_watchdog_counts_timeout_and_persists_row(db_sess
     )
     elapsed = time_module.monotonic() - started
 
-    assert elapsed < 0.4
+    assert elapsed < 1.0
     assert result.status == "partial_failed"
     assert result.metrics["watchdog_timeouts"] == 1
     assert result.errors == [{

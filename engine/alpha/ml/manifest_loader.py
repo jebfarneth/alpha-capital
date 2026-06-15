@@ -22,6 +22,8 @@ class MLManifestError(RuntimeError):
 
 
 _SIGNAL_HORIZON_RE = re.compile(r"^([1-9][0-9]*)d$")
+_REQUIRED_OOS_METRICS = {"top_decile_lift", "rank_ic"}
+_NON_PROMOTING_REJECT_STATUSES = {"rejected"}
 
 
 def _canonical_json(payload: Any) -> str:
@@ -43,6 +45,59 @@ def _signal_horizon_sessions(signal_horizon: str) -> int:
             f"signal_horizon must be canonical '<positive integer>d', got {signal_horizon!r}"
         )
     return int(match.group(1))
+
+
+def _validated_oos_quality_gate(
+    pattern_id: str,
+    oos_quality_gate: dict[str, Any],
+) -> dict[str, Any]:
+    gate = dict(oos_quality_gate)
+    try:
+        min_top_decile_lift = (
+            float(gate["min_top_decile_lift"])
+            if "min_top_decile_lift" in gate
+            else None
+        )
+        min_rank_ic = (
+            float(gate["min_rank_ic"]) if "min_rank_ic" in gate else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise MLManifestError(
+            f"pattern {pattern_id!r} oos_quality_gate thresholds must be numeric"
+        ) from exc
+    if min_top_decile_lift is not None and min_top_decile_lift < 1.0:
+        raise MLManifestError(
+            f"pattern {pattern_id!r} oos_quality_gate.min_top_decile_lift "
+            "must be >= 1.0"
+        )
+    if min_rank_ic is not None and min_rank_ic < 0.0:
+        raise MLManifestError(
+            f"pattern {pattern_id!r} oos_quality_gate.min_rank_ic must be >= 0.0"
+        )
+    if "required_metrics" in gate:
+        required_metrics = gate["required_metrics"]
+        if not isinstance(required_metrics, list) or not all(
+            isinstance(value, str) for value in required_metrics
+        ):
+            raise MLManifestError(
+                f"pattern {pattern_id!r} oos_quality_gate.required_metrics "
+                "must be a list of strings"
+            )
+        missing = _REQUIRED_OOS_METRICS - set(required_metrics)
+        if missing:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} oos_quality_gate.required_metrics "
+                f"must include {sorted(_REQUIRED_OOS_METRICS)}; "
+                f"missing {sorted(missing)}"
+            )
+    if "reject_status" in gate:
+        reject_status = str(gate["reject_status"])
+        if reject_status not in _NON_PROMOTING_REJECT_STATUSES:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} oos_quality_gate.reject_status must "
+                f"be one of {sorted(_NON_PROMOTING_REJECT_STATUSES)}"
+            )
+    return gate
 
 
 @dataclass(frozen=True)
@@ -170,6 +225,10 @@ def load_manifest(path: str | Path) -> FrozenMLManifest:
             raise MLManifestError(
                 f"pattern {pattern_id!r} oos_quality_gate must be an object"
             )
+        oos_quality_gate = _validated_oos_quality_gate(
+            str(pattern_id),
+            oos_quality_gate,
+        )
         model_params = raw.get("model_params") or {}
         if not isinstance(model_params, dict):
             raise MLManifestError(

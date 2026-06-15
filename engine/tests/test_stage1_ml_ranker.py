@@ -18,8 +18,10 @@ from alpha.db.models import (
     ForwardReturnObservation,
     MLModelRegistry,
     MarketPathFeature,
+    SecurityIdentitySnapshot,
     SignalMLScore,
     SignalRegistry,
+    UniverseScan,
 )
 from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
@@ -41,6 +43,7 @@ from alpha.jobs.train_model import (
     _top_quantile_mean,
     _top_quantile_unreliable,
 )
+from alpha.market_calendar import next_us_equity_session, nth_us_equity_session
 from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
 from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
 from alpha.ml.manifest_loader import PatternManifest, load_manifest, manifest_payload_hash
@@ -215,11 +218,25 @@ def _seed_signal(
     forward_return_status: str = "computed",
     entry_session_date: date | None = None,
     exit_session_date: date | None = None,
+    missing_realized_dates: bool = False,
 ) -> str:
     signal_id = f"sig-{idx}"
     ticker = ticker or f"T{idx % 3}"
     ts_date = signal_date or (datetime(2025, 1, 2).date() + timedelta(days=idx))
     ts = datetime.combine(ts_date, datetime.min.time(), timezone.utc)
+    if missing_realized_dates:
+        realized_entry_session = None
+        realized_exit_session = None
+    else:
+        realized_entry_session = entry_session_date or next_us_equity_session(ts_date)
+        try:
+            horizon_session_count = int(str(signal_horizon).removesuffix("d"))
+        except ValueError:
+            horizon_session_count = 2
+        realized_exit_session = exit_session_date or nth_us_equity_session(
+            realized_entry_session + timedelta(days=1),
+            horizon_session_count,
+        )
     feature_snapshot_id = f"fs-{idx}"
     feature_json = {
         "signal_context": {
@@ -272,13 +289,13 @@ def _seed_signal(
             else (idx - 4) / 100.0,
             status="computed",
             entry_session_date=(
-                entry_session_date.isoformat()
-                if entry_session_date is not None
+                realized_entry_session.isoformat()
+                if realized_entry_session is not None
                 else None
             ),
             exit_session_date=(
-                exit_session_date.isoformat()
-                if exit_session_date is not None
+                realized_exit_session.isoformat()
+                if realized_exit_session is not None
                 else None
             ),
             input_hash=f"input-{idx}",
@@ -286,6 +303,58 @@ def _seed_signal(
         )
     )
     return signal_id
+
+
+def _seed_rename_identity_pair(db_session) -> None:
+    scan = UniverseScan(
+        scan_id="scan-rename",
+        trading_date="2025-02-03",
+        asof_timestamp=datetime(2025, 2, 3, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=2,
+        deduped_count=2,
+        duplicate_symbol_count=0,
+        included_count=2,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    events = json.dumps(
+        [
+            {
+                "old_ticker": "CEP",
+                "new_ticker": "XXI",
+                "event_date": "2025-01-15",
+            }
+        ],
+        sort_keys=True,
+    )
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-cep",
+            scan_id=scan.scan_id,
+            ticker="CEP",
+            cik="0001234567",
+            active=False,
+            ticker_events_json=events,
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 1, 20, tzinfo=timezone.utc),
+        )
+    )
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-xxi",
+            scan_id=scan.scan_id,
+            ticker="XXI",
+            cik="0001234567",
+            active=True,
+            ticker_events_json=events,
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 3, tzinfo=timezone.utc),
+        )
+    )
 
 
 def _add_model_registry(
@@ -353,7 +422,7 @@ def _seed_training_corpus(db_session, *, count: int = 14) -> list[str]:
             _seed_signal(
                 db_session,
                 idx=idx,
-                ticker=f"T{idx % 4}",
+                ticker=f"T{idx}",
                 gap=-0.02 + (idx % 5) * 0.01,
                 forward_return=returns_by_bucket[idx % 5],
             )
@@ -367,7 +436,8 @@ def _training_example(idx: int, *, label: float, signal_date: date) -> TrainingE
     values = [float(idx)]
     return TrainingExample(
         signal_id=f"cv-{idx}",
-        ticker=f"T{idx % 5}",
+        ticker=f"T{idx}",
+        security_identity=f"ticker:T{idx}",
         signal_date=signal_date,
         label=label,
         vector=SelectedFeatureVector(
@@ -952,7 +1022,12 @@ def test_manifest_loader_runs_leakage_audit_for_intraday_schema(tmp_path):
 def test_purged_embargoed_cv_excludes_nearby_training_dates():
     start = datetime(2025, 1, 1).date()
     examples = [
-        CVExample(signal_id=f"s{i}", ticker=f"T{i % 2}", signal_date=start + timedelta(days=i))
+        CVExample(
+            signal_id=f"s{i}",
+            ticker=f"T{i}",
+            security_identity=f"ticker:T{i}",
+            signal_date=start + timedelta(days=i),
+        )
         for i in range(12)
     ]
     folds = purged_embargoed_walk_forward_splits(
@@ -974,18 +1049,87 @@ def test_purged_embargoed_cv_excludes_nearby_training_dates():
 def test_fold_train_weights_are_recomputed_inside_each_fold():
     start = date(2025, 1, 1)
     rows = [
-        CVExample(signal_id="a0", ticker="AAA", signal_date=start),
-        CVExample(signal_id="a1", ticker="AAA", signal_date=start + timedelta(days=1)),
-        CVExample(signal_id="b0", ticker="BBB", signal_date=start + timedelta(days=2)),
-        CVExample(signal_id="b1", ticker="BBB", signal_date=start + timedelta(days=3)),
-        CVExample(signal_id="a2", ticker="AAA", signal_date=start + timedelta(days=4)),
-        CVExample(signal_id="a3", ticker="AAA", signal_date=start + timedelta(days=5)),
+        CVExample(
+            signal_id="a0",
+            ticker="AAA",
+            security_identity="sec:A",
+            signal_date=start,
+        ),
+        CVExample(
+            signal_id="a1",
+            ticker="AAA",
+            security_identity="sec:A",
+            signal_date=start + timedelta(days=1),
+        ),
+        CVExample(
+            signal_id="b0",
+            ticker="BBB",
+            security_identity="sec:B",
+            signal_date=start + timedelta(days=2),
+        ),
+        CVExample(
+            signal_id="b1",
+            ticker="BBB",
+            security_identity="sec:B",
+            signal_date=start + timedelta(days=3),
+        ),
+        CVExample(
+            signal_id="a2",
+            ticker="AAA",
+            security_identity="sec:A",
+            signal_date=start + timedelta(days=4),
+        ),
+        CVExample(
+            signal_id="a3",
+            ticker="AAA",
+            security_identity="sec:A",
+            signal_date=start + timedelta(days=5),
+        ),
     ]
 
     weights = _fold_train_weights(rows, [0, 1, 2, 3])
 
-    assert sum(weight for row, weight in zip(rows[:4], weights) if row.ticker == "AAA") == pytest.approx(1.0)
-    assert sum(weight for row, weight in zip(rows[:4], weights) if row.ticker == "BBB") == pytest.approx(1.0)
+    assert sum(
+        weight
+        for row, weight in zip(rows[:4], weights)
+        if row.security_identity == "sec:A"
+    ) == pytest.approx(1.0)
+    assert sum(
+        weight
+        for row, weight in zip(rows[:4], weights)
+        if row.security_identity == "sec:B"
+    ) == pytest.approx(1.0)
+
+
+def test_purged_embargoed_cv_excludes_same_security_identity_from_train_and_test():
+    start = date(2025, 1, 1)
+    rows = [
+        CVExample("cep-old", "CEP", "sec:rename", start),
+        CVExample("o1", "O1", "sec:o1", start + timedelta(days=1)),
+        CVExample("o2", "O2", "sec:o2", start + timedelta(days=2)),
+        CVExample("o3", "O3", "sec:o3", start + timedelta(days=3)),
+        CVExample("xxi-new", "XXI", "sec:rename", start + timedelta(days=4)),
+        CVExample("o4", "O4", "sec:o4", start + timedelta(days=5)),
+        CVExample("o5", "O5", "sec:o5", start + timedelta(days=6)),
+        CVExample("o6", "O6", "sec:o6", start + timedelta(days=7)),
+    ]
+
+    folds = purged_embargoed_walk_forward_splits(
+        rows,
+        n_splits=2,
+        horizon_sessions=0,
+        embargo_sessions=0,
+    )
+
+    saw_rename_test_fold = False
+    for fold in folds:
+        train_identities = {rows[idx].security_identity for idx in fold.train_indices}
+        test_identities = {rows[idx].security_identity for idx in fold.test_indices}
+        assert train_identities.isdisjoint(test_identities)
+        if "sec:rename" in test_identities:
+            saw_rename_test_fold = True
+            assert "cep-old" not in {rows[idx].signal_id for idx in fold.train_indices}
+    assert saw_rename_test_fold is True
 
 
 def test_prediction_quality_metrics_capture_perfect_top_decile_lift():
@@ -1723,6 +1867,56 @@ def test_train_model_rejected_when_pooled_oos_gate_fails(
     assert metrics["oos_quality_gate"]["failures"][0]["metric"] == "top_decile_lift"
 
 
+def test_cv_and_final_fit_use_identical_resolved_model_params(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+    captured_params: list[dict] = []
+
+    def fake_new_gbrt_model(*, max_iter, random_state, model_params=None):
+        captured_params.append(dict(model_params or {}))
+        return ConstantFitModel()
+
+    monkeypatch.setattr(
+        train_model_module,
+        "_new_gbrt_model",
+        fake_new_gbrt_model,
+    )
+    signal_ids = _seed_training_corpus(db_session, count=40)
+    payload = _manifest_payload(
+        signal_ids,
+        model_params={
+            "min_samples_leaf": 7,
+            "l2_regularization": 0.2,
+            "early_stopping": False,
+        },
+    )
+    path = tmp_path / "model-param-parity.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    manifest = load_manifest(path)
+    job = Stage1TrainModelJob(
+        session=db_session,
+        manifest=manifest,
+        pattern_id="M4",
+        artifact_dir=tmp_path / "artifacts",
+        n_splits=2,
+        max_iter=3,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert len(captured_params) >= 3
+    assert all(params == captured_params[-1] for params in captured_params)
+    assert captured_params[-1] == {
+        "min_samples_leaf": 7,
+        "l2_regularization": 0.2,
+        "early_stopping": False,
+    }
+
+
 def test_default_model_params_raise_min_samples_leaf():
     pattern = PatternManifest(
         pattern_id="M4",
@@ -1745,6 +1939,30 @@ def test_default_model_params_raise_min_samples_leaf():
     assert DEFAULT_MIN_SAMPLES_LEAF != 1
     assert params["min_samples_leaf"] == DEFAULT_MIN_SAMPLES_LEAF
     assert params["l2_regularization"] > 0.0
+    assert params["early_stopping"] is True
+
+
+def test_model_params_allow_small_corpus_to_disable_early_stopping():
+    pattern = PatternManifest(
+        pattern_id="M4",
+        signal_horizon="2d",
+        min_graded_cohorts=1,
+        embargo_sessions=2,
+        feature_schema=_feature_schema(),
+        label={"field": "forward_return"},
+        selection={
+            "source": "forward_return_observations",
+            "statuses": ["computed"],
+            "horizon_sessions": 2,
+            "signal_ids": [],
+        },
+        diagnostics={},
+        model_params={"early_stopping": False},
+    )
+
+    params = _resolved_model_params(pattern)
+
+    assert params["early_stopping"] is False
 
 
 def test_training_rejects_many_rows_on_too_few_graded_cohorts(db_session, tmp_path):
@@ -1801,6 +2019,56 @@ def test_manifest_loader_rejects_noncanonical_or_mismatched_signal_horizon(tmp_p
     noncanonical_path.write_text(json.dumps(noncanonical, sort_keys=True))
     with pytest.raises(Exception, match="signal_horizon must be canonical"):
         load_manifest(noncanonical_path)
+
+
+def test_manifest_loader_accepts_stricter_oos_quality_gate_override(tmp_path):
+    payload = _manifest_payload(
+        ["sig-1"],
+        oos_quality_gate={
+            "min_top_decile_lift": 1.25,
+            "min_rank_ic": 0.05,
+            "required_metrics": [
+                "top_decile_lift",
+                "rank_ic",
+                "weighted_top_decile_lift",
+            ],
+            "reject_status": "rejected",
+        },
+    )
+    path = tmp_path / "valid-oos-gate.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+
+    manifest = load_manifest(path)
+
+    gate = manifest.pattern("M4").oos_quality_gate
+    assert gate["min_top_decile_lift"] == pytest.approx(1.25)
+    assert gate["min_rank_ic"] == pytest.approx(0.05)
+    assert "top_decile_lift" in gate["required_metrics"]
+    assert "rank_ic" in gate["required_metrics"]
+
+
+@pytest.mark.parametrize(
+    "oos_quality_gate, message",
+    [
+        ({"min_top_decile_lift": 0.99}, "min_top_decile_lift"),
+        ({"min_rank_ic": -0.01}, "min_rank_ic"),
+        ({"required_metrics": ["rank_ic"]}, "required_metrics"),
+        ({"required_metrics": ["top_decile_lift"]}, "required_metrics"),
+        ({"reject_status": "shadow"}, "reject_status"),
+        ({"reject_status": "active"}, "reject_status"),
+    ],
+)
+def test_manifest_loader_rejects_fail_open_oos_quality_gate_overrides(
+    tmp_path,
+    oos_quality_gate,
+    message,
+):
+    payload = _manifest_payload(["sig-1"], oos_quality_gate=oos_quality_gate)
+    path = tmp_path / f"bad-oos-gate-{message}.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+
+    with pytest.raises(Exception, match=message):
+        load_manifest(path)
 
 
 def test_training_loader_filters_to_manifest_signal_horizon(db_session, tmp_path):
@@ -1878,9 +2146,54 @@ def test_training_loader_excludes_non_active_or_uncomputed_registry_rows(
         )
     )
 
-    examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
 
     assert [row.signal_id for row in examples] == [active_id]
+    assert metrics["hard_filter_drop_counts"] == {
+        "signal_status_active": 1,
+        "lookahead_guard_passed": 1,
+        "forward_return_status_computed": 1,
+        "point_in_time_passed": 0,
+    }
+
+
+def test_training_loader_collapses_same_security_same_date_rename_pair(
+    db_session,
+    tmp_path,
+):
+    _seed_rename_identity_pair(db_session)
+    signal_date = date(2025, 2, 3)
+    cep_id = _seed_signal(
+        db_session,
+        idx=140,
+        ticker="CEP",
+        signal_date=signal_date,
+        forward_return=0.01,
+    )
+    xxi_id = _seed_signal(
+        db_session,
+        idx=141,
+        ticker="XXI",
+        signal_date=signal_date,
+        forward_return=0.08,
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [cep_id, xxi_id]))
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [xxi_id]
+    assert examples[0].ticker == "XXI"
+    assert examples[0].security_identity == "cik:0001234567"
+    assert metrics["security_identity_duplicate_rows_dropped"] == 1
 
 
 def test_training_loader_signs_short_labels_by_direction(db_session, tmp_path):
@@ -1938,6 +2251,84 @@ def test_training_loader_rejects_manifest_direction_mismatch(db_session, tmp_pat
         _load_training_examples(db_session, pattern=manifest.pattern("M4"))
 
 
+def test_training_loader_accepts_legitimate_realized_label_trading_session_window(
+    db_session,
+    tmp_path,
+):
+    signal_date = date(2025, 2, 3)
+    exit_date = nth_us_equity_session(signal_date + timedelta(days=1), 15)
+    signal_id = _seed_signal(
+        db_session,
+        idx=130,
+        signal_date=signal_date,
+        entry_session_date=signal_date,
+        exit_session_date=exit_date,
+        signal_horizon="15d",
+    )
+    db_session.commit()
+    payload = _manifest_payload(
+        [signal_id],
+        signal_horizon="15d",
+        horizon_sessions=15,
+    )
+    path = tmp_path / "m4-15-session.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    manifest = load_manifest(path)
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [signal_id]
+    assert examples[0].realized_label_window_sessions == 15
+    assert metrics["max_realized_label_window_sessions"] == 15
+
+
+def test_training_loader_accepts_weekend_holiday_calendar_span_within_sessions(
+    db_session,
+    tmp_path,
+):
+    entry = date(2025, 1, 17)
+    exit_date = date(2025, 1, 21)
+    signal_id = _seed_signal(
+        db_session,
+        idx=135,
+        signal_date=entry,
+        entry_session_date=entry,
+        exit_session_date=exit_date,
+        signal_horizon="1d",
+    )
+    db_session.commit()
+    payload = _manifest_payload([signal_id], signal_horizon="1d", horizon_sessions=1)
+    path = tmp_path / "holiday-overnight.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    manifest = load_manifest(path)
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [signal_id]
+    assert examples[0].realized_label_window_sessions == 1
+    assert metrics["max_realized_label_window_sessions"] == 1
+
+
+def test_training_loader_fails_closed_on_missing_realized_label_dates(
+    db_session,
+    tmp_path,
+):
+    signal_id = _seed_signal(db_session, idx=136, missing_realized_dates=True)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="missing realized label session dates"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
 def test_training_loader_rejects_realized_label_window_beyond_purge_horizon(
     db_session,
     tmp_path,
@@ -1945,10 +2336,10 @@ def test_training_loader_rejects_realized_label_window_beyond_purge_horizon(
     signal_date = date(2025, 2, 3)
     signal_id = _seed_signal(
         db_session,
-        idx=130,
+        idx=137,
         signal_date=signal_date,
         entry_session_date=signal_date,
-        exit_session_date=signal_date + timedelta(days=5),
+        exit_session_date=nth_us_equity_session(signal_date + timedelta(days=1), 3),
     )
     db_session.commit()
     manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
@@ -2009,6 +2400,8 @@ def test_training_loader_picks_latest_canonical_observation(db_session, tmp_path
             signal_horizon="2d",
             forward_return=0.42,
             status="computed",
+            entry_session_date=old.entry_session_date,
+            exit_session_date=old.exit_session_date,
             input_hash="input-24-fresh",
             outcome_hash="outcome-24-fresh",
             created_at=datetime(2025, 1, 2, tzinfo=timezone.utc),

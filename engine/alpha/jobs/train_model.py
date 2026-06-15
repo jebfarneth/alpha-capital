@@ -15,7 +15,7 @@ import math
 import pickle
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -30,6 +30,7 @@ from alpha.db.models import (
 )
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.runner import run_job
+from alpha.market_calendar import is_us_equity_session, next_us_equity_session
 from alpha.ml.cv import (
     CVExample,
     purged_embargoed_walk_forward_splits,
@@ -41,6 +42,10 @@ from alpha.ml.model_features import (
     audit_feature_schema_no_leakage,
     feature_schema_hash,
     select_features,
+)
+from alpha.security_identity import (
+    ResolvedSecurityIdentity,
+    resolve_security_identities_for_tickers,
 )
 
 
@@ -956,7 +961,12 @@ def _labels(examples: list[TrainingExample]) -> list[float]:
 
 def _cv_examples(examples: list[TrainingExample]) -> list[CVExample]:
     return [
-        CVExample(signal_id=row.signal_id, ticker=row.ticker, signal_date=row.signal_date)
+        CVExample(
+            signal_id=row.signal_id,
+            ticker=row.ticker,
+            security_identity=row.security_identity,
+            signal_date=row.signal_date,
+        )
         for row in examples
     ]
 
@@ -1022,12 +1032,36 @@ def _direction_signed_label(raw_label: float, direction: str) -> float:
     return raw_label if direction == "long" else -raw_label
 
 
-def _realized_label_window_sessions(row: ForwardReturnObservation) -> int | None:
+def _realized_label_window_sessions(row: ForwardReturnObservation) -> int:
     entry = _parse_date(row.entry_session_date)
     exit_ = _parse_date(row.exit_session_date)
     if entry is None or exit_ is None:
-        return None
-    return (exit_ - entry).days
+        raise RuntimeError(
+            "Stage-1 training row is missing realized label session dates: "
+            f"signal_id={row.signal_id!r} "
+            f"entry_session_date={row.entry_session_date!r} "
+            f"exit_session_date={row.exit_session_date!r}"
+        )
+    if not is_us_equity_session(entry) or not is_us_equity_session(exit_):
+        raise RuntimeError(
+            "Stage-1 training row has non-session realized label dates: "
+            f"signal_id={row.signal_id!r} "
+            f"entry_session_date={entry.isoformat()} "
+            f"exit_session_date={exit_.isoformat()}"
+        )
+    if exit_ < entry:
+        raise RuntimeError(
+            "Stage-1 training row has an exit session before entry session: "
+            f"signal_id={row.signal_id!r} "
+            f"entry_session_date={entry.isoformat()} "
+            f"exit_session_date={exit_.isoformat()}"
+        )
+    sessions = 0
+    cursor = next_us_equity_session(entry + timedelta(days=1))
+    while cursor <= exit_:
+        sessions += 1
+        cursor = next_us_equity_session(cursor + timedelta(days=1))
+    return sessions
 
 
 def _validate_realized_label_windows(
@@ -1035,11 +1069,7 @@ def _validate_realized_label_windows(
     *,
     declared_horizon_sessions: int,
 ) -> int | None:
-    realized = [
-        window
-        for row in rows
-        if (window := _realized_label_window_sessions(row)) is not None
-    ]
+    realized = [_realized_label_window_sessions(row) for row in rows]
     if not realized:
         return None
     max_window = max(realized)
@@ -1050,6 +1080,67 @@ def _validate_realized_label_windows(
             f"max_realized_label_window_sessions={max_window}"
         )
     return max_window
+
+
+def _fallback_security_identity(ticker: str) -> ResolvedSecurityIdentity:
+    normalized = str(ticker).upper()
+    return ResolvedSecurityIdentity(
+        security_identity=f"ticker:{normalized}",
+        canonical_ticker=normalized,
+    )
+
+
+def _security_identity_for_row(
+    row: ForwardReturnObservation,
+    identities: dict[str, ResolvedSecurityIdentity],
+) -> ResolvedSecurityIdentity:
+    ticker = str(row.ticker or "").upper()
+    return identities.get(ticker) or _fallback_security_identity(ticker)
+
+
+def _dedupe_security_identity_rows(
+    rows: list[ForwardReturnObservation],
+    identities: dict[str, ResolvedSecurityIdentity],
+) -> tuple[list[ForwardReturnObservation], int]:
+    selected: dict[tuple[str, date], ForwardReturnObservation] = {}
+
+    def priority(row: ForwardReturnObservation) -> tuple[bool, datetime, datetime, str]:
+        identity = _security_identity_for_row(row, identities)
+        return (
+            str(row.ticker or "").upper() == identity.canonical_ticker,
+            row.updated_at or datetime.min.replace(tzinfo=timezone.utc),
+            row.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            str(row.forward_return_observation_id),
+        )
+
+    for row in rows:
+        identity = _security_identity_for_row(row, identities)
+        key = (identity.security_identity, _signal_date(row.signal))
+        current = selected.get(key)
+        if current is None or priority(row) > priority(current):
+            selected[key] = row
+    dropped = len(rows) - len(selected)
+    if dropped:
+        LOGGER.warning(
+            "Stage-1 trainer dropped %s duplicate rows after security identity "
+            "collapse",
+            dropped,
+        )
+    return list(selected.values()), dropped
+
+
+def _apply_counted_hard_filter(
+    query: Any,
+    condition: Any,
+    *,
+    name: str,
+    drop_counts: dict[str, int],
+) -> Any:
+    before = query.count()
+    filtered = query.filter(condition)
+    after = filtered.count()
+    drop_counts[name] = int(before - after)
+    return filtered
 
 
 def _mean_or_nan(values: list[float]) -> float:
@@ -1162,9 +1253,6 @@ def _load_training_examples(
         .join(SignalRegistry, ForwardReturnObservation.signal_id == SignalRegistry.signal_id)
         .filter(ForwardReturnObservation.pattern_id == pattern.pattern_id)
         .filter(ForwardReturnObservation.status.in_(list(statuses)))
-        .filter(SignalRegistry.signal_status == "active")
-        .filter(SignalRegistry.lookahead_guard_passed.is_(True))
-        .filter(SignalRegistry.forward_return_status == "computed")
     )
     start = _parse_date(selection.get("start_date"))
     end = _parse_date(selection.get("end_date"))
@@ -1180,6 +1268,25 @@ def _load_training_examples(
         query = query.filter(
             ForwardReturnObservation.signal_horizon == pattern.signal_horizon
         )
+    hard_filter_drop_counts: dict[str, int] = {}
+    query = _apply_counted_hard_filter(
+        query,
+        SignalRegistry.signal_status == "active",
+        name="signal_status_active",
+        drop_counts=hard_filter_drop_counts,
+    )
+    query = _apply_counted_hard_filter(
+        query,
+        SignalRegistry.lookahead_guard_passed.is_(True),
+        name="lookahead_guard_passed",
+        drop_counts=hard_filter_drop_counts,
+    )
+    query = _apply_counted_hard_filter(
+        query,
+        SignalRegistry.forward_return_status == "computed",
+        name="forward_return_status_computed",
+        drop_counts=hard_filter_drop_counts,
+    )
     pit_failed_row_count = query.filter(
         SignalRegistry.point_in_time_passed.isnot(True)
     ).count()
@@ -1191,6 +1298,7 @@ def _load_training_examples(
             f"pit_failed_row_count={pit_failed_row_count}"
         )
     if pattern.allow_deferred_pit:
+        hard_filter_drop_counts["point_in_time_passed"] = 0
         if pit_failed_row_count:
             LOGGER.warning(
                 "Stage-1 trainer is using %s point-in-time failed rows because "
@@ -1198,7 +1306,13 @@ def _load_training_examples(
                 pit_failed_row_count,
             )
     else:
+        hard_filter_drop_counts["point_in_time_passed"] = int(pit_failed_row_count)
         query = query.filter(SignalRegistry.point_in_time_passed.is_(True))
+    if any(hard_filter_drop_counts.values()):
+        LOGGER.warning(
+            "Stage-1 trainer hard-filter drop counts: %s",
+            json.dumps(hard_filter_drop_counts, sort_keys=True),
+        )
     rows = query.order_by(
         ForwardReturnObservation.signal_id.asc(),
         ForwardReturnObservation.updated_at.desc(),
@@ -1221,6 +1335,14 @@ def _load_training_examples(
     max_realized_label_window_sessions = _validate_realized_label_windows(
         rows,
         declared_horizon_sessions=declared_horizon_sessions,
+    )
+    identities = resolve_security_identities_for_tickers(
+        session,
+        [str(row.ticker or "") for row in rows],
+    )
+    rows, security_identity_duplicate_rows_dropped = _dedupe_security_identity_rows(
+        rows,
+        identities,
     )
     rows = sorted(rows, key=lambda row: row.signal_timestamp)
     out: list[TrainingExample] = []
@@ -1256,10 +1378,12 @@ def _load_training_examples(
                 )
             continue
         kept_labels.append(label)
+        identity = _security_identity_for_row(obs, identities)
         out.append(
             TrainingExample(
                 signal_id=obs.signal_id,
-                ticker=obs.ticker,
+                ticker=identity.canonical_ticker,
+                security_identity=identity.security_identity,
                 signal_date=_signal_date(signal),
                 label=label,
                 vector=vector,
@@ -1297,6 +1421,10 @@ def _load_training_examples(
             **drop_metrics,
             "pit_deferred": bool(pattern.allow_deferred_pit and pit_failed_row_count),
             "pit_failed_row_count": int(pit_failed_row_count),
+            "hard_filter_drop_counts": hard_filter_drop_counts,
+            "security_identity_duplicate_rows_dropped": int(
+                security_identity_duplicate_rows_dropped
+            ),
             "expected_direction": expected_direction,
             "selected_direction": selected_direction,
             "declared_horizon_sessions": declared_horizon_sessions,
@@ -1590,7 +1718,7 @@ class Stage1TrainModelJob(BaseJob):
                     "max_iter": self.max_iter,
                     "random_state": self.random_state,
                     "n_splits": self.n_splits,
-                    "sample_weight": "unique_name_cluster_by_ticker",
+                    "sample_weight": "unique_name_cluster_by_security_identity",
                     "model_params": model_params,
                 },
                 sort_keys=True,

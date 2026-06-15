@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Sequence
 
 from sqlalchemy.orm import Session
 
 from alpha.db.models import SecurityIdentitySnapshot
+
+
+@dataclass(frozen=True)
+class ResolvedSecurityIdentity:
+    """Canonical security identity for ML row-level de-duplication."""
+
+    security_identity: str
+    canonical_ticker: str
 
 
 def load_security_identity_by_ticker(
@@ -22,6 +31,110 @@ def load_security_identity_by_ticker(
         .all()
     )
     return {str(row.ticker).upper(): row for row in rows}
+
+
+def _identity_key(identity: SecurityIdentitySnapshot | None, ticker: str) -> str:
+    if identity is None:
+        return f"ticker:{ticker.upper()}"
+    for prefix, value in (
+        ("cik", identity.cik),
+        ("composite_figi", identity.composite_figi),
+        ("share_class_figi", identity.share_class_figi),
+        ("identity_hash", identity.identity_hash),
+    ):
+        if value:
+            return f"{prefix}:{str(value).upper()}"
+    return f"ticker:{str(identity.ticker or ticker).upper()}"
+
+
+def _ticker_aliases_from_events(events_json: str | None) -> set[str]:
+    if not events_json:
+        return set()
+    try:
+        parsed = json.loads(events_json)
+    except json.JSONDecodeError:
+        return set()
+    aliases: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if "ticker" in str(key).lower() and isinstance(child, str) and child:
+                    aliases.add(child.upper())
+                else:
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(parsed)
+    return aliases
+
+
+def _canonical_ticker(rows: Iterable[SecurityIdentitySnapshot]) -> str | None:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            row.active is True,
+            row.asof_timestamp is not None,
+            row.asof_timestamp,
+            str(row.ticker or ""),
+        ),
+        reverse=True,
+    )
+    return str(ordered[0].ticker).upper() if ordered else None
+
+
+def resolve_security_identities_for_tickers(
+    session: Session,
+    tickers: Sequence[str],
+) -> Dict[str, ResolvedSecurityIdentity]:
+    """Resolve tickers to security identities, honoring persisted rename events.
+
+    The ML trainer uses this as a defense-in-depth boundary: historical ticker
+    renames and mergers should be one security for de-duplication, weighting,
+    and CV purge purposes. Missing identity evidence intentionally falls back
+    to the raw ticker, making absence visible but not fatal.
+    """
+
+    requested = {str(ticker).upper() for ticker in tickers if ticker}
+    if not requested:
+        return {}
+    rows = (
+        session.query(SecurityIdentitySnapshot)
+        .filter(
+            (SecurityIdentitySnapshot.ticker.in_(requested))
+            | (SecurityIdentitySnapshot.ticker_events_json.isnot(None))
+        )
+        .all()
+    )
+    groups: dict[str, list[SecurityIdentitySnapshot]] = {}
+    alias_to_identity: dict[str, str] = {}
+    for row in rows:
+        ticker = str(row.ticker or "").upper()
+        key = _identity_key(row, ticker)
+        groups.setdefault(key, []).append(row)
+        aliases = {ticker, *_ticker_aliases_from_events(row.ticker_events_json)}
+        for alias in aliases:
+            if alias:
+                alias_to_identity.setdefault(alias, key)
+    canonical_by_identity = {
+        key: _canonical_ticker(group) or key.rsplit(":", 1)[-1]
+        for key, group in groups.items()
+    }
+    resolved: dict[str, ResolvedSecurityIdentity] = {}
+    for ticker in requested:
+        key = alias_to_identity.get(ticker)
+        if key is None:
+            key = f"ticker:{ticker}"
+            canonical = ticker
+        else:
+            canonical = canonical_by_identity.get(key, ticker)
+        resolved[ticker] = ResolvedSecurityIdentity(
+            security_identity=key,
+            canonical_ticker=canonical,
+        )
+    return resolved
 
 
 def security_identity_payload(

@@ -15,6 +15,7 @@ class CrossValidationError(RuntimeError):
 class CVExample:
     signal_id: str
     ticker: str
+    security_identity: str
     signal_date: date
 
 
@@ -28,13 +29,18 @@ class PurgedEmbargoedFold:
     horizon_sessions: int
 
 
+def _security_identity_key(row: CVExample) -> str:
+    return row.security_identity or row.ticker
+
+
 def unique_name_weights(examples: Sequence[CVExample]) -> list[float]:
-    """Cluster-by-ticker weighting: each ticker contributes total weight 1."""
+    """Cluster-by-security weighting: each security contributes total weight 1."""
 
     counts: dict[str, int] = {}
     for row in examples:
-        counts[row.ticker] = counts.get(row.ticker, 0) + 1
-    return [1.0 / counts[row.ticker] for row in examples]
+        key = _security_identity_key(row)
+        counts[key] = counts.get(key, 0) + 1
+    return [1.0 / counts[_security_identity_key(row)] for row in examples]
 
 
 def purged_embargoed_walk_forward_splits(
@@ -75,10 +81,16 @@ def purged_embargoed_walk_forward_splits(
             continue
         test_positions = {date_to_position[value] for value in block}
         train_cutoff = min(test_positions) - embargo
+        test_identities = {
+            _security_identity_key(row)
+            for row in examples
+            if row.signal_date in set(block)
+        }
         train_indices = [
             idx
             for idx, row in enumerate(examples)
             if date_to_position[row.signal_date] < train_cutoff
+            and _security_identity_key(row) not in test_identities
         ]
         test_indices = [
             idx
