@@ -16,6 +16,7 @@ from alpha.db.models import (
     FeatureSnapshot,
     ForwardReturnObservation,
     MLModelRegistry,
+    MarketPathFeature,
     SignalMLScore,
     SignalRegistry,
 )
@@ -326,6 +327,133 @@ def test_leakage_audit_rejects_forward_market_path_feature_role():
     }
     with pytest.raises(FeatureSelectionError):
         audit_feature_schema_no_leakage(schema)
+
+
+def test_signal_registry_unknown_column_fails_closed(tmp_path):
+    schema = {
+        "schema_version": "bad_signal_registry_column_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "raw_strength_typo",
+                "source": "signal_registry",
+                "column": "raw_signal_strenght",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError, match="unknown column"):
+        audit_feature_schema_no_leakage(schema)
+
+    manifest_path = tmp_path / "bad-signal-registry-column.json"
+    manifest_path.write_text(
+        json.dumps(_manifest_payload(["sig-1"], feature_schema=schema), sort_keys=True)
+    )
+    with pytest.raises(Exception, match="leakage audit"):
+        load_manifest(manifest_path)
+
+
+def test_signal_registry_valid_null_column_stays_typed_missing_and_scores(
+    db_session,
+    tmp_path,
+):
+    audit_feature_schema_no_leakage(
+        {
+            "schema_version": "valid_raw_strength_column_v1",
+            "pattern_id": "M4",
+            "pattern_clock": "eod",
+            "fields": [
+                {
+                    "name": "raw_signal_strength",
+                    "source": "signal_registry",
+                    "column": "raw_signal_strength",
+                }
+            ],
+        }
+    )
+    signal_id = _seed_signal(db_session, idx=38, gap=-0.01)
+    signal = db_session.get(SignalRegistry, signal_id)
+    signal.data_confidence = None
+    schema = {
+        "schema_version": "signal_registry_null_column_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "data_confidence",
+                "source": "signal_registry",
+                "column": "data_confidence",
+            }
+        ],
+    }
+    artifact_path = tmp_path / "signal-registry-null.pkl"
+    _write_artifact(
+        artifact_path,
+        model_id="model-signal-registry-null",
+        schema=schema,
+        training_feature_ranges=[{"min": None, "max": None}],
+    )
+    _add_model_registry(
+        db_session,
+        model_id="model-signal-registry-null",
+        artifact_uri=str(artifact_path),
+        schema_hash=feature_schema_hash(schema),
+    )
+    db_session.commit()
+
+    vector = select_features(db_session, signal_id, schema)
+    score = score_signal_shadow(
+        db_session,
+        signal_id=signal_id,
+        model_id="model-signal-registry-null",
+    )
+    db_session.flush()
+
+    assert vector.missing_statuses["data_confidence"] == "stored_null"
+    assert score.score_source == "model_shadow"
+    assert score.fallback_reason is None
+
+
+def test_market_path_feature_column_unknown_column_fails_closed():
+    assert not hasattr(MarketPathFeature, "open_prize")
+    schema = {
+        "schema_version": "bad_market_path_column_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "open_prize",
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": "open_prize",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError, match="unknown column"):
+        audit_feature_schema_no_leakage(schema)
+
+
+def test_market_path_feature_column_valid_column_passes():
+    assert hasattr(MarketPathFeature, "open_price")
+    schema = {
+        "schema_version": "valid_market_path_column_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "open_price",
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": "open_price",
+            }
+        ],
+    }
+
+    audit_feature_schema_no_leakage(schema)
 
 
 def test_leakage_audit_is_pattern_clock_aware_for_signal_session_fields():

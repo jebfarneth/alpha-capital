@@ -98,6 +98,7 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
     }
 )
 INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()
+_MISSING_COLUMN = object()
 _MALFORMED_PATH = object()
 
 
@@ -240,6 +241,18 @@ def _audit_feature_field_no_leakage(
     feature_role = str(field.get("feature_role") or "").strip()
     reference_parts = _read_locator_parts(field)
     terminal_name = reference_parts[-1] if reference_parts else ""
+    if source == "signal_registry":
+        if len(reference_parts) != 1 or not hasattr(SignalRegistry, reference_parts[0]):
+            raise FeatureSelectionError(
+                "signal_registry feature references unknown column "
+                f"{'.'.join(reference_parts)!r}"
+            )
+    elif source == "market_path_feature_column":
+        if not hasattr(MarketPathFeature, reference_parts[0]):
+            raise FeatureSelectionError(
+                "market_path_feature_column feature references unknown column "
+                f"{reference_parts[0]!r}"
+            )
     if source.startswith("market_path_feature"):
         if not feature_role:
             raise FeatureSelectionError(
@@ -405,7 +418,12 @@ class _StoredFeatureSource:
             )
         if source == "signal_registry":
             attr = ".".join(locator_parts)
-            return getattr(self.signal, attr, None), None
+            value = getattr(self.signal, attr, _MISSING_COLUMN)
+            if value is _MISSING_COLUMN:
+                raise FeatureSelectionError(
+                    f"signal_registry feature references unknown column {attr!r}"
+                )
+            return value, None
         if source in {"market_path_feature_column", "market_path_feature_json"}:
             feature_version = str(field.get("feature_version") or "")
             if not feature_version:
@@ -422,7 +440,13 @@ class _StoredFeatureSource:
             if row is None:
                 return None, "missing_market_path_feature"
             if source == "market_path_feature_column":
-                return getattr(row, locator_parts[0], None), None
+                value = getattr(row, locator_parts[0], _MISSING_COLUMN)
+                if value is _MISSING_COLUMN:
+                    raise FeatureSelectionError(
+                        "market_path_feature_column feature references unknown "
+                        f"column {locator_parts[0]!r}"
+                    )
+                return value, None
             return _get_path(_json_loads_or_empty(row.feature_json), locator_parts), None
         raise FeatureSelectionError(f"unsupported stored feature source {source!r}")
 
