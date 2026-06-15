@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from alpha.data.config import PolygonConfig
 from alpha.data.contracts import (
@@ -32,6 +34,7 @@ from alpha.data.contracts import (
 )
 
 PROVIDER = "Polygon"
+POLYGON_REQUEST_TIMEOUT = (10, 30)
 TICKERS_ENDPOINT = "/v3/reference/tickers"
 TICKER_EVENTS_ENDPOINT_PREFIX = "/vX/reference/tickers"
 SPLITS_ENDPOINT = "/stocks/v1/splits"
@@ -294,6 +297,18 @@ class PolygonAdapter:
     ):
         self._config = config
         self._session = session or requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            respect_retry_after_header=True,
+            allowed_methods=["GET"],
+        )
+        retry_adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", retry_adapter)
+        self._session.mount("http://", retry_adapter)
         self._session.params = {"apiKey": config.api_key}  # type: ignore[assignment]
 
     def _request(
@@ -333,7 +348,11 @@ class PolygonAdapter:
                 )
 
         try:
-            resp = self._session.get(url, params=params or {}, timeout=30)
+            resp = self._session.get(
+                url,
+                params=params or {},
+                timeout=POLYGON_REQUEST_TIMEOUT,
+            )
         except requests.exceptions.Timeout:
             return AdapterResponse(
                 data=None,

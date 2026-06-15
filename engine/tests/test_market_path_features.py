@@ -4,6 +4,7 @@ import json
 import math
 import statistics
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event, inspect, text
@@ -13,6 +14,7 @@ from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import DataLineage, FeatureSnapshot, MarketPathFeature, SignalRegistry
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import JobResult
+from alpha.jobs import run_market_path_bulk_backfill as bulk_runner
 from alpha.jobs.market_path_features import MarketPathFeatureJob
 from alpha.jobs.market_path_features import _same_day_pattern_strengths_from_cache
 from alpha.jobs.market_path_features import sanitize_provider_error_message
@@ -101,6 +103,20 @@ class FakeFmpAdapter:
                     }
                     for bar in bars
                 ]),
+            ),
+        )
+
+
+class EmptyMinuteAdapter:
+    def get_minute_aggs(self, *_args, **_kwargs):
+        return AdapterResponse(
+            data=[],
+            lineage=LineageMeta(
+                provider="Polygon",
+                endpoint="/v2/aggs/ticker/{ticker}/range/1/minute",
+                request_timestamp=RUN_TS,
+                asof_timestamp=RUN_TS,
+                raw_payload_hash=stable_hash({"minute_bars": []}),
             ),
         )
 
@@ -1486,6 +1502,54 @@ def test_market_path_bulk_backfill_plans_pattern_date_batches():
         ("M1", "2026-06-03", "2026-06-04"),
         ("M1", "2026-06-05", "2026-06-05"),
     ]
+
+
+def test_market_path_bulk_single_shard_audit_runs_first_batch_only(
+    db_session,
+    tmp_path,
+):
+    _add_signal(
+        db_session,
+        ticker="AAAA",
+        signal_day=date(2026, 6, 1),
+        entry_day=date(2026, 6, 2),
+    )
+    _add_signal(
+        db_session,
+        ticker="BBBB",
+        signal_day=date(2026, 6, 2),
+        entry_day=date(2026, 6, 3),
+    )
+
+    result = run_job(
+        db_session,
+        MarketPathBulkBackfillJob(
+            session=db_session,
+            fmp_adapter=FakeFmpAdapter({
+                "AAAA": _rich_bars(),
+                "BBBB": _rich_bars(),
+            }),
+            pattern_ids=("M4",),
+            signal_start_date=date(2026, 6, 1),
+            signal_end_date=date(2026, 6, 2),
+            through_date=date(2026, 6, 2),
+            run_timestamp=RUN_TS,
+            batch_days=1,
+            include_signal_session=True,
+            single_shard_audit_sample=True,
+            progress_artifact=tmp_path / "single_shard.json",
+            schema="scratch_test",
+        ),
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["batch_count"] == 1
+    assert result.metrics["signal_count"] == 1
+    rows = db_session.query(MarketPathFeature).order_by(
+        MarketPathFeature.ticker,
+        MarketPathFeature.feature_session_date,
+    ).all()
+    assert {row.ticker for row in rows} == {"AAAA"}
 
 
 def test_market_path_bulk_validation_queries_are_feature_session_range_scoped():
@@ -3042,3 +3106,235 @@ def test_market_path_feature_job_writes_signal_session_before_future_entry(db_se
     assert row.feature_role == "signal_session"
     assert row.entry_session_date == "2026-06-08"
     assert row.return_from_entry_close is None
+
+
+def _bars_with_day0(*, close: float, high: float, low: float) -> list[FmpBar]:
+    bars = {date.fromisoformat(row.date): row for row in _rich_bars()}
+    bars[date(2026, 6, 5)] = FmpBar(
+        date="2026-06-05",
+        open=33.0,
+        high=high,
+        low=low,
+        close=close,
+        volume=1_200_000,
+        split_adjusted_close=close,
+        adj_close=close,
+        vwap=33.5,
+    )
+    return [bars[day] for day in sorted(bars)]
+
+
+def _run_signal_session_backfill(
+    db_session,
+    *,
+    signal_day: date = date(2026, 6, 5),
+    ticker: str = "LCUT",
+    bars: list[FmpBar] | None = None,
+    skip_existing: bool = False,
+    polygon_minute_adapter=None,
+):
+    signal = _add_signal(
+        db_session,
+        ticker=ticker,
+        signal_day=signal_day,
+        entry_day=signal_day + timedelta(days=3),
+    )
+    adapter = FakeFmpAdapter({ticker: bars or _rich_bars()})
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=adapter,
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=signal_day,
+        signal_end_date=signal_day,
+        through_date=signal_day,
+        include_signal_session=True,
+        skip_existing=skip_existing,
+        polygon_minute_adapter=polygon_minute_adapter,
+    )
+    result = run_job(db_session, job)
+    row = (
+        db_session.query(MarketPathFeature)
+        .filter(
+            MarketPathFeature.signal_id == signal.signal_id,
+            MarketPathFeature.feature_role == "signal_session",
+        )
+        .one()
+    )
+    return signal, row, result
+
+
+def test_m4_day0_signal_session_row_per_fire_and_skip_existing_noop(db_session):
+    signal, row, result = _run_signal_session_backfill(db_session)
+
+    assert result.status == "finished"
+    assert result.metrics["rows_inserted"] == 1
+    assert row.signal_id == signal.signal_id
+    assert row.feature_session_date == "2026-06-05"
+    original_updated_at = row.updated_at
+    original_hash = row.input_hash
+
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"LCUT": _rich_bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 5),
+        signal_end_date=date(2026, 6, 5),
+        through_date=date(2026, 6, 5),
+        include_signal_session=True,
+        skip_existing=True,
+    )
+    second = run_job(db_session, job)
+    db_session.expire_all()
+    rerun_row = db_session.get(MarketPathFeature, row.market_path_feature_id)
+
+    assert second.status == "finished"
+    assert second.metrics["rows_upserted"] == 0
+    assert second.metrics["rows_unchanged"] == 1
+    assert rerun_row.input_hash == original_hash
+    assert rerun_row.updated_at == original_updated_at
+
+
+def test_m4_day0_predictor_contract_is_invariant_to_day0_close_high_low(db_session):
+    _signal_a, row_a, _result_a = _run_signal_session_backfill(
+        db_session,
+        ticker="LCUA",
+        bars=_bars_with_day0(close=34.0, high=35.0, low=32.0),
+    )
+    _signal_b, row_b, _result_b = _run_signal_session_backfill(
+        db_session,
+        ticker="LCUB",
+        bars=_bars_with_day0(close=44.0, high=55.0, low=25.0),
+    )
+
+    payload_a = json.loads(row_a.feature_json)["leakage_contract"]
+    payload_b = json.loads(row_b.feature_json)["leakage_contract"]
+
+    assert payload_a["predictor_features"] == payload_b["predictor_features"]
+    assert payload_a["outcome_features"]["close_price"] != payload_b["outcome_features"]["close_price"]
+    assert row_a.open_to_close_return != row_b.open_to_close_return
+
+
+def test_m4_day0_breakout_extension_and_prior_high_touches_populated(db_session):
+    _signal, row, _result = _run_signal_session_backfill(db_session)
+
+    assert row.breakout_extension_pct is not None
+    assert row.prior_52w_high_touches_20d is not None
+    assert row.prior_52w_high_touches_60d is not None
+    assert row.prior_52w_high_touches_126d is not None
+    payload = json.loads(row.feature_json)
+    predictors = payload["leakage_contract"]["predictor_features"]
+    assert predictors["prior_52w_high_touches_20d"] is not None
+    assert predictors["volume_expansion_20d"] == pytest.approx(row.volume_expansion_20d)
+    assert predictors["liquidity_proxy_score"] == row.liquidity_proxy_score
+    assert payload["leakage_contract"]["outcome_features"]["breakout_extension_pct"] is not None
+
+
+def test_m4_day0_catalyst_pit_gate_excludes_after_open_events(db_session):
+    signal, _row, _result = _run_signal_session_backfill(db_session)
+    feature = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    payload = json.loads(feature.feature_json)
+    payload["day0_catalyst_events"] = [
+        {
+            "type": "news",
+            "timestamp": "2026-06-05T13:29:00+00:00",
+            "category": "offering",
+        },
+        {
+            "type": "news",
+            "timestamp": "2026-06-05T13:31:00+00:00",
+            "category": "fda",
+        },
+    ]
+    feature.feature_json = json.dumps(payload, sort_keys=True)
+    db_session.query(MarketPathFeature).delete()
+    db_session.flush()
+
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"LCUT": _rich_bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 5),
+        signal_end_date=date(2026, 6, 5),
+        through_date=date(2026, 6, 5),
+        include_signal_session=True,
+    )
+    run_job(db_session, job)
+    row = db_session.query(MarketPathFeature).one()
+    context = json.loads(row.feature_json)["catalyst_context_status"]
+
+    assert row.news_count_1d == 1
+    assert row.offering_flag is True
+    assert row.fda_clinical_flag is False
+    assert row.catalyst_context_status == "snapshot_catalyst_events_pit_filtered"
+    assert context["excluded_after_day0_open_count"] == 1
+
+
+def test_m4_day0_delisted_fixture_writes_row_and_marks_missing_intraday(db_session):
+    _signal, row, result = _run_signal_session_backfill(
+        db_session,
+        ticker="DEAD",
+        bars=_rich_bars(),
+        polygon_minute_adapter=EmptyMinuteAdapter(),
+    )
+
+    assert result.status == "finished"
+    assert row.ticker == "DEAD"
+    assert row.feature_role == "signal_session"
+    assert row.missing_intraday_bars is True
+    assert row.intraday_structure_status == "minute_bars_missing"
+
+
+def test_market_path_bulk_runner_single_shard_prints_audit_sample(
+    db_session,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _add_signal(
+        db_session,
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    monkeypatch.setattr(bulk_runner, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(bulk_runner, "reset_globals", lambda: None)
+    monkeypatch.setattr(bulk_runner, "get_session", lambda: db_session)
+    monkeypatch.setattr(bulk_runner.FmpConfig, "from_env", staticmethod(lambda: object()))
+    monkeypatch.setattr(
+        bulk_runner,
+        "FmpAdapter",
+        lambda *_args, **_kwargs: FakeFmpAdapter({"LCUT": _rich_bars()}),
+    )
+    monkeypatch.setattr(
+        bulk_runner,
+        "CachedHistoricalPriceFmpAdapter",
+        lambda adapter: adapter,
+    )
+    monkeypatch.setattr(
+        bulk_runner,
+        "RetryingHistoricalPriceFmpAdapter",
+        lambda adapter, **_kwargs: adapter,
+    )
+
+    rc = bulk_runner.main([
+        "--live",
+        "--confirm-live-write",
+        "--start-date", "2026-06-05",
+        "--end-date", "2026-06-05",
+        "--through-date", "2026-06-05",
+        "--include-signal-session",
+        "--single-shard-audit-sample",
+        "--skip-existing",
+        "--minute-cache-dir", str(tmp_path / "minutes"),
+        "--polygon-rate-limit-per-minute", "120",
+        "--disable-polygon-minute-layer",
+        "--progress-artifact", str(tmp_path / "progress.json"),
+    ])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "AUDIT_SAMPLE " in out
+    assert '"feature_role": "signal_session"' in out
+    assert '"predictor_features"' in out

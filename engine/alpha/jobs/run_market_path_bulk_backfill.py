@@ -26,8 +26,9 @@ from sqlalchemy import Column, MetaData, Table, bindparam, text
 from sqlalchemy.orm import Session
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash, utcnow
-from alpha.data.config import ConfigError, FmpConfig
+from alpha.data.config import ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
     SchemaTargetError,
     create_all_tables,
@@ -180,6 +181,123 @@ class RetryingHistoricalPriceFmpAdapter:
             max_retries=self._max_retries,
             request_timeout_seconds=self._request_timeout_seconds,
         )
+
+
+class CachedPolygonMinuteAdapter:
+    """Filesystem cache for Polygon minute bars keyed by ticker and trading date."""
+
+    def __init__(self, wrapped: Any, cache_dir: str | Path) -> None:
+        self._wrapped = wrapped
+        self._cache_dir = Path(cache_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def get_minute_aggs(
+        self,
+        ticker: str,
+        *,
+        from_date: str,
+        to_date: str,
+        adjusted: bool = True,
+        **kwargs: Any,
+    ) -> AdapterResponse[Any]:
+        if from_date != to_date:
+            return self._wrapped.get_minute_aggs(
+                ticker,
+                from_date=from_date,
+                to_date=to_date,
+                adjusted=adjusted,
+                **kwargs,
+            )
+        path = self._cache_path(ticker, from_date, adjusted=adjusted)
+        if path.exists():
+            self.cache_hits += 1
+            payload = json.loads(path.read_text())
+            return AdapterResponse(
+                data=[_CachedMinuteBar(row) for row in payload.get("bars", [])],
+                lineage=LineageMeta(
+                    provider="Polygon",
+                    endpoint="/v2/aggs/ticker/{ticker}/range/1/minute",
+                    request_timestamp=datetime.now(timezone.utc),
+                    asof_timestamp=datetime.now(timezone.utc),
+                    raw_payload_hash=payload.get("raw_payload_hash")
+                    or stable_hash(payload.get("bars", [])),
+                    data_quality_flags={
+                        "minute_cache_hit": True,
+                        "minute_cache_path": str(path),
+                    },
+                ),
+            )
+        self.cache_misses += 1
+        response = self._wrapped.get_minute_aggs(
+            ticker,
+            from_date=from_date,
+            to_date=to_date,
+            adjusted=adjusted,
+            **kwargs,
+        )
+        if response.ok and response.data is not None:
+            bars = [_minute_bar_payload(row) for row in response.data]
+            path.write_text(json.dumps({
+                "ticker": ticker.upper(),
+                "date": from_date,
+                "adjusted": adjusted,
+                "bars": bars,
+                "raw_payload_hash": stable_hash(bars),
+            }, sort_keys=True))
+        return response
+
+    def _cache_path(self, ticker: str, trading_date: str, *, adjusted: bool) -> Path:
+        suffix = "adjusted" if adjusted else "raw"
+        return self._cache_dir / f"{ticker.upper()}_{trading_date}_{suffix}.json"
+
+
+class RateLimitedPolygonMinuteAdapter:
+    """Simple process-local rate limiter for Polygon minute requests."""
+
+    def __init__(self, wrapped: Any, *, rate_limit_per_minute: int | None) -> None:
+        self._wrapped = wrapped
+        self._rate_limit_per_minute = rate_limit_per_minute
+        self._last_call_at: float | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def get_minute_aggs(self, *args: Any, **kwargs: Any) -> AdapterResponse[Any]:
+        if self._rate_limit_per_minute and self._rate_limit_per_minute > 0:
+            min_interval = 60.0 / float(self._rate_limit_per_minute)
+            now = time.monotonic()
+            if self._last_call_at is not None:
+                sleep_for = min_interval - (now - self._last_call_at)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+            self._last_call_at = time.monotonic()
+        return self._wrapped.get_minute_aggs(*args, **kwargs)
+
+
+class _CachedMinuteBar:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.timestamp = payload.get("timestamp")
+        self.open = payload.get("open")
+        self.high = payload.get("high")
+        self.low = payload.get("low")
+        self.close = payload.get("close")
+        self.volume = payload.get("volume")
+
+
+def _minute_bar_payload(row: Any) -> dict[str, Any]:
+    return {
+        "timestamp": getattr(row, "timestamp", None),
+        "open": getattr(row, "open", None),
+        "high": getattr(row, "high", None),
+        "low": getattr(row, "low", None),
+        "close": getattr(row, "close", None),
+        "volume": getattr(row, "volume", None),
+    }
 
 
 class NoopHistoricalPriceFmpAdapter:
@@ -383,6 +501,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         run_timestamp: datetime | None = None,
         batch_days: int = 20,
         include_signal_session: bool = False,
+        skip_existing: bool = False,
         lookback_calendar_days: int = DEFAULT_LOOKBACK_CALENDAR_DAYS,
         feature_version: str = FEATURE_VERSION,
         progress_artifact: str | Path | None = None,
@@ -391,6 +510,10 @@ class MarketPathBulkBackfillJob(BaseJob):
         request_timeout_seconds: float = 30.0,
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
+        polygon_minute_adapter: Any | None = None,
+        minute_cache_dir: str | Path | None = None,
+        polygon_rate_limit_per_minute: int | None = None,
+        single_shard_audit_sample: bool = False,
         print_fn: PrintFn = print,
     ) -> None:
         if batch_days < 1:
@@ -410,6 +533,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._run_timestamp = run_timestamp
         self._batch_days = batch_days
         self._include_signal_session = include_signal_session
+        self._skip_existing = skip_existing
         self._lookback_calendar_days = lookback_calendar_days
         self._feature_version = feature_version
         self._progress_artifact = Path(progress_artifact) if progress_artifact else None
@@ -418,6 +542,10 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._request_timeout_seconds = request_timeout_seconds
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
+        self._polygon_minute_adapter = polygon_minute_adapter
+        self._minute_cache_dir = Path(minute_cache_dir) if minute_cache_dir else None
+        self._polygon_rate_limit_per_minute = polygon_rate_limit_per_minute
+        self._single_shard_audit_sample = single_shard_audit_sample
         self._print_fn = print_fn
 
     @property
@@ -430,6 +558,17 @@ class MarketPathBulkBackfillJob(BaseJob):
 
     def run(self, ctx: JobContext) -> JobResult:
         started_total = time.perf_counter()
+        run_timestamp = self._run_timestamp
+        if run_timestamp is None:
+            ctx_started_at = ctx.started_at
+            if (
+                ctx_started_at is not None
+                and ctx_started_at.tzinfo is not None
+                and ctx_started_at.utcoffset() is not None
+            ):
+                run_timestamp = ctx_started_at
+            else:
+                run_timestamp = datetime.now(timezone.utc)
         if self._signal_start_date > self._signal_end_date:
             return JobResult(
                 status="failed",
@@ -442,12 +581,19 @@ class MarketPathBulkBackfillJob(BaseJob):
             signal_end_date=self._signal_end_date,
             batch_days=self._batch_days,
         )
+        if self._single_shard_audit_sample and batches:
+            batches = batches[:1]
         artifact: dict[str, Any] = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "schema": self._schema,
             "feature_version": self._feature_version,
             "request_timeout_seconds": self._request_timeout_seconds,
             "signal_source": self._signal_source,
+            "skip_existing": self._skip_existing,
+            "minute_cache_dir": str(self._minute_cache_dir) if self._minute_cache_dir else None,
+            "polygon_rate_limit_per_minute": self._polygon_rate_limit_per_minute,
+            "polygon_minute_layer_enabled": self._polygon_minute_adapter is not None,
+            "single_shard_audit_sample": self._single_shard_audit_sample,
             "max_fetch_concurrency_requested": self._max_fetch_concurrency,
             "max_fetch_concurrency_effective": 1,
             "batches": [],
@@ -505,7 +651,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             feature_job = MarketPathFeatureJob(
                 session=self._session,
                 fmp_adapter=self._fmp,
-                run_timestamp=self._run_timestamp,
+                run_timestamp=run_timestamp,
                 pattern_ids=(batch.pattern_id,),
                 signal_start_date=batch.signal_start_date,
                 signal_end_date=batch.signal_end_date,
@@ -513,6 +659,8 @@ class MarketPathBulkBackfillJob(BaseJob):
                 lookback_calendar_days=self._lookback_calendar_days,
                 feature_version=self._feature_version,
                 include_signal_session=self._include_signal_session,
+                polygon_minute_adapter=self._polygon_minute_adapter,
+                skip_existing=self._skip_existing,
                 progress_callback=batch_progress,
                 progress_every=self._progress_every,
                 max_fetch_concurrency=self._max_fetch_concurrency,
@@ -647,7 +795,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             rank_job = MarketPathFeatureJob(
                 session=self._session,
                 fmp_adapter=self._fmp,
-                run_timestamp=self._run_timestamp,
+                run_timestamp=run_timestamp,
                 pattern_ids=self._pattern_ids,
                 signal_start_date=self._signal_start_date,
                 signal_end_date=self._signal_end_date,
@@ -655,6 +803,8 @@ class MarketPathBulkBackfillJob(BaseJob):
                 lookback_calendar_days=self._lookback_calendar_days,
                 feature_version=self._feature_version,
                 include_signal_session=self._include_signal_session,
+                polygon_minute_adapter=self._polygon_minute_adapter,
+                skip_existing=self._skip_existing,
                 signal_source=self._signal_source,
             )
             rank_rows_updated = rank_job._populate_cross_sectional_ranks(
@@ -722,6 +872,11 @@ class MarketPathBulkBackfillJob(BaseJob):
             "ticker_fetch_error_count": ticker_fetch_error_total,
             "request_timeout_seconds": self._request_timeout_seconds,
             "signal_source": self._signal_source,
+            "skip_existing": self._skip_existing,
+            "minute_cache_dir": str(self._minute_cache_dir) if self._minute_cache_dir else None,
+            "polygon_rate_limit_per_minute": self._polygon_rate_limit_per_minute,
+            "polygon_minute_layer_enabled": self._polygon_minute_adapter is not None,
+            "single_shard_audit_sample": self._single_shard_audit_sample,
             "max_fetch_concurrency_requested": self._max_fetch_concurrency,
             "max_fetch_concurrency_effective": 1,
             "rows_inserted": rows_inserted,
@@ -1142,6 +1297,7 @@ def _run_live(args: argparse.Namespace) -> int:
         except ConfigError as exc:
             print(f"ERROR: {exc}")
             return 1
+        polygon_minute_adapter = _build_polygon_minute_adapter(args)
 
         job = MarketPathBulkBackfillJob(
             session=get_session(),
@@ -1153,6 +1309,7 @@ def _run_live(args: argparse.Namespace) -> int:
             run_timestamp=_parse_timestamp(args.run_timestamp),
             batch_days=args.batch_days,
             include_signal_session=args.include_signal_session,
+            skip_existing=args.skip_existing,
             lookback_calendar_days=args.lookback_calendar_days,
             feature_version=args.feature_version,
             progress_artifact=artifact_path,
@@ -1161,8 +1318,13 @@ def _run_live(args: argparse.Namespace) -> int:
             request_timeout_seconds=args.request_timeout_seconds,
             max_fetch_concurrency=args.max_fetch_concurrency,
             signal_source=args.signal_source,
+            polygon_minute_adapter=polygon_minute_adapter,
+            minute_cache_dir=args.minute_cache_dir,
+            polygon_rate_limit_per_minute=args.polygon_rate_limit_per_minute,
+            single_shard_audit_sample=args.single_shard_audit_sample,
         )
         source = JOB_NAME
+    result = None
     try:
         result = run_job(
             job._session,
@@ -1175,6 +1337,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "signal_end_date": args.signal_end_date,
                 "through_date": through_date.isoformat(),
                 "include_signal_session": args.include_signal_session,
+                "skip_existing": args.skip_existing,
                 "batch_days": args.batch_days,
                 "feature_version": args.feature_version,
                 "schema": target_schema,
@@ -1184,12 +1347,86 @@ def _run_live(args: argparse.Namespace) -> int:
                 "request_timeout_seconds": args.request_timeout_seconds,
                 "max_fetch_concurrency": args.max_fetch_concurrency,
                 "signal_source": args.signal_source,
+                "minute_cache_dir": args.minute_cache_dir,
+                "polygon_rate_limit_per_minute": args.polygon_rate_limit_per_minute,
+                "single_shard_audit_sample": args.single_shard_audit_sample,
             },
         )
+        if args.single_shard_audit_sample and not args.rank_only:
+            sample = _signal_session_audit_sample(
+                job._session,
+                pattern_ids=args.pattern_id or ["M4"],
+                signal_start_date=signal_start_date,
+                signal_end_date=signal_end_date,
+                feature_version=args.feature_version,
+            )
+            result.metrics["audit_sample"] = sample
+            print("AUDIT_SAMPLE " + json.dumps(sample, sort_keys=True, default=str))
     finally:
         job._session.close()
+    assert result is not None
     print(json.dumps(result.metrics, sort_keys=True, indent=2, default=str))
     return 0 if result.ok else 1
+
+
+def _build_polygon_minute_adapter(args: argparse.Namespace) -> Any | None:
+    if args.rank_only or not args.include_signal_session or args.disable_polygon_minute_layer:
+        return None
+    try:
+        adapter: Any = PolygonAdapter(PolygonConfig.from_env())
+    except ConfigError:
+        print(
+            "WARN: POLYGON_API_KEY not configured; signal_session rows will mark "
+            "missing_intraday_bars=True"
+        )
+        return None
+    adapter = RateLimitedPolygonMinuteAdapter(
+        adapter,
+        rate_limit_per_minute=args.polygon_rate_limit_per_minute,
+    )
+    if args.minute_cache_dir:
+        adapter = CachedPolygonMinuteAdapter(adapter, args.minute_cache_dir)
+    return adapter
+
+
+def _signal_session_audit_sample(
+    session: Session,
+    *,
+    pattern_ids: Sequence[str],
+    signal_start_date: date,
+    signal_end_date: date,
+    feature_version: str,
+) -> dict[str, Any]:
+    row = (
+        session.query(MarketPathFeature)
+        .filter(
+            MarketPathFeature.pattern_id.in_(tuple(pattern_ids)),
+            MarketPathFeature.signal_date >= signal_start_date.isoformat(),
+            MarketPathFeature.signal_date <= signal_end_date.isoformat(),
+            MarketPathFeature.feature_role == "signal_session",
+            MarketPathFeature.feature_version == feature_version,
+        )
+        .order_by(MarketPathFeature.signal_date, MarketPathFeature.ticker)
+        .first()
+    )
+    if row is None:
+        return {"status": "no_signal_session_rows"}
+    payload = json.loads(row.feature_json)
+    contract = payload.get("leakage_contract", {})
+    return {
+        "status": "ok",
+        "signal_id": row.signal_id,
+        "ticker": row.ticker,
+        "signal_date": row.signal_date,
+        "feature_role": row.feature_role,
+        "feature_version": row.feature_version,
+        "predictor_input_window_end": contract.get("predictor_input_window_end"),
+        "predictor_features": contract.get("predictor_features", {}),
+        "outcome_features": contract.get("outcome_features", {}),
+        "catalyst_context_status": row.catalyst_context_status,
+        "intraday_structure_status": row.intraday_structure_status,
+        "missing_intraday_bars": row.missing_intraday_bars,
+    }
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1210,14 +1447,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="Pattern id to backfill. Repeat for multiple patterns.",
     )
-    parser.add_argument("--signal-start-date", required=True)
-    parser.add_argument("--signal-end-date", required=True)
+    parser.add_argument("--signal-start-date", "--start-date", dest="signal_start_date", required=True)
+    parser.add_argument("--signal-end-date", "--end-date", dest="signal_end_date", required=True)
     parser.add_argument("--through-date")
     parser.add_argument("--include-signal-session", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--batch-days", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--request-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--max-fetch-concurrency", type=int, default=1)
+    parser.add_argument("--minute-cache-dir")
+    parser.add_argument("--polygon-rate-limit-per-minute", type=int)
+    parser.add_argument("--disable-polygon-minute-layer", action="store_true")
+    parser.add_argument(
+        "--single-shard-audit-sample",
+        action="store_true",
+        help="Run the requested shard then print one signal_session audit sample.",
+    )
     parser.add_argument(
         "--signal-source",
         choices=SIGNAL_SOURCE_CHOICES,

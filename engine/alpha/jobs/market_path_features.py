@@ -33,11 +33,13 @@ from alpha.jobs.historical_m4_signal_selector import (
     normalize_signal_source,
 )
 from alpha.market_calendar import (
+    EASTERN_TZ,
     is_us_equity_session,
     next_us_equity_session,
     nth_us_equity_session,
     resolve_us_equity_session,
     us_equity_session_close_timestamp,
+    us_equity_session_open_timestamp,
 )
 
 
@@ -200,6 +202,75 @@ ADVANCED_CONTEXT_FIELDS = (
     "chaikin_money_flow_20d",
     "stochastic_oscillator_14d",
     "technical_indicator_status",
+)
+
+SIGNAL_SESSION_PREDICTOR_FIELDS = (
+    "sigma_20d",
+    "realized_volatility_5d",
+    "realized_volatility_10d",
+    "realized_volatility_20d",
+    "base_range_10d",
+    "base_range_20d",
+    "base_range_60d",
+    "base_max_drawdown_10d",
+    "base_max_drawdown_20d",
+    "base_max_drawdown_60d",
+    "distance_from_sma_20d",
+    "distance_from_sma_50d",
+    "distance_from_sma_200d",
+    "momentum_5d",
+    "momentum_20d",
+    "momentum_60d",
+    "prior_52w_high_touches_20d",
+    "prior_52w_high_touches_60d",
+    "prior_52w_high_touches_126d",
+    "age_of_52w_high_sessions",
+    "failed_breakout_count_20d",
+    "failed_breakout_count_60d",
+    "failed_breakout_count_126d",
+    "rsi_2",
+    "rsi_5",
+    "rsi_14",
+    "adx_14",
+    "atr_14_pct",
+    "range_expansion_vs_20d",
+    "volume_expansion_20d",
+    "volume_expansion_60d",
+    "dollar_volume",
+    "dollar_volume_expansion_20d",
+    "dollar_volume_expansion_60d",
+    "liquidity_proxy_score",
+    "relative_strength_vs_spy_5d",
+    "relative_strength_vs_spy_20d",
+    "relative_strength_vs_spy_60d",
+    "relative_strength_vs_qqq_5d",
+    "relative_strength_vs_qqq_20d",
+    "relative_strength_vs_qqq_60d",
+    "relative_strength_vs_iwm_5d",
+    "relative_strength_vs_iwm_20d",
+    "relative_strength_vs_iwm_60d",
+    "relative_strength_vs_sector_5d",
+    "relative_strength_vs_sector_20d",
+    "relative_strength_vs_sector_60d",
+    "prior_close_vs_52w_high_pct",
+)
+SIGNAL_SESSION_OUTCOME_FIELDS = (
+    "previous_close",
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume",
+    "open_to_close_return",
+    "gap_pct",
+    "breakout_extension_pct",
+    "open_vs_52w_high_pct",
+    "close_vs_52w_high_pct",
+    "high_vs_52w_high_pct",
+    "closed_above_breakout",
+    "gap_over_breakout",
+    "high_from_open_return",
+    "low_from_open_return",
 )
 
 ML_OUTPUT_HASH_FIELDS = (
@@ -369,6 +440,17 @@ class _ReferenceSeries:
 
 
 @dataclass(frozen=True)
+class _MinuteBar:
+    timestamp: datetime
+    minute_index: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass(frozen=True)
 class _SectorResolution:
     sector: str | None
     sector_etf: str | None
@@ -425,6 +507,8 @@ class MarketPathFeatureCollection:
     errors: list[dict[str, Any]] | None = None
     stage_timings: dict[str, float] | None = None
     no_op_reason: str | None = None
+    skip_existing: bool = False
+    polygon_minute_layer_enabled: bool = False
 
     @property
     def status(self) -> str:
@@ -448,6 +532,8 @@ class MarketPathFeatureCollection:
             "through_date": self.through_date.isoformat() if self.through_date else None,
             "feature_version": self.feature_version,
             "reconstruction_method": RECONSTRUCTION_METHOD,
+            "skip_existing": self.skip_existing,
+            "polygon_minute_layer_enabled": self.polygon_minute_layer_enabled,
             "signals_scanned": self.signals_scanned,
             "ticker_planned_count": self.ticker_planned_count,
             "ticker_fetch_started_count": self.ticker_fetch_started_count,
@@ -499,6 +585,8 @@ class MarketPathFeatureJob(BaseJob):
         progress_every: int = 10,
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
+        polygon_minute_adapter: Any | None = None,
+        skip_existing: bool = False,
     ) -> None:
         if progress_every < 1:
             raise ValueError("progress_every must be >= 1")
@@ -521,6 +609,8 @@ class MarketPathFeatureJob(BaseJob):
         self._progress_every = progress_every
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
+        self._polygon_minute_adapter = polygon_minute_adapter
+        self._skip_existing = skip_existing
 
     @property
     def job_name(self) -> str:
@@ -599,6 +689,8 @@ class MarketPathFeatureJob(BaseJob):
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
                 signal_source=self._signal_source,
+                skip_existing=self._skip_existing,
+                polygon_minute_layer_enabled=self._polygon_minute_adapter is not None,
                 errors=[{
                     "stage": "args",
                     "message": "signal_start_date must be on or before signal_end_date",
@@ -613,6 +705,8 @@ class MarketPathFeatureJob(BaseJob):
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
                 signal_source=self._signal_source,
+                skip_existing=self._skip_existing,
+                polygon_minute_layer_enabled=self._polygon_minute_adapter is not None,
                 errors=[{
                     "stage": "args",
                     "message": "lookback_calendar_days must be at least 70",
@@ -648,6 +742,8 @@ class MarketPathFeatureJob(BaseJob):
                 feature_version=self._feature_version,
                 pattern_ids=self._pattern_ids,
                 signal_source=self._signal_source,
+                skip_existing=self._skip_existing,
+                polygon_minute_layer_enabled=self._polygon_minute_adapter is not None,
                 pending_lineages=[],
                 pending_feature_rows=[],
                 fetch_errors=[],
@@ -863,10 +959,19 @@ class MarketPathFeatureJob(BaseJob):
             _record_timing(stage_timings, "ticker_lineage_record_seconds", started)
             lineages_recorded += 1
             started = perf_counter()
+            minute_bars_by_date = self._fetch_ticker_signal_minutes(
+                ticker,
+                signal_dates=sorted({
+                    signal.signal_timestamp.date()
+                    for signal in ticker_signals
+                    if self._include_signal_session
+                }),
+            )
             for signal in ticker_signals:
                 result = self._persist_signal_rows(
                     signal,
                     bars=bars,
+                    minute_bars_by_date=minute_bars_by_date,
                     through_date=through_date,
                     data_lineage_id=lineage.data_lineage_id,
                     job_run_id=ctx.job_run_id,
@@ -905,6 +1010,8 @@ class MarketPathFeatureJob(BaseJob):
             feature_version=self._feature_version,
             pattern_ids=self._pattern_ids,
             signal_source=self._signal_source,
+            skip_existing=self._skip_existing,
+            polygon_minute_layer_enabled=self._polygon_minute_adapter is not None,
             signals_scanned=len(signals),
             ticker_planned_count=len(by_ticker),
             ticker_fetch_started_count=ticker_fetch_started,
@@ -1010,6 +1117,34 @@ class MarketPathFeatureJob(BaseJob):
             (row.signal_id, row.feature_session_date): row
             for row in rows
         }
+
+    def _fetch_ticker_signal_minutes(
+        self,
+        ticker: str,
+        *,
+        signal_dates: Sequence[date],
+    ) -> dict[date, tuple[_MinuteBar, ...]]:
+        if self._polygon_minute_adapter is None or not signal_dates:
+            return {}
+        out: dict[date, tuple[_MinuteBar, ...]] = {}
+        for trading_date in signal_dates:
+            try:
+                resp = self._polygon_minute_adapter.get_minute_aggs(
+                    ticker,
+                    from_date=trading_date.isoformat(),
+                    to_date=trading_date.isoformat(),
+                    adjusted=True,
+                )
+            except Exception:
+                out[trading_date] = ()
+                continue
+            if not getattr(resp, "ok", False) or getattr(resp, "data", None) is None:
+                out[trading_date] = ()
+                continue
+            out[trading_date] = tuple(
+                _clean_minute_bars(trading_date, getattr(resp, "data") or ())
+            )
+        return out
 
     def _fetch_reference_series(
         self,
@@ -1120,6 +1255,7 @@ class MarketPathFeatureJob(BaseJob):
         signal: SignalRegistry,
         *,
         bars: Sequence[_CleanBar],
+        minute_bars_by_date: dict[date, tuple[_MinuteBar, ...]] | None = None,
         through_date: date,
         data_lineage_id: str,
         job_run_id: str,
@@ -1172,6 +1308,11 @@ class MarketPathFeatureJob(BaseJob):
                 signal,
                 bar=bar,
                 bars=bars,
+                minute_bars=(
+                    (minute_bars_by_date or {}).get(bar.date, ())
+                    if role == "signal_session"
+                    else ()
+                ),
                 entry_date=entry_date,
                 entry_price=entry_price,
                 path_sequence=max(path_sequence, 0),
@@ -1187,6 +1328,9 @@ class MarketPathFeatureJob(BaseJob):
             started = perf_counter()
             key = (signal.signal_id, bar.date.isoformat())
             row = existing.get(key)
+            if row is not None and self._skip_existing:
+                unchanged += 1
+                continue
             if row is None:
                 inserted += 1
             else:
@@ -1217,6 +1361,7 @@ class MarketPathFeatureJob(BaseJob):
         *,
         bar: _CleanBar,
         bars: Sequence[_CleanBar],
+        minute_bars: Sequence[_MinuteBar] = (),
         entry_date: date | None,
         entry_price: float | None,
         path_sequence: int,
@@ -1228,13 +1373,19 @@ class MarketPathFeatureJob(BaseJob):
         same_day_pattern_strengths: SameDayPatternStrengthCache,
     ) -> dict[str, Any]:
         signal_date = signal.signal_timestamp.date()
+        is_signal_session = feature_role == "signal_session" and bar.date == signal_date
         previous = _previous_bar(bars, bar.date)
         prior = [candidate for candidate in bars if candidate.date < bar.date]
         row_input_bars = [candidate for candidate in bars if candidate.date <= bar.date]
+        predictor_input_bars = list(prior) if is_signal_session else row_input_bars
         prior20 = prior[-20:]
         prior60 = prior[-60:]
         close_basis = _price_basis(bar)
         prev_close = _price_basis(previous) if previous is not None else None
+        volume_basis_bar = previous if is_signal_session and previous is not None else bar
+        liquidity_price_basis = (
+            _price_basis(volume_basis_bar) if volume_basis_bar is not None else close_basis
+        )
         median_volume_20d = _median([b.volume for b in prior20])
         median_volume_60d = _median([b.volume for b in prior60])
         median_dollar_volume_20d = _median([b.dollar_volume for b in prior20])
@@ -1252,12 +1403,13 @@ class MarketPathFeatureJob(BaseJob):
         liquidity_passed = (
             median_dollar_volume_20d is not None
             and median_dollar_volume_20d >= self._liquidity_min_dollar_volume_20d
-            and close_basis >= self._liquidity_min_price
+            and liquidity_price_basis >= self._liquidity_min_price
         )
         rich_features, rich_status = _rich_eod_features(
             bar=bar,
             previous=previous,
             prior=prior,
+            asof_prior_close=is_signal_session,
         )
         relative_features, relative_status, relative_input_payload = (
             _relative_features(
@@ -1277,11 +1429,36 @@ class MarketPathFeatureJob(BaseJob):
             signal=signal,
             feature_date=bar.date,
             bar=bar,
+            minute_bars=minute_bars,
+            minute_layer_enabled=(
+                is_signal_session and self._polygon_minute_adapter is not None
+            ),
             prior=prior,
             benchmark_series=benchmark_series,
             entry_price=entry_price,
             same_day_pattern_strengths=same_day_pattern_strengths,
         )
+        top_level_predictor_features = {
+            "sigma_20d": sigma_20d,
+            "dollar_volume": volume_basis_bar.dollar_volume,
+            "volume_expansion_20d": _safe_ratio(
+                volume_basis_bar.volume,
+                median_volume_20d,
+            ),
+            "volume_expansion_60d": _safe_ratio(
+                volume_basis_bar.volume,
+                median_volume_60d,
+            ),
+            "dollar_volume_expansion_20d": _safe_ratio(
+                volume_basis_bar.dollar_volume,
+                median_dollar_volume_20d,
+            ),
+            "dollar_volume_expansion_60d": _safe_ratio(
+                volume_basis_bar.dollar_volume,
+                median_dollar_volume_60d,
+            ),
+            "liquidity_proxy_score": 1.0 if liquidity_passed else 0.0,
+        }
         relative_input_hash = stable_hash(relative_input_payload)
         row_input_payload = {
             "signal_id": signal.signal_id,
@@ -1294,6 +1471,10 @@ class MarketPathFeatureJob(BaseJob):
             "bars_through_feature_session": [
                 _bar_payload(candidate) for candidate in row_input_bars
             ],
+            "predictor_bars_through": (
+                predictor_input_bars[-1].date.isoformat()
+                if predictor_input_bars else None
+            ),
             "relative_input_hash": relative_input_hash,
             "relative_inputs": relative_input_payload,
         }
@@ -1308,6 +1489,10 @@ class MarketPathFeatureJob(BaseJob):
                 row_input_bars[0].date.isoformat() if row_input_bars else None
             ),
             "row_input_window_end": bar.date.isoformat(),
+            "predictor_input_window_end": (
+                predictor_input_bars[-1].date.isoformat()
+                if predictor_input_bars else None
+            ),
             "row_input_hash": row_input_hash,
             "row_input_hash_schema": "bars_through_feature_session_v1",
             "batch_lineage_contains_future_rows_for_earlier_feature_dates": (
@@ -1359,6 +1544,48 @@ class MarketPathFeatureJob(BaseJob):
             "relative_feature_status": relative_status,
             "relative_input_hash": relative_input_hash,
         }
+        if is_signal_session:
+            feature_json["leakage_contract"] = _signal_session_leakage_contract(
+                predictor_features={
+                    **top_level_predictor_features,
+                    **{
+                        key: rich_features.get(key)
+                        for key in SIGNAL_SESSION_PREDICTOR_FIELDS
+                        if key in rich_features
+                    },
+                    **{
+                        key: relative_features.get(key)
+                        for key in SIGNAL_SESSION_PREDICTOR_FIELDS
+                        if key in relative_features
+                    },
+                    **{
+                        key: advanced_features.get(key)
+                        for key in SIGNAL_SESSION_PREDICTOR_FIELDS
+                        if key in advanced_features
+                    },
+                },
+                outcome_features={
+                    "previous_close": prev_close,
+                    "open_price": bar.open,
+                    "high_price": bar.high,
+                    "low_price": bar.low,
+                    "close_price": bar.close,
+                    "volume": bar.volume,
+                    "open_to_close_return": _safe_return(bar.close, bar.open),
+                    "gap_pct": _safe_return(bar.open, prev_close),
+                    "breakout_extension_pct": rich_features["breakout_extension_pct"],
+                    "open_vs_52w_high_pct": rich_features["open_vs_52w_high_pct"],
+                    "close_vs_52w_high_pct": rich_features["close_vs_52w_high_pct"],
+                    "high_vs_52w_high_pct": rich_features["high_vs_52w_high_pct"],
+                    "closed_above_breakout": rich_features["closed_above_breakout"],
+                    "gap_over_breakout": rich_features["gap_over_breakout"],
+                    "high_from_open_return": _safe_return(bar.high, bar.open),
+                    "low_from_open_return": _safe_return(bar.low, bar.open),
+                },
+                predictor_input_end=(
+                    predictor_input_bars[-1].date if predictor_input_bars else None
+                ),
+            )
         feature_json_text = json.dumps(feature_json, sort_keys=True)
         input_payload = {
             "signal_id": signal.signal_id,
@@ -1391,15 +1618,15 @@ class MarketPathFeatureJob(BaseJob):
             "volume": bar.volume,
             "split_adjusted_close": bar.split_adjusted_close,
             "adj_close": bar.adj_close,
-            "dollar_volume": bar.dollar_volume,
+            "dollar_volume": volume_basis_bar.dollar_volume,
             "median_volume_20d": median_volume_20d,
             "median_volume_60d": median_volume_60d,
             "median_dollar_volume_20d": median_dollar_volume_20d,
             "median_dollar_volume_60d": median_dollar_volume_60d,
-            "volume_expansion_20d": _safe_ratio(bar.volume, median_volume_20d),
-            "volume_expansion_60d": _safe_ratio(bar.volume, median_volume_60d),
-            "dollar_volume_expansion_20d": _safe_ratio(bar.dollar_volume, median_dollar_volume_20d),
-            "dollar_volume_expansion_60d": _safe_ratio(bar.dollar_volume, median_dollar_volume_60d),
+            "volume_expansion_20d": _safe_ratio(volume_basis_bar.volume, median_volume_20d),
+            "volume_expansion_60d": _safe_ratio(volume_basis_bar.volume, median_volume_60d),
+            "dollar_volume_expansion_20d": _safe_ratio(volume_basis_bar.dollar_volume, median_dollar_volume_20d),
+            "dollar_volume_expansion_60d": _safe_ratio(volume_basis_bar.dollar_volume, median_dollar_volume_60d),
             "gap_pct": _safe_return(bar.open, prev_close),
             "open_to_close_return": _safe_return(bar.close, bar.open),
             "high_from_open_return": _safe_return(bar.high, bar.open),
@@ -1412,7 +1639,10 @@ class MarketPathFeatureJob(BaseJob):
             "effective_hard_stop_pct": effective_stop,
             "liquidity_proxy_score": 1.0 if liquidity_passed else 0.0,
             "liquidity_proxy_passed": liquidity_passed,
-            **rich_features,
+            **{
+                key: value for key, value in rich_features.items()
+                if key != "prior_close_vs_52w_high_pct"
+            },
             **relative_features,
             **advanced_features,
             **_empty_cross_sectional_features(),
@@ -2143,6 +2373,54 @@ def _clean_bars(
     return sorted(clean, key=lambda item: item.date)
 
 
+def _clean_minute_bars(
+    trading_date: date,
+    bars: Sequence[Any],
+) -> list[_MinuteBar]:
+    market_open = us_equity_session_open_timestamp(trading_date).astimezone(EASTERN_TZ)
+    market_close = us_equity_session_close_timestamp(trading_date).astimezone(EASTERN_TZ)
+    clean: list[_MinuteBar] = []
+    for bar in bars:
+        raw_ts = getattr(bar, "timestamp", None)
+        if raw_ts is None:
+            continue
+        ts = (
+            datetime.fromtimestamp(float(raw_ts) / 1000.0, timezone.utc)
+            if isinstance(raw_ts, (int, float))
+            else _ensure_aware(raw_ts)
+        )
+        ts_et = ts.astimezone(EASTERN_TZ)
+        if ts_et.date() != trading_date or ts_et < market_open or ts_et > market_close:
+            continue
+        values = (
+            getattr(bar, "open", None),
+            getattr(bar, "high", None),
+            getattr(bar, "low", None),
+            getattr(bar, "close", None),
+        )
+        if any(
+            value is None or not math.isfinite(float(value)) or float(value) <= 0
+            for value in values
+        ):
+            continue
+        volume = getattr(bar, "volume", 0) or 0
+        if not math.isfinite(float(volume)) or float(volume) < 0:
+            continue
+        minute_index = int((ts_et - market_open).total_seconds() // 60)
+        clean.append(
+            _MinuteBar(
+                timestamp=ts,
+                minute_index=minute_index,
+                open=float(getattr(bar, "open")),
+                high=float(getattr(bar, "high")),
+                low=float(getattr(bar, "low")),
+                close=float(getattr(bar, "close")),
+                volume=float(volume),
+            )
+        )
+    return sorted(clean, key=lambda row: row.timestamp)
+
+
 def _bar_payload(bar: _CleanBar) -> dict[str, Any]:
     return {
         "date": bar.date.isoformat(),
@@ -2184,6 +2462,30 @@ def _bar_lineage_payload(
     if source_role is not None:
         payload["source_role"] = source_role
     return payload
+
+
+def _signal_session_leakage_contract(
+    *,
+    predictor_features: dict[str, Any],
+    outcome_features: dict[str, Any],
+    predictor_input_end: date | None,
+) -> dict[str, Any]:
+    return {
+        "asof_rule": "predictors_prior_close_or_day0_open_only",
+        "predictor_input_window_end": (
+            predictor_input_end.isoformat() if predictor_input_end is not None else None
+        ),
+        "predictor_features": predictor_features,
+        "predictor_field_names": sorted(predictor_features),
+        "outcome_features": outcome_features,
+        "outcome_field_names": list(SIGNAL_SESSION_OUTCOME_FIELDS),
+        "forbidden_predictor_inputs": [
+            "day0_close",
+            "day0_high",
+            "day0_low",
+            "forward_bars_after_open",
+        ],
+    }
 
 
 def _lineage_quality_flags(resp: Any, **flags: Any) -> dict[str, Any]:
@@ -2348,6 +2650,8 @@ def _advanced_context_features(
     signal: SignalRegistry,
     feature_date: date,
     bar: _CleanBar,
+    minute_bars: Sequence[_MinuteBar] = (),
+    minute_layer_enabled: bool = False,
     prior: Sequence[_CleanBar],
     benchmark_series: dict[str, _ReferenceSeries],
     entry_price: float | None,
@@ -2357,9 +2661,16 @@ def _advanced_context_features(
         feature_date=feature_date,
         benchmark_series=benchmark_series,
     )
-    intraday_features, intraday_status = _intraday_unavailable_features()
+    intraday_features, intraday_status = _intraday_features_from_minutes(
+        minute_bars,
+        minute_layer_enabled=minute_layer_enabled,
+        breakout_level=(
+            max(candidate.high for candidate in prior[-PRIOR_52W_SESSION_COUNT:])
+            if len(prior) >= PRIOR_52W_SESSION_COUNT else None
+        ),
+    )
     execution_features, execution_status = _execution_quality_unavailable_features()
-    supply_features, supply_status = _supply_squeeze_unavailable_features()
+    supply_features, supply_status = _supply_squeeze_features(signal)
     catalyst_features, catalyst_status = _catalyst_context_features(
         signal=signal,
         feature_date=feature_date,
@@ -2447,7 +2758,10 @@ def _market_regime_features(
     return features, status
 
 
-def _intraday_unavailable_features() -> tuple[dict[str, Any], dict[str, Any]]:
+def _intraday_unavailable_features(
+    *,
+    status_text: str = "intraday_adapter_unavailable",
+) -> tuple[dict[str, Any], dict[str, Any]]:
     features = {
         "opening_range_high_5m": None,
         "opening_range_low_5m": None,
@@ -2476,13 +2790,79 @@ def _intraday_unavailable_features() -> tuple[dict[str, Any], dict[str, Any]]:
         "intraday_mfe_timestamp": None,
         "intraday_mae_timestamp": None,
         "t1_before_stop": None,
-        "intraday_structure_status": "intraday_adapter_unavailable",
+        "intraday_structure_status": status_text,
         "missing_intraday_bars": True,
     }
     status = {
-        "status": "intraday_adapter_unavailable",
+        "status": status_text,
         "missing_intraday_bars": True,
         "values_null_by_design": True,
+    }
+    return features, status
+
+
+def _intraday_features_from_minutes(
+    minute_bars: Sequence[_MinuteBar],
+    *,
+    minute_layer_enabled: bool,
+    breakout_level: float | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not minute_bars:
+        status_text = (
+            "minute_bars_missing"
+            if minute_layer_enabled
+            else "intraday_adapter_unavailable"
+        )
+        return _intraday_unavailable_features(status_text=status_text)
+    ordered = sorted(minute_bars, key=lambda row: row.minute_index)
+    day_open = ordered[0].open
+    day_close = ordered[-1].close
+    total_volume = sum(row.volume for row in ordered)
+
+    def window(minutes: int) -> list[_MinuteBar]:
+        return [row for row in ordered if row.minute_index < minutes]
+
+    features, _status = _intraday_unavailable_features(status_text="available")
+    for minutes in (5, 15, 30, 60):
+        rows = window(minutes)
+        high = max((row.high for row in rows), default=None)
+        low = min((row.low for row in rows), default=None)
+        close = rows[-1].close if rows else None
+        volume = sum(row.volume for row in rows)
+        features[f"opening_range_high_{minutes}m"] = high
+        features[f"opening_range_low_{minutes}m"] = low
+        features[f"first_{minutes}m_return"] = _safe_return(close, day_open)
+        features[f"intraday_volume_{minutes}m"] = volume if rows else None
+        features[f"pct_expected_volume_{minutes}m"] = (
+            volume / total_volume if rows and total_volume > 0 else None
+        )
+    vwap_denom = sum(row.volume for row in ordered)
+    intraday_vwap = (
+        sum(((row.high + row.low + row.close) / 3.0) * row.volume for row in ordered)
+        / vwap_denom
+        if vwap_denom > 0 else None
+    )
+    features["intraday_vwap"] = intraday_vwap
+    features["open_vs_intraday_vwap_pct"] = _safe_return(day_open, intraday_vwap)
+    features["close_vs_intraday_vwap_pct"] = _safe_return(day_close, intraday_vwap)
+    after_first_hour = [row for row in ordered if row.minute_index >= 60]
+    features["held_above_breakout_after_first_hour"] = (
+        None
+        if breakout_level is None or not after_first_hour
+        else all(row.low >= breakout_level for row in after_first_hour)
+    )
+    mfe_bar = max(ordered, key=lambda row: row.high)
+    mae_bar = min(ordered, key=lambda row: row.low)
+    features["intraday_mfe_timestamp"] = mfe_bar.timestamp
+    features["intraday_mae_timestamp"] = mae_bar.timestamp
+    features["intraday_structure_status"] = "available"
+    features["missing_intraday_bars"] = False
+    status = {
+        "status": "available",
+        "missing_intraday_bars": False,
+        "minute_bar_count": len(ordered),
+        "first_minute": ordered[0].timestamp.isoformat(),
+        "last_minute": ordered[-1].timestamp.isoformat(),
     }
     return features, status
 
@@ -2515,7 +2895,84 @@ def _execution_quality_unavailable_features() -> tuple[dict[str, Any], dict[str,
     return features, status
 
 
-def _supply_squeeze_unavailable_features() -> tuple[dict[str, Any], dict[str, Any]]:
+def _supply_squeeze_features(signal: SignalRegistry | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _signal_feature_payload(signal) if signal is not None else {}
+    context = payload.get("signal_context") if isinstance(payload.get("signal_context"), dict) else {}
+    profile = context.get("fmp_profile") if isinstance(context.get("fmp_profile"), dict) else {}
+    short_interest = (
+        context.get("polygon_short_interest")
+        if isinstance(context.get("polygon_short_interest"), dict)
+        else {}
+    )
+    short_volume = (
+        context.get("polygon_short_volume")
+        if isinstance(context.get("polygon_short_volume"), dict)
+        else {}
+    )
+    float_shares = _optional_float(profile.get("float_shares") or profile.get("float"))
+    shares_outstanding = _optional_float(profile.get("shares_outstanding"))
+    short_interest_latest = (
+        short_interest.get("latest")
+        if isinstance(short_interest.get("latest"), dict)
+        else {}
+    )
+    short_volume_latest = (
+        short_volume.get("latest")
+        if isinstance(short_volume.get("latest"), dict)
+        else {}
+    )
+    short_interest_shares = _optional_float(
+        short_interest.get("short_interest")
+        if short_interest.get("short_interest") is not None
+        else short_interest_latest.get("short_interest")
+    )
+    short_interest_days_to_cover = _optional_float(
+        short_interest.get("days_to_cover")
+        if short_interest.get("days_to_cover") is not None
+        else short_interest_latest.get("days_to_cover")
+    )
+    short_volume_ratio = _optional_float(
+        short_volume.get("short_volume_ratio")
+        if short_volume.get("short_volume_ratio") is not None
+        else short_volume_latest.get("short_volume_ratio")
+    )
+    short_interest_pct_float = (
+        short_interest_shares / float_shares
+        if short_interest_shares is not None and float_shares not in (None, 0)
+        else None
+    )
+    if any(
+        value is not None
+        for value in (
+            float_shares,
+            shares_outstanding,
+            short_interest_shares,
+            short_interest_days_to_cover,
+            short_volume_ratio,
+        )
+    ):
+        features = {
+            "float_shares": float_shares,
+            "shares_outstanding": shares_outstanding,
+            "turnover_float": None,
+            "dollar_turnover_float": None,
+            "short_volume_ratio": short_volume_ratio,
+            "short_interest_pct_float": short_interest_pct_float,
+            "short_interest_shares": short_interest_shares,
+            "short_interest_days_to_cover": short_interest_days_to_cover,
+            "proxy_days_to_cover": short_interest_days_to_cover,
+            "borrow_fee_rate": None,
+            "float_source_status": "snapshot_context_available" if float_shares is not None else "pit_float_source_unavailable",
+            "short_source_status": "snapshot_context_available",
+            "borrow_fee_status": "not_available_historical",
+            "supply_squeeze_status": "snapshot_context_available_borrow_unavailable",
+        }
+        return features, {
+            "status": features["supply_squeeze_status"],
+            "float_source_status": features["float_source_status"],
+            "short_source_status": features["short_source_status"],
+            "borrow_fee_status": features["borrow_fee_status"],
+        }
     features = {
         "float_shares": None,
         "shares_outstanding": None,
@@ -2529,7 +2986,7 @@ def _supply_squeeze_unavailable_features() -> tuple[dict[str, Any], dict[str, An
         "borrow_fee_rate": None,
         "float_source_status": "pit_float_source_unavailable",
         "short_source_status": "short_interest_source_unavailable",
-        "borrow_fee_status": "borrow_fee_source_unavailable",
+        "borrow_fee_status": "not_available_historical",
         "supply_squeeze_status": "pit_safe_sources_unavailable",
     }
     status = {
@@ -2539,6 +2996,16 @@ def _supply_squeeze_unavailable_features() -> tuple[dict[str, Any], dict[str, An
         "borrow_fee_status": features["borrow_fee_status"],
     }
     return features, status
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _catalyst_context_features(
@@ -2559,6 +3026,7 @@ def _catalyst_context_features(
             pattern_strength.items(),
             key=lambda item: (-item[1], item[0]),
         )[0][0]
+    snapshot_catalyst = _snapshot_catalyst_features(signal, feature_date)
     features = {
         "news_count_1d": None,
         "news_count_5d": None,
@@ -2582,14 +3050,139 @@ def _catalyst_context_features(
         "catalyst_context_status": "signal_registry_context_available_external_sources_missing",
         "missing_catalyst_source": True,
     }
+    if snapshot_catalyst is not None:
+        features.update(snapshot_catalyst["features"])
     status = {
         "status": features["catalyst_context_status"],
         "signal_registry_context_available": True,
-        "external_catalyst_sources_available": False,
+        "external_catalyst_sources_available": snapshot_catalyst is not None,
         "patterns_present": sorted(pattern_strength),
-        "missing_catalyst_source": True,
+        "missing_catalyst_source": features["missing_catalyst_source"],
     }
+    if snapshot_catalyst is not None:
+        status.update(snapshot_catalyst["status"])
     return features, status
+
+
+def _snapshot_catalyst_features(
+    signal: SignalRegistry,
+    feature_date: date,
+) -> dict[str, Any] | None:
+    payload = _signal_feature_payload(signal)
+    source_events = payload.get("day0_catalyst_events")
+    if source_events is None:
+        source_events = (
+            payload.get("signal_context", {}).get("day0_catalyst_events")
+            if isinstance(payload.get("signal_context"), dict)
+            else None
+        )
+    if not isinstance(source_events, list):
+        return None
+    cutoff = us_equity_session_open_timestamp(feature_date)
+    eligible: list[dict[str, Any]] = []
+    excluded_after_open = 0
+    for event in source_events:
+        if not isinstance(event, dict):
+            continue
+        event_ts = _parse_event_timestamp(
+            event.get("timestamp")
+            or event.get("published_at")
+            or event.get("accepted_at")
+            or event.get("updated")
+        )
+        if event_ts is None:
+            continue
+        if event_ts > cutoff:
+            excluded_after_open += 1
+            continue
+        eligible.append({**event, "_timestamp": event_ts})
+
+    def news_count(days: int) -> int:
+        start = cutoff - timedelta(days=days)
+        return sum(
+            1
+            for event in eligible
+            if str(event.get("type", "news")).lower() == "news"
+            and event["_timestamp"] >= start
+        )
+
+    flags = sorted({
+        str(event.get("flag") or event.get("category") or event.get("form") or "").lower()
+        for event in eligible
+        if event.get("flag") or event.get("category") or event.get("form")
+    })
+    earnings_dates = [
+        _parse_date_or_none(event.get("earnings_date")) or event["_timestamp"].date()
+        for event in eligible
+        if str(event.get("type", "")).lower() == "earnings"
+    ]
+    future_earnings = [item for item in earnings_dates if item >= feature_date]
+    past_earnings = [item for item in earnings_dates if item <= feature_date]
+    features = {
+        "news_count_1d": news_count(1),
+        "news_count_5d": news_count(5),
+        "news_count_20d": news_count(20),
+        "news_catalyst_flags_json": json.dumps(flags, sort_keys=True),
+        "earnings_days_to_next": (
+            min((item - feature_date).days for item in future_earnings)
+            if future_earnings else None
+        ),
+        "earnings_days_since_last": (
+            min((feature_date - item).days for item in past_earnings)
+            if past_earnings else None
+        ),
+        "offering_flag": any("offering" in flag for flag in flags),
+        "atm_flag": any(flag == "atm" or "atm" in flag for flag in flags),
+        "shelf_registration_flag": any("shelf" in flag or flag == "s-3" for flag in flags),
+        "fda_clinical_flag": any("fda" in flag or "clinical" in flag for flag in flags),
+        "corporate_action_flag": any("corporate" in flag for flag in flags),
+        "catalyst_context_status": "snapshot_catalyst_events_pit_filtered",
+        "missing_catalyst_source": False,
+    }
+    status = {
+        "snapshot_event_count": len(source_events),
+        "eligible_event_count": len(eligible),
+        "excluded_after_day0_open_count": excluded_after_open,
+        "pit_cutoff": cutoff.isoformat(),
+    }
+    return {"features": features, "status": status}
+
+
+def _signal_feature_payload(signal: SignalRegistry) -> dict[str, Any]:
+    feature = getattr(signal, "feature_snapshot", None)
+    if feature is None or not getattr(feature, "feature_json", None):
+        return {}
+    try:
+        parsed = json.loads(feature.feature_json)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_event_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        try:
+            return _ensure_aware(value)
+        except ValueError:
+            return value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_date_or_none(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _same_day_pattern_strengths_from_cache(
@@ -2792,7 +3385,10 @@ def _rich_eod_features(
     bar: _CleanBar,
     previous: _CleanBar | None,
     prior: Sequence[_CleanBar],
+    asof_prior_close: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    predictor_bar = previous if asof_prior_close and previous is not None else bar
+    predictor_history = list(prior)
     prior20 = prior[-20:]
     prior60 = prior[-60:]
     prior126 = prior[-126:]
@@ -2803,14 +3399,21 @@ def _rich_eod_features(
     )
     prior_close = _price_basis(previous) if previous is not None else None
     current_range = bar.high - bar.low
+    predictor_range = predictor_bar.high - predictor_bar.low
     prior_ranges_20 = [candidate.high - candidate.low for candidate in prior20]
     vwap = bar.vwap if bar.vwap is not None and bar.vwap > 0 else None
+    predictor_vwap = (
+        predictor_bar.vwap
+        if predictor_bar.vwap is not None and predictor_bar.vwap > 0
+        else None
+    )
     rich = {
         "prior_52w_high": prior_52w_high,
         "breakout_extension_pct": _safe_return(bar.close, prior_52w_high),
         "open_vs_52w_high_pct": _safe_return(bar.open, prior_52w_high),
         "close_vs_52w_high_pct": _safe_return(bar.close, prior_52w_high),
         "high_vs_52w_high_pct": _safe_return(bar.high, prior_52w_high),
+        "prior_close_vs_52w_high_pct": _safe_return(prior_close, prior_52w_high),
         "gap_over_breakout": (
             bar.open > prior_52w_high if prior_52w_high is not None else None
         ),
@@ -2833,22 +3436,22 @@ def _rich_eod_features(
         # feature date, not the feature-date range.
         "atr_14_pct": _atr_14_pct(prior),
         "range_expansion_vs_20d": _safe_ratio(
-            current_range if current_range > 0 else None,
+            predictor_range if predictor_range > 0 else None,
             _median(prior_ranges_20),
         ),
-        "volume_zscore_20d": _zscore(bar.volume, [candidate.volume for candidate in prior20]),
-        "volume_zscore_60d": _zscore(bar.volume, [candidate.volume for candidate in prior60]),
+        "volume_zscore_20d": _zscore(predictor_bar.volume, [candidate.volume for candidate in prior20]),
+        "volume_zscore_60d": _zscore(predictor_bar.volume, [candidate.volume for candidate in prior60]),
         "dollar_volume_zscore_20d": _zscore(
-            bar.dollar_volume, [candidate.dollar_volume for candidate in prior20]
+            predictor_bar.dollar_volume, [candidate.dollar_volume for candidate in prior20]
         ),
         "dollar_volume_zscore_60d": _zscore(
-            bar.dollar_volume, [candidate.dollar_volume for candidate in prior60]
+            predictor_bar.dollar_volume, [candidate.dollar_volume for candidate in prior60]
         ),
         "volume_acceleration_1d_vs_5d": _safe_return(
-            bar.volume, _mean([candidate.volume for candidate in prior[-5:]])
+            predictor_bar.volume, _mean([candidate.volume for candidate in prior[-5:]])
         ),
         "volume_acceleration_1d_vs_20d": _safe_return(
-            bar.volume, _mean([candidate.volume for candidate in prior20])
+            predictor_bar.volume, _mean([candidate.volume for candidate in prior20])
         ),
         "realized_volatility_5d": _realized_volatility(prior, 5),
         "realized_volatility_10d": _realized_volatility(prior, 10),
@@ -2859,9 +3462,9 @@ def _rich_eod_features(
         "base_max_drawdown_10d": _base_max_drawdown(prior, 10),
         "base_max_drawdown_20d": _base_max_drawdown(prior, 20),
         "base_max_drawdown_60d": _base_max_drawdown(prior, 60),
-        "distance_from_sma_20d": _sma_distance(bar, prior, 20),
-        "distance_from_sma_50d": _sma_distance(bar, prior, 50),
-        "distance_from_sma_200d": _sma_distance(bar, prior, 200),
+        "distance_from_sma_20d": _sma_distance(predictor_bar, predictor_history, 20),
+        "distance_from_sma_50d": _sma_distance(predictor_bar, predictor_history, 50),
+        "distance_from_sma_200d": _sma_distance(predictor_bar, predictor_history, 200),
         "momentum_5d": _momentum(prior, 5),
         "momentum_20d": _momentum(prior, 20),
         "momentum_60d": _momentum(prior, 60),
@@ -2872,14 +3475,15 @@ def _rich_eod_features(
         "failed_breakout_count_20d": _failed_breakout_count(prior, 20),
         "failed_breakout_count_60d": _failed_breakout_count(prior, 60),
         "failed_breakout_count_126d": _failed_breakout_count(prior, 126),
-        "vwap": vwap,
-        "open_vs_vwap_pct": _safe_return(bar.open, vwap),
-        "high_vs_vwap_pct": _safe_return(bar.high, vwap),
-        "low_vs_vwap_pct": _safe_return(bar.low, vwap),
-        "close_vs_vwap_pct": _safe_return(bar.close, vwap),
+        "vwap": predictor_vwap,
+        "open_vs_vwap_pct": _safe_return(predictor_bar.open, predictor_vwap),
+        "high_vs_vwap_pct": _safe_return(predictor_bar.high, predictor_vwap),
+        "low_vs_vwap_pct": _safe_return(predictor_bar.low, predictor_vwap),
+        "close_vs_vwap_pct": _safe_return(predictor_bar.close, predictor_vwap),
     }
     status = {
         "prior_only_trailing_features": True,
+        "asof_prior_close": asof_prior_close,
         "atr_basis": "prior_14_completed_sessions",
         "touch_tolerance_pct": TOUCH_TOLERANCE_PCT,
         "prior_bar_count": len(prior),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -72,6 +73,30 @@ class FakePolygon:
         trading_date = date.fromisoformat(from_date)
         self.calls[(ticker.upper(), trading_date)] += 1
         bars = self.bars_by_ticker_date[(ticker.upper(), trading_date)]
+        return AdapterResponse(data=bars, lineage=_lineage("Polygon", ticker, bars))
+
+
+class SleepyPolygon(FakePolygon):
+    def __init__(
+        self,
+        bars_by_ticker_date: dict[tuple[str, date], list[PolygonBar]],
+        *,
+        delays: dict[tuple[str, date], float],
+    ) -> None:
+        super().__init__(bars_by_ticker_date)
+        self.delays = {
+            (ticker.upper(), trading_date): delay
+            for (ticker, trading_date), delay in delays.items()
+        }
+
+    def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
+        trading_date = date.fromisoformat(from_date)
+        key = (ticker.upper(), trading_date)
+        self.calls[key] += 1
+        delay = self.delays.get(key, 0)
+        if delay > 0:
+            time_module.sleep(delay)
+        bars = self.bars_by_ticker_date[key]
         return AdapterResponse(data=bars, lineage=_lineage("Polygon", ticker, bars))
 
 
@@ -296,6 +321,7 @@ def _run_i11(
     skip_existing=False,
     max_db_retries=3,
     db_retry_backoff_seconds=5.0,
+    fetch_deadline_seconds=120.0,
     catalyst_tags_by_ticker_date=None,
     at_open=False,
 ):
@@ -315,6 +341,7 @@ def _run_i11(
         skip_existing=skip_existing,
         max_db_retries=max_db_retries,
         db_retry_backoff_seconds=db_retry_backoff_seconds,
+        fetch_deadline_seconds=fetch_deadline_seconds,
         catalyst_tags_by_ticker_date=catalyst_tags_by_ticker_date,
         at_open=at_open,
     )
@@ -466,6 +493,37 @@ def test_i11_corpus_uses_disk_cached_polygon_minutes(db_session, tmp_path):
     assert second.metrics["minute_cache_hits"] == 1
     assert second.metrics["minute_cache_misses"] == 0
     assert second_polygon.calls == Counter()
+
+
+def test_i11_minute_fetch_watchdog_quarantines_and_surfaces_error(db_session):
+    polygon = SleepyPolygon(
+        {("TEST", DAY): _minute_bars_confirmed()},
+        delays={("TEST", DAY): 0.8},
+    )
+
+    started = time_module.monotonic()
+    result, _polygon = _run_i11(
+        db_session,
+        polygon=polygon,
+        fetch_deadline_seconds=0.05,
+    )
+    elapsed = time_module.monotonic() - started
+
+    assert elapsed < 0.6
+    assert result.status == "finished"
+    assert result.metrics["candidates"] == 1
+    assert result.metrics["watchdog_timeouts"] == 1
+    assert result.metrics["fetch_errors"] == 1
+    assert result.metrics["quarantined"] == 1
+    assert result.errors == [{
+        "ticker": "TEST",
+        "trading_date": DAY.isoformat(),
+        "error": "minute_fetch_watchdog_timeout",
+        "deadline_seconds": 0.05,
+    }]
+    assert polygon.calls[("TEST", DAY)] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
 
 
 def test_i11_corpus_skip_existing_avoids_refetching_processed_ticker_day(db_session):
@@ -938,6 +996,8 @@ def test_i11_runner_skip_existing_and_retry_args():
         "5",
         "--db-retry-backoff-seconds",
         "0.25",
+        "--fetch-deadline-seconds",
+        "9.5",
     ])
 
     assert args.polygon_cache_dir == "/var/tmp/i11_polygon_cache"
@@ -945,6 +1005,7 @@ def test_i11_runner_skip_existing_and_retry_args():
     assert args.at_open is True
     assert args.max_db_retries == 5
     assert args.db_retry_backoff_seconds == 0.25
+    assert args.fetch_deadline_seconds == 9.5
 
 
 def test_i11_and_i12_required_tables_are_output_only():

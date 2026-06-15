@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -23,6 +24,7 @@ from alpha.db.models import (
 )
 from alpha.jobs.i12_historical_corpus import (
     CANDIDATE_SCREEN_STAMP,
+    DEFAULT_FETCH_DEADLINE_SECONDS,
     I12HistoricalCorpusJob,
     OUTCOME_CONFIRMED,
     OUTCOME_NEVER_CONFIRMED,
@@ -71,6 +73,35 @@ class FakePolygon:
         return AdapterResponse(data=bars, lineage=_lineage("Polygon", ticker, bars))
 
 
+class InstrumentedPolygon(FakePolygon):
+    def __init__(
+        self,
+        bars_by_ticker_date: dict[tuple[str, date], list[PolygonBar]],
+        *,
+        delays: dict[tuple[str, date], float] | None = None,
+        observed_events: list[tuple[str, dict]] | None = None,
+    ) -> None:
+        super().__init__(bars_by_ticker_date)
+        self.delays = {
+            (ticker.upper(), trading_date): delay
+            for (ticker, trading_date), delay in (delays or {}).items()
+        }
+        self.observed_events = observed_events
+        self.events_seen_at_fetch: list[list[tuple[str, dict]]] = []
+
+    def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
+        trading_date = date.fromisoformat(from_date)
+        key = (ticker.upper(), trading_date)
+        self.calls[key] += 1
+        if self.observed_events is not None:
+            self.events_seen_at_fetch.append(list(self.observed_events))
+        delay = self.delays.get(key, 0)
+        if delay > 0:
+            time_module.sleep(delay)
+        bars = self.bars_by_ticker_date[key]
+        return AdapterResponse(data=bars, lineage=_lineage("Polygon", ticker, bars))
+
+
 def _lineage(provider: str, ticker: str, bars: list) -> LineageMeta:
     return LineageMeta(
         provider=provider,
@@ -81,9 +112,13 @@ def _lineage(provider: str, ticker: str, bars: list) -> LineageMeta:
     )
 
 
-def _classification(security_type: str = "common_stock") -> SecurityTypeClassification:
+def _classification(
+    security_type: str = "common_stock",
+    *,
+    ticker: str = "TEST",
+) -> SecurityTypeClassification:
     return SecurityTypeClassification(
-        ticker="TEST",
+        ticker=ticker,
         security_type=security_type,
         reason="fixture",
         signals=1,
@@ -231,6 +266,7 @@ def _run_i12(
     classifications=None,
     run_timestamp=None,
     progress_callback=None,
+    fetch_deadline_seconds=DEFAULT_FETCH_DEADLINE_SECONDS,
 ):
     _seed_hur(db_session, ticker)
     if classifications is None:
@@ -243,6 +279,7 @@ def _run_i12(
         end_date=DAY,
         classification_records=classifications,
         run_timestamp=run_timestamp,
+        fetch_deadline_seconds=fetch_deadline_seconds,
         progress_callback=progress_callback,
     )
     return run_job(db_session, job)
@@ -257,6 +294,8 @@ def _run_i12_with_polygon(
     classifications=None,
     minute_cache_dir=None,
     skip_existing=False,
+    progress_callback=None,
+    fetch_deadline_seconds=DEFAULT_FETCH_DEADLINE_SECONDS,
 ):
     _seed_hur(db_session, ticker)
     if classifications is None:
@@ -270,6 +309,8 @@ def _run_i12_with_polygon(
         classification_records=classifications,
         minute_cache_dir=minute_cache_dir,
         skip_existing=skip_existing,
+        fetch_deadline_seconds=fetch_deadline_seconds,
+        progress_callback=progress_callback,
     )
     return run_job(db_session, job)
 
@@ -782,6 +823,82 @@ def test_i12_corpus_gap_exactly_minus_five_percent_remains_minute_candidate(db_s
     assert db_session.query(IntradayEventDetail).one().outcome == OUTCOME_CONFIRMED
 
 
+def test_i12_minute_fetch_watchdog_quarantines_and_continues(db_session):
+    slow_ticker = "ASLOW"
+    fast_ticker = "BFAST"
+    _seed_hur(db_session, slow_ticker)
+    _seed_hur(db_session, fast_ticker)
+    polygon = InstrumentedPolygon(
+        {
+            (slow_ticker, DAY): _minute_bars(),
+            (fast_ticker, DAY): _minute_bars(),
+        },
+        delays={(slow_ticker, DAY): 0.8},
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({
+            slow_ticker: _daily_bars(),
+            fast_ticker: _daily_bars(),
+        }),
+        polygon_adapter=polygon,
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={
+            slow_ticker: _classification(ticker=slow_ticker),
+            fast_ticker: _classification(ticker=fast_ticker),
+        },
+        fetch_deadline_seconds=0.05,
+    )
+
+    started = time_module.monotonic()
+    result = run_job(db_session, job)
+    elapsed = time_module.monotonic() - started
+
+    assert elapsed < 0.6
+    assert result.status == "finished"
+    assert result.metrics["watchdog_timeouts"] == 1
+    assert result.metrics["fetch_errors"] == 1
+    assert result.metrics["quarantined"] == 1
+    assert result.metrics["confirmed"] == 1
+    assert result.errors == [{
+        "ticker": slow_ticker,
+        "trading_date": DAY.isoformat(),
+        "error": "minute_fetch_watchdog_timeout",
+        "deadline_seconds": 0.05,
+    }]
+    assert polygon.calls[(slow_ticker, DAY)] == 1
+    assert polygon.calls[(fast_ticker, DAY)] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(ticker=fast_ticker).count() == 1
+    assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
+
+
+def test_i12_progress_records_uncached_fetch_heartbeat_before_fetch(db_session):
+    events: list[tuple[str, dict]] = []
+    polygon = InstrumentedPolygon(
+        {("TEST", DAY): _minute_bars()},
+        observed_events=events,
+    )
+
+    result = _run_i12_with_polygon(
+        db_session,
+        polygon=polygon,
+        progress_callback=lambda event, payload: events.append((event, dict(payload))),
+    )
+
+    assert result.status == "finished"
+    fetch_payload = next(payload for event, payload in events if event == "minute_fetch_start")
+    assert fetch_payload["ticker"] == "TEST"
+    assert fetch_payload["trading_date"] == DAY.isoformat()
+    assert fetch_payload["deadline_seconds"] == DEFAULT_FETCH_DEADLINE_SECONDS
+    assert fetch_payload["cache_status"] == "miss"
+    assert fetch_payload["wall_clock_utc"].endswith("Z")
+    datetime.fromisoformat(fetch_payload["wall_clock_utc"].replace("Z", "+00:00"))
+    assert any(event == "minute_fetch_start" for event, _payload in polygon.events_seen_at_fetch[0])
+    batch_finish_payload = next(payload for event, payload in events if event == "batch_finish")
+    assert batch_finish_payload["wall_clock_utc"].endswith("Z")
+
+
 def test_i12_corpus_poison_gap_low_full_day_volume_writes_no_row(db_session):
     polygon = FakePolygon({})
     result = _run_i12_with_polygon(
@@ -939,11 +1056,14 @@ def test_i12_runner_minute_cache_alias_and_skip_existing_args():
         "--skip-existing",
         "--max-db-retries",
         "5",
+        "--fetch-deadline-seconds",
+        "7.5",
     ])
 
     assert args.minute_cache_dir == "/var/tmp/i12_minutes"
     assert args.skip_existing is True
     assert args.max_db_retries == 5
+    assert args.fetch_deadline_seconds == 7.5
 
     alias = _parse_args([
         "--live",

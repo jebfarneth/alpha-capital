@@ -35,7 +35,7 @@ from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.edgar import SecEdgarAdapter
-from alpha.data.polygon import PolygonAdapter, _normalized_cik
+from alpha.data.polygon import POLYGON_REQUEST_TIMEOUT, PolygonAdapter, _normalized_cik
 from alpha.jobs.security_type import (
     ADR,
     BUSINESS_DEVELOPMENT_COMPANY,
@@ -2094,6 +2094,21 @@ class TestPolygonAdapter:
     def _adapter(self, mock_session):
         return PolygonAdapter(_polygon_config(), session=mock_session)
 
+    def test_polygon_adapter_mounts_retrying_http_adapter(self):
+        session = requests.Session()
+
+        self._adapter(session)
+
+        https_adapter = session.get_adapter("https://api.polygon.io")
+        retry = https_adapter.max_retries
+        assert retry.total == 3
+        assert retry.connect == 3
+        assert retry.read == 3
+        assert retry.backoff_factor == 0.5
+        assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
+        assert retry.respect_retry_after_header is True
+        assert set(retry.allowed_methods) == {"GET"}
+
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
@@ -2170,7 +2185,7 @@ class TestPolygonAdapter:
                 "limit": 50000,
                 "sort": "settlement_date.desc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_get_short_volume_ok(self):
@@ -2228,7 +2243,7 @@ class TestPolygonAdapter:
                 "limit": 25,
                 "sort": "date.asc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_polygon_short_feeds_empty_payload_success(self):
@@ -2485,7 +2500,7 @@ class TestPolygonAdapter:
                 "limit": 1000,
                 "sort": "date.desc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_polygon_short_volume_flags_semantic_warnings(self):
@@ -2914,7 +2929,7 @@ class TestPolygonAdapter:
                 "sort": "published_utc",
                 "order": "desc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_polygon_news_skips_invalid_rows_with_telemetry(self):
@@ -3526,8 +3541,8 @@ class TestPolygonAdapter:
         assert resp.lineage.data_quality_flags["skipped_rows"] == 0
         session.get.assert_called_once_with(
             "https://api.polygon.io/v2/aggs/ticker/ACME/range/1/day/2026-05-01/2026-05-19",
-            params={"limit": 5000, "sort": "asc"},
-            timeout=30,
+            params={"limit": 5000, "sort": "asc", "adjusted": "true"},
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_get_daily_bars_accepts_float_volume(self):
@@ -3704,7 +3719,7 @@ class TestPolygonAdapter:
                 "limit": 5000,
                 "sort": "execution_date.asc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_get_dividends_ok(self):
@@ -3763,7 +3778,7 @@ class TestPolygonAdapter:
                 "limit": 10,
                 "sort": "ex_dividend_date.desc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_polygon_corporate_action_rejects_invalid_dates(self):
@@ -3837,7 +3852,7 @@ class TestPolygonAdapter:
                 "limit": 1000,
                 "sort": "execution_date.asc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
         session.get.assert_any_call(
             "https://api.polygon.io/stocks/v1/dividends",
@@ -3847,7 +3862,7 @@ class TestPolygonAdapter:
                 "limit": 1000,
                 "sort": "ex_dividend_date.asc",
             },
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_polygon_splits_skip_invalid_rows(self):
@@ -5139,7 +5154,7 @@ class TestPolygonAdapter:
         session.get.assert_called_once_with(
             "https://api.polygon.io/v3/reference/tickers/AAPL",
             params={},
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_get_ticker_details_figi_in_cik_field_does_not_fabricate_cik(self):
@@ -5321,7 +5336,7 @@ class TestPolygonAdapter:
         session.get.assert_called_with(
             "https://api.polygon.io/vX/reference/tickers/META/events",
             params={"types": "ticker_change"},
-            timeout=30,
+            timeout=POLYGON_REQUEST_TIMEOUT,
         )
 
     def test_get_ticker_events_rejects_invalid_identifiers_without_request(self):
@@ -5386,7 +5401,7 @@ class TestPolygonAdapter:
             session.get.assert_called_once_with(
                 f"https://api.polygon.io/vX/reference/tickers/{normalized}/events",
                 params={"types": "ticker_change"},
-                timeout=30,
+                timeout=POLYGON_REQUEST_TIMEOUT,
             )
             assert resp.lineage.data_quality_flags["identifier_queried"] == normalized
 

@@ -98,6 +98,50 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
     }
 )
 INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()
+EOD_ALLOWED_SIGNAL_SESSION_FIELDS = frozenset(
+    {
+        "open_price",
+        "previous_close",
+        "gap_pct",
+        "median_volume_20d",
+        "median_volume_60d",
+        "median_dollar_volume_20d",
+        "median_dollar_volume_60d",
+    }
+)
+EOD_ALLOWED_SNAPSHOT_PATHS = frozenset(
+    {
+        "mom20",
+        "volume_ratio",
+        "gap",
+        "off_low252",
+        "sigma20",
+        "distance_from_max252",
+        "drawdown_from_max252",
+        "signal_context.mom20",
+        "signal_context.volume_ratio",
+        "signal_context.gap",
+        "signal_context.off_low252",
+        "signal_context.sigma20",
+        "signal_context.dist_hi252",
+        "signal_context.proj_mult",
+        "signal_context.chase",
+    }
+)
+EOD_ALLOWED_STATUS_PATHS = frozenset(
+    {
+        "gap",
+        "mom20",
+        "statuses.gap",
+        "statuses.mom20",
+    }
+)
+EOD_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset(
+    {
+        "raw_signal_strength",
+        "data_confidence",
+    }
+)
 _MISSING_COLUMN = object()
 _MALFORMED_PATH = object()
 
@@ -157,7 +201,11 @@ def _transform(value: float, transform: str | None) -> float:
     if math.isnan(value):
         return value
     if transform == "log1p":
-        return math.log1p(value) if value > -1.0 else math.nan
+        if value <= -1.0:
+            raise FeatureSelectionError(
+                f"log1p transform domain violation for stored value {value!r}"
+            )
+        return math.log1p(value)
     if transform == "signed_log1p":
         return math.copysign(math.log1p(abs(value)), value)
     raise FeatureSelectionError(f"unsupported deterministic transform {transform!r}")
@@ -241,6 +289,7 @@ def _audit_feature_field_no_leakage(
     feature_role = str(field.get("feature_role") or "").strip()
     reference_parts = _read_locator_parts(field)
     terminal_name = reference_parts[-1] if reference_parts else ""
+    locator = ".".join(reference_parts)
     status_path = field.get("status_path")
     if status_path and source != "feature_snapshot_json":
         raise FeatureSelectionError(
@@ -257,6 +306,13 @@ def _audit_feature_field_no_leakage(
         if status_parts[-1] not in INTRADAY_ALLOWED_SNAPSHOT_PATHS:
             raise FeatureSelectionError(
                 "intraday Stage-1 status_path fields must reference an "
+                f"allowlisted as-of-signal-time field: {field!r}"
+            )
+    if pattern_clock == "eod" and status_path:
+        status_locator = ".".join(_path_parts(status_path))
+        if status_locator not in EOD_ALLOWED_STATUS_PATHS:
+            raise FeatureSelectionError(
+                "eod Stage-1 status_path fields must reference an explicitly "
                 f"allowlisted as-of-signal-time field: {field!r}"
             )
     if source == "signal_registry":
@@ -295,6 +351,19 @@ def _audit_feature_field_no_leakage(
                     "allowlisted as-of-signal-time market-path fields: "
                     f"{field!r}"
                 )
+        if pattern_clock == "eod":
+            if source == "market_path_feature_json" and len(reference_parts) != 1:
+                raise FeatureSelectionError(
+                    "eod Stage-1 market-path JSON fields must use flat "
+                    "explicitly allowlisted as-of-entry paths: "
+                    f"{field!r}"
+                )
+            if terminal_name not in EOD_ALLOWED_SIGNAL_SESSION_FIELDS:
+                raise FeatureSelectionError(
+                    "eod Stage-1 predictors can read only explicitly "
+                    "allowlisted as-of-entry market-path fields: "
+                    f"{field!r}"
+                )
     else:
         if feature_role and any(
             token in feature_role.lower() for token in FORBIDDEN_ZONE_TOKENS
@@ -326,6 +395,24 @@ def _audit_feature_field_no_leakage(
                 raise FeatureSelectionError(
                     "intraday Stage-1 signal_registry fields are denied by "
                     f"default: {field!r}"
+                )
+        if pattern_clock == "eod" and source == "feature_snapshot_json":
+            if locator not in EOD_ALLOWED_SNAPSHOT_PATHS:
+                raise FeatureSelectionError(
+                    "eod Stage-1 feature snapshots can read only explicitly "
+                    "allowlisted as-of-entry fields: "
+                    f"{field!r}"
+                )
+        if pattern_clock == "eod" and source == "signal_registry":
+            if len(reference_parts) != 1:
+                raise FeatureSelectionError(
+                    "eod Stage-1 signal_registry fields must use flat "
+                    f"top-level column names: {field!r}"
+                )
+            if terminal_name not in EOD_ALLOWED_SIGNAL_REGISTRY_COLUMNS:
+                raise FeatureSelectionError(
+                    "eod Stage-1 signal_registry fields can read only explicitly "
+                    f"allowlisted columns: {field!r}"
                 )
     haystack = " ".join(
         str(field.get(key) or "")

@@ -25,7 +25,11 @@ from alpha.db.engine import (
     prepare_writable_schema_target,
     reset_globals,
 )
-from alpha.jobs.i12_historical_corpus import I12HistoricalCorpusJob, JOB_NAME
+from alpha.jobs.i12_historical_corpus import (
+    DEFAULT_FETCH_DEADLINE_SECONDS,
+    I12HistoricalCorpusJob,
+    JOB_NAME,
+)
 from alpha.jobs.run_market_path_backfill import CachedHistoricalPriceFmpAdapter
 from alpha.jobs.runner import run_job
 from alpha.runtime_env import load_runtime_env
@@ -108,6 +112,13 @@ def _run_live(args: argparse.Namespace) -> int:
         )
         artifact["events"].append(record)
         artifact["last_event"] = record
+        if "ticker" in record["payload"] and "trading_date" in record["payload"]:
+            artifact["last_ticker_day_activity"] = {
+                "event": event,
+                "ticker": record["payload"]["ticker"],
+                "trading_date": record["payload"]["trading_date"],
+                "at": record["payload"].get("wall_clock_utc", record["at"]),
+            }
         if progress_artifact is not None:
             progress_artifact.parent.mkdir(parents=True, exist_ok=True)
             progress_artifact.write_text(json.dumps(artifact, indent=2, default=str))
@@ -126,6 +137,7 @@ def _run_live(args: argparse.Namespace) -> int:
         skip_existing=args.skip_existing,
         max_db_retries=args.max_db_retries,
         db_retry_backoff_seconds=args.db_retry_backoff_seconds,
+        fetch_deadline_seconds=args.fetch_deadline_seconds,
         progress_callback=progress,
     )
     try:
@@ -145,6 +157,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "skip_existing": args.skip_existing,
                 "max_db_retries": args.max_db_retries,
                 "db_retry_backoff_seconds": args.db_retry_backoff_seconds,
+                "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
             },
         )
@@ -212,6 +225,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--max-db-retries", type=int, default=3)
     parser.add_argument("--db-retry-backoff-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--fetch-deadline-seconds",
+        type=float,
+        default=DEFAULT_FETCH_DEADLINE_SECONDS,
+        help="Wall-clock deadline for one uncached Polygon minute fetch.",
+    )
     parser.add_argument("--progress-artifact")
     return parser.parse_args(argv)
 

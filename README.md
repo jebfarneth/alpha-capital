@@ -1,447 +1,551 @@
 # Alpha Capital
 
-Production-grade alpha research and signal-accumulation infrastructure for U.S. equities.
+Last materially refreshed: 2026-06-15.
 
-Alpha Capital is a backend-first systematic trading engine. It is built around one idea: a trading system is only useful if it can prove what it knew at decision time, preserve the full evidence trail, measure what happened afterward without survivorship bias, and feed those outcomes back into an optimizer or ML layer.
+Alpha Capital is backend-first infrastructure for systematic U.S. equities
+research, signal measurement, historical replay, and supervised ranking. It is
+not a dashboard, not a notebook backtest, and not a single detector with a
+broker API bolted on.
 
-This repository is not a charting app and it is not a notebook backtest. It is the operating spine of a quant platform:
-
-```text
-Universe -> Feature Assembly -> Pattern Detection -> Signal Registry
-         -> Market Path Features -> Forward Measurement -> Scoreboard
-         -> Candidate Selection -> Optimizer -> Execution
-```
-
-The current system runs live signal accumulation, persists evidence to Postgres, tracks provider lineage, and is being expanded into a historical replay + ML training corpus. Broker execution is intentionally downstream of measurement. The engine is collecting the truth set first.
-
----
-
-## Current Snapshot
-
-As of June 2026, Alpha Capital has moved beyond a single-pattern prototype into a multi-pattern measurement platform.
-
-| Area | Current state |
-|---|---|
-| Runtime | Python 3.9+ engine with SQLAlchemy, Alembic, pytest, Postgres/Supabase, and provider adapters. |
-| Production DB | Supabase Postgres 17 (Pro plan, `us-east-2`) with Alembic-managed schema. The corpus is ~29 GB (~2.7 GB of indexes) on auto-expanding provisioned storage; database compute is being scaled up from the 1 GB Micro tier as the ML-read/backfill workload grows. |
-| Production compute | Always-on Google Compute Engine `e2-standard-2` VM (2 vCPU / 8 GB, `us-east4`, on-demand) scheduled after the market close and monitored by Healthchecks.io. Heavy historical backfills temporarily scale it to a 32 GB high-memory instance, and bursty ML training runs on a separate spun-up/torn-down box rather than fattening the always-on engine. |
-| Universe | Live FMP/Polygon-built operating universe widened from microcap-only to `$30M-$5B`; latest proven wide build included 2,621 names. |
-| Live accumulation | M4 live since June 1; M1 enabled June 4 (first real fire the same week); M2 live June 5 in SEC-only mode. All three run under one canonical nightly orchestrator. |
-| Historical corpus | Survivorship-correct M4 replay executed on production: ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), every month independently audited for exact trading calendars, zero duplicates, and PIT flags. |
-| Forward labels | Full-corpus forward-return backfill executed on production: ~94% of historical M4 signals labeled, with per-signal 15-session forward paths (~1.04M path rows); the remainder is honest residue (immature 2026 windows, survivorship-review states), not silent gaps. |
-| ML training hygiene | Security-type exclusion artifact + fail-closed loader: every corpus ticker classified (common stock vs. SPAC/ETF/fund/preferred/listed debt/CEF), ~22% of historical signals marked non-common and excluded from training without deleting a single registry row. |
-| Paper execution | Pattern-agnostic three-layer paper-trading leg built and dual-audited (execution core, snapshot data leg, per-pattern gate plug-ins): own evidence table, fail-closed paper-URL guard, data-clock entries, never writes the signal registry. Multi-day dry-run is the next operational step. |
-| Pattern research | Every bars-testable pattern swept through survivorship-aware corpus sims (June 10-12): two intraday candidates validated with leakage-free minute-bar entries and out-of-time + survivorship + cost kill-tests (I12, I11); three patterns chopped with evidence archived (M5, I3, I9); one parked-reframed (M3). |
-| M2 | SEC Form 4 backfill/warm-start path built; production runs SEC-only (FMP enrichment skipped) while the widened-universe seed is staged as a resumable job. |
-| M3 | Sector-rotation detector and PIT sector-history pipeline built, default-off until coverage and governance gates are met. |
-| Market-path features | Durable per-signal/per-day feature store built for base EOD, rich EOD technicals, relative features, ML context fields, lineage, hashes, and null/status auditability. Bulk backfill runner proven idempotent and self-healing; historical EOD enrichment now spans the full 29-month corpus, with the deferred cross-sectional rank-population pass finishing the 2024-2025 window. |
-| Testing | Current full-suite baseline is over 2,280 passing Python tests with scratch-schema and real-provider integration probes. |
-| Safety posture | Public writes are guarded; scratch schemas are isolated; M3 remains default-off; market-path failures are observability-only; M4/M1/M2 producer behavior is protected by regression tests. |
-
-The project has completed historical replay and forward-return labeling, is finishing feature backfill and ML corpus assembly (the pre-signal setup-context store is now built and dual-audited, with its scratch pilot the next gate), and has the paper-trading execution leg built and audited (multi-day dry-run next). It is not yet live broker execution.
-
----
-
-## What Makes It Different
-
-Most trading projects fail quietly. The backtest looks good because the data is not point-in-time, delisted names disappeared, a provider error became a clean empty result, or the model trained on a label that could not have been known in production.
-
-Alpha Capital is engineered against those failure modes.
-
-| Failure mode | Engine response |
-|---|---|
-| Lookahead | Assemblers use explicit decision/evidence/execution clocks and PIT cutoffs. |
-| Survivorship bias | Delisting/listing authority is modeled separately from price providers. |
-| Provider partial failure | Source attempts are recorded; provider errors are not silently collapsed into no-data. |
-| Duplicate signals | Signal identity hashes and uniqueness constraints protect the registry. |
-| Stale schema | Canonical runs verify Alembic state before writing. |
-| Scratch accidents | Scratch mode refuses public, creates isolated schemas, and can be dropped/verified. |
-| ML feature contamination | Feature rows carry lineage, hashes, status flags, pattern identity, and missing-source markers. |
-| Default-off features leaking into prod | M3 and other prospective work are gated by flags, migration order, and tests. |
-
-The engineering standard is not "the detector fired." The standard is "we can audit every input that caused it to fire and every label later used to score it."
-
----
-
-## System Architecture
-
-### Engine
-
-The core engine lives under `engine/alpha`.
-
-| Module | Purpose |
-|---|---|
-| `alpha.data` | Typed adapters for FMP, Polygon, Benzinga, SEC EDGAR, Nasdaq, and Alpaca. |
-| `alpha.db` | SQLAlchemy models and Postgres session management. |
-| `alpha.evidence` | Evidence job/run helpers, lineage, and schema-correct persistence. |
-| `alpha.patterns` | Pure pattern detectors and shared guard logic. |
-| `alpha.assembly` | Pattern-specific feature assembly and market-data payload builders. |
-| `alpha.jobs` | Production/scratch entrypoints, orchestration, forward measurement, market-path features, universe builds, and scoreboard jobs. |
-| `engine/migrations` | Alembic schema history. |
-| `engine/tests` | Unit, integration, schema, provider, and orchestration regression tests. |
-
-### Production Flow
+The project is large because the job is large: prove what the system knew at
+decision time, preserve the evidence that caused a signal to fire, measure what
+happened afterward without survivorship bias, and train models only from data
+that could have existed at serve time.
 
 ```text
-1. Resolve market calendar and decision/evidence/execution sessions.
-2. Build or reuse the canonical operating universe.
-3. Run enabled pattern producers.
-4. Persist fired signals and no-signal evidence.
-5. Persist provider attempts, feature snapshots, data lineage, and run metrics.
-6. Enrich each signal with market-path features across its forward window.
-7. Measure forward returns when the observation window matures.
-8. Feed labels and feature rows into scoreboard / ML research.
+Universe reconstruction
+  -> provider evidence and lineage
+  -> pattern-specific feature assembly
+  -> signal registry and feature snapshots
+  -> forward return/path measurement
+  -> market-path and pre-signal feature stores
+  -> clean supervised corpora
+  -> Stage-1 ranking models
+  -> shadow scores / paper execution / optimizer
 ```
 
-The canonical runner owns market-calendar logic. Cron can fire blindly; the runner exits cleanly on non-trading days and refuses unsafe write targets.
+Broker execution is intentionally downstream. The engine is first collecting,
+auditing, and scoring the truth set.
 
----
+## Read This First
 
-## Data Model
+This README is a system map, not the legal source of truth. It is expected to
+go stale because the platform is changing quickly. When this file disagrees
+with code or data, trust sources in this order:
 
-The schema is designed for replayability and auditability rather than just storing "signals."
+1. Alembic migrations under `engine/migrations/versions/`
+2. SQLAlchemy models in `engine/alpha/db/models.py`
+3. Current tests under `engine/tests/`
+4. Job entrypoints under `engine/alpha/jobs/`
+5. This README
 
-| Data family | Examples |
+The most stale-prone sections are:
+
+- exact corpus row counts
+- current test totals
+- production DB size and instance sizing
+- pattern research verdicts
+- ML metric names while the Stage-1 scoreboard is being hardened
+- scratch schema names used for one-off corpus builds
+
+If you change the schema, training contract, corpus rules, or production write
+guards, update this file in the same branch or explicitly leave a note in the
+task checkpoint.
+
+## Current State
+
+This snapshot is date-bound. It is useful for orientation, not for proving the
+latest production state.
+
+| Area | State as of this refresh |
 |---|---|
-| Evidence jobs | `evidence_jobs`, `evidence_job_runs`, structured metrics, run statuses. |
-| Lineage | `data_lineage` rows carrying provider, endpoint, payload hashes, quality flags, and source attempts. |
-| Universe | `universe_scans`, `canonical_universe_scans`, `universe_snapshots`, `security_profiles`, identity snapshots. |
-| Signals | `signal_registry`, detector output, feature snapshots, signal identity hashes, pattern IDs. |
-| Forward measurement | Forward-return observations, forward path rows, maturity states, provider-revision review states. |
-| Market-path ML features | One row per signal per market day with base EOD, rich EOD technical, relative, context, status, hash, and lineage fields. |
-| M2 insider data | SEC Form 4 transaction history, source-gated M2/M2U signal assembly, SEC fetch-coverage ledger. |
-| M3 sector data | PIT sector-assignment history, sector returns, sector-change logs, validation metadata, default-off until coverage gates. |
+| Runtime | Python engine in `engine/alpha`, SQLAlchemy 2.x, Alembic, pytest, scikit-learn, Postgres/Supabase, provider adapters, and guarded CLI jobs. |
+| Database | Supabase/Postgres is the canonical target. SQLite exists for local/unit paths only and is refused by canonical write paths. |
+| Production compute | Always-on cloud VM runs scheduled jobs; large historical backfills and ML runs are treated as separate heavy jobs rather than fattening the always-on worker. |
+| Live patterns | M4, M1, and M2 have production paths. M3 exists but remains default-off. Intraday I11/I12 are research/corpus/paper lanes, not live broker execution. |
+| Historical corpus | M4 has a survivorship-correct historical replay and forward-labeling path. I11 and I12 have durable intraday corpus builders with scratch-schema guards. |
+| ML layer | Stage-1 ranker machinery exists: manifest loader, leakage-audited feature selection, purged/embargoed walk-forward CV, GBRT trainer, shadow inference, score persistence, registry identity checks, and fail-closed fallback. |
+| Safety | Public writes are guarded; scratch schemas are explicitly bound; direct scratch writes verify `search_path`; ML manifests self-check hashes; intraday feature schemas deny known leaky roles by default. |
+| Test baseline | Recent local runs are around 2,500 passing tests, 6 skipped, with one known pre-existing Polygon adapter expected-call mismatch around `adjusted=true`. Re-run locally before relying on this number. |
+| Execution | Paper execution infrastructure exists. Live broker execution is intentionally not the current milestone. |
 
-The platform treats nulls as first-class evidence. A null with `missing_intraday_bars` is different from a null with `provider_error`, and both are different from a value that was computed.
+## What This System Is Trying To Prevent
 
----
+Most trading research fails quietly. The curve looks good because the data was
+not point-in-time, delisted names disappeared, a provider error looked like
+"no signal", or the model trained on a label hiding inside the feature row.
 
-## Market-Path Feature Store
+Alpha Capital is built against those quiet failures.
 
-`market_path_features` is the ML data spine. It stores one row per signal per market session and is intentionally pattern-agnostic while preserving pattern identity. The full 29-month historical M4 corpus is now enriched with signal-day plus forward-path rows, and a dedicated pre-signal setup-context store has been built and dual-audited so models can learn what strong winners looked like before the signal fired; its scratch pilot is the remaining gate.
-
-The intended ML corpus has three separate zones:
-
-| Zone | Purpose | Leakage rule |
-|---|---|---|
-| Pre-signal setup | T-20 (configurable) raw daily-bar sequence before a signal fires, in a dedicated ticker-date-keyed table. | Predictors only; no signal-day or forward-path values, and no cross-sectional ranks (the fired-cohort denominator is circular). |
-| Signal-day anatomy | T0 close/candle/volume/context and day-zero behavior. | Usable only when the decision clock could have known it. |
-| Forward outcome path | T+1 through horizon returns, MFE/MAE, barrier/exit labels. | Labels and diagnostics only; never same-row predictors. |
-
-Already built locally:
-
-| Feature group | Examples |
+| Failure mode | Defensive design |
 |---|---|
-| Base EOD | OHLCV, dollar volume, 20d/60d medians, volume expansion, gap, open-to-close, high/low-from-open, entry-relative returns. |
-| Risk/path | Sigma, effective hard-stop proxy, liquidity proxy, feature role, path sequence. |
-| Breakout anatomy | Prior 52-week high, breakout extension, open/high/close vs. high, gap-over-breakout, close-held-above-breakout. |
-| Candle/range | Close-location value, upper/lower wick ratios, true range, ATR, range expansion. |
-| Volume | Volume and dollar-volume z-scores, acceleration, expansion ranks and percentiles. |
-| Compression/base | Realized volatility, base range, base drawdown over multiple windows. |
-| Trend/momentum | SMA distances, 5d/20d/60d momentum, prior high touches, failed-breakout counts. |
-| VWAP | FMP raw VWAP and OHLC vs. VWAP fields when available. |
-| Relative context | SPY/QQQ/IWM benchmark returns, benchmark relative strength, IWM-vs-SPY and QQQ-vs-SPY regime fields. |
-| Sector relative | Sector ETF mapping and relative strength when PIT sector history exists. |
-| Market regime | SPY/IWM realized-volatility proxy, status fields for missing breadth/VIX sources. |
-| Intraday placeholders | Opening range, first-window returns, intraday VWAP, time-bucket volume, MFE/MAE timestamps, T1-before-stop ordering, all null/status until real intraday bars are wired. |
-| Liquidity/execution placeholders | Quote spread, quote age, depth, executable-entry proxy, participation, halt/offering risk, all source-stamped. |
-| Supply/squeeze placeholders | Float, shares, turnover, short volume, short interest, days-to-cover, borrow fee, with PIT/source status. |
-| Catalyst/cross-pattern | M2 insider overlap, co-fire flags, overlap counts, strongest-overlap pattern, and source-stamped catalyst placeholders. |
-| Classic technicals | RSI, ADX/DMI, Bollinger, Keltner, MACD histogram, OBV, accumulation/distribution, Chaikin money flow, stochastic oscillator. |
-
-Feature rows carry output hashes, input/window metadata, lineage IDs, and explicit status fields so the ML layer can distinguish "not available yet" from "not applicable" from "provider failed."
-
----
-
-## Pattern Portfolio
-
-Alpha Capital uses a pattern roster rather than a single monolithic signal. Each detector is separated from the assembler that feeds it, which makes it possible to audit detector logic independently from data availability.
-
-| Pattern | Thesis | Current status |
-|---|---|---|
-| M1 - Post-Earnings Drift | Earnings surprise continuation and drift. | Live since June 4; corpus sim produced a binding research overlay (cap ceiling, hold length, avoid-filters) now part of the spec. |
-| M2 - Insider Cluster | Opportunistic insider buying clusters from SEC Form 4s. | Live in production in SEC-only mode since June 5; corpus sim overlay vaulted, including an EDGAR acceptance-minute intraday entry fork. |
-| M2U - Insider Cluster Upside | M2 variant focused on upside cluster behavior. | Built with M2 path. |
-| M3 - Sector Rotation | PIT sector-relative return and cross-sectional sector rank. | Detector and sector-history pipeline built, default-off. Research parked-reframed: the spec form failed on proxy; a hot-industry-pullback variant survives and awaits out-of-time validation. |
-| M4 - 52-Week High | EOD close breaks prior 52-week high. | Original live signal-accumulation lane; full 29-month survivorship-correct historical corpus with forward labels. |
-| M5 - Failed Breakdown Reversal | Failed downside break with reversal dynamics. | Chopped after daily-corpus and minute-bar re-attack sims both failed (no entry-knowable separator; volume anti-predictive on reclaims). Detector remains in code; evidence archived. |
-| M6 - Volatility Compression Breakout | Low-volatility compression followed by expansion. | Detector built; last unsimmed M-track pattern — corpus sim queued. |
-| M7 - Pure Technical ML | ML-recognized multi-day technical setups under Reality-Check governance. | Detector scaffold built; effectively the ML layer, blocked on mature labels. |
-| I1 - Gap and Go | Gap continuation with intraday confirmation. | Spec overnight form failed in sims, but the day-0 form (large gap + volume flood, open-to-close) validated and is part of the intraday book research. |
-| I8 - Opening Range Breakout | Opening range breakout behavior. | Detector built; intraday data remains a blocker for production. |
-| I11 - 52-Week High Breakout | Intraday twin of M4: cross prior high live, volume-confirmed, day-0 capture. | Validated on real minute bars with leakage-free confirmed entries (heavy haircut vs. daily-proxy numbers); best exit is overnight carry to next open; durable corpus build is specced and gated on the I12 pilot. |
-| I12 - Capitulation Volume Bounce | Day-0 reversal in deeply crushed names on extreme volume floods. | Discovered June 11 via cross-ablation; passed out-of-time, survivorship, and leakage-free minute-bar kill-tests plus a 2021-23 regime stress; the book's correction-regime diversifier. Durable corpus build in progress. |
-
-Additional event and intraday overlays are specified in the vault but intentionally not promoted until their data sources, PIT proof, and execution assumptions are validated. Two intraday patterns (I3 Short Squeeze, I9 ATR Expansion) were chopped in the June research sweep with evidence archived.
-
----
-
-## M4 And I11
-
-M4 and I11 are intentionally related but not the same.
-
-| Pattern | Clock | Entry idea | Main risk |
-|---|---|---|---|
-| M4 | End-of-day | Next session after a confirmed close above the prior 52-week high. | Gives up day-0 surge. |
-| I11 | Intraday | Enter when price crosses the prior 52-week high live, volume-confirmed. | Requires real intraday ordering, spreads, and executable fills. |
-
-M4 is the stable accumulation lane. I11 captures the day-0 move M4 structurally misses. The minute-bar proof has now been run: leakage-free volume-confirmed entries retain a real but much smaller edge than the daily proxy implied, the optimal exit is overnight carry to the next open, and a faster-trigger fork remains open (the breakout pop concentrates at the cross, before volume confirmation can fire). Book-level sims combine I11 with I12 under position caps and pattern-priority ranking rather than first-come fills.
-
----
-
-## M2 Insider Pipeline
-
-M2 is built around SEC Form 4 transactions.
-
-Key design decisions:
-
-- Transaction IDs are deterministic hashes of SEC content.
-- Nightly upserts by transaction ID make warm-start seeding safe.
-- Source-gating prevents transient fetch errors on non-firing tickers from false-failing the canonical nightly.
-- Fetch errors on tickers that actually fire are fatal because the signal would be certified on incomplete evidence.
-- A SEC fetch-coverage ledger warms tickers even when they have no Form 4 history, preventing repeated full-history cold pulls.
-
-The widened `$30M-$5B` universe materially increases the number of tickers M2 must scan. The first long SEC warm seed exposed a runtime/DB reliability problem; M2 now runs live in production in SEC-only mode (FMP enrichment skipped) while the widened-universe seed path is staged as a resumable/batched job.
-
----
-
-## M3 Sector Rotation
-
-M3 is the point-in-time sector-rotation lane.
-
-It includes:
-
-- Polygon SIC-as-of sector-history pipeline.
-- Versioned SIC-to-sector mapping.
-- Exact-as-of sector intervals with overlap protection.
-- Value-weighted formation-cohort sector returns.
-- PIT proof flags consumed by the detector.
-- Shadow-only behavior until coverage gates are satisfied.
-- M3S shadow pattern handling for undercovered sectors.
-
-M3 remains default-off. The schema and code are built, but production firing is blocked until the PIT history and coverage requirements are satisfied.
-
----
-
-## Provider Authority
-
-Alpha Capital separates data convenience from data authority.
-
-| Provider | Current role |
-|---|---|
-| FMP | Universe screening, profiles, daily OHLCV, EOD replay/backfill, fundamentals where appropriate. |
-| Polygon | Identity, corporate actions, news, short volume/short interest/float availability, daily sanity checks, PIT ticker details. |
-| Benzinga | Catalyst/news calendars, WIIMs, earnings, ratings, offerings, insider/news context. |
-| SEC EDGAR | Official filing authority for Form 4s, Form 25/25-NSE, acceptance-time PIT handling. |
-| Nasdaq | Listing/halt/archive authority pipeline. |
-| Alpaca | Paper-trading account wired into the paper-execution leg; live broker execution intentionally not enabled. Real-time entitlement is IEX-only, so volume gates run on Polygon delayed snapshots by design. |
-
-Provider errors are observable states. The engine records attempts and distinguishes `no_data`, `provider_error`, `parse_error`, `validation_error`, and PIT exclusion states.
-
----
-
-## Point-In-Time Discipline
-
-The system uses multiple clocks because trading evidence lives on multiple clocks.
-
-| Clock | Meaning |
-|---|---|
-| Decision date | Session for which the engine is deciding signal eligibility. |
-| Evidence session | Market session whose close is allowed into EOD features. |
-| PIT cutoff | Timestamp after which provider filings/news cannot be used. |
-| Execution session | Earliest realistic next-session entry point. |
-| Forward window | Post-signal sessions used for measurement labels. |
-
-Examples of PIT handling:
-
-- SEC EDGAR acceptance timestamps are normalized to the correct knowledge time before comparison to cutoff.
-- M3 sector returns use formation-date sector membership, not current sector membership.
-- Market-path trailing features use prior bars only unless explicitly defined as same-day post-close fields.
-- Relative ranks are isolated by feature date and pattern ID, preventing accidental cross-pattern pooling.
-- Missing PIT sector history produces `null + status`, not a guessed sector.
-
----
-
-## Machine Learning Strategy
-
-The ML objective is not "ask AI what to buy." The objective is to build a clean, labeled, point-in-time feature corpus that can support supervised ranking, calibration, and allocation.
-
-The design principles:
-
-1. Preserve `pattern_id` on every feature and label row.
-2. Train per-pattern models first.
-3. Allow cross-pattern models only when `pattern_id` is an explicit feature and performance is reported per pattern.
-4. Never pool M1/M2/M3/M4/I11 blindly.
-5. Treat source-missing flags as model inputs, not data-cleaning noise.
-6. Backfill historical cohorts only with survivorship-correct PIT universe reconstruction.
-7. Mark, never delete: non-common instruments (SPACs, ETFs, funds, preferreds, listed debt) are excluded from training through a fail-closed classification artifact, not registry mutation.
-8. Prefer robust ranking and capital allocation over a single binary classifier.
-
-The immediate research loop is:
-
-```text
-Build historical PIT universe by date
--> replay pattern fires by date
--> persist pre-signal setup context
--> persist signal-day anatomy
--> reconstruct forward paths and labels
--> train ranking/exit/selection models
--> test by date, universe bucket, liquidity bucket, and pattern
-```
-
-This is also why the current system is collecting broad feature rows before broker execution. The M-patterns are useful as event and evidence generators even if their naive next-session trade rules are not profitable. The likely trading edge is expected to come from point-in-time meta-labeling and intraday derivative patterns such as I11, after the corpus proves which day-zero setups actually follow through.
-
----
-
-## Historical Replay Plan
-
-The historical replay path is designed to answer: "What would the live engine have fired on each past date?"
-
-Target path:
-
-1. Load a point-in-time delisted-company source before public replay.
-2. Reconstruct the point-in-time universe for each historical session.
-3. Include names alive on that date, including names later delisted.
-4. Exclude names not yet IPO'd, already delisted, foreign, or non-common securities.
-5. Pull historical OHLCV and source-backed context.
-6. Recompute the exact pattern gates from the code, not from an approximation.
-7. Persist reconstructed signals with provenance.
-8. Compute forward labels immediately because the 15-session windows are already in the past.
-9. Keep reconstructed rows separate from live-collected rows.
-
-For bounded replay windows, the FMP delisted-company ingest supports a date cutoff such as `--stop-after-delisted-before 2026-01-01`. The cohort runner accepts that bounded source only when the recorded cutoff covers the requested replay start date; otherwise public replay fails closed.
-
-This plan has been executed on production: the full M4 historical corpus now covers ~72,000 reconstructed signals across 29 months (Jan 2024 - Jun 2026), with every month independently audited for exact trading calendars, zero duplicates, and PIT provenance flags. Full-corpus forward-return labels are computed (~94%, with the remainder being immature windows and explicit survivorship-review states rather than silent gaps), and post-signal market-path enrichment is on its final cross-sectional rank-population pass. The pre-signal setup-context store is built and dual-audited (scratch pilot pending), and a frozen ML manifest follows the end-to-end corpus join audit.
-
----
-
-## Operations And Safety
-
-Production writes are intentionally hard to do accidentally.
-
-| Guard | Purpose |
-|---|---|
-| `--live` + confirmation | Canonical writes require explicit live mode and confirmation. |
-| PostgreSQL-only canonical | SQLite is refused for canonical writes. |
-| No `ALPHA_DB_SCHEMA` in canonical | Prevents accidentally writing production through a scratch setting. |
-| Scratch schema required for scratch | Scratch runs must provide a schema and refuse `public`. |
-| Alembic head/runtime checks | Production writes require the expected schema state. |
-| Non-trading day no-op | Weekends/holidays exit cleanly before provider/DB work. |
-| Source-gated health | Provider errors fail only when they affect fired-source evidence. |
-| Health report | Canonical jobs emit structured health and metrics. |
-| Idempotency checks | Reruns update existing rows rather than duplicating signal/path rows. |
-
-Market-path feature collection is deliberately observability-only: a feature enrichment issue should be visible, but it should not falsely mark M4/M1/M2 signal production as failed after those producers already persisted correctly.
-
----
-
-## Testing And Audit Culture
-
-The test suite is large because the system is data-critical.
-
-Current themes:
-
-- schema completeness tests
-- Alembic head and migration-chain tests
-- canonical write-target guards
-- scratch-schema integration tests
-- provider parser tests
-- market-calendar tests
-- detector and assembler tests
-- no-lookahead tests
-- idempotency tests
-- source-gating tests
-- real Postgres scratch probes
-- real provider probes when fixture-only tests are insufficient
-
-The workflow uses dual adversarial audits. One terminal may pass a change while another finds a blocker; the stricter verdict wins. Findings are labeled `NEEDS FIXING`, fixed in a new pass, then re-audited.
-
-Recent examples of issues caught by this process:
-
-- M2 fetch errors on non-firing tickers falsely failing the canonical nightly.
-- M3 default-off failures leaking into canonical exit code.
-- M3 shadow pattern rows persisting outside downstream contracts.
-- Sector-history interval overlap on out-of-order writes.
-- Market-path feature lineage containing batch bars that needed row-scope clarification.
-- Alembic migration order accidentally forcing M3 schema before default-off public rollout.
-- Missing 1d benchmark fields in the relative-feature surface.
-- Series listings (preferred/notes/units traded under suffixed symbols) classifying as common stock because the provider serves the parent issuer's profile.
-- Closed-end funds with paraphrased provider descriptions slipping past literal phrase matching, caught only by a full-corpus live-profile sweep.
-
-The point is not theater. In a trading system, silent optimism is the expensive failure.
-
----
+| Lookahead leakage | Decision, evidence, execution, and forward clocks are modeled separately. Feature schemas are audited for forbidden roles and label-like names. |
+| Survivorship bias | Historical universe reconstruction includes delisted names and separates listing authority from price providers. |
+| Provider ambiguity | Provider attempts, payload hashes, statuses, and lineage rows are persisted. Errors are not silently collapsed into empty data. |
+| Duplicate signals | Signal identity hashes and uniqueness constraints protect `signal_registry`. |
+| Dirty training rows | Feature vector hashes, schema hashes, missing statuses, finite checks, and manifest pins are verified before training/scoring. |
+| Scratch/public contamination | Scratch writers bind schema search paths and fail if a session can resolve to `public` unexpectedly. |
+| Misleading ML scoreboard | Stage-1 metrics fail closed on flat predictions, tied cutoffs, tiny invalid decile curves, lumpy weights, and unreliable folds. |
+| Over-optimistic pattern promotion | Pattern candidates are expected to survive out-of-time, survivorship, cost, and leakage checks before promotion. |
+
+The standard is not "the detector fired." The standard is "we can prove why it
+fired, what data was knowable, and how the later label was computed."
 
 ## Repository Layout
 
 ```text
 alpha-capital/
+  README.md                         This system map
   engine/
     alpha/
-      assembly/        Pattern feature assembly
-      data/            Provider adapters
-      db/              SQLAlchemy models and engine
-      evidence/        Job/run and lineage helpers
-      jobs/            Production and scratch jobs
-      ml/              ML training-hygiene artifacts (security-type exclusion artifact + fail-closed loader)
-      patterns/        Pure detectors and shared guards
-    migrations/        Alembic schema history
-    tests/             Python test suite
-  client/              Dashboard frontend scaffold
-  server/              API/server scaffold
-  docs/                Dashboard mockups and support docs
-  expansion.md         Market-path feature expansion notes
-  m4_backfill_task_list.md
+      assembly/                     Pattern-specific feature assembly
+      data/                         FMP, Polygon, Benzinga, SEC, Nasdaq, Alpaca adapters
+      db/                           SQLAlchemy models and engine/session guards
+      evidence/                     Evidence writer and export helpers
+      jobs/                         Production jobs, replay jobs, corpus builders, trainer
+      ml/                           Manifest loader, feature selector, CV, inference, exclusions
+      patterns/                     Pure detector logic and shared contracts
+    migrations/                     Alembic schema history
+    tests/                          Unit, integration, guard, replay, and ML tests
+    pyproject.toml                  Engine package and dependencies
+    .env.example                    Environment template, never real keys
+  client/                           Dashboard/frontend scaffold
+  server/                           API/server scaffold
+  docs/                             Dashboard mockups and support notes
+  expansion.md                      Feature expansion notes
+  m4_backfill_task_list.md          Historical M4 backfill notes
 ```
 
----
+The heart of the repo is `engine/alpha`. The client/server scaffolds are not
+the trading system.
 
-## Running Locally
+## Architecture
 
-The engine expects provider credentials and a database URL in `engine/.env`.
+### Runtime Spine
+
+The canonical nightly and historical jobs share the same design:
+
+```text
+1. Resolve trading calendar and run timestamp.
+2. Verify the write target.
+3. Build or reuse the universe.
+4. Assemble pattern inputs.
+5. Run pure detectors.
+6. Persist evidence, feature snapshots, lineage, and signals.
+7. Measure forward returns when windows mature.
+8. Build market-path/pre-signal context.
+9. Train or score only through a manifest-bound feature contract.
+```
+
+The runtime favors explicit records over implicit assumptions. A null value
+with `missing_intraday_bars` is not the same as a null value with
+`provider_error`, and neither is the same as a computed zero.
+
+### Main Engine Modules
+
+| Module | Responsibility |
+|---|---|
+| `alpha.data` | Typed provider clients and parsers. |
+| `alpha.db` | Database models, engine/session lifecycle, schema guards, writable target checks. |
+| `alpha.evidence` | Evidence persistence, export manifests, lineage helpers. |
+| `alpha.patterns` | Pure pattern detectors and detector contracts. |
+| `alpha.assembly` | Pattern-specific transformation from provider data to detector inputs. |
+| `alpha.jobs` | CLI/job entrypoints, canonical orchestration, replay, corpus building, forward measurement, feature backfill, paper execution, training. |
+| `alpha.ml` | Manifest loading, stored-feature selection, leakage audit, cross-validation, inference, security-type exclusions. |
+
+## Data Model
+
+The schema is designed for replayability and auditability, not just storing
+"signals".
+
+| Family | Representative tables |
+|---|---|
+| Evidence and runs | `evidence_jobs`, `evidence_job_runs`, `evidence_datasets`, `agent_export_manifests` |
+| Provider lineage | `data_lineage`, payload hashes, source attempts, quality flags |
+| Universe and identity | `universe_scans`, `canonical_universe_scans`, `universe_snapshots`, `security_profiles`, `security_identity_snapshots`, `nasdaq_listing_snapshots`, `fmp_delisted_companies` |
+| Historical reconstruction | `historical_universe_reconstructions`, replay job metrics, scratch schemas |
+| Signals | `signal_registry`, `feature_snapshots`, identity hashes, pattern IDs, status fields |
+| Forward measurement | `forward_return_observations`, `forward_return_path_rows`, `forward_context_path_rows`, observation events |
+| Feature stores | `market_path_features`, `market_path_pre_signal_contexts`, `market_path_pre_signal_links` |
+| ML | `ml_model_registry`, `signal_ml_scores` |
+| Intraday corpora | `intraday_event_details` plus confirmed `signal_registry`/`feature_snapshots` rows |
+| Paper/execution | `paper_execution_events`, `trade_candidates`, `optimizer_runs`, `order_events`, position/lifecycle tables |
+| Pattern-specific stores | M1 earnings/friction tables, M2 insider/sec tables, M3 sector/PIT sector history tables |
+
+Many tables intentionally store both machine-consumable values and audit
+metadata. That is not accidental bloat; it is how later training and review
+distinguish "unknown", "not applicable", "not yet populated", "provider failed",
+and "known clean".
+
+## Pattern Portfolio
+
+Patterns are independent detectors fed by pattern-specific assemblers. A
+detector should be understandable without knowing how FMP, Polygon, or SEC data
+was fetched.
+
+| Pattern | Thesis | Current posture |
+|---|---|---|
+| M1 | Post-earnings drift / earnings continuation. | Production path exists. Research overlays and hold/avoid filters are treated as part of the evolving spec. |
+| M2 | Insider cluster buying from SEC Form 4s. | Production path exists in SEC-first/SEC-only mode where needed. FMP enrichment is not required for the safe path. |
+| M2U | Upside-oriented M2 variant. | Built with the M2 lane. |
+| M3 | Point-in-time sector rotation. | Detector and sector-history pipeline exist, default-off until governance and coverage gates are met. |
+| M4 | Daily 52-week high breakout. | Original live accumulation lane and historical replay anchor. Full replay/forward-label machinery exists. |
+| M5 | Failed breakdown reversal. | Evidence archived; not currently promoted after failed daily/minute-bar research attacks. |
+| M6 | Volatility compression breakout. | Detector exists; research status can change, check tests and current task notes. |
+| M7 | Pure technical ML scaffold. | Effectively downstream of the ML corpus and ranking layer; blocked on mature clean labels. |
+| I1 | Gap-and-go intraday/day-0 continuation. | Spec variants have been researched; do not assume production readiness. |
+| I8 | Opening range breakout. | Detector exists; production viability depends on intraday data and execution assumptions. |
+| I11 | Intraday 52-week-high breakout, day-0 twin of M4. | Durable corpus builder exists. Minute-bar work showed real but smaller edge than daily proxies; overnight exit research matters. |
+| I12 | Capitulation volume bounce. | Durable corpus builder exists and is a key intraday research lane. Clean corpus rebuilds must use current code and scratch schemas before any training copy. |
+
+Pattern status is intentionally conservative. "Code exists" does not mean
+"tradable".
+
+## Historical Replay And Corpora
+
+### M4 Historical Replay
+
+The M4 replay path answers:
+
+> What would the live M4 engine have fired on each past date if it had been
+> running with the then-knowable universe?
+
+Important properties:
+
+- uses historical universe reconstruction rather than today's universe
+- includes delisted names when they were alive at the decision date
+- separates common-stock training eligibility from registry preservation
+- persists reconstructed signals rather than manufacturing labels in memory
+- computes forward observations and path rows as first-class records
+- protects reruns with idempotency and identity hashes
+
+The historical M4 corpus has been used as the backbone for forward-return
+measurement, market-path features, and initial Stage-1 training work.
+
+### I11 And I12 Historical Corpora
+
+I11 and I12 are intraday corpus builders, not casual backtests. They persist
+events into `intraday_event_details`; confirmed trainable events also get
+`signal_registry`, `feature_snapshots`, and, for I12 current code,
+`forward_return_observations`.
+
+Rules that matter:
+
+- build to a scratch schema first
+- bind scratch search path explicitly
+- keep `public` canonical data protected
+- keep split-basis-mismatch rows out of trainable `signal_registry`
+- quarantine full-day/research-only fields under `research_only_leaky`
+- preserve delisted names for survivorship correctness
+- do not promote a corpus to public until feature JSON, labels, dead-name share,
+  duplicates, split-basis outliers, and forward observations have been queried
+  and audited
+
+The corpus question is not merely "did the edge survive?" The first question is
+"is this clean enough to train on without teaching the model a lie?"
+
+## Stage-1 ML Ranker
+
+The Stage-1 ranker is the supervised ranking layer that sits on top of the
+measured corpus. It is intentionally narrow: start with per-pattern ranking and
+shadow inference before any allocator is allowed to trust the scores.
+
+### What Exists
+
+| Component | Behavior |
+|---|---|
+| Manifest loader | Loads frozen ML manifests, checks pinned SHA-256, validates horizon contracts, and runs leakage audit during load. |
+| Feature selector | Pulls stored features through explicit locators, preserves train/serve vector parity, hashes schema/vector identity, handles typed missing values, and rejects non-finite stored values. |
+| Leakage gate | Fails on forward-path roles, label-like names, snake-case leakage labels, forbidden intraday `signal_session` fields, and dotted leaky paths such as `research_only_leaky.*` or `exit.*`. |
+| Training loader | Reads `forward_return_observations`, filters by pattern and manifest horizon, collapses duplicate observations to latest, rejects mixed horizons, drops corrupt/non-finite feature rows. |
+| CV | Purged/embargoed walk-forward splits with fold-local ticker-cluster weights. Random K-fold is explicitly forbidden for this use. |
+| Model | Initial GBRT path via scikit-learn `HistGradientBoostingRegressor`. This is ranker infrastructure, not a claim that GBRT is final. |
+| Registry | `ml_model_registry` stores model identity, manifest hash, feature schema hash, artifact URI, CV metrics, and status. |
+| Shadow inference | `signal_ml_scores` stores shadow scores. Inference fails closed to fallback on artifact load errors, registry mismatch, OTD/range failures, non-finite features, non-finite predictions, and predict exceptions. |
+| Fallback | Raw-strength fallback is idempotent for `model_id = NULL` and has a null-safe unique index. |
+
+### Scoreboard Contract
+
+The Stage-1 scoreboard has been hardened because misleading model metrics are
+dangerous. Current intent:
+
+- flat predictions do not inherit time order
+- tied score cutoffs fail closed instead of slicing arbitrary rows
+- headline pooled top metrics and IC use fold-normalized prediction percentiles
+  to avoid fold score-offset bias
+- raw pooled IC is preserved separately under `raw_pooled_*` fields
+- top-decile lift is `NaN` when population mean is not positive
+- decile curves fail closed when any internal boundary is unreliable
+- tiny folds use a top-quintile fallback for top metrics but do not pretend full
+  decile curves are reliable
+- weighted deciles use whole rows, not fractional copies of one signal
+- lumpy/heavy weights either report the actual bucket share or fail closed
+- fold aggregates do not silently resurrect failed top/decile metrics
+
+Metric names and exact fail-closed behavior are active work. Check
+`engine/tests/test_stage1_ml_ranker.py` and `engine/alpha/jobs/train_model.py`
+before interpreting a model registry JSON blob.
+
+### What The ML Layer Is Not
+
+It is not "AI picks stocks." It is a supervised ranker over evidence that the
+engine already knew how to collect, label, and audit.
+
+The expected research loop is:
+
+```text
+clean corpus
+  -> manifest-bound feature set
+  -> purged walk-forward ranking
+  -> shadow scores
+  -> paper allocator
+  -> execution analysis
+  -> promotion or deletion
+```
+
+If the corpus is dirty, no model type can save it.
+
+## Market-Path And Pre-Signal Feature Stores
+
+`market_path_features` stores one row per signal per market session. It is the
+post-signal and signal-day path spine: base OHLCV, rich technicals, relative
+features, ML context fields, hashes, lineage, status flags, and pattern identity.
+
+`market_path_pre_signal_contexts` and links store setup context before a signal
+fires. This exists because the model should learn what the setup looked like
+before the event, not just what happened on the signal day.
+
+Feature groups include:
+
+- base EOD OHLCV and dollar volume
+- 20/60 day liquidity and volume context
+- gap, open-to-close, high/low-from-open, entry-relative returns
+- realized volatility, ATR/range, wick/body/candle location
+- breakout extension and prior high relationships
+- compression/base/trend/momentum windows
+- benchmark and sector-relative context
+- classic technicals such as RSI, ADX/DMI, Bollinger/Keltner, MACD histogram,
+  OBV, accumulation/distribution, CMF, stochastic oscillator
+- cross-pattern/catalyst placeholders
+- explicit null/status fields for future intraday, spread, short/borrow, float,
+  offering/halt, and depth sources
+
+Predictor eligibility depends on the decision clock. A field being present in a
+row is not enough to make it trainable.
+
+## Provider Authority
+
+Providers have roles. Convenience is not authority.
+
+| Provider | Role |
+|---|---|
+| FMP | Universe screening, profiles, daily OHLCV, historical replay bars, some fundamentals. |
+| Polygon / Massive | Identity details, corporate actions, daily sanity checks, ticker details, short/float style data where available. |
+| Benzinga | Catalyst/news/earnings/ratings/offering context. |
+| SEC EDGAR | Official Form 4 authority and filing acceptance timestamps. |
+| Nasdaq | Listing, halt, and archive authority paths. |
+| Alpaca | Paper trading integration. Live broker execution is not the current promoted path. |
+
+Provider failures are observable states. Jobs should preserve whether data was
+missing, provider-failed, parse-failed, validation-failed, or excluded by policy.
+
+## Point-In-Time Discipline
+
+The system uses multiple clocks because financial evidence arrives on multiple
+clocks.
+
+| Clock | Meaning |
+|---|---|
+| Decision date | Session for which the engine is deciding eligibility. |
+| Evidence session | Market session whose completed data may be used. |
+| PIT cutoff | Timestamp after which filings/news/provider updates are not allowed. |
+| Signal timestamp | Time the event would have become observable. |
+| Execution session/time | Earliest realistic fill assumption. |
+| Forward window | Future sessions used only for labels and diagnostics. |
+
+Examples:
+
+- SEC Form 4 acceptance timestamps must be normalized before comparing to a
+  decision cutoff.
+- M3 sector membership must use formation-date sector assignment, not current
+  sector labels.
+- Intraday I11/I12 predictors must be as-of-entry, while full-day research
+  fields belong under `research_only_leaky`.
+- Forward path values are labels/diagnostics unless a manifest explicitly and
+  safely says otherwise.
+
+## Operations And Safety
+
+Production writes are intentionally difficult to do accidentally.
+
+| Guard | Purpose |
+|---|---|
+| `--live` / confirmation flags | Prevent accidental canonical writes from dry-run commands. |
+| Postgres canonical target | Canonical writes require the intended database class; SQLite is for local/unit work. |
+| Alembic checks | Jobs verify expected migration heads before writing where appropriate. |
+| Scratch schemas | Historical/corpus work should land in named scratch schemas before promotion. |
+| Scratch search path binding | Scratch sessions bind `search_path` to scratch-first and assert it before writing. |
+| Public-write guard | Jobs refuse `public` unless the path is explicitly intended and confirmed. |
+| Idempotent upserts | Replay/backfill/corpus jobs should update/reuse rows rather than duplicate them. |
+| Source-gated health | Provider failures are fatal only when they invalidate certified evidence. |
+| Non-trading day no-op | Calendar-aware jobs exit safely on weekends/holidays. |
+
+If a scratch job writes to `public`, that is an incident. Treat it as data
+contamination until scoped deletes and verification queries prove otherwise.
+
+## Common Entry Points
+
+Run from `engine/` unless noted.
+
+```bash
+# Local tests
+uv run pytest -q
+uv run alembic heads
+
+# Canonical nightly dry run
+uv run python -m alpha.jobs.run_nightly_canonical --dry-run
+
+# Universe build
+uv run python -m alpha.jobs.run_universe --live --trading-date YYYY-MM-DD
+
+# Daily pattern jobs
+uv run python -m alpha.jobs.run_m4_daily --live --run-timestamp YYYY-MM-DDTHH:MM:SS-04:00
+uv run python -m alpha.jobs.run_m1_daily --live --run-timestamp YYYY-MM-DDTHH:MM:SS-04:00
+uv run python -m alpha.jobs.run_m2_daily --live --run-timestamp YYYY-MM-DDTHH:MM:SS-04:00
+
+# Historical M4 replay / measurement
+uv run python -m alpha.jobs.run_historical_m4_replay --schema scratch_schema --create-tables
+uv run python -m alpha.jobs.run_forward_return --live --pattern-id M4
+
+# Intraday corpora
+uv run python -m alpha.jobs.run_i11_historical_corpus --schema scratch_schema --create-tables
+uv run python -m alpha.jobs.run_i12_historical_corpus --schema scratch_schema --create-tables
+
+# Market path and pre-signal context
+uv run python -m alpha.jobs.run_market_path_features --schema scratch_schema
+uv run python -m alpha.jobs.run_market_path_pre_signal_context --schema scratch_schema
+
+# Stage-1 training
+uv run python -m alpha.jobs.run_train_model --manifest path/to/manifest.json --pattern-id M4
+
+# Paper execution
+uv run python -m alpha.jobs.run_paper_execution --dry-run
+```
+
+Read each job's `--help` before running against anything important. Several
+jobs have deliberate public/scratch restrictions.
+
+## Local Setup
 
 ```bash
 cd engine
+cp .env.example .env
+uv sync
 uv run pytest -q
-uv run alembic heads
 ```
 
-Common entrypoints:
+`engine/.env` holds database URLs and provider keys. Never commit real keys.
+
+Useful checks:
 
 ```bash
-# Build / inspect the universe
-uv run python -m alpha.jobs.run_universe --live --trading-date YYYY-MM-DD
-
-# Run M4 daily path
-uv run python -m alpha.jobs.run_m4_daily --live --run-timestamp YYYY-MM-DDTHH:MM:SS-04:00
-
-# Run the canonical orchestrator in dry-run mode
-uv run python -m alpha.jobs.run_nightly_canonical --dry-run
-
-# Run market-path feature enrichment
-uv run python -m alpha.jobs.run_market_path_features --schema scratch_schema
+cd engine
+uv run pytest -q tests/test_stage1_ml_ranker.py
+uv run pytest -q tests/test_writable_schema_guard.py
+uv run alembic heads
+git diff --check
 ```
 
-Canonical production writes require stricter flags and should only be run against the intended Supabase/Postgres target.
+The full suite is the real regression signal, but targeted tests are useful
+when working on one subsystem.
 
----
+## Testing And Audit Culture
 
-## Engineering Skills Demonstrated
+The test suite is large because the project is data-critical. Recent themes:
 
-This project exercises the kind of backend and data-engineering work that is hard to fake in toy apps:
+- migration and schema integrity
+- public/scratch write guards
+- provider parser behavior
+- market calendar behavior
+- detector/assembler contracts
+- signal identity and idempotency
+- forward-return label computation
+- survivorship and historical universe reconstruction
+- market-path feature lineage/status/null handling
+- ML manifest and feature leakage gates
+- purged/embargoed CV and fold-local weights
+- shadow scoring fallback behavior
+- paper execution isolation from `signal_registry`
+- real Postgres scratch probes
+- real provider probes where fixture-only tests are insufficient
+
+The workflow intentionally uses adversarial audits. A change is not accepted
+because one happy-path test passed. It is attacked for:
+
+- hidden lookahead
+- stale global DB sessions
+- scratch/public contamination
+- duplicate rows
+- non-finite values
+- tied or flat model predictions
+- lumpy ticker weights
+- fold leakage
+- dirty labels
+- impossible entry/exit assumptions
+
+This is why apparently small ML scoreboard work can take many passes. The
+first pass computes the metric; the later passes make sure the metric cannot
+lie when the model is weak, flat, tied, underweighted, overweighted, or tested
+on a tiny fold.
+
+## Known Operational Principles
+
+1. Mark, do not delete. Training exclusions should not mutate the historical
+   signal registry.
+2. Scratch first. Promote only after query-backed audits.
+3. A clean corpus matters more than a promising edge estimate.
+4. Pattern code and corpus code must agree on clocks.
+5. Full-day fields in intraday corpora are research-only unless proven
+   entry-knowable.
+6. A provider profile saying "common stock" is not enough for training
+   eligibility when series listings, funds, units, notes, or preferreds are in
+   play.
+7. Scoreboards should fail closed. `NaN` is better than false confidence.
+8. Production paths should be boring; research paths can be expensive and
+   isolated.
+
+## What Is Not Done
+
+This repo is infrastructure in motion. Important non-final areas include:
+
+- broker live execution promotion
+- full allocator/optimizer promotion
+- final I11/I12 corpus promotion decisions
+- broader Stage-1 pattern manifests beyond the active pattern set
+- complete intraday provider entitlement and execution-quality modeling
+- final M3 governance/promotion
+- final UI/API productization
+
+That is normal. The engine is being built so these decisions can be made with
+evidence rather than hope.
+
+## Engineering Scope
+
+This project demonstrates:
 
 - production Python service design
-- SQLAlchemy/Postgres schema design
+- SQLAlchemy/Postgres modeling
 - Alembic migration governance
-- point-in-time data modeling
+- point-in-time financial data modeling
 - provider adapter hardening
-- financial-data lineage and replay
+- survivorship-correct historical replay
 - idempotent job orchestration
-- canonical vs. scratch environment safety
-- real-provider integration testing
-- ML feature-store design
-- audit-heavy release process
-- cloud scheduling and monitoring
+- scratch/canonical environment safety
+- feature-store design
+- supervised ranking infrastructure
+- adversarial metric validation
+- cloud scheduling and health monitoring
 - systematic-trading risk discipline
 
-The system is intentionally built as infrastructure first. The edge can only be trusted if the data path, labels, and operational controls are trustworthy.
+The edge can only be trusted if the data path, labels, and operational controls
+are trustworthy. This repository is the machinery for earning that trust.

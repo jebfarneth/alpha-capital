@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,10 @@ class PatternManifest:
     label: dict[str, Any]
     selection: dict[str, Any]
     diagnostics: dict[str, Any]
+    direction: str = "long"
+    allow_deferred_pit: bool = False
+    oos_quality_gate: dict[str, Any] = field(default_factory=dict)
+    model_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,26 @@ def load_manifest(path: str | Path) -> FrozenMLManifest:
             raise MLManifestError(
                 f"pattern {pattern_id!r} embargo_sessions must be >= 0"
             )
+        direction = str(
+            raw.get("direction")
+            or selection.get("direction")
+            or label.get("direction")
+            or "long"
+        ).strip().lower()
+        if direction not in {"long", "short"}:
+            raise MLManifestError(
+                f"pattern {pattern_id!r} direction must be 'long' or 'short'"
+            )
+        oos_quality_gate = raw.get("oos_quality_gate") or selection.get("oos_quality_gate") or {}
+        if not isinstance(oos_quality_gate, dict):
+            raise MLManifestError(
+                f"pattern {pattern_id!r} oos_quality_gate must be an object"
+            )
+        model_params = raw.get("model_params") or {}
+        if not isinstance(model_params, dict):
+            raise MLManifestError(
+                f"pattern {pattern_id!r} model_params must be an object"
+            )
         patterns[str(pattern_id)] = PatternManifest(
             pattern_id=str(pattern_id),
             signal_horizon=signal_horizon,
@@ -160,6 +184,10 @@ def load_manifest(path: str | Path) -> FrozenMLManifest:
             label=label,
             selection=selection,
             diagnostics=dict(raw.get("diagnostics") or {}),
+            direction=direction,
+            allow_deferred_pit=bool(selection.get("allow_deferred_pit", False)),
+            oos_quality_gate=dict(oos_quality_gate),
+            model_params=dict(model_params),
         )
     return FrozenMLManifest(
         manifest_version=version,

@@ -37,6 +37,7 @@ from alpha.db.models import (
 from alpha.evidence.writer import record_feature_snapshot, record_signal
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.i12_historical_corpus import (
+    DEFAULT_FETCH_DEADLINE_SECONDS,
     MIN_PRIOR_DAILY_SESSIONS,
     OUTCOME_CONFIRMED,
     OUTCOME_HALTED_UNFILLABLE,
@@ -125,6 +126,7 @@ class _RunCounters:
     primary_label_unavailable: int = 0
     non_session_bars_skipped: int = 0
     fetch_errors: int = 0
+    watchdog_timeouts: int = 0
     quarantined: int = 0
     inserted_details: int = 0
     reused_details: int = 0
@@ -168,6 +170,7 @@ class _RunCounters:
         self.primary_label_unavailable += other.primary_label_unavailable
         self.non_session_bars_skipped += other.non_session_bars_skipped
         self.fetch_errors += other.fetch_errors
+        self.watchdog_timeouts += other.watchdog_timeouts
         self.quarantined += other.quarantined
         self.inserted_details += other.inserted_details
         self.reused_details += other.reused_details
@@ -223,6 +226,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         skip_existing: bool = False,
         max_db_retries: int = 3,
         db_retry_backoff_seconds: float = 5.0,
+        fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         progress_callback: Any | None = None,
         catalyst_tags_by_ticker_date: Mapping[tuple[str, date], Sequence[str]] | None = None,
         at_open: bool = False,
@@ -241,6 +245,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             skip_existing=skip_existing,
             max_db_retries=max_db_retries,
             db_retry_backoff_seconds=db_retry_backoff_seconds,
+            fetch_deadline_seconds=fetch_deadline_seconds,
             progress_callback=progress_callback,
         )
         self._catalyst_tags_by_ticker_date = {
@@ -1353,6 +1358,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             "non_session_bars_skipped": counters.non_session_bars_skipped,
             "non_session_bar_skip_sample": counters.non_session_bar_samples,
             "fetch_errors": counters.fetch_errors,
+            "watchdog_timeouts": counters.watchdog_timeouts,
             "quarantined": counters.quarantined,
             "inserted_details": counters.inserted_details,
             "reused_details": counters.reused_details,

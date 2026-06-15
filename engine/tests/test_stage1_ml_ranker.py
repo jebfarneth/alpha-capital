@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import random
 from importlib import import_module
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -23,11 +24,22 @@ from alpha.db.models import (
 from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
 from alpha.jobs.train_model import (
+    DEFAULT_MIN_SAMPLES_LEAF,
     MODEL_FAMILY,
+    PREDICTION_VARIANCE_EPSILON,
     Stage1TrainModelJob,
+    TrainingExample,
+    _cross_validate,
     _finite,
     _fold_train_weights,
     _load_training_examples,
+    _mean_fold_metrics,
+    _prediction_quality_metrics,
+    _prediction_weight_bins,
+    _resolved_model_params,
+    _score_percentiles,
+    _top_quantile_mean,
+    _top_quantile_unreliable,
 )
 from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
 from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
@@ -35,8 +47,10 @@ from alpha.ml.manifest_loader import PatternManifest, load_manifest, manifest_pa
 from alpha.ml.model_features import (
     FeatureSelectionError,
     _as_float,
+    SelectedFeatureVector,
     audit_feature_schema_no_leakage,
     feature_schema_hash,
+    feature_vector_hash,
     select_features,
 )
 
@@ -44,6 +58,47 @@ from alpha.ml.model_features import (
 class ConstantModel:
     def predict(self, rows):
         return [0.123 for _ in rows]
+
+
+class ConstantFitModel:
+    def fit(self, rows, labels, sample_weight=None):
+        return self
+
+    def predict(self, rows):
+        return [0.0 for _ in rows]
+
+
+class EpsilonLadderFitModel:
+    def fit(self, rows, labels, sample_weight=None):
+        return self
+
+    def predict(self, rows):
+        if not rows:
+            return []
+        step = PREDICTION_VARIANCE_EPSILON / (2.0 * max(len(rows), 1))
+        return [idx * step for idx, _row in enumerate(rows)]
+
+
+class NonFiniteFitModel:
+    def __init__(self, value):
+        self.value = value
+
+    def fit(self, rows, labels, sample_weight=None):
+        return self
+
+    def predict(self, rows):
+        return [self.value for _ in rows]
+
+
+class FoldOffsetFitModel:
+    def __init__(self, offset: float):
+        self.offset = offset
+
+    def fit(self, rows, labels, sample_weight=None):
+        return self
+
+    def predict(self, rows):
+        return [self.offset + float(row[0]) for row in rows]
 
 
 class ExplodingModel:
@@ -96,27 +151,44 @@ def _manifest_payload(
     feature_schema: dict | None = None,
     signal_horizon: str = "2d",
     horizon_sessions: int = 2,
+    direction: str = "long",
+    allow_deferred_pit: bool = False,
+    oos_quality_gate: dict | None = None,
+    model_params: dict | None = None,
 ) -> dict:
+    selection = {
+        "source": "forward_return_observations",
+        "statuses": ["computed"],
+        "horizon_sessions": horizon_sessions,
+        "signal_ids": signal_ids or [],
+    }
+    if allow_deferred_pit:
+        selection["allow_deferred_pit"] = True
     payload = {
         "manifest_version": "test_stage1_manifest_v1",
         "manifest_sha256": "",
         "patterns": {
             "M4": {
+                "direction": direction,
                 "signal_horizon": signal_horizon,
                 "min_graded_cohorts": 8,
                 "embargo_sessions": 2,
-                "selection": {
-                    "source": "forward_return_observations",
-                    "statuses": ["computed"],
-                    "horizon_sessions": horizon_sessions,
-                    "signal_ids": signal_ids or [],
-                },
+                "selection": selection,
                 "label": {"field": "forward_return"},
                 "feature_schema": feature_schema or _feature_schema(),
                 "diagnostics": {"pooled_metrics_diagnostic_only": True},
+                "model_params": model_params
+                if model_params is not None
+                else {
+                    "min_samples_leaf": 2,
+                    "l2_regularization": 0.01,
+                    "early_stopping": False,
+                },
             }
         },
     }
+    if oos_quality_gate is not None:
+        payload["patterns"]["M4"]["oos_quality_gate"] = oos_quality_gate
     payload["manifest_sha256"] = manifest_payload_hash(payload)
     return payload
 
@@ -136,6 +208,13 @@ def _seed_signal(
     signal_date: date | None = None,
     signal_horizon: str = "2d",
     forward_return: float | None = None,
+    direction: str = "long",
+    signal_status: str = "active",
+    point_in_time_passed: bool = True,
+    lookahead_guard_passed: bool = True,
+    forward_return_status: str = "computed",
+    entry_session_date: date | None = None,
+    exit_session_date: date | None = None,
 ) -> str:
     signal_id = f"sig-{idx}"
     ticker = ticker or f"T{idx % 3}"
@@ -165,13 +244,16 @@ def _seed_signal(
         signal_id=signal_id,
         pattern_id="M4",
         ticker=ticker,
-        direction="long",
+        direction=direction,
         signal_timestamp=ts,
         raw_signal_strength=1.0 + idx,
         raw_expected_edge=0.0,
         signal_horizon=signal_horizon,
         feature_snapshot_id=feature_snapshot_id,
-        signal_status="active",
+        signal_status=signal_status,
+        point_in_time_passed=point_in_time_passed,
+        lookahead_guard_passed=lookahead_guard_passed,
+        forward_return_status=forward_return_status,
         trading_date=ts.date().isoformat(),
         signal_identity_hash=f"signal-hash-{idx}",
     )
@@ -182,13 +264,23 @@ def _seed_signal(
             signal_id=signal_id,
             pattern_id="M4",
             ticker=ticker,
-            direction="long",
+            direction=direction,
             signal_timestamp=ts,
             signal_horizon=signal_horizon,
             forward_return=forward_return
             if forward_return is not None
             else (idx - 4) / 100.0,
             status="computed",
+            entry_session_date=(
+                entry_session_date.isoformat()
+                if entry_session_date is not None
+                else None
+            ),
+            exit_session_date=(
+                exit_session_date.isoformat()
+                if exit_session_date is not None
+                else None
+            ),
             input_hash=f"input-{idx}",
             outcome_hash=f"outcome-{idx}",
         )
@@ -255,6 +347,7 @@ def _write_artifact(
 
 def _seed_training_corpus(db_session, *, count: int = 14) -> list[str]:
     signal_ids = []
+    returns_by_bucket = [-0.03, -0.01, 0.01, 0.03, 0.05]
     for idx in range(count):
         signal_ids.append(
             _seed_signal(
@@ -262,10 +355,31 @@ def _seed_training_corpus(db_session, *, count: int = 14) -> list[str]:
                 idx=idx,
                 ticker=f"T{idx % 4}",
                 gap=-0.02 + (idx % 5) * 0.01,
+                forward_return=returns_by_bucket[idx % 5],
             )
         )
     db_session.commit()
     return signal_ids
+
+
+def _training_example(idx: int, *, label: float, signal_date: date) -> TrainingExample:
+    names = ["x"]
+    values = [float(idx)]
+    return TrainingExample(
+        signal_id=f"cv-{idx}",
+        ticker=f"T{idx % 5}",
+        signal_date=signal_date,
+        label=label,
+        vector=SelectedFeatureVector(
+            signal_id=f"cv-{idx}",
+            pattern_id="M4",
+            feature_names=names,
+            values=values,
+            feature_schema_hash="fixture-schema",
+            feature_vector_hash=feature_vector_hash(names, values),
+            missing_statuses={},
+        ),
+    )
 
 
 def test_manifest_loader_fails_closed_on_hash_drift(tmp_path):
@@ -456,7 +570,7 @@ def test_market_path_feature_column_valid_column_passes():
     audit_feature_schema_no_leakage(schema)
 
 
-def test_leakage_audit_is_pattern_clock_aware_for_signal_session_fields():
+def test_signal_session_fields_require_allowlist_for_all_pattern_clocks():
     field = {
         "name": "close_price",
         "source": "market_path_feature_column",
@@ -477,7 +591,8 @@ def test_leakage_audit_is_pattern_clock_aware_for_signal_session_fields():
 
     with pytest.raises(FeatureSelectionError):
         audit_feature_schema_no_leakage(intraday_schema)
-    audit_feature_schema_no_leakage(eod_schema)
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(eod_schema)
 
 
 @pytest.mark.parametrize(
@@ -537,7 +652,26 @@ def test_intraday_signal_session_allows_only_asof_signal_time_fields(field_name)
     "field_name",
     ["volume", "dollar_volume", "volume_expansion_20d", "t1_before_stop"],
 )
-def test_eod_signal_session_keeps_session_fields_allowed(field_name):
+def test_eod_signal_session_rejects_full_day_or_outcome_fields(field_name):
+    schema = {
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "market_path_feature_column",
+                "feature_role": "signal_session",
+                "feature_version": "market_path_daily_v3",
+                "column": field_name,
+            }
+        ],
+    }
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize("field_name", ["open_price", "previous_close", "gap_pct"])
+def test_eod_signal_session_allows_only_asof_entry_fields(field_name):
     schema = {
         "pattern_id": "M4",
         "pattern_clock": "eod",
@@ -552,6 +686,27 @@ def test_eod_signal_session_keeps_session_fields_allowed(field_name):
         ],
     }
     audit_feature_schema_no_leakage(schema)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["gate_values.full_day_volume_ratio", "signal_context.t1_before_stop"],
+)
+def test_eod_snapshot_rejects_named_leaky_locators(path):
+    schema = {
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": path.replace(".", "_"),
+                "source": "feature_snapshot_json",
+                "path": path,
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
 
 
 @pytest.mark.parametrize(
@@ -719,7 +874,7 @@ def test_intraday_market_path_json_allows_flat_prior_window_paths():
     audit_feature_schema_no_leakage(schema)
 
 
-def test_eod_market_path_json_keeps_nested_payloads_allowed():
+def test_eod_market_path_json_rejects_nested_payloads():
     schema = {
         "pattern_id": "M4",
         "pattern_clock": "eod",
@@ -734,7 +889,8 @@ def test_eod_market_path_json_keeps_nested_payloads_allowed():
         ],
     }
 
-    audit_feature_schema_no_leakage(schema)
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
 
 
 @pytest.mark.parametrize(
@@ -832,10 +988,645 @@ def test_fold_train_weights_are_recomputed_inside_each_fold():
     assert sum(weight for row, weight in zip(rows[:4], weights) if row.ticker == "BBB") == pytest.approx(1.0)
 
 
+def test_prediction_quality_metrics_capture_perfect_top_decile_lift():
+    labels = [float(idx) for idx in range(100)]
+    preds = list(labels)
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert metrics["rank_ic"] == pytest.approx(1.0)
+    assert metrics["value_ic"] == pytest.approx(1.0)
+    assert metrics["top_decile_lift"] > 1.0
+    assert metrics["top_decile_spread"] > 0.0
+    assert metrics["top_decile_win_rate"] == pytest.approx(1.0)
+    assert metrics["population_win_rate"] == pytest.approx(0.99)
+    assert metrics["top_decile_too_small"] is False
+    assert len(metrics["per_decile_mean_label"]) == 10
+    assert metrics["per_decile_mean_label"] == sorted(metrics["per_decile_mean_label"])
+
+
+def test_prediction_quality_metrics_constant_predictions_do_not_inherit_time_order():
+    labels = [float(idx) for idx in range(100)]
+    preds = [0.0 for _ in labels]
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert math.isnan(metrics["rank_ic"])
+    assert math.isnan(_top_quantile_mean(labels, preds))
+    assert metrics["top_decile_unreliable"] is True
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isnan(metrics["top_decile_spread"])
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert math.isnan(metrics["bottom_9_deciles_mean_label"])
+    assert math.isnan(metrics["weighted_bottom_9_deciles_mean_label"])
+
+
+def test_score_percentiles_group_sub_epsilon_spread_as_one_tie():
+    preds = [
+        idx * PREDICTION_VARIANCE_EPSILON / 20.0
+        for idx in range(10)
+    ]
+
+    percentiles = _score_percentiles(preds)
+
+    assert len(set(percentiles)) == 1
+    assert percentiles[0] == pytest.approx(0.5)
+
+
+def test_prediction_quality_metrics_sub_epsilon_predictions_have_no_ic_signal():
+    labels = [float(idx) for idx in range(100)]
+    preds = [
+        idx * PREDICTION_VARIANCE_EPSILON / 200.0
+        for idx in range(100)
+    ]
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert math.isnan(metrics["value_ic"])
+    assert math.isnan(metrics["rank_ic"])
+    assert metrics["top_decile_unreliable"] is True
+    assert metrics["per_decile_unreliable"] is True
+
+
+@pytest.mark.parametrize(
+    ("labels", "preds", "weights", "match"),
+    [
+        ([1.0, 2.0, 3.0], [1.0, 2.0], None, "matching lengths"),
+        ([1.0, math.nan, 3.0], [1.0, 2.0, 3.0], None, "y_true contains non-finite"),
+        ([1.0, 2.0, 3.0], [1.0, math.nan, 3.0], None, "y_pred contains non-finite"),
+        ([1.0, 2.0, 3.0], [1.0, float("inf"), 3.0], None, "y_pred contains non-finite"),
+        ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 1.0], "weights must match"),
+        ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, -1.0, 1.0], "negative"),
+    ],
+)
+def test_prediction_quality_metrics_rejects_corrupt_metric_vectors(
+    labels,
+    preds,
+    weights,
+    match,
+):
+    with pytest.raises(ValueError, match=match):
+        _prediction_quality_metrics(labels, preds, weights=weights)
+
+
+def test_cross_validate_constant_fold_predictions_keep_pooled_rank_ic_unreliable(
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+    monkeypatch.setattr(
+        train_model_module,
+        "_new_gbrt_model",
+        lambda **_kwargs: ConstantFitModel(),
+    )
+    start = date(2025, 1, 1)
+    examples = [
+        _training_example(idx, label=float(idx), signal_date=start + timedelta(days=idx))
+        for idx in range(80)
+    ]
+
+    metrics = _cross_validate(
+        examples,
+        horizon_sessions=1,
+        embargo_sessions=1,
+        n_splits=2,
+        max_iter=1,
+        random_state=7,
+    )
+
+    assert math.isnan(metrics["rank_ic"])
+    assert (
+        metrics["rank_ic_score_basis"]
+        == "fold_normalized_prediction_percentile_midrank"
+    )
+    assert metrics["top_decile_unreliable"] is True
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert math.isnan(metrics["top_quantile_label_mean"])
+    assert all(math.isnan(fold["top_quantile_label_mean"]) for fold in metrics["folds"])
+
+
+def test_cross_validate_rejects_non_finite_fold_predictions(monkeypatch):
+    train_model_module = import_module("alpha.jobs.train_model")
+    monkeypatch.setattr(
+        train_model_module,
+        "_new_gbrt_model",
+        lambda **_kwargs: NonFiniteFitModel(float("nan")),
+    )
+    start = date(2025, 1, 1)
+    examples = [
+        _training_example(idx, label=float(idx), signal_date=start + timedelta(days=idx))
+        for idx in range(80)
+    ]
+
+    with pytest.raises(ValueError, match="y_pred contains non-finite"):
+        _cross_validate(
+            examples,
+            horizon_sessions=1,
+            embargo_sessions=1,
+            n_splits=2,
+            max_iter=1,
+            random_state=7,
+        )
+
+
+def test_cross_validate_sub_epsilon_fold_predictions_do_not_resurrect_pooled_edge(
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+    monkeypatch.setattr(
+        train_model_module,
+        "_new_gbrt_model",
+        lambda **_kwargs: EpsilonLadderFitModel(),
+    )
+    start = date(2025, 1, 1)
+    examples = [
+        _training_example(idx, label=float(idx), signal_date=start + timedelta(days=idx))
+        for idx in range(80)
+    ]
+
+    metrics = _cross_validate(
+        examples,
+        horizon_sessions=1,
+        embargo_sessions=1,
+        n_splits=2,
+        max_iter=1,
+        random_state=7,
+    )
+
+    assert all(fold["top_decile_unreliable"] for fold in metrics["folds"])
+    assert metrics["top_decile_unreliable"] is True
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert math.isnan(metrics["value_ic"])
+    assert math.isnan(metrics["rank_ic"])
+
+
+def test_cross_validate_keeps_normalized_pooled_ic_when_raw_scores_have_fold_offsets(
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+
+    def model_factory(**kwargs):
+        offset = 10000.0 if kwargs["random_state"] == 7 else 0.0
+        return FoldOffsetFitModel(offset)
+
+    monkeypatch.setattr(train_model_module, "_new_gbrt_model", model_factory)
+    start = date(2025, 1, 1)
+    examples = [
+        _training_example(idx, label=float(idx), signal_date=start + timedelta(days=idx))
+        for idx in range(120)
+    ]
+
+    metrics = _cross_validate(
+        examples,
+        horizon_sessions=1,
+        embargo_sessions=1,
+        n_splits=2,
+        max_iter=1,
+        random_state=7,
+    )
+
+    assert metrics["pooled_score_basis"] == "fold_normalized_prediction_percentile"
+    assert (
+        metrics["rank_ic_score_basis"]
+        == "fold_normalized_prediction_percentile_midrank"
+    )
+    assert metrics["raw_pooled_score_basis"] == "raw_prediction"
+    assert metrics["raw_pooled_value_ic"] < -0.8
+    assert metrics["raw_pooled_pearson"] == pytest.approx(
+        metrics["raw_pooled_value_ic"]
+    )
+    assert metrics["raw_pooled_rank_ic"] < -0.45
+    assert metrics["value_ic"] > 0.45
+    assert metrics["pearson"] == pytest.approx(metrics["value_ic"])
+    assert metrics["rank_ic"] > 0.45
+    assert metrics["top_decile_mean_label"] > 80.0
+    assert metrics["top_decile_lift"] > 1.0
+
+
+def test_top_quantile_mean_returns_nan_when_tie_crosses_cutoff():
+    labels = [float(idx) for idx in range(100)]
+    preds = [0.0 for _ in range(75)] + [1.0 for _ in range(10)] + [2.0 for _ in range(15)]
+
+    assert math.isnan(_top_quantile_mean(labels, preds))
+
+
+def test_top_quantile_unreliable_is_independent_of_top_decile_boundary():
+    labels = [float(idx) for idx in range(100)]
+    preds = (
+        [0.0 for _ in range(75)]
+        + [1.0 for _ in range(10)]
+        + [float(2 + idx) for idx in range(15)]
+    )
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert _top_quantile_unreliable(preds) is True
+    assert math.isnan(_top_quantile_mean(labels, preds))
+    assert metrics["top_decile_unreliable"] is False
+    assert math.isfinite(metrics["top_decile_mean_label"])
+
+
+def test_per_decile_curve_fails_closed_when_lower_boundary_splits_tie():
+    labels = [float(idx) for idx in range(100)]
+    preds = [0.0 for _ in range(20)] + [float(idx) for idx in range(20, 100)]
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert metrics["top_decile_unreliable"] is False
+    assert all(math.isnan(value) for value in metrics["per_decile_mean_label"])
+
+
+def test_prediction_quality_metrics_signed_negative_baseline_has_no_lift_ratio():
+    labels = [float(idx) for idx in range(-100, 0)]
+    preds = list(labels)
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert metrics["population_mean_label"] < 0.0
+    assert math.isnan(metrics["top_decile_lift"])
+    assert metrics["top_decile_lift_unreliable"] is True
+    assert metrics["top_decile_spread"] > 0.0
+    assert metrics["top_decile_win_rate"] == pytest.approx(0.0)
+
+
+def test_prediction_quality_metrics_random_distinct_ranker_lift_is_near_baseline():
+    rng = random.Random(17)
+    labels = [0.5 + rng.random() for _ in range(1000)]
+    preds = list(range(1000))
+    rng.shuffle(preds)
+    preds = [float(value) for value in preds]
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert abs(metrics["rank_ic"]) < 0.1
+    assert metrics["top_decile_lift"] == pytest.approx(1.0, abs=0.15)
+
+
+def test_fold_normalized_percentiles_prevent_pooled_score_offset_bias():
+    fold1_labels = [0.0 for _ in range(50)]
+    fold2_labels = [10.0 for _ in range(50)]
+    fold1_preds = [1000.0 + idx for idx in range(50)]
+    fold2_preds = [float(idx) for idx in range(50)]
+    labels = fold1_labels + fold2_labels
+    raw_preds = fold1_preds + fold2_preds
+    normalized_preds = _score_percentiles(fold1_preds) + _score_percentiles(fold2_preds)
+
+    raw_metrics = _prediction_quality_metrics(labels, raw_preds)
+    normalized_metrics = _prediction_quality_metrics(labels, normalized_preds)
+
+    assert raw_metrics["top_decile_mean_label"] == pytest.approx(0.0)
+    assert normalized_metrics["top_decile_mean_label"] == pytest.approx(5.0)
+    assert normalized_metrics["top_decile_lift"] == pytest.approx(1.0)
+
+
+def test_prediction_quality_metrics_emit_weighted_edge_variants():
+    labels = [float(idx + 1) for idx in range(100)]
+    preds = [float(idx) for idx in range(100)]
+    weights = [1.0 for _ in range(100)]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert metrics["weighted_top_decile_weight_share"] == pytest.approx(0.1)
+    assert metrics["weighted_population_mean_label"] == pytest.approx(
+        metrics["population_mean_label"]
+    )
+    assert metrics["weighted_top_decile_lift"] == pytest.approx(metrics["top_decile_lift"])
+    assert len(metrics["weighted_per_decile_mean_label"]) == 10
+
+
+@pytest.mark.parametrize("row_count", [99, 101, 109, 111])
+def test_weighted_deciles_balance_equal_weights_for_non_multiple_sizes(row_count):
+    labels = [float(idx + 1) for idx in range(row_count)]
+    preds = [float(idx) for idx in range(row_count)]
+    weights = [1.0 for _ in range(row_count)]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert metrics["weighted_top_decile_unreliable"] is False
+    assert metrics["weighted_per_decile_unreliable"] is False
+    assert metrics["weighted_top_decile_weight_share"] == pytest.approx(0.1, abs=0.015)
+    assert math.isfinite(metrics["weighted_top_decile_mean_label"])
+    assert math.isfinite(metrics["weighted_top_decile_lift"])
+    assert all(math.isfinite(value) for value in metrics["weighted_per_decile_mean_label"])
+
+
+def test_cluster_like_weights_do_not_report_empty_reliable_top_decile():
+    labels = [float(idx) for idx in range(100)]
+    preds = [float(idx) for idx in range(100)]
+    weights = [1.0 / 91.0 for _ in range(91)] + [1.0 for _ in range(9)]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    if metrics["weighted_top_decile_unreliable"]:
+        assert math.isnan(metrics["weighted_top_decile_weight_share"])
+        assert math.isnan(metrics["weighted_top_decile_mean_label"])
+    else:
+        assert math.isfinite(metrics["weighted_top_decile_weight_share"])
+        assert metrics["weighted_top_decile_weight_share"] > 0.05
+        assert math.isfinite(metrics["weighted_top_decile_mean_label"])
+
+
+def test_weighted_deciles_do_not_fractionally_represent_single_heavy_row():
+    labels = [float(idx) for idx in range(99)] + [999.0]
+    preds = [float(idx) for idx in range(100)]
+    weights = [1.0 for _ in range(99)] + [100.0]
+
+    weighted_buckets = _prediction_weight_bins(labels, preds, weights, bins=10)
+    heavy_bucket_count = sum(
+        1 for bucket in weighted_buckets if any(label == 999.0 for label, _weight in bucket)
+    )
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert heavy_bucket_count == 1
+    assert metrics["weighted_top_decile_unreliable"] is True
+    assert math.isnan(metrics["weighted_top_decile_weight_share"])
+    assert all(math.isnan(value) for value in metrics["weighted_per_decile_mean_label"])
+    assert math.isnan(metrics["weighted_top_decile_lift"])
+    assert math.isnan(metrics["weighted_top_decile_mean_label"])
+
+
+def test_weighted_near_tie_cutoff_uses_same_tolerance_as_unweighted():
+    labels = [float(idx + 1) for idx in range(100)]
+    preds = [float(idx) for idx in range(100)]
+    preds[90] = preds[89] + (PREDICTION_VARIANCE_EPSILON / 2.0)
+    weights = [1.0 for _ in labels]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert metrics["top_decile_unreliable"] is True
+    assert metrics["weighted_top_decile_unreliable"] is True
+    assert math.isnan(metrics["weighted_top_decile_weight_share"])
+    assert math.isnan(metrics["weighted_top_decile_mean_label"])
+    assert math.isnan(metrics["weighted_top_decile_lift"])
+
+
+def test_weighted_chained_near_tie_cutoff_matches_unweighted_reliability():
+    labels = [float(idx + 1) for idx in range(100)]
+    preds = [
+        idx * PREDICTION_VARIANCE_EPSILON * 0.6
+        for idx in range(100)
+    ]
+    weights = [1.0 for _ in labels]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert metrics["top_decile_unreliable"] is True
+    assert metrics["weighted_top_decile_unreliable"] is True
+    assert math.isnan(metrics["weighted_top_decile_weight_share"])
+    assert math.isnan(metrics["weighted_top_decile_mean_label"])
+
+
+def test_mean_fold_decile_curves_fail_closed_when_any_fold_unreliable():
+    finite_deciles = [float(idx) for idx in range(10)]
+    fold_metrics = [
+        {
+            "per_decile_mean_label": [math.nan for _ in range(10)],
+            "per_decile_unreliable": True,
+            "weighted_per_decile_mean_label": [math.nan for _ in range(10)],
+            "weighted_per_decile_unreliable": True,
+        },
+        {
+            "per_decile_mean_label": finite_deciles,
+            "per_decile_unreliable": False,
+            "weighted_per_decile_mean_label": finite_deciles,
+            "weighted_per_decile_unreliable": False,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["unreliable_per_decile_fold_count"] == 1
+    assert metrics["unreliable_weighted_per_decile_fold_count"] == 1
+    assert all(math.isnan(value) for value in metrics["per_decile_mean_label"])
+    assert all(math.isnan(value) for value in metrics["weighted_per_decile_mean_label"])
+
+
+def test_mean_fold_top_scalars_fail_closed_when_any_fold_unreliable():
+    fold_metrics = [
+        {
+            "top_decile_unreliable": True,
+            "top_quantile_label_mean": math.nan,
+            "top_decile_lift": math.nan,
+            "top_decile_spread": math.nan,
+            "top_decile_mean_label": math.nan,
+            "top_decile_median_label": math.nan,
+            "top_decile_win_rate": math.nan,
+            "bottom_9_deciles_mean_label": math.nan,
+        },
+        {
+            "top_decile_unreliable": False,
+            "top_quantile_label_mean": 4.0,
+            "top_decile_lift": 1.5,
+            "top_decile_spread": 2.0,
+            "top_decile_mean_label": 5.0,
+            "top_decile_median_label": 5.0,
+            "top_decile_win_rate": 0.8,
+            "bottom_9_deciles_mean_label": 3.0,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["unreliable_top_decile_fold_count"] == 1
+    for field in (
+        "top_decile_lift",
+        "top_decile_spread",
+        "top_decile_mean_label",
+        "top_decile_median_label",
+        "top_decile_win_rate",
+        "bottom_9_deciles_mean_label",
+    ):
+        assert math.isnan(metrics[field])
+
+
+def test_mean_fold_keeps_strict_decile_separate_from_quintile_fallback():
+    fold_metrics = [
+        {
+            "top_decile_too_small": True,
+            "top_decile_unreliable": True,
+            "top_decile_lift": math.nan,
+            "top_decile_spread": math.nan,
+            "top_decile_mean_label": math.nan,
+            "top_decile_median_label": math.nan,
+            "top_decile_win_rate": math.nan,
+            "bottom_9_deciles_mean_label": math.nan,
+            "top_effective_unreliable": False,
+            "top_effective_lift": 2.0,
+            "top_effective_spread": 3.0,
+            "top_effective_mean_label": 6.0,
+            "top_effective_win_rate": 1.0,
+        },
+        {
+            "top_decile_too_small": False,
+            "top_decile_unreliable": False,
+            "top_decile_lift": 1.5,
+            "top_decile_spread": 2.0,
+            "top_decile_mean_label": 5.0,
+            "top_decile_median_label": 5.0,
+            "top_decile_win_rate": 0.8,
+            "bottom_9_deciles_mean_label": 3.0,
+            "top_effective_unreliable": False,
+            "top_effective_lift": 1.5,
+            "top_effective_spread": 2.0,
+            "top_effective_mean_label": 5.0,
+            "top_effective_win_rate": 0.8,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["too_small_fold_count"] == 1
+    assert metrics["unreliable_top_decile_fold_count"] == 1
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert metrics["unreliable_top_effective_fold_count"] == 0
+    assert metrics["top_effective_lift"] == pytest.approx(1.75)
+    assert metrics["top_effective_mean_label"] == pytest.approx(5.5)
+
+
+def test_mean_fold_top_quantile_fails_closed_independent_of_top_decile():
+    fold_metrics = [
+        {
+            "top_quantile_label_mean": math.nan,
+            "top_quantile_unreliable": True,
+            "top_decile_unreliable": False,
+            "top_decile_lift": 1.5,
+        },
+        {
+            "top_quantile_label_mean": 4.0,
+            "top_quantile_unreliable": False,
+            "top_decile_unreliable": False,
+            "top_decile_lift": 2.0,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["unreliable_top_quantile_fold_count"] == 1
+    assert math.isnan(metrics["top_quantile_label_mean"])
+    assert metrics["unreliable_top_decile_fold_count"] == 0
+    assert metrics["top_decile_lift"] == pytest.approx(1.75)
+
+
+def test_mean_fold_lift_denominator_unreliability_is_visible():
+    fold_metrics = [
+        {
+            "top_decile_unreliable": False,
+            "top_decile_lift_unreliable": True,
+            "top_decile_lift": math.nan,
+            "top_decile_spread": 0.2,
+        },
+        {
+            "top_decile_unreliable": False,
+            "top_decile_lift_unreliable": False,
+            "top_decile_lift": 2.0,
+            "top_decile_spread": 0.4,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["unreliable_lift_fold_count"] == 1
+    assert math.isnan(metrics["top_decile_lift"])
+    assert metrics["top_decile_spread"] == pytest.approx(0.3)
+
+
+def test_mean_fold_weighted_top_scalars_fail_closed_when_any_fold_unreliable():
+    fold_metrics = [
+        {
+            "weighted_top_decile_unreliable": True,
+            "weighted_top_decile_lift": math.nan,
+            "weighted_top_decile_spread": math.nan,
+            "weighted_top_decile_mean_label": math.nan,
+            "weighted_top_decile_win_rate": math.nan,
+            "weighted_top_decile_weight_share": math.nan,
+            "weighted_bottom_9_deciles_mean_label": math.nan,
+        },
+        {
+            "weighted_top_decile_unreliable": False,
+            "weighted_top_decile_lift": 1.5,
+            "weighted_top_decile_spread": 2.0,
+            "weighted_top_decile_mean_label": 5.0,
+            "weighted_top_decile_win_rate": 0.8,
+            "weighted_top_decile_weight_share": 0.1,
+            "weighted_bottom_9_deciles_mean_label": 3.0,
+        },
+    ]
+
+    metrics = _mean_fold_metrics(fold_metrics)
+
+    assert metrics["unreliable_weighted_top_decile_fold_count"] == 1
+    for field in (
+        "weighted_top_decile_lift",
+        "weighted_top_decile_spread",
+        "weighted_top_decile_mean_label",
+        "weighted_top_decile_win_rate",
+        "weighted_top_decile_weight_share",
+        "weighted_bottom_9_deciles_mean_label",
+    ):
+        assert math.isnan(metrics[field])
+
+
+@pytest.mark.parametrize("row_count", [5, 9])
+def test_small_row_count_full_decile_curve_fails_closed_but_top_fallback_works(row_count):
+    labels = [float(idx + 1) for idx in range(row_count)]
+    preds = [float(idx) for idx in range(row_count)]
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert metrics["per_decile_unreliable"] is True
+    assert all(math.isnan(value) for value in metrics["per_decile_mean_label"])
+    assert metrics["top_decile_too_small"] is True
+    assert metrics["top_decile_effective_bins"] == 5
+    assert metrics["top_effective_bins"] == 5
+    assert metrics["top_effective_bucket_name"] == "top_quintile"
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isfinite(metrics["top_effective_mean_label"])
+    assert math.isfinite(metrics["top_effective_lift"])
+
+
+def test_weighted_tiny_full_decile_curve_fails_closed_but_top_fallback_is_sensible():
+    labels = [float(idx + 1) for idx in range(5)]
+    preds = [float(idx) for idx in range(5)]
+    weights = [1.0 for _ in labels]
+
+    metrics = _prediction_quality_metrics(labels, preds, weights=weights)
+
+    assert metrics["weighted_per_decile_unreliable"] is True
+    assert all(math.isnan(value) for value in metrics["weighted_per_decile_mean_label"])
+    assert metrics["weighted_top_decile_unreliable"] is True
+    assert math.isnan(metrics["weighted_top_decile_weight_share"])
+    assert math.isnan(metrics["weighted_top_decile_mean_label"])
+    assert metrics["weighted_top_effective_weight_share"] == pytest.approx(0.2)
+    assert math.isfinite(metrics["weighted_top_effective_mean_label"])
+
+
+def test_prediction_quality_metrics_tiny_fold_falls_back_without_crashing():
+    labels = [float(idx) for idx in range(12)]
+    preds = list(labels)
+
+    metrics = _prediction_quality_metrics(labels, preds)
+
+    assert metrics["top_decile_too_small"] is True
+    assert metrics["top_decile_fallback"] == "quintile"
+    assert metrics["top_decile_effective_bins"] == 5
+    assert metrics["top_decile_effective_quantile"] == pytest.approx(0.2)
+    assert metrics["top_effective_bins"] == 5
+    assert metrics["top_effective_quantile"] == pytest.approx(0.2)
+    assert metrics["top_effective_bucket_name"] == "top_quintile"
+    assert len(metrics["per_decile_mean_label"]) == 10
+    assert math.isnan(metrics["top_decile_lift"])
+    assert math.isnan(metrics["top_decile_mean_label"])
+    assert math.isfinite(metrics["top_effective_lift"])
+    assert math.isfinite(metrics["top_effective_mean_label"])
+
+
 def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     db_session, tmp_path
 ):
-    signal_ids = _seed_training_corpus(db_session)
+    signal_ids = _seed_training_corpus(db_session, count=80)
     manifest = load_manifest(_write_manifest(tmp_path, signal_ids))
     artifact_dir = tmp_path / "artifacts"
     job = Stage1TrainModelJob(
@@ -856,6 +1647,26 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     metrics = json.loads(model.cv_metrics_json)
     assert metrics["per_pattern"]["M4"]["cv_type"] == "purged_embargoed_walk_forward"
     assert metrics["per_pattern"]["M4"]["random_kfold_forbidden"] is True
+    assert "value_ic" in metrics["per_pattern"]["M4"]
+    assert "rank_ic" in metrics["per_pattern"]["M4"]
+    assert "top_decile_lift" in metrics["per_pattern"]["M4"]
+    assert "top_effective_lift" in metrics["per_pattern"]["M4"]
+    assert "per_decile_mean_label" in metrics["per_pattern"]["M4"]
+    assert "weighted_top_decile_lift" in metrics["per_pattern"]["M4"]
+    assert "raw_pooled_value_ic" in metrics["per_pattern"]["M4"]
+    assert metrics["per_pattern"]["M4"]["pooled_score_basis"] == "fold_normalized_prediction_percentile"
+    assert metrics["per_pattern"]["M4"]["raw_pooled_score_basis"] == "raw_prediction"
+    assert "mean_fold_metrics" in metrics["per_pattern"]["M4"]
+    assert "top_decile_lift" in metrics["per_pattern"]["M4"]["folds"][0]
+    assert "top_effective_lift" in metrics["per_pattern"]["M4"]["folds"][0]
+    assert "weighted_top_decile_lift" in metrics["per_pattern"]["M4"]["folds"][0]
+    assert metrics["per_pattern"]["M4"]["training_selection"]["kept_row_count"] == 80
+    assert (
+        metrics["per_pattern"]["M4"]["training_selection"]["dropped_non_finite"]
+        == 0
+    )
+    assert metrics["per_pattern"]["M4"]["oos_quality_gate"]["passed"] is True
+    assert metrics["per_pattern"]["M4"]["model_params"]["min_samples_leaf"] == 2
     assert metrics["pooled"]["diagnostic_only"] is True
 
     train_vector = select_features(db_session, signal_ids[0], _feature_schema())
@@ -870,6 +1681,70 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     assert score.score_source == "model_shadow"
     assert score.score_metadata_json is not None
     assert json.loads(score.score_metadata_json)["acts_on_book"] is False
+
+
+def test_train_model_rejected_when_pooled_oos_gate_fails(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+
+    def bad_cv(*_args, **_kwargs):
+        return {
+            "cv_type": "purged_embargoed_walk_forward",
+            "random_kfold_forbidden": True,
+            "top_decile_lift": 0.75,
+            "rank_ic": 0.25,
+            "top_decile_unreliable": False,
+            "top_decile_too_small": False,
+            "top_decile_lift_unreliable": False,
+        }
+
+    monkeypatch.setattr(train_model_module, "_cross_validate", bad_cv)
+    signal_ids = _seed_training_corpus(db_session, count=20)
+    manifest = load_manifest(_write_manifest(tmp_path, signal_ids))
+    job = Stage1TrainModelJob(
+        session=db_session,
+        manifest=manifest,
+        pattern_id="M4",
+        artifact_dir=tmp_path / "artifacts",
+        n_splits=2,
+        max_iter=3,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    model = db_session.query(MLModelRegistry).one()
+    metrics = json.loads(model.cv_metrics_json)["per_pattern"]["M4"]
+    assert model.status == "rejected"
+    assert metrics["oos_quality_gate"]["passed"] is False
+    assert metrics["oos_quality_gate"]["failures"][0]["metric"] == "top_decile_lift"
+
+
+def test_default_model_params_raise_min_samples_leaf():
+    pattern = PatternManifest(
+        pattern_id="M4",
+        signal_horizon="2d",
+        min_graded_cohorts=1,
+        embargo_sessions=2,
+        feature_schema=_feature_schema(),
+        label={"field": "forward_return"},
+        selection={
+            "source": "forward_return_observations",
+            "statuses": ["computed"],
+            "horizon_sessions": 2,
+            "signal_ids": [],
+        },
+        diagnostics={},
+    )
+
+    params = _resolved_model_params(pattern)
+
+    assert DEFAULT_MIN_SAMPLES_LEAF != 1
+    assert params["min_samples_leaf"] == DEFAULT_MIN_SAMPLES_LEAF
+    assert params["l2_regularization"] > 0.0
 
 
 def test_training_rejects_many_rows_on_too_few_graded_cohorts(db_session, tmp_path):
@@ -937,6 +1812,158 @@ def test_training_loader_filters_to_manifest_signal_horizon(db_session, tmp_path
     examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
 
     assert [row.signal_id for row in examples] == [sig_2d]
+
+
+def test_training_loader_fails_closed_on_pit_failed_rows(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=120, point_in_time_passed=False)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="pit_failed_row_count=1"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
+def test_training_loader_allows_deferred_pit_only_with_manifest_opt_in(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        train_model_module.LOGGER,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+    signal_id = _seed_signal(db_session, idx=121, point_in_time_passed=False)
+    payload = _manifest_payload([signal_id], allow_deferred_pit=True)
+    path = tmp_path / "deferred-pit.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    db_session.commit()
+    manifest = load_manifest(path)
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [signal_id]
+    assert metrics["pit_deferred"] is True
+    assert metrics["pit_failed_row_count"] == 1
+    assert any("allow_deferred_pit=true" in message for message in warnings)
+
+
+def test_training_loader_excludes_non_active_or_uncomputed_registry_rows(
+    db_session,
+    tmp_path,
+):
+    active_id = _seed_signal(db_session, idx=122)
+    excluded_id = _seed_signal(db_session, idx=123, signal_status="excluded")
+    pending_id = _seed_signal(
+        db_session,
+        idx=124,
+        forward_return_status="pending",
+    )
+    lookahead_failed_id = _seed_signal(
+        db_session,
+        idx=125,
+        lookahead_guard_passed=False,
+    )
+    db_session.commit()
+    manifest = load_manifest(
+        _write_manifest(
+            tmp_path,
+            [active_id, excluded_id, pending_id, lookahead_failed_id],
+        )
+    )
+
+    examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+    assert [row.signal_id for row in examples] == [active_id]
+
+
+def test_training_loader_signs_short_labels_by_direction(db_session, tmp_path):
+    signal_id = _seed_signal(
+        db_session,
+        idx=126,
+        direction="short",
+        forward_return=0.12,
+    )
+    payload = _manifest_payload([signal_id], direction="short")
+    path = tmp_path / "short-manifest.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    db_session.commit()
+    manifest = load_manifest(path)
+
+    examples = _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+    assert len(examples) == 1
+    assert examples[0].raw_label == pytest.approx(0.12)
+    assert examples[0].label == pytest.approx(-0.12)
+    assert examples[0].direction == "short"
+
+
+def test_training_loader_rejects_mixed_direction_cohort(db_session):
+    long_id = _seed_signal(db_session, idx=127, direction="long")
+    short_id = _seed_signal(db_session, idx=128, direction="short")
+    db_session.commit()
+    pattern = PatternManifest(
+        pattern_id="M4",
+        signal_horizon="2d",
+        min_graded_cohorts=1,
+        embargo_sessions=2,
+        feature_schema=_feature_schema(),
+        label={"field": "forward_return"},
+        selection={
+            "source": "forward_return_observations",
+            "statuses": ["computed"],
+            "horizon_sessions": 2,
+            "signal_ids": [long_id, short_id],
+        },
+        diagnostics={},
+        direction="long",
+    )
+
+    with pytest.raises(RuntimeError, match="mixed directions"):
+        _load_training_examples(db_session, pattern=pattern)
+
+
+def test_training_loader_rejects_manifest_direction_mismatch(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=129, direction="short")
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="manifest direction"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
+def test_training_loader_rejects_realized_label_window_beyond_purge_horizon(
+    db_session,
+    tmp_path,
+):
+    signal_date = date(2025, 2, 3)
+    signal_id = _seed_signal(
+        db_session,
+        idx=130,
+        signal_date=signal_date,
+        entry_session_date=signal_date,
+        exit_session_date=signal_date + timedelta(days=5),
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="realized label window"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
+def test_training_loader_rejects_non_finite_label(db_session, tmp_path):
+    signal_id = _seed_signal(db_session, idx=25, forward_return=float("inf"))
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="non-finite.*sig-25"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
 
 
 def test_training_loader_rejects_mixed_loaded_horizons(db_session):
@@ -1026,10 +2053,84 @@ def test_training_loader_drops_corrupt_vectors_but_keeps_stored_null(
 
     assert [row.signal_id for row in examples] == [missing_signal_id]
     assert examples[0].vector.missing_statuses["mom20"] == "stored_null"
-    assert metrics == {
-        "dropped_non_finite": 1,
-        "dropped_non_finite_by_feature": {"mom20": 1},
-    }
+    assert metrics["dropped_non_finite"] == 1
+    assert metrics["dropped_non_finite_by_feature"] == {"mom20": 1}
+    assert metrics["selected_row_count"] == 2
+    assert metrics["kept_row_count"] == 1
+    assert metrics["dropped_non_finite_fraction"] == pytest.approx(0.5)
+    assert math.isfinite(metrics["kept_label_mean"])
+    assert math.isfinite(metrics["dropped_non_finite_label_mean"])
+    assert metrics["dropped_non_finite_selection_bias_flag"] is False
+
+
+def test_training_loader_rejects_skewed_non_finite_drops_without_ack(
+    db_session,
+    tmp_path,
+):
+    corrupt_signal_id = _seed_signal(
+        db_session,
+        idx=131,
+        forward_return=1.0,
+    )
+    kept_signal_id = _seed_signal(
+        db_session,
+        idx=132,
+        forward_return=-1.0,
+    )
+    corrupt_snapshot = db_session.get(FeatureSnapshot, "fs-131")
+    corrupt_json = json.loads(corrupt_snapshot.feature_json)
+    corrupt_json["signal_context"]["mom20"] = "not-a-number"
+    corrupt_json["statuses"]["mom20"] = "computed"
+    corrupt_snapshot.feature_json = json.dumps(corrupt_json, sort_keys=True)
+    db_session.commit()
+    manifest = load_manifest(
+        _write_manifest(tmp_path, [corrupt_signal_id, kept_signal_id])
+    )
+
+    with pytest.raises(RuntimeError, match="selection-biased non-finite"):
+        _load_training_examples(
+            db_session,
+            pattern=manifest.pattern("M4"),
+            return_metrics=True,
+        )
+
+
+def test_training_loader_records_skewed_non_finite_drops_with_ack(
+    db_session,
+    tmp_path,
+):
+    corrupt_signal_id = _seed_signal(
+        db_session,
+        idx=133,
+        forward_return=1.0,
+    )
+    kept_signal_id = _seed_signal(
+        db_session,
+        idx=134,
+        forward_return=-1.0,
+    )
+    corrupt_snapshot = db_session.get(FeatureSnapshot, "fs-133")
+    corrupt_json = json.loads(corrupt_snapshot.feature_json)
+    corrupt_json["signal_context"]["mom20"] = "not-a-number"
+    corrupt_json["statuses"]["mom20"] = "computed"
+    corrupt_snapshot.feature_json = json.dumps(corrupt_json, sort_keys=True)
+    payload = _manifest_payload([corrupt_signal_id, kept_signal_id])
+    payload["patterns"]["M4"]["selection"]["allow_skewed_non_finite_drops"] = True
+    payload["manifest_sha256"] = manifest_payload_hash(payload)
+    path = tmp_path / "skewed-drops-ack.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    db_session.commit()
+    manifest = load_manifest(path)
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [kept_signal_id]
+    assert metrics["dropped_non_finite_selection_bias_flag"] is True
+    assert metrics["dropped_non_finite_label_mean_delta"] == pytest.approx(2.0)
 
 
 def test_missing_model_degrades_to_raw_strength_fallback_and_is_idempotent(db_session):
@@ -1387,7 +2488,6 @@ def test_non_finite_stored_value_overrides_truthy_status_path(db_session, tmp_pa
         (27, "not-a-number", None),
         (28, {}, None),
         (29, [], None),
-        (30, -2.0, "log1p"),
     ],
 )
 def test_present_values_that_become_nan_fall_back(
@@ -1446,6 +2546,33 @@ def test_present_values_that_become_nan_fall_back(
     assert db_session.query(SignalMLScore).filter(
         SignalMLScore.score_source == "model_shadow"
     ).count() == 0
+
+
+def test_log1p_domain_violation_raises_feature_selection_error(db_session):
+    signal_id = _seed_signal(db_session, idx=30, gap=-0.01)
+    snapshot = db_session.get(FeatureSnapshot, "fs-30")
+    feature_json = json.loads(snapshot.feature_json)
+    feature_json["signal_context"]["mom20"] = -2.0
+    feature_json["statuses"]["mom20"] = "computed"
+    snapshot.feature_json = json.dumps(feature_json, sort_keys=True)
+    schema = {
+        "schema_version": "log1p_domain_guard_v1",
+        "pattern_id": "M4",
+        "pattern_clock": "eod",
+        "fields": [
+            {
+                "name": "mom20",
+                "source": "feature_snapshot_json",
+                "path": "signal_context.mom20",
+                "status_path": "statuses.mom20",
+                "transform": "log1p",
+            }
+        ],
+    }
+    db_session.commit()
+
+    with pytest.raises(FeatureSelectionError, match="log1p transform domain"):
+        select_features(db_session, signal_id, schema)
 
 
 def test_absent_value_stays_typed_missing_and_scores_shadow(db_session, tmp_path):

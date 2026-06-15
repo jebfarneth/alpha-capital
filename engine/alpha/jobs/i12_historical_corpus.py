@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import time as time_module
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from copy import deepcopy
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -98,6 +99,7 @@ CANDIDATE_SCREEN_STAMP = {
     "poison_gap_controls": "gap_below_-0.05_retained_as_poison_premarket_when_volume_screen_passes",
 }
 PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS = 250
+DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
 
 ProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
@@ -225,6 +227,7 @@ class _RunCounters:
     sub_dollar_included: int = 0
     non_session_bars_skipped: int = 0
     fetch_errors: int = 0
+    watchdog_timeouts: int = 0
     quarantined: int = 0
     inserted_details: int = 0
     reused_details: int = 0
@@ -265,6 +268,7 @@ class _RunCounters:
         self.sub_dollar_included += other.sub_dollar_included
         self.non_session_bars_skipped += other.non_session_bars_skipped
         self.fetch_errors += other.fetch_errors
+        self.watchdog_timeouts += other.watchdog_timeouts
         self.quarantined += other.quarantined
         self.inserted_details += other.inserted_details
         self.reused_details += other.reused_details
@@ -316,6 +320,7 @@ class I12HistoricalCorpusJob(BaseJob):
         skip_existing: bool = False,
         max_db_retries: int = 3,
         db_retry_backoff_seconds: float = 5.0,
+        fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
         if end_date < start_date:
@@ -326,6 +331,8 @@ class I12HistoricalCorpusJob(BaseJob):
             raise ValueError("max_db_retries must be >= 0")
         if db_retry_backoff_seconds < 0:
             raise ValueError("db_retry_backoff_seconds must be >= 0")
+        if fetch_deadline_seconds <= 0:
+            raise ValueError("fetch_deadline_seconds must be > 0")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -339,6 +346,7 @@ class I12HistoricalCorpusJob(BaseJob):
         self._skip_existing = skip_existing
         self._max_db_retries = max_db_retries
         self._db_retry_backoff_seconds = db_retry_backoff_seconds
+        self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._last_polygon_fetch_monotonic: float | None = None
         self._progress_callback = progress_callback
         self._latest_metrics: dict[str, Any] = {}
@@ -685,11 +693,10 @@ class I12HistoricalCorpusJob(BaseJob):
             if raw_minutes is None:
                 counters.minute_cache_misses += 1
                 self._throttle_polygon_fetch()
-                resp = self._polygon.get_minute_aggs(
+                resp = self._fetch_polygon_minutes_with_deadline(
                     ticker,
-                    trading_date.isoformat(),
-                    trading_date.isoformat(),
-                    adjusted=True,
+                    trading_date,
+                    counters=counters,
                 )
                 if not resp.ok:
                     counters.fetch_errors += 1
@@ -736,6 +743,45 @@ class I12HistoricalCorpusJob(BaseJob):
             security_type=daily_input.security_type,
             sessions_to_delist=daily_input.sessions_to_delist,
         )
+
+    def _fetch_polygon_minutes_with_deadline(
+        self,
+        ticker: str,
+        trading_date: date,
+        *,
+        counters: _RunCounters,
+    ) -> AdapterResponse[Any]:
+        self._progress("minute_fetch_start", {
+            "ticker": ticker,
+            "trading_date": trading_date.isoformat(),
+            "deadline_seconds": self._fetch_deadline_seconds,
+            "cache_status": "miss",
+        })
+
+        def _fetch() -> AdapterResponse[Any]:
+            return self._polygon.get_minute_aggs(
+                ticker,
+                trading_date.isoformat(),
+                trading_date.isoformat(),
+                adjusted=True,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="polygon-minute-fetch")
+        future = executor.submit(_fetch)
+        try:
+            return future.result(timeout=self._fetch_deadline_seconds)
+        except FuturesTimeoutError as exc:
+            counters.fetch_errors += 1
+            counters.watchdog_timeouts += 1
+            future.cancel()
+            raise _Quarantine({
+                "ticker": ticker,
+                "trading_date": trading_date.isoformat(),
+                "error": "minute_fetch_watchdog_timeout",
+                "deadline_seconds": self._fetch_deadline_seconds,
+            }) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _sessions_to_delist(self, ticker: str, trading_date: date) -> int | None:
         row = (
@@ -1064,6 +1110,7 @@ class I12HistoricalCorpusJob(BaseJob):
             "non_session_bars_skipped": counters.non_session_bars_skipped,
             "non_session_bar_skip_sample": counters.non_session_bar_samples,
             "fetch_errors": counters.fetch_errors,
+            "watchdog_timeouts": counters.watchdog_timeouts,
             "quarantined": counters.quarantined,
             "inserted_details": counters.inserted_details,
             "reused_details": counters.reused_details,
@@ -1079,6 +1126,8 @@ class I12HistoricalCorpusJob(BaseJob):
         }
 
     def _progress(self, event: str, payload: Mapping[str, Any]) -> None:
+        payload = dict(payload)
+        payload.setdefault("wall_clock_utc", _utc_progress_timestamp())
         metrics = payload.get("metrics")
         if isinstance(metrics, dict):
             self._latest_metrics = dict(metrics)
@@ -1146,6 +1195,10 @@ class _Quarantine(RuntimeError):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(str(payload))
         self.payload = payload
+
+
+def _utc_progress_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _daily_context_from_bars(
