@@ -297,6 +297,10 @@ class PolygonAdapter:
     ):
         self._config = config
         self._session = session or requests.Session()
+        self._configure_session(self._session)
+        self._session.params = {"apiKey": config.api_key}  # type: ignore[assignment]
+
+    def _configure_session(self, session: requests.Session) -> None:
         retry = Retry(
             total=3,
             connect=3,
@@ -306,10 +310,19 @@ class PolygonAdapter:
             respect_retry_after_header=True,
             allowed_methods=["GET"],
         )
-        retry_adapter = HTTPAdapter(max_retries=retry)
-        self._session.mount("https://", retry_adapter)
-        self._session.mount("http://", retry_adapter)
-        self._session.params = {"apiKey": config.api_key}  # type: ignore[assignment]
+        retry_adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+        mount = getattr(session, "mount", None)
+        if callable(mount):
+            mount("https://", retry_adapter)
+            mount("http://", retry_adapter)
+
+    def reset_session(self) -> None:
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = requests.Session()
+        self._configure_session(self._session)
+        self._session.params = {"apiKey": self._config.api_key}  # type: ignore[assignment]
 
     def _request(
         self,

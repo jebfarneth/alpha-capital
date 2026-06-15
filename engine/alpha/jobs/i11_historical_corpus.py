@@ -36,8 +36,10 @@ from alpha.db.models import (
 )
 from alpha.evidence.writer import record_feature_snapshot, record_signal
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.watchdog import ProviderOutageCircuitBreaker
 from alpha.jobs.i12_historical_corpus import (
     DEFAULT_FETCH_DEADLINE_SECONDS,
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     MIN_PRIOR_DAILY_SESSIONS,
     OUTCOME_CONFIRMED,
     OUTCOME_HALTED_UNFILLABLE,
@@ -227,6 +229,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         max_db_retries: int = 3,
         db_retry_backoff_seconds: float = 5.0,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
+        max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         progress_callback: Any | None = None,
         catalyst_tags_by_ticker_date: Mapping[tuple[str, date], Sequence[str]] | None = None,
         at_open: bool = False,
@@ -246,6 +249,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             max_db_retries=max_db_retries,
             db_retry_backoff_seconds=db_retry_backoff_seconds,
             fetch_deadline_seconds=fetch_deadline_seconds,
+            max_outstanding_fetch_timeouts=max_outstanding_fetch_timeouts,
             progress_callback=progress_callback,
         )
         self._catalyst_tags_by_ticker_date = {
@@ -295,15 +299,35 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         daily_cache: dict[str, tuple[tuple[_DailyBar, ...], Any]] = {}
         minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], Any]] = {}
 
-        self._run_batches_with_retry(
-            ctx,
-            counters=counters,
-            trading_dates=trading_dates,
-            classifications=classifications,
-            daily_cache=daily_cache,
-            minute_cache=minute_cache,
-            process_batch=self._run_batch_once,
-        )
+        try:
+            self._run_batches_with_retry(
+                ctx,
+                counters=counters,
+                trading_dates=trading_dates,
+                classifications=classifications,
+                daily_cache=daily_cache,
+                minute_cache=minute_cache,
+                process_batch=self._run_batch_once,
+            )
+        except ProviderOutageCircuitBreaker as exc:
+            counters.fetch_errors += 1
+            counters.watchdog_timeouts = max(
+                counters.watchdog_timeouts,
+                self._fetch_watchdog.total_timeouts,
+            )
+            counters.errors.append(exc.payload)
+            self._progress(
+                "provider_outage_circuit_breaker",
+                {
+                    "metrics": self._metrics(counters, trading_dates=trading_dates),
+                    **exc.payload,
+                },
+            )
+            return JobResult(
+                status="partial_failed",
+                metrics=self._metrics(counters, trading_dates=trading_dates),
+                errors=counters.errors,
+            )
 
         return JobResult(
             status="finished",
@@ -1359,6 +1383,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             "non_session_bar_skip_sample": counters.non_session_bar_samples,
             "fetch_errors": counters.fetch_errors,
             "watchdog_timeouts": counters.watchdog_timeouts,
+            **self._fetch_watchdog.snapshot(),
             "quarantined": counters.quarantined,
             "inserted_details": counters.inserted_details,
             "reused_details": counters.reused_details,

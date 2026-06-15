@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import json
 import math
-import queue
 import re
 import statistics
-import threading
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -26,10 +24,16 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from alpha.data.contracts import stable_hash
+from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import FmpAdapter, FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import DataLineage, MarketPathFeature, SignalRegistry
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.watchdog import (
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+    ProviderOutageCircuitBreaker,
+    WatchdogState,
+    call_with_daemon_deadline,
+)
 from alpha.jobs.historical_m4_signal_selector import (
     SIGNAL_SOURCE_LIVE,
     apply_signal_source_filter,
@@ -511,6 +515,7 @@ class MarketPathFeatureCollection:
     fetch_errors: list[dict[str, Any]] | None = None
     errors: list[dict[str, Any]] | None = None
     stage_timings: dict[str, float] | None = None
+    watchdog_state: dict[str, Any] | None = None
     no_op_reason: str | None = None
     skip_existing: bool = False
     polygon_minute_layer_enabled: bool = False
@@ -554,6 +559,7 @@ class MarketPathFeatureCollection:
             "missing_entry_row_count": self.missing_entry_rows,
             "fetch_error_count": len(self.fetch_errors or []),
             "watchdog_timeouts": self.watchdog_timeouts,
+            **(self.watchdog_state or {}),
             "benchmark_fetch_count": self.benchmark_fetch_count,
             "benchmark_fetch_error_count": self.benchmark_fetch_error_count,
             "sector_etf_fetch_count": self.sector_etf_fetch_count,
@@ -593,6 +599,7 @@ class MarketPathFeatureJob(BaseJob):
         signal_source: str = SIGNAL_SOURCE_LIVE,
         polygon_minute_adapter: Any | None = None,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
+        max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         skip_existing: bool = False,
     ) -> None:
         if progress_every < 1:
@@ -601,6 +608,8 @@ class MarketPathFeatureJob(BaseJob):
             raise ValueError("max_fetch_concurrency must be >= 1")
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
+        if max_outstanding_fetch_timeouts < 1:
+            raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._run_timestamp = run_timestamp
@@ -620,6 +629,10 @@ class MarketPathFeatureJob(BaseJob):
         self._signal_source = normalize_signal_source(signal_source)
         self._polygon_minute_adapter = polygon_minute_adapter
         self._fetch_deadline_seconds = float(fetch_deadline_seconds)
+        self._fetch_watchdog = WatchdogState(
+            max_outstanding_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_timeouts=max_outstanding_fetch_timeouts,
+        )
         self._skip_existing = skip_existing
 
     @property
@@ -631,7 +644,19 @@ class MarketPathFeatureJob(BaseJob):
         return "feature_enrichment"
 
     def run(self, ctx: JobContext) -> JobResult:
-        collection = self.collect_feature_rows(ctx)
+        try:
+            collection = self.collect_feature_rows(ctx)
+        except ProviderOutageCircuitBreaker as exc:
+            return JobResult(
+                status="failed",
+                metrics={
+                    "feature_version": self._feature_version,
+                    "pattern_ids": list(self._pattern_ids),
+                    "fetch_deadline_seconds": self._fetch_deadline_seconds,
+                    **self._fetch_watchdog.snapshot(),
+                },
+                errors=[exc.payload],
+            )
         if collection.errors:
             return JobResult(
                 status="failed",
@@ -882,12 +907,13 @@ class MarketPathFeatureJob(BaseJob):
                 through_date=through_date,
             )
             started = perf_counter()
-            resp = self._fmp.get_historical_price(
+            resp = self._fmp_historical_price_with_deadline(
                 ticker,
                 from_date=from_date,
                 to_date=through_date,
                 asof=run_ts,
                 adjusted=False,
+                stage="fmp_historical_price",
             )
             _record_timing(stage_timings, "ticker_fmp_fetch_seconds", started)
             tickers_fetched += 1
@@ -1037,7 +1063,7 @@ class MarketPathFeatureJob(BaseJob):
             rows_unchanged=rows_unchanged,
             rows_skipped=rows_skipped,
             missing_entry_rows=missing_entry_rows,
-            watchdog_timeouts=watchdog_timeouts,
+            watchdog_timeouts=self._fetch_watchdog.total_timeouts,
             benchmark_fetch_count=len(BENCHMARK_SYMBOLS),
             benchmark_fetch_error_count=_reference_error_count(benchmark_series),
             sector_etf_fetch_count=len(sector_etf_series),
@@ -1049,6 +1075,7 @@ class MarketPathFeatureJob(BaseJob):
             pending_feature_rows=pending_feature_rows,
             fetch_errors=fetch_errors,
             stage_timings=stage_timings,
+            watchdog_state=self._fetch_watchdog.snapshot(),
         )
 
     def _emit_progress(self, event: str, payload: dict[str, Any]) -> None:
@@ -1092,6 +1119,7 @@ class MarketPathFeatureJob(BaseJob):
                 "ticker_count": total,
                 "from_date": from_date.isoformat(),
                 "through_date": through_date.isoformat(),
+                **self._fetch_watchdog.snapshot(),
                 **extra,
             },
         )
@@ -1134,6 +1162,76 @@ class MarketPathFeatureJob(BaseJob):
             for row in rows
         }
 
+    def _fmp_historical_price_with_deadline(
+        self,
+        ticker: str,
+        *,
+        from_date: date,
+        to_date: date,
+        asof: datetime,
+        adjusted: bool,
+        stage: str,
+    ) -> Any:
+        self._emit_progress(
+            "fmp_fetch_start",
+            {
+                "ticker": ticker.upper(),
+                "from_date": from_date.isoformat(),
+                "to_date": to_date.isoformat(),
+                "stage": stage,
+                "deadline_seconds": self._fetch_deadline_seconds,
+                **self._fetch_watchdog.snapshot(),
+            },
+        )
+
+        def _fetch(
+            ticker: str = ticker,
+            from_date: date = from_date,
+            to_date: date = to_date,
+            asof: datetime = asof,
+            adjusted: bool = adjusted,
+        ) -> Any:
+            return self._fmp.get_historical_price(
+                ticker,
+                from_date=from_date,
+                to_date=to_date,
+                asof=asof,
+                adjusted=adjusted,
+            )
+
+        try:
+            return call_with_daemon_deadline(
+                _fetch,
+                timeout_seconds=self._fetch_deadline_seconds,
+                thread_name="market-path-fmp-fetch",
+                state=self._fetch_watchdog,
+                context={
+                    "ticker": ticker.upper(),
+                    "stage": stage,
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                },
+            )
+        except FuturesTimeoutError:
+            return AdapterResponse(
+                data=None,
+                lineage=LineageMeta(
+                    provider="FMP",
+                    endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                    request_timestamp=datetime.now(timezone.utc),
+                    asof_timestamp=asof,
+                    raw_payload_hash="",
+                    data_quality_flags=self._fetch_watchdog.snapshot(),
+                ),
+                error=ProviderError(
+                    provider="FMP",
+                    endpoint=HISTORICAL_PRICE_FULL_ENDPOINT,
+                    status_code=None,
+                    error_type="watchdog_timeout",
+                    message="FMP historical price fetch exceeded watchdog deadline",
+                    retryable=True,
+                ),
+            )
+
     def _fetch_ticker_signal_minutes(
         self,
         ticker: str,
@@ -1153,10 +1251,14 @@ class MarketPathFeatureJob(BaseJob):
                     "trading_date": trading_date.isoformat(),
                     "deadline_seconds": self._fetch_deadline_seconds,
                     "cache_status": "unknown",
+                    **self._fetch_watchdog.snapshot(),
                 },
             )
 
-            def _fetch() -> Any:
+            def _fetch(
+                ticker: str = ticker,
+                trading_date: date = trading_date,
+            ) -> Any:
                 return self._polygon_minute_adapter.get_minute_aggs(
                     ticker,
                     from_date=trading_date.isoformat(),
@@ -1165,24 +1267,35 @@ class MarketPathFeatureJob(BaseJob):
                 )
 
             try:
-                resp = _call_with_daemon_deadline(
+                resp = call_with_daemon_deadline(
                     _fetch,
                     timeout_seconds=self._fetch_deadline_seconds,
                     thread_name="market-path-polygon-minute-fetch",
+                    state=self._fetch_watchdog,
+                    context={
+                        "ticker": ticker.upper(),
+                        "trading_date": trading_date.isoformat(),
+                        "stage": "polygon_minute_fetch",
+                        "deadline_seconds": self._fetch_deadline_seconds,
+                    },
                 )
             except FuturesTimeoutError:
                 watchdog_timeouts += 1
+                self._maybe_reset_polygon_session()
                 fetch_error = {
                     "ticker": ticker.upper(),
                     "trading_date": trading_date.isoformat(),
                     "stage": "polygon_minute_fetch",
                     "error": "fetch_watchdog_timeout",
                     "deadline_seconds": self._fetch_deadline_seconds,
+                    **self._fetch_watchdog.snapshot(),
                 }
                 fetch_errors.append(fetch_error)
                 self._emit_progress("fetch_watchdog_timeout", fetch_error)
                 out[trading_date] = ()
                 continue
+            except ProviderOutageCircuitBreaker:
+                raise
             except Exception:
                 fetch_errors.append({
                     "ticker": ticker.upper(),
@@ -1206,6 +1319,17 @@ class MarketPathFeatureJob(BaseJob):
             )
         return out, watchdog_timeouts
 
+    def _maybe_reset_polygon_session(self) -> None:
+        if (
+            self._fetch_watchdog.total_timeouts == 0
+            or self._fetch_watchdog.total_timeouts % 3
+        ):
+            return
+        reset = getattr(self._polygon_minute_adapter, "reset_session", None)
+        if callable(reset):
+            reset()
+            self._emit_progress("polygon_session_reset", self._fetch_watchdog.snapshot())
+
     def _fetch_reference_series(
         self,
         symbols: Sequence[str],
@@ -1220,13 +1344,34 @@ class MarketPathFeatureJob(BaseJob):
     ) -> dict[str, _ReferenceSeries]:
         series: dict[str, _ReferenceSeries] = {}
         for symbol in sorted({item.upper() for item in symbols if item}):
-            resp = self._fmp.get_historical_price(
-                symbol,
-                from_date=from_date,
-                to_date=through_date,
-                asof=run_ts,
-                adjusted=False,
-            )
+            try:
+                resp = self._fmp_historical_price_with_deadline(
+                    symbol,
+                    from_date=from_date,
+                    to_date=through_date,
+                    asof=run_ts,
+                    adjusted=False,
+                    stage=f"fmp_{source_role}",
+                )
+            except FuturesTimeoutError:
+                series[symbol] = _ReferenceSeries(
+                    symbol=symbol,
+                    bars=(),
+                    data_lineage_id=None,
+                    raw_payload_hash=None,
+                    status="fetch_error",
+                    error={
+                        "symbol": symbol,
+                        "stage": f"fmp_{source_role}",
+                        "message": "fetch watchdog timeout",
+                        "error_type": "watchdog_timeout",
+                        "provider": "FMP",
+                        "retryable": True,
+                        "deadline_seconds": self._fetch_deadline_seconds,
+                        **self._fetch_watchdog.snapshot(),
+                    },
+                )
+                continue
             if not resp.ok or resp.data is None:
                 series[symbol] = _ReferenceSeries(
                     symbol=symbol,
@@ -2131,31 +2276,6 @@ def _utc_progress_timestamp() -> str:
         "+00:00",
         "Z",
     )
-
-
-def _call_with_daemon_deadline(
-    func: Callable[[], Any],
-    *,
-    timeout_seconds: float,
-    thread_name: str,
-) -> Any:
-    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def _target() -> None:
-        try:
-            results.put_nowait((True, func()))
-        except Exception as exc:
-            results.put_nowait((False, exc))
-
-    thread = threading.Thread(target=_target, name=thread_name, daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise FuturesTimeoutError()
-    ok, value = results.get_nowait()
-    if ok:
-        return value
-    raise value
 
 
 def _safe_rank_progress(

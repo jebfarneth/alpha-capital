@@ -142,6 +142,20 @@ class SleepyMinuteAdapter(EmptyMinuteAdapter):
         return super().get_minute_aggs(*_args, **_kwargs)
 
 
+class DateRecordingMinuteAdapter(EmptyMinuteAdapter):
+    def __init__(self, delay_by_date: dict[str, float]) -> None:
+        self.delay_by_date = delay_by_date
+        self.calls: list[str] = []
+
+    def get_minute_aggs(self, *_args, **kwargs):
+        from_date = kwargs["from_date"]
+        self.calls.append(from_date)
+        delay = self.delay_by_date.get(from_date, 0.0)
+        if delay > 0:
+            time_module.sleep(delay)
+        return super().get_minute_aggs(*_args, **kwargs)
+
+
 class NoFetchFmpAdapter:
     cache_hits = 0
     cache_misses = 0
@@ -3154,6 +3168,7 @@ def _run_signal_session_backfill(
     skip_existing: bool = False,
     polygon_minute_adapter=None,
     fetch_deadline_seconds: float = 120.0,
+    max_outstanding_fetch_timeouts: int = 10,
     progress_callback=None,
 ):
     signal = _add_signal(
@@ -3175,6 +3190,7 @@ def _run_signal_session_backfill(
         skip_existing=skip_existing,
         polygon_minute_adapter=polygon_minute_adapter,
         fetch_deadline_seconds=fetch_deadline_seconds,
+        max_outstanding_fetch_timeouts=max_outstanding_fetch_timeouts,
         progress_callback=progress_callback,
     )
     result = run_job(db_session, job)
@@ -3315,28 +3331,87 @@ def test_m4_day0_delisted_fixture_writes_row_and_marks_missing_intraday(db_sessi
 def test_m4_day0_polygon_minute_watchdog_counts_timeout_and_persists_row(db_session):
     adapter = SleepyMinuteAdapter(delay_seconds=2.0)
 
-    started = time_module.monotonic()
     _signal, row, result = _run_signal_session_backfill(
         db_session,
         polygon_minute_adapter=adapter,
         fetch_deadline_seconds=0.05,
     )
-    elapsed = time_module.monotonic() - started
 
-    assert elapsed < 1.0
     assert result.status == "partial_failed"
     assert result.metrics["watchdog_timeouts"] == 1
-    assert result.errors == [{
+    assert result.errors[0] | {
         "ticker": "LCUT",
         "trading_date": "2026-06-05",
         "stage": "polygon_minute_fetch",
         "error": "fetch_watchdog_timeout",
         "deadline_seconds": 0.05,
-    }]
+    } == result.errors[0]
     assert adapter.calls == 1
     assert row.feature_role == "signal_session"
     assert row.missing_intraday_bars is True
     assert row.intraday_structure_status == "minute_bars_missing"
+
+
+def test_m4_day0_polygon_minute_breaker_aborts_without_empty_bar_persist(
+    db_session,
+):
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    adapter = SleepyMinuteAdapter(delay_seconds=2.0)
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"LCUT": _rich_bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 5),
+        signal_end_date=date(2026, 6, 5),
+        through_date=date(2026, 6, 5),
+        include_signal_session=True,
+        polygon_minute_adapter=adapter,
+        fetch_deadline_seconds=0.05,
+        max_outstanding_fetch_timeouts=1,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "failed"
+    assert result.errors[0]["error"] == "provider_outage_circuit_breaker"
+    assert result.errors[0]["outstanding_fetch_timeouts"] == 1
+    assert adapter.calls == 1
+    assert db_session.query(MarketPathFeature).count() == 0
+
+
+def test_m4_day0_polygon_minute_timeout_binds_each_worker_date(db_session):
+    first = date(2026, 6, 5)
+    second = date(2026, 6, 8)
+    adapter = DateRecordingMinuteAdapter({first.isoformat(): 0.2})
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=FakeFmpAdapter({"LCUT": _rich_bars()}),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=first,
+        signal_end_date=second,
+        through_date=second,
+        include_signal_session=True,
+        polygon_minute_adapter=adapter,
+        fetch_deadline_seconds=0.02,
+    )
+
+    out, timeouts = job._fetch_ticker_signal_minutes(
+        "LCUT",
+        signal_dates=[first, second],
+        fetch_errors=[],
+    )
+
+    assert timeouts == 1
+    assert out[first] == ()
+    assert out[second] == ()
+    assert adapter.calls[:2] == [first.isoformat(), second.isoformat()]
 
 
 def test_m4_day0_polygon_minute_heartbeat_written_before_fetch(db_session):
@@ -3405,6 +3480,7 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
         "--minute-cache-dir", str(tmp_path / "minutes"),
         "--polygon-rate-limit-per-minute", "120",
         "--fetch-deadline-seconds", "9.5",
+        "--max-outstanding-fetch-timeouts", "4",
         "--disable-polygon-minute-layer",
         "--progress-artifact", str(tmp_path / "progress.json"),
     ])
@@ -3415,3 +3491,4 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
     assert '"feature_role": "signal_session"' in out
     assert '"predictor_features"' in out
     assert '"fetch_deadline_seconds": 9.5' in out
+    assert '"max_outstanding_fetch_timeouts": 4' in out

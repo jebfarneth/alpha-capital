@@ -46,6 +46,10 @@ from alpha.jobs.market_path_features import (
     _bulk_upsert_market_path_features,
     sanitize_provider_error_message,
 )
+from alpha.jobs.watchdog import (
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+    ProviderOutageCircuitBreaker,
+)
 from alpha.jobs.historical_m4_signal_selector import (
     SIGNAL_SOURCE_CHOICES,
     SIGNAL_SOURCE_LIVE,
@@ -510,6 +514,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         progress_every: int = 10,
         request_timeout_seconds: float = 30.0,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
+        max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
         polygon_minute_adapter: Any | None = None,
@@ -526,6 +531,8 @@ class MarketPathBulkBackfillJob(BaseJob):
             raise ValueError("request_timeout_seconds must be > 0")
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
+        if max_outstanding_fetch_timeouts < 1:
+            raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
         if max_fetch_concurrency < 1:
             raise ValueError("max_fetch_concurrency must be >= 1")
         self._session = session
@@ -545,6 +552,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._progress_every = progress_every
         self._request_timeout_seconds = request_timeout_seconds
         self._fetch_deadline_seconds = float(fetch_deadline_seconds)
+        self._max_outstanding_fetch_timeouts = int(max_outstanding_fetch_timeouts)
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
         self._polygon_minute_adapter = polygon_minute_adapter
@@ -668,6 +676,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 include_signal_session=self._include_signal_session,
                 polygon_minute_adapter=self._polygon_minute_adapter,
                 fetch_deadline_seconds=self._fetch_deadline_seconds,
+                max_outstanding_fetch_timeouts=self._max_outstanding_fetch_timeouts,
                 skip_existing=self._skip_existing,
                 progress_callback=batch_progress,
                 progress_every=self._progress_every,
@@ -675,7 +684,24 @@ class MarketPathBulkBackfillJob(BaseJob):
                 signal_source=self._signal_source,
             )
             collect_started = time.perf_counter()
-            collection = feature_job.collect_feature_rows(ctx)
+            try:
+                collection = feature_job.collect_feature_rows(ctx)
+            except ProviderOutageCircuitBreaker as exc:
+                fetch_errors.append(exc.payload)
+                batch_record["status"] = "failed"
+                batch_record["errors"] = [exc.payload]
+                batch_progress(
+                    "provider_outage_circuit_breaker",
+                    {
+                        **exc.payload,
+                        "elapsed_seconds": round(
+                            time.perf_counter() - collect_started,
+                            6,
+                        ),
+                    },
+                )
+                _write_artifact(self._progress_artifact, artifact)
+                break
             compute_seconds += time.perf_counter() - collect_started
             batch_progress(
                 "collect_finish",
@@ -816,6 +842,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 include_signal_session=self._include_signal_session,
                 polygon_minute_adapter=self._polygon_minute_adapter,
                 fetch_deadline_seconds=self._fetch_deadline_seconds,
+                max_outstanding_fetch_timeouts=self._max_outstanding_fetch_timeouts,
                 skip_existing=self._skip_existing,
                 signal_source=self._signal_source,
             )
@@ -884,6 +911,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "ticker_fetch_error_count": ticker_fetch_error_total,
             "request_timeout_seconds": self._request_timeout_seconds,
             "fetch_deadline_seconds": self._fetch_deadline_seconds,
+            "max_outstanding_fetch_timeouts": self._max_outstanding_fetch_timeouts,
             "watchdog_timeouts": watchdog_timeouts,
             "signal_source": self._signal_source,
             "skip_existing": self._skip_existing,
@@ -1331,6 +1359,7 @@ def _run_live(args: argparse.Namespace) -> int:
             progress_every=args.progress_every,
             request_timeout_seconds=args.request_timeout_seconds,
             fetch_deadline_seconds=args.fetch_deadline_seconds,
+            max_outstanding_fetch_timeouts=args.max_outstanding_fetch_timeouts,
             max_fetch_concurrency=args.max_fetch_concurrency,
             signal_source=args.signal_source,
             polygon_minute_adapter=polygon_minute_adapter,
@@ -1361,6 +1390,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "progress_every": args.progress_every,
                 "request_timeout_seconds": args.request_timeout_seconds,
                 "fetch_deadline_seconds": args.fetch_deadline_seconds,
+                "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
                 "max_fetch_concurrency": args.max_fetch_concurrency,
                 "signal_source": args.signal_source,
                 "minute_cache_dir": args.minute_cache_dir,
@@ -1476,6 +1506,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=DEFAULT_FETCH_DEADLINE_SECONDS,
         help="Wall-clock deadline for one Polygon minute fetch.",
+    )
+    parser.add_argument(
+        "--max-outstanding-fetch-timeouts",
+        type=int,
+        default=DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        help="Abort the shard when this many timed-out fetch workers remain outstanding.",
     )
     parser.add_argument("--max-fetch-concurrency", type=int, default=1)
     parser.add_argument("--minute-cache-dir")

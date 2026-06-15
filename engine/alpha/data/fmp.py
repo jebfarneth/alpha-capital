@@ -18,6 +18,8 @@ import re
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from alpha.data.config import FmpConfig
 from alpha.data.contracts import (
@@ -32,6 +34,7 @@ from alpha.data.contracts import (
 from alpha.data.universe_config import MCAP_MAX, MCAP_MIN
 
 PROVIDER = "FMP"
+FMP_REQUEST_TIMEOUT = (10, 30)
 HISTORICAL_PRICE_FULL_ENDPOINT = "/stable/historical-price-eod/full"
 HISTORICAL_PRICE_DIVIDEND_ADJUSTED_ENDPOINT = (
     "/stable/historical-price-eod/dividend-adjusted"
@@ -222,7 +225,32 @@ class FmpAdapter:
     def __init__(self, config: FmpConfig, session: Optional[requests.Session] = None):
         self._config = config
         self._session = session or requests.Session()
+        self._configure_session(self._session)
         self._session.params = {"apikey": config.api_key}  # type: ignore[assignment]
+
+    def _configure_session(self, session: requests.Session) -> None:
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            respect_retry_after_header=True,
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+        mount = getattr(session, "mount", None)
+        if callable(mount):
+            mount("https://", adapter)
+            mount("http://", adapter)
+
+    def reset_session(self) -> None:
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = requests.Session()
+        self._configure_session(self._session)
+        self._session.params = {"apikey": self._config.api_key}  # type: ignore[assignment]
 
     def _request(
         self,
@@ -257,7 +285,11 @@ class FmpAdapter:
                 )
 
         try:
-            resp = self._session.get(url, params=params or {}, timeout=30)
+            resp = self._session.get(
+                url,
+                params=params or {},
+                timeout=FMP_REQUEST_TIMEOUT,
+            )
         except requests.exceptions.Timeout:
             return AdapterResponse(
                 data=None,

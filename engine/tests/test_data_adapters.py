@@ -32,7 +32,7 @@ from alpha.data.config import (
     SecEdgarConfig,
 )
 from alpha.data.contracts import stable_hash
-from alpha.data.fmp import FmpAdapter
+from alpha.data.fmp import FMP_REQUEST_TIMEOUT, FmpAdapter
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.polygon import POLYGON_REQUEST_TIMEOUT, PolygonAdapter, _normalized_cik
@@ -1146,6 +1146,18 @@ class TestFmpAdapter:
     def _adapter(self, mock_session):
         return FmpAdapter(_fmp_config(), session=mock_session)
 
+    def test_retry_adapter_and_timeout_contract(self):
+        session = requests.Session()
+
+        adapter = self._adapter(session)
+
+        retry_adapter = adapter._session.get_adapter("https://")
+        assert retry_adapter.max_retries.total == 3
+        assert retry_adapter.max_retries.connect == 3
+        assert retry_adapter.max_retries.read == 3
+        assert 429 in retry_adapter.max_retries.status_forcelist
+        assert FMP_REQUEST_TIMEOUT == (10, 30)
+
     def test_get_quote_ok(self):
         session = MagicMock(spec=requests.Session)
         session.params = {}
@@ -1182,7 +1194,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/quote",
             params={"symbol": "ACME"},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_quote_empty_result_is_no_data_error(self):
@@ -1250,7 +1262,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/insider-trading/search",
             params={"page": 0, "limit": 50, "symbol": "ACME"},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_historical_price_ok(self):
@@ -1288,7 +1300,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/historical-price-eod/full",
             params={"symbol": "ACME"},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_historical_price_passes_date_window_and_asof(self):
@@ -1324,7 +1336,7 @@ class TestFmpAdapter:
                 "from": "2025-03-15",
                 "to": "2026-05-19",
             },
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_historical_price_missing_split_adjusted_close_is_contract_error(self):
@@ -1429,7 +1441,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/earnings-calendar",
             params={"from": "2026-05-01", "to": "2026-05-20"},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_earnings_calendar_filters_symbol_client_side(self):
@@ -1453,7 +1465,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/earnings-calendar",
             params={"from": "2026-05-20", "to": "2026-05-20", "symbol": "FIRE"},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_earnings_calendar_marks_malformed_eps(self):
@@ -1519,7 +1531,7 @@ class TestFmpAdapter:
         session.get.assert_called_with(
             "https://financialmodelingprep.com/stable/income-statement",
             params={"symbol": "FIRE", "period": "quarter", "limit": 20},
-            timeout=30,
+            timeout=FMP_REQUEST_TIMEOUT,
         )
 
     def test_get_earnings_history_marks_malformed_eps_and_accepted_date(self):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time as time_module
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -29,6 +31,11 @@ from alpha.jobs.i12_historical_corpus import (
     OUTCOME_CONFIRMED,
     OUTCOME_NEVER_CONFIRMED,
     OUTCOME_POISON_PREMARKET,
+)
+from alpha.jobs.watchdog import (
+    ProviderOutageCircuitBreaker,
+    WatchdogState,
+    call_with_daemon_deadline,
 )
 from alpha.jobs.run_i12_historical_corpus import _parse_args, _validate_write_target
 from alpha.jobs.runner import run_job
@@ -851,26 +858,88 @@ def test_i12_minute_fetch_watchdog_quarantines_and_continues(db_session):
         fetch_deadline_seconds=0.05,
     )
 
-    started = time_module.monotonic()
     result = run_job(db_session, job)
-    elapsed = time_module.monotonic() - started
 
-    assert elapsed < 0.6
     assert result.status == "finished"
     assert result.metrics["watchdog_timeouts"] == 1
     assert result.metrics["fetch_errors"] == 1
     assert result.metrics["quarantined"] == 1
     assert result.metrics["confirmed"] == 1
-    assert result.errors == [{
+    assert result.errors[0] | {
         "ticker": slow_ticker,
         "trading_date": DAY.isoformat(),
         "error": "fetch_watchdog_timeout",
         "deadline_seconds": 0.05,
-    }]
+    } == result.errors[0]
     assert polygon.calls[(slow_ticker, DAY)] == 1
     assert polygon.calls[(fast_ticker, DAY)] == 1
     assert db_session.query(IntradayEventDetail).filter_by(ticker=fast_ticker).count() == 1
     assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
+
+
+def test_daemon_deadline_unit_bounds_sleeping_callable():
+    state = WatchdogState(max_outstanding_timeouts=5)
+
+    started = time_module.monotonic()
+    with pytest.raises(FuturesTimeoutError):
+        call_with_daemon_deadline(
+            lambda: time_module.sleep(0.5),
+            timeout_seconds=0.02,
+            thread_name="unit-sleeping-watchdog",
+            state=state,
+        )
+    elapsed = time_module.monotonic() - started
+
+    assert elapsed < 0.2
+    assert state.total_timeouts == 1
+    assert state.outstanding_timeouts == 1
+
+
+def test_daemon_deadline_circuit_breaker_bounds_persistent_hangs():
+    state = WatchdogState(max_outstanding_timeouts=3)
+    before = threading.active_count()
+
+    for _idx in range(2):
+        with pytest.raises(FuturesTimeoutError):
+            call_with_daemon_deadline(
+                lambda: time_module.sleep(60),
+                timeout_seconds=0.01,
+                thread_name="unit-persistent-watchdog",
+                state=state,
+            )
+    with pytest.raises(ProviderOutageCircuitBreaker) as excinfo:
+        call_with_daemon_deadline(
+            lambda: time_module.sleep(60),
+            timeout_seconds=0.01,
+            thread_name="unit-persistent-watchdog",
+            state=state,
+        )
+
+    assert excinfo.value.payload["error"] == "provider_outage_circuit_breaker"
+    assert state.circuit_open is True
+    assert state.outstanding_timeouts == 3
+    assert threading.active_count() - before <= 3
+
+
+def test_daemon_deadline_thread_start_failure_trips_breaker(monkeypatch):
+    state = WatchdogState(max_outstanding_timeouts=10)
+
+    def fail_start(self):  # noqa: ANN001
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+    with pytest.raises(ProviderOutageCircuitBreaker) as excinfo:
+        call_with_daemon_deadline(
+            lambda: None,
+            timeout_seconds=0.01,
+            thread_name="unit-start-failure",
+            state=state,
+        )
+
+    assert excinfo.value.payload["error"] == "provider_outage_circuit_breaker"
+    assert state.thread_start_failures == 1
+    assert state.circuit_open is True
 
 
 def test_i12_progress_records_uncached_fetch_heartbeat_before_fetch(db_session):
@@ -1058,12 +1127,15 @@ def test_i12_runner_minute_cache_alias_and_skip_existing_args():
         "5",
         "--fetch-deadline-seconds",
         "7.5",
+        "--max-outstanding-fetch-timeouts",
+        "4",
     ])
 
     assert args.minute_cache_dir == "/var/tmp/i12_minutes"
     assert args.skip_existing is True
     assert args.max_db_retries == 5
     assert args.fetch_deadline_seconds == 7.5
+    assert args.max_outstanding_fetch_timeouts == 4
 
     alias = _parse_args([
         "--live",

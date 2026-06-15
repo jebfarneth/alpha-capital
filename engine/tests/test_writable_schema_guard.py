@@ -540,7 +540,9 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
         (engines[1], "scratch_ready", tuple(db_engine.Base.metadata.tables.keys()))
     ]
     assert create_engine_calls[1][1]["connect_args"]["options"] == (
-        "-csearch_path=scratch_ready"
+        "-csearch_path=scratch_ready "
+        "-cstatement_timeout=300000 "
+        "-cidle_in_transaction_session_timeout=300000"
     )
     assert engines[0].disposed is True
     assert engines[1].disposed is True

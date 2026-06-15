@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import json
 import math
-import queue
-import threading
 import time as time_module
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from copy import deepcopy
@@ -52,6 +50,12 @@ from alpha.db.models import (
 )
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.watchdog import (
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+    ProviderOutageCircuitBreaker,
+    WatchdogState,
+    call_with_daemon_deadline,
+)
 from alpha.jobs.paper_execution import (
     BOUNDARY_EPSILON,
     EASTERN,
@@ -102,6 +106,7 @@ CANDIDATE_SCREEN_STAMP = {
 }
 PROGRESS_HEARTBEAT_EVERY_TICKER_DAYS = 250
 DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
+POLYGON_SESSION_RESET_TIMEOUT_INTERVAL = 3
 
 ProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
@@ -324,6 +329,7 @@ class I12HistoricalCorpusJob(BaseJob):
         db_retry_backoff_seconds: float = 5.0,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         progress_callback: ProgressCallback | None = None,
+        max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must be on or after start_date")
@@ -335,6 +341,8 @@ class I12HistoricalCorpusJob(BaseJob):
             raise ValueError("db_retry_backoff_seconds must be >= 0")
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
+        if max_outstanding_fetch_timeouts < 1:
+            raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -352,6 +360,10 @@ class I12HistoricalCorpusJob(BaseJob):
         self._last_polygon_fetch_monotonic: float | None = None
         self._progress_callback = progress_callback
         self._latest_metrics: dict[str, Any] = {}
+        self._fetch_watchdog = WatchdogState(
+            max_outstanding_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_timeouts=max_outstanding_fetch_timeouts,
+        )
 
     @property
     def partial_metrics(self) -> dict[str, Any]:
@@ -376,15 +388,35 @@ class I12HistoricalCorpusJob(BaseJob):
         daily_cache: dict[str, tuple[tuple[_DailyBar, ...], DataLineage]] = {}
         minute_cache: dict[tuple[str, date], tuple[tuple[_MinuteBar, ...], DataLineage]] = {}
 
-        self._run_batches_with_retry(
-            ctx,
-            counters=counters,
-            trading_dates=trading_dates,
-            classifications=classifications,
-            daily_cache=daily_cache,
-            minute_cache=minute_cache,
-            process_batch=self._run_batch_once,
-        )
+        try:
+            self._run_batches_with_retry(
+                ctx,
+                counters=counters,
+                trading_dates=trading_dates,
+                classifications=classifications,
+                daily_cache=daily_cache,
+                minute_cache=minute_cache,
+                process_batch=self._run_batch_once,
+            )
+        except ProviderOutageCircuitBreaker as exc:
+            counters.fetch_errors += 1
+            counters.watchdog_timeouts = max(
+                counters.watchdog_timeouts,
+                self._fetch_watchdog.total_timeouts,
+            )
+            counters.errors.append(exc.payload)
+            self._progress(
+                "provider_outage_circuit_breaker",
+                {
+                    "metrics": self._metrics(counters, trading_dates=trading_dates),
+                    **exc.payload,
+                },
+            )
+            return JobResult(
+                status="partial_failed",
+                metrics=self._metrics(counters, trading_dates=trading_dates),
+                errors=counters.errors,
+            )
 
         return JobResult(
             status="finished",
@@ -642,12 +674,48 @@ class I12HistoricalCorpusJob(BaseJob):
         if ticker not in daily_cache:
             from_date = self._start_date - timedelta(days=460)
             to_date = next_us_equity_session(self._end_date + timedelta(days=1))
-            resp = self._fmp.get_historical_price(
-                ticker,
-                from_date=from_date,
-                to_date=to_date,
-                adjusted=False,
-            )
+            self._progress("daily_fetch_start", {
+                "ticker": ticker,
+                "trading_date": trading_date.isoformat(),
+                "deadline_seconds": self._fetch_deadline_seconds,
+                **self._fetch_watchdog.snapshot(),
+            })
+
+            def _fetch_daily(
+                ticker: str = ticker,
+                from_date: date = from_date,
+                to_date: date = to_date,
+            ) -> AdapterResponse[Any]:
+                return self._fmp.get_historical_price(
+                    ticker,
+                    from_date=from_date,
+                    to_date=to_date,
+                    adjusted=False,
+                )
+
+            try:
+                resp = call_with_daemon_deadline(
+                    _fetch_daily,
+                    timeout_seconds=self._fetch_deadline_seconds,
+                    thread_name="fmp-daily-fetch",
+                    state=self._fetch_watchdog,
+                    context={
+                        "ticker": ticker.upper(),
+                        "trading_date": trading_date.isoformat(),
+                        "stage": "fmp_daily_fetch",
+                        "deadline_seconds": self._fetch_deadline_seconds,
+                    },
+                )
+            except FuturesTimeoutError as exc:
+                counters.fetch_errors += 1
+                counters.watchdog_timeouts += 1
+                raise _Quarantine({
+                    "ticker": ticker,
+                    "trading_date": trading_date.isoformat(),
+                    "error": "daily_fetch_watchdog_timeout",
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                    **self._fetch_watchdog.snapshot(),
+                }) from exc
             if not resp.ok:
                 counters.fetch_errors += 1
                 raise _Quarantine({
@@ -758,9 +826,13 @@ class I12HistoricalCorpusJob(BaseJob):
             "trading_date": trading_date.isoformat(),
             "deadline_seconds": self._fetch_deadline_seconds,
             "cache_status": "miss",
+            **self._fetch_watchdog.snapshot(),
         })
 
-        def _fetch() -> AdapterResponse[Any]:
+        def _fetch(
+            ticker: str = ticker,
+            trading_date: date = trading_date,
+        ) -> AdapterResponse[Any]:
             return self._polygon.get_minute_aggs(
                 ticker,
                 trading_date.isoformat(),
@@ -769,20 +841,40 @@ class I12HistoricalCorpusJob(BaseJob):
             )
 
         try:
-            return _call_with_daemon_deadline(
+            return call_with_daemon_deadline(
                 _fetch,
                 timeout_seconds=self._fetch_deadline_seconds,
                 thread_name="polygon-minute-fetch",
+                state=self._fetch_watchdog,
+                context={
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "stage": "polygon_minute_fetch",
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                },
             )
         except FuturesTimeoutError as exc:
             counters.fetch_errors += 1
             counters.watchdog_timeouts += 1
+            self._maybe_reset_polygon_session()
             raise _Quarantine({
                 "ticker": ticker,
                 "trading_date": trading_date.isoformat(),
                 "error": "fetch_watchdog_timeout",
                 "deadline_seconds": self._fetch_deadline_seconds,
+                **self._fetch_watchdog.snapshot(),
             }) from exc
+
+    def _maybe_reset_polygon_session(self) -> None:
+        if (
+            self._fetch_watchdog.total_timeouts == 0
+            or self._fetch_watchdog.total_timeouts % POLYGON_SESSION_RESET_TIMEOUT_INTERVAL
+        ):
+            return
+        reset = getattr(self._polygon, "reset_session", None)
+        if callable(reset):
+            reset()
+            self._progress("polygon_session_reset", self._fetch_watchdog.snapshot())
 
     def _sessions_to_delist(self, ticker: str, trading_date: date) -> int | None:
         row = (
@@ -1112,6 +1204,7 @@ class I12HistoricalCorpusJob(BaseJob):
             "non_session_bar_skip_sample": counters.non_session_bar_samples,
             "fetch_errors": counters.fetch_errors,
             "watchdog_timeouts": counters.watchdog_timeouts,
+            **self._fetch_watchdog.snapshot(),
             "quarantined": counters.quarantined,
             "inserted_details": counters.inserted_details,
             "reused_details": counters.reused_details,
@@ -1200,31 +1293,6 @@ class _Quarantine(RuntimeError):
 
 def _utc_progress_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _call_with_daemon_deadline(
-    func: Callable[[], Any],
-    *,
-    timeout_seconds: float,
-    thread_name: str,
-) -> Any:
-    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def _target() -> None:
-        try:
-            results.put_nowait((True, func()))
-        except Exception as exc:
-            results.put_nowait((False, exc))
-
-    thread = threading.Thread(target=_target, name=thread_name, daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise FuturesTimeoutError()
-    ok, value = results.get_nowait()
-    if ok:
-        return value
-    raise value
 
 
 def _daily_context_from_bars(

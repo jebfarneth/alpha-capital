@@ -16,6 +16,12 @@ _engine = None
 _SessionLocal = None
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_SCHEMAS = frozenset({"public", "pg_catalog", "information_schema"})
+DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_POSTGRES_KEEPALIVES_IDLE_SECONDS = 30
+DEFAULT_POSTGRES_KEEPALIVES_INTERVAL_SECONDS = 10
+DEFAULT_POSTGRES_KEEPALIVES_COUNT = 5
+DEFAULT_POSTGRES_STATEMENT_TIMEOUT_MS = 300_000
+DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 300_000
 
 
 class SchemaTargetError(RuntimeError):
@@ -34,19 +40,73 @@ def _validate_schema_name(schema: str) -> str:
     return schema
 
 
+def _postgres_timeout_options(schema: str | None) -> str:
+    options: list[str] = []
+    if schema:
+        options.append(f"-csearch_path={schema}")
+    statement_timeout = int(
+        os.environ.get(
+            "ALPHA_DB_STATEMENT_TIMEOUT_MS",
+            str(DEFAULT_POSTGRES_STATEMENT_TIMEOUT_MS),
+        )
+    )
+    idle_timeout = int(
+        os.environ.get(
+            "ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
+            str(DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS),
+        )
+    )
+    options.append(f"-cstatement_timeout={statement_timeout}")
+    options.append(f"-cidle_in_transaction_session_timeout={idle_timeout}")
+    return " ".join(options)
+
+
+def _postgres_connect_args(schema: str | None = None) -> dict:
+    return {
+        "connect_timeout": int(
+            os.environ.get(
+                "ALPHA_DB_CONNECT_TIMEOUT_SECONDS",
+                str(DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS),
+            )
+        ),
+        "keepalives": 1,
+        "keepalives_idle": int(
+            os.environ.get(
+                "ALPHA_DB_KEEPALIVES_IDLE_SECONDS",
+                str(DEFAULT_POSTGRES_KEEPALIVES_IDLE_SECONDS),
+            )
+        ),
+        "keepalives_interval": int(
+            os.environ.get(
+                "ALPHA_DB_KEEPALIVES_INTERVAL_SECONDS",
+                str(DEFAULT_POSTGRES_KEEPALIVES_INTERVAL_SECONDS),
+            )
+        ),
+        "keepalives_count": int(
+            os.environ.get(
+                "ALPHA_DB_KEEPALIVES_COUNT",
+                str(DEFAULT_POSTGRES_KEEPALIVES_COUNT),
+            )
+        ),
+        "options": _postgres_timeout_options(schema),
+    }
+
+
 def schema_connect_args(url: str, schema: str | None = None) -> dict:
     """Return SQLAlchemy kwargs that route PostgreSQL connections to schema.
 
-    The startup option intentionally names only the target schema. Some
-    poolers ignore startup options, so ``get_engine`` also binds the live
-    session search path with ``SET`` on connect.
+    Startup options also set statement timeouts so a stuck DB operation cannot
+    pin a long-running shard forever. Some poolers ignore startup options, so
+    ``get_engine`` also binds the live session search path with ``SET`` on
+    connect.
     """
-    if not schema:
-        return {}
-    schema = _validate_schema_name(schema)
-    if not url.startswith("postgresql"):
+    if schema and not url.startswith("postgresql"):
         raise ValueError("ALPHA_DB_SCHEMA is only supported for PostgreSQL URLs")
-    return {"connect_args": {"options": f"-csearch_path={schema}"}}
+    if not url.startswith("postgresql"):
+        return {}
+    if schema:
+        schema = _validate_schema_name(schema)
+    return {"connect_args": _postgres_connect_args(schema)}
 
 
 def _bind_schema_search_path(engine, url: str, schema: str | None) -> None:
