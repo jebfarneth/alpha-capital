@@ -93,8 +93,8 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
         "drawdown_from_max252",
         "projected_volume_ratio_at_confirmation",
         "projected_volume_at_confirmation",
-        "chase_pct",
         "spy_prior_day_return",
+        "price_at_open",
     }
 )
 INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()
@@ -241,6 +241,24 @@ def _audit_feature_field_no_leakage(
     feature_role = str(field.get("feature_role") or "").strip()
     reference_parts = _read_locator_parts(field)
     terminal_name = reference_parts[-1] if reference_parts else ""
+    status_path = field.get("status_path")
+    if status_path and source != "feature_snapshot_json":
+        raise FeatureSelectionError(
+            "status_path is supported only for feature_snapshot_json fields: "
+            f"{field!r}"
+        )
+    if pattern_clock == "intraday" and status_path:
+        status_parts = _path_parts(status_path)
+        if len(status_parts) != 1:
+            raise FeatureSelectionError(
+                "intraday Stage-1 status_path fields must use flat top-level "
+                f"paths: {field!r}"
+            )
+        if status_parts[-1] not in INTRADAY_ALLOWED_SNAPSHOT_PATHS:
+            raise FeatureSelectionError(
+                "intraday Stage-1 status_path fields must reference an "
+                f"allowlisted as-of-signal-time field: {field!r}"
+            )
     if source == "signal_registry":
         if len(reference_parts) != 1 or not hasattr(SignalRegistry, reference_parts[0]):
             raise FeatureSelectionError(

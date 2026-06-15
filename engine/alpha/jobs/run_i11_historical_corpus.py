@@ -62,10 +62,13 @@ def _run_live(args: argparse.Namespace) -> int:
 
     if target_schema is not None:
         try:
+            required_tables = list(I11_CORPUS_REQUIRED_TABLES)
+            if args.at_open:
+                required_tables.append("forward_return_observations")
             prepare_writable_schema_target(
                 schema=target_schema,
                 create_tables=args.create_tables,
-                required_tables=I11_CORPUS_REQUIRED_TABLES,
+                required_tables=required_tables,
             )
         except (SchemaTargetError, ValueError) as exc:
             print(f"ERROR: {exc}")
@@ -123,6 +126,7 @@ def _run_live(args: argparse.Namespace) -> int:
         db_retry_backoff_seconds=args.db_retry_backoff_seconds,
         progress_callback=progress,
         catalyst_tags_by_ticker_date=_load_catalyst_tags_artifact(args.catalyst_tags_artifact),
+        at_open=args.at_open,
     )
     try:
         result = run_job(
@@ -142,6 +146,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "db_retry_backoff_seconds": args.db_retry_backoff_seconds,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
                 "catalyst_tags_artifact": args.catalyst_tags_artifact,
+                "at_open": args.at_open,
             },
         )
     finally:
@@ -256,6 +261,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--max-db-retries", type=int, default=3)
     parser.add_argument("--db-retry-backoff-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--at-open",
+        action="store_true",
+        help="Build the widened I11 at-open early-entry corpus instead of the confirmed-entry corpus.",
+    )
     parser.add_argument("--progress-artifact")
     parser.add_argument(
         "--catalyst-tags-artifact",

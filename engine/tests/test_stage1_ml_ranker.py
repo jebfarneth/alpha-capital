@@ -620,6 +620,24 @@ def test_intraday_snapshot_allows_only_signal_time_fields(field_name):
     audit_feature_schema_no_leakage(schema)
 
 
+@pytest.mark.parametrize("field_name", ["chase_pct", "chase_over_hb_pct"])
+def test_intraday_snapshot_rejects_execution_chase_fields(field_name):
+    schema = {
+        "pattern_id": "I11",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": field_name,
+                "source": "feature_snapshot_json",
+                "path": field_name,
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(schema)
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -1514,6 +1532,39 @@ def test_string_status_path_value_is_preserved(db_session):
     vector = select_features(db_session, signal_id, _feature_schema())
 
     assert vector.missing_statuses["gap"] == "not_available"
+
+
+def test_intraday_status_path_must_be_flat_and_allowlisted():
+    nested_status_schema = {
+        "schema_version": "intraday_status_path_v1",
+        "pattern_id": "I11",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "gap",
+                "source": "feature_snapshot_json",
+                "path": "gap",
+                "status_path": "statuses.gap",
+            }
+        ],
+    }
+    flat_status_schema = {
+        "schema_version": "intraday_status_path_v1",
+        "pattern_id": "I11",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": "gap",
+                "source": "feature_snapshot_json",
+                "path": "gap",
+                "status_path": "gap",
+            }
+        ],
+    }
+
+    with pytest.raises(FeatureSelectionError):
+        audit_feature_schema_no_leakage(nested_status_schema)
+    audit_feature_schema_no_leakage(flat_status_schema)
 
 
 def test_malformed_parent_path_falls_back(db_session, tmp_path):

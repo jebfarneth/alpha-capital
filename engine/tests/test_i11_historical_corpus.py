@@ -13,13 +13,16 @@ from alpha.data.fmp import FmpBar
 from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
     FeatureSnapshot,
+    ForwardReturnObservation,
     HistoricalUniverseReconstruction,
     IntradayEventDetail,
     SignalRegistry,
 )
 from alpha.jobs.i11_historical_corpus import (
+    AT_OPEN_CANDIDATE_SCREEN_STAMP,
     CANDIDATE_SCREEN_STAMP,
     I11HistoricalCorpusJob,
+    OUTCOME_AT_OPEN_NO_CROSS,
     OUTCOME_FAILED_TEST,
     OUTCOME_NEVER_CONFIRMED,
 )
@@ -34,6 +37,7 @@ from alpha.jobs.run_i11_historical_corpus import (
 from alpha.jobs.run_i12_historical_corpus import I12_CORPUS_REQUIRED_TABLES
 from alpha.jobs.runner import run_job
 from alpha.market_calendar import next_us_equity_session, previous_us_equity_session
+from alpha.ml.model_features import FeatureSelectionError, audit_feature_schema_no_leakage
 from alpha.ml.security_type_exclusions import ExclusionArtifactError, SecurityTypeClassification
 
 
@@ -211,6 +215,40 @@ def _minute_bars_daily_high_unconfirmed() -> list[PolygonBar]:
     ]
 
 
+def _minute_bars_at_open_no_cross() -> list[PolygonBar]:
+    return [
+        _minute_bar(0, 9.70, 9.75, 9.65, 9.72, 500),
+        _minute_bar(1, 9.72, 9.80, 9.70, 9.78, 500),
+        _minute_bar(2, 9.78, 9.82, 9.74, 9.79, 500),
+        _minute_bar(3, 9.79, 9.86, 9.76, 9.84, 500),
+        _minute_bar(4, 9.84, 9.92, 9.80, 9.90, 500),
+        _minute_bar(385, 10.10, 10.25, 10.00, 10.20, 200),
+    ]
+
+
+def _minute_bars_at_open_gap_up() -> list[PolygonBar]:
+    return [
+        _minute_bar(0, 10.80, 10.90, 10.70, 10.85, 500),
+        _minute_bar(1, 10.85, 11.00, 10.80, 10.95, 500),
+        _minute_bar(385, 11.10, 11.25, 10.95, 11.20, 200),
+    ]
+
+
+def _minute_bars_at_open_split_mismatch() -> list[PolygonBar]:
+    return [
+        _minute_bar(0, 10.50, 10.60, 10.40, 10.55, 500),
+        _minute_bar(1, 10.55, 10.70, 10.50, 10.65, 500),
+        _minute_bar(385, 10.80, 10.90, 10.60, 10.70, 200),
+    ]
+
+
+def _minute_bars_missing_open_minute() -> list[PolygonBar]:
+    return [
+        _minute_bar(1, 9.72, 9.80, 9.70, 9.78, 500),
+        _minute_bar(2, 9.78, 9.82, 9.74, 9.79, 500),
+    ]
+
+
 def _minute_bars_late_confirmed() -> list[PolygonBar]:
     return [
         _minute_bar(385, 9.80, 9.90, 9.75, 9.92, 500),
@@ -259,6 +297,7 @@ def _run_i11(
     max_db_retries=3,
     db_retry_backoff_seconds=5.0,
     catalyst_tags_by_ticker_date=None,
+    at_open=False,
 ):
     _seed_hur(db_session, ticker)
     if classifications is None:
@@ -277,6 +316,7 @@ def _run_i11(
         max_db_retries=max_db_retries,
         db_retry_backoff_seconds=db_retry_backoff_seconds,
         catalyst_tags_by_ticker_date=catalyst_tags_by_ticker_date,
+        at_open=at_open,
     )
     return run_job(db_session, job), polygon
 
@@ -324,6 +364,8 @@ def test_i11_corpus_persists_confirmed_entry_with_next_open_primary_label(db_ses
     assert feature_json["off_low252"] is not None
     assert "avg20_volume" not in feature_json
     assert "price" not in feature_json
+    assert "chase_pct" not in feature_json
+    assert feature_json["chase_over_hb_pct"] == pytest.approx((10.30 / 10.0) - 1.0)
     assert set(feature_json["research_only_leaky"]) == {
         "avg20_volume",
         "price",
@@ -552,6 +594,313 @@ def test_i11_daily_screen_out_does_not_fetch_minutes_or_write_detail(db_session)
     assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
 
 
+def test_i11_at_open_wide_screen_persists_trainable_non_crosser(db_session):
+    result, polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=9.65, day_high=9.95, day_low=9.50, day_close=9.90),
+        minutes=_minute_bars_at_open_no_cross(),
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["corpus_mode"] == "at_open"
+    assert result.metrics["candidates"] == 1
+    assert result.metrics["at_open_added_candidates"] == 1
+    assert result.metrics["at_open_crosser_screen_candidates"] == 0
+    assert result.metrics["outcome_counts"] == {OUTCOME_AT_OPEN_NO_CROSS: 1}
+    assert result.metrics["outcome_counts_by_year"] == {f"{DAY.year}:{OUTCOME_AT_OPEN_NO_CROSS}": 1}
+    assert result.metrics["forward_return_observations_inserted"] == 1
+    assert polygon.calls[("TEST", DAY)] == 1
+
+    detail = db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).one()
+    assert detail.outcome == OUTCOME_AT_OPEN_NO_CROSS
+    assert detail.entry_price == pytest.approx(9.65)
+    assert detail.ret_open_close == pytest.approx((9.90 / 9.65) - 1.0)
+    assert detail.ret_next_open == pytest.approx((11.2 / 9.65) - 1.0)
+    labels = json.loads(detail.label_json)
+    assert labels["crossed_high"] is False
+    assert labels["ran_plus_3"] is True
+    assert labels["ran_plus_5"] is False
+
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").one()
+    assert signal.thesis_category == "intraday_52week_high_breakout_at_open"
+    assert signal.signal_horizon == "1d"
+    assert signal.forward_return_status == "computed"
+    assert signal.forward_return == pytest.approx(detail.ret_open_close)
+    assert detail.confirmation_timestamp == detail.entry_timestamp
+    assert signal.signal_timestamp == detail.entry_timestamp
+    snapshot = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    assert snapshot.feature_manifest_version == "i11_at_open_historical_corpus_v1"
+    assert snapshot.lookahead_guard_passed is True
+    feature_json = json.loads(snapshot.feature_json)
+    assert feature_json == json.loads(detail.feature_json)
+    assert feature_json["candidate_screen"] == AT_OPEN_CANDIDATE_SCREEN_STAMP
+    assert feature_json["distance_from_max252"] == pytest.approx((9.65 / 10.0) - 1.0)
+    assert feature_json["price_at_open"] == pytest.approx(9.65)
+    for forbidden in (
+        "first_1min_volume",
+        "first_5min_volume",
+        "opening_relative_volume",
+        "opening_range_high",
+        "opening_range_low",
+    ):
+        assert forbidden not in feature_json
+    assert "avg20_volume" not in feature_json
+    assert "price" not in feature_json
+    assert set(feature_json["research_only_leaky"]) == {"avg20_volume"}
+
+    feature_schema = {
+        "pattern_id": I11_PATTERN_ID,
+        "pattern_clock": "intraday",
+        "fields": [
+            {"name": key, "source": "feature_snapshot_json", "path": key}
+            for key in (
+                "gap",
+                "distance_from_max252",
+                "mom20",
+                "off_low252",
+                "sigma20",
+                "prev_day_return",
+                "prev_day_green",
+                "price_at_open",
+            )
+        ],
+    }
+    audit_feature_schema_no_leakage(feature_schema)
+    for forbidden in (
+        "first_1min_volume",
+        "first_5min_volume",
+        "opening_relative_volume",
+        "opening_range_high",
+        "opening_range_low",
+    ):
+        with pytest.raises(FeatureSelectionError):
+            audit_feature_schema_no_leakage({
+                "pattern_id": I11_PATTERN_ID,
+                "pattern_clock": "intraday",
+                "fields": [
+                    {"name": forbidden, "source": "feature_snapshot_json", "path": forbidden},
+                ],
+            })
+
+    observation = (
+        db_session.query(ForwardReturnObservation)
+        .filter_by(pattern_id=I11_PATTERN_ID, signal_id=signal.signal_id)
+        .one()
+    )
+    assert observation.signal_horizon == "1d"
+    assert observation.status == "computed"
+    assert observation.entry_price == pytest.approx(9.65)
+    assert observation.exit_price == pytest.approx(9.90)
+    assert observation.forward_return == pytest.approx(detail.ret_open_close)
+    assert json.loads(observation.provider_request_json)["label_json"]["ret_open_next_open"] == pytest.approx(
+        (11.2 / 9.65) - 1.0
+    )
+
+
+def test_i11_at_open_and_confirmed_modes_coexist_same_ticker_day(db_session):
+    at_open_result, _polygon = _run_i11(db_session, at_open=True)
+    confirmed_result, _polygon = _run_i11(db_session)
+
+    assert at_open_result.status == "finished"
+    assert confirmed_result.status == "finished"
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 2
+    signals = db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").all()
+    assert len(signals) == 2
+    assert {signal.detector_version for signal in signals} == {
+        "historical_i11_at_open_replay_polygon_minute_fmp_eod_v1",
+        "historical_i11_replay_polygon_minute_fmp_eod_v1",
+    }
+
+
+def test_i11_at_open_skip_existing_ignores_confirmed_mode_detail(db_session):
+    confirmed_result, _polygon = _run_i11(db_session)
+    at_open_polygon = FakePolygon({("TEST", DAY): _minute_bars_confirmed()})
+    at_open_result, _polygon = _run_i11(
+        db_session,
+        polygon=at_open_polygon,
+        skip_existing=True,
+        at_open=True,
+    )
+
+    assert confirmed_result.status == "finished"
+    assert at_open_result.status == "finished"
+    assert at_open_result.metrics["skipped_existing"] == 0
+    assert at_open_result.metrics["inserted_details"] == 1
+    assert at_open_polygon.calls[("TEST", DAY)] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 2
+
+
+def test_i11_at_open_idempotent_rerun_backfills_missing_forward_observation(db_session):
+    first, _polygon = _run_i11(db_session, at_open=True)
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").one()
+    deleted = (
+        db_session.query(ForwardReturnObservation)
+        .filter_by(pattern_id=I11_PATTERN_ID, signal_id=signal.signal_id)
+        .delete()
+    )
+    db_session.commit()
+
+    second, _polygon = _run_i11(db_session, at_open=True)
+
+    assert first.status == "finished"
+    assert deleted == 1
+    assert second.status == "finished"
+    assert second.metrics["inserted_details"] == 0
+    assert second.metrics["reused_details"] == 1
+    assert second.metrics["forward_return_observations_inserted"] == 1
+    assert db_session.query(ForwardReturnObservation).filter_by(
+        pattern_id=I11_PATTERN_ID,
+        signal_id=signal.signal_id,
+    ).count() == 1
+
+
+def test_i11_at_open_missing_minute_bars_records_bucketed_quarantine(db_session):
+    polygon = FakePolygon({("TEST", DAY): []})
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=9.65, day_high=9.95, day_low=9.50, day_close=9.90),
+        polygon=polygon,
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["candidates"] == 1
+    assert result.metrics["at_open_added_candidates"] == 1
+    assert result.metrics["quarantined"] == 1
+    assert result.metrics["at_open_missing_minute_bars_by_bucket"] == {"wide_non_crosser": 1}
+    assert result.errors[0]["error"] == "missing_minute_bars"
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+
+
+def test_i11_at_open_missing_open_minute_records_bucketed_quarantine(db_session):
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=9.65, day_high=9.95, day_low=9.50, day_close=9.90),
+        minutes=_minute_bars_missing_open_minute(),
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["candidates"] == 1
+    assert result.metrics["at_open_missing_minute_bars_by_bucket"] == {"wide_non_crosser": 1}
+    assert result.errors[0]["error"] == "missing_open_minute_bar"
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+
+
+def test_i11_at_open_gap_up_crosser_is_not_truncated_by_upper_band(db_session):
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=10.80, day_high=11.20, day_low=10.60, day_close=11.10),
+        minutes=_minute_bars_at_open_gap_up(),
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["candidates"] == 1
+    assert result.metrics["at_open_crosser_screen_candidates"] == 1
+    assert result.metrics["at_open_added_candidates"] == 0
+    detail = db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).one()
+    labels = json.loads(detail.label_json)
+    assert labels["crossed_high"] is True
+    feature_json = json.loads(detail.feature_json)
+    assert feature_json["distance_from_max252"] == pytest.approx(0.08)
+
+
+def test_i11_at_open_rejects_future_day_high_only_crosser(db_session):
+    polygon = FakePolygon({})
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(
+            day_open=9.00,
+            day_high=10.90,
+            day_low=8.90,
+            day_close=10.50,
+            prior_close=9.00,
+        ),
+        polygon=polygon,
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    assert result.metrics["candidates"] == 0
+    assert result.metrics["candidates_screened_out"] == 1
+    assert result.metrics["candidate_screen_fail_reasons"] == {"at_open_near_high_screen": 1}
+    assert polygon.calls == Counter()
+    assert db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+
+
+def test_i11_at_open_split_basis_mismatch_is_not_trainable(db_session):
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=9.65, day_high=9.95, day_low=9.50, day_close=9.90),
+        minutes=_minute_bars_at_open_split_mismatch(),
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").one()
+    detail = db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).one()
+    assert detail.split_basis_mismatch is True
+    assert detail.ret_open_close is None
+    assert detail.ret_open_close_leaky_research_only is False
+    assert detail.is_ml_excluded is True
+    assert detail.ml_exclusion_reason == "split_basis_mismatch"
+    feature_json = json.loads(detail.feature_json)
+    assert feature_json["is_ml_excluded"] is True
+    assert feature_json["ml_exclusion_reason"] == "split_basis_mismatch"
+    assert signal.signal_status == "excluded"
+    assert signal.forward_return_status == "outcome_unavailable"
+    assert signal.outcome_unavailable_reason == "split_basis_mismatch"
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+
+
+def test_i11_at_open_security_type_exclusion_is_not_trainable(db_session):
+    result, _polygon = _run_i11(
+        db_session,
+        daily=_daily_bars(day_open=9.65, day_high=9.95, day_low=9.50, day_close=9.90),
+        minutes=_minute_bars_at_open_no_cross(),
+        classifications={"TEST": _classification("etf")},
+        at_open=True,
+    )
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id=I11_PATTERN_ID, ticker="TEST").one()
+    detail = db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).one()
+    feature_json = json.loads(detail.feature_json)
+    assert detail.is_ml_excluded is True
+    assert detail.ml_exclusion_reason == "fixture"
+    assert feature_json["is_ml_excluded"] is True
+    assert feature_json["ml_exclusion_reason"] == "fixture"
+    assert signal.signal_status == "excluded"
+    assert signal.forward_return_status == "outcome_unavailable"
+    assert signal.outcome_unavailable_reason == "fixture"
+    assert signal.forward_return is None
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id=I11_PATTERN_ID).count() == 0
+
+
+def test_i11_at_open_rerun_raises_on_dangling_detail_signal_id(db_session, monkeypatch):
+    first, _polygon = _run_i11(db_session, at_open=True)
+    detail = db_session.query(IntradayEventDetail).filter_by(pattern_id=I11_PATTERN_ID).one()
+    signal_id = detail.signal_id
+    original_get = db_session.get
+
+    def _missing_signal(entity, ident, *args, **kwargs):
+        if entity is SignalRegistry and ident == signal_id:
+            return None
+        return original_get(entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "get", _missing_signal)
+
+    second, _polygon = _run_i11(db_session, at_open=True)
+
+    assert first.status == "finished"
+    assert second.status == "failed"
+    assert "detail references missing signal" in second.errors[0]["exception"]
+
+
 def test_i11_missing_security_type_artifact_fails_closed(db_session):
     result, _polygon = _run_i11(db_session, classifications={})
 
@@ -584,6 +933,7 @@ def test_i11_runner_skip_existing_and_retry_args():
         "--polygon-cache-dir",
         "/var/tmp/i11_polygon_cache",
         "--skip-existing",
+        "--at-open",
         "--max-db-retries",
         "5",
         "--db-retry-backoff-seconds",
@@ -592,6 +942,7 @@ def test_i11_runner_skip_existing_and_retry_args():
 
     assert args.polygon_cache_dir == "/var/tmp/i11_polygon_cache"
     assert args.skip_existing is True
+    assert args.at_open is True
     assert args.max_db_retries == 5
     assert args.db_retry_backoff_seconds == 0.25
 
