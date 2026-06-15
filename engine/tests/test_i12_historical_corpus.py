@@ -16,6 +16,7 @@ from alpha.db.models import (
     EvidenceJobRun,
     FeatureSnapshot,
     FmpDelistedCompanyRecord,
+    ForwardReturnObservation,
     HistoricalUniverseReconstruction,
     IntradayEventDetail,
     SignalRegistry,
@@ -321,8 +322,9 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
 
     assert result.status == "finished"
     assert result.metrics["confirmed"] == 1
+    assert result.metrics["forward_return_observations_inserted"] == 1
     signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").one()
-    assert signal.signal_horizon == "0d"
+    assert signal.signal_horizon == "1d"
     assert signal.forward_return_status == "computed"
     assert signal.raw_expected_edge == 0.0
     assert signal.point_in_time_passed is False
@@ -333,6 +335,7 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
     detail = db_session.query(IntradayEventDetail).filter_by(ticker="TEST").one()
     assert detail.signal_id == signal.signal_id
     assert detail.outcome == OUTCOME_CONFIRMED
+    assert signal.forward_return == pytest.approx(detail.ret_next_open)
     assert detail.ret_conf == pytest.approx((11.0 / detail.entry_price) - 1.0)
     feature_json = json.loads(detail.feature_json)
     assert "ret_conf" not in feature_json
@@ -352,13 +355,27 @@ def test_i12_corpus_persists_confirmed_entry_and_is_idempotent(db_session):
     gate_values = json.loads(detail.gate_values_json)
     assert labels["full_day_volume_ratio_leaky_research_only"] is True
     assert gate_values["full_day_volume_ratio_leaky_research_only"] is True
+    observation = db_session.query(ForwardReturnObservation).filter_by(
+        pattern_id="I12",
+        signal_id=signal.signal_id,
+    ).one()
+    assert observation.signal_horizon == "1d"
+    assert observation.status == "computed"
+    assert observation.forward_return == pytest.approx(detail.ret_next_open)
+    assert observation.entry_price == pytest.approx(detail.entry_price)
+    assert observation.exit_price == pytest.approx(detail.next_open_price)
+    assert observation.entry_session_date == DAY.isoformat()
+    assert observation.exit_session_date == next_us_equity_session(DAY + timedelta(days=1)).isoformat()
 
     second = _run_i12(db_session)
 
     assert second.metrics["inserted_details"] == 0
     assert second.metrics["reused_details"] == 1
+    assert second.metrics["forward_return_observations_inserted"] == 0
+    assert second.metrics["forward_return_observations_reused"] == 1
     assert db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").count() == 1
     assert db_session.query(IntradayEventDetail).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id="I12").count() == 1
 
 
 def test_i12_corpus_ret_next_open_uses_next_session_open(db_session):
@@ -492,11 +509,37 @@ def test_i12_corpus_split_basis_mismatch_records_detail_without_signal(db_sessio
     assert result.status == "finished"
     assert result.metrics["artifact_excluded"] == 1
     assert result.metrics["inserted_signals"] == 0
+    assert result.metrics["forward_return_observations_inserted"] == 0
     assert db_session.query(SignalRegistry).filter_by(pattern_id="I12").count() == 0
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id="I12").count() == 0
     detail = db_session.query(IntradayEventDetail).one()
     assert detail.outcome == OUTCOME_CONFIRMED
     assert detail.split_basis_mismatch is True
+    assert detail.is_ml_excluded is True
+    assert detail.ml_exclusion_reason == "split_basis_mismatch"
     assert detail.signal_id is None
+
+
+def test_i12_corpus_primary_label_unavailable_records_detail_without_signal(db_session):
+    daily = _daily_bars()[:-1]
+    result = _run_i12(db_session, daily=daily)
+
+    assert result.status == "finished"
+    assert result.metrics["confirmed"] == 1
+    assert result.metrics["inserted_signals"] == 0
+    assert result.metrics["forward_return_observations_inserted"] == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="I12").count() == 0
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id="I12").count() == 0
+    detail = db_session.query(IntradayEventDetail).one()
+    assert detail.outcome == OUTCOME_CONFIRMED
+    assert detail.signal_id is None
+    assert detail.ret_next_open is None
+    assert detail.next_open_price is None
+    assert detail.is_ml_excluded is True
+    assert detail.ml_exclusion_reason == "primary_label_unavailable"
+    feature_json = json.loads(detail.feature_json)
+    assert feature_json["is_ml_excluded"] is True
+    assert feature_json["ml_exclusion_reason"] == "primary_label_unavailable"
 
 
 def test_i12_corpus_uses_disk_cached_polygon_minutes(db_session, tmp_path):
@@ -588,8 +631,10 @@ def test_i12_corpus_retries_transient_db_disconnect_once(db_session):
     assert result.metrics["db_reconnect_retries"] == 1
     assert result.metrics["inserted_details"] == 1
     assert result.metrics["inserted_signals"] == 1
+    assert result.metrics["forward_return_observations_inserted"] == 1
     assert db_session.query(IntradayEventDetail).filter_by(pattern_id="I12", ticker="TEST").count() == 1
     assert db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").count() == 1
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id="I12", ticker="TEST").count() == 1
 
 
 def test_i12_corpus_never_confirmed_control_has_no_signal(db_session):
@@ -788,25 +833,18 @@ def test_i12_corpus_stamps_ml_excluded_rows(db_session):
 
     assert result.status == "finished"
     assert result.metrics["excluded_by_type"] == 1
-    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12").one()
+    assert result.metrics["inserted_signals"] == 0
+    assert result.metrics["forward_return_observations_inserted"] == 0
+    assert db_session.query(SignalRegistry).filter_by(pattern_id="I12").count() == 0
+    assert db_session.query(ForwardReturnObservation).filter_by(pattern_id="I12").count() == 0
     detail = db_session.query(IntradayEventDetail).one()
-    assert detail.signal_id == signal.signal_id
+    assert detail.signal_id is None
     assert detail.is_ml_excluded is True
     assert detail.security_type == "etf"
     assert detail.ml_exclusion_reason == "fixture"
     feature_json = json.loads(detail.feature_json)
     assert feature_json["is_ml_excluded"] is True
     assert feature_json["security_type"] == "etf"
-    manifest_eligible = (
-        db_session.query(SignalRegistry)
-        .join(IntradayEventDetail, IntradayEventDetail.signal_id == SignalRegistry.signal_id)
-        .filter(
-            SignalRegistry.pattern_id == "I12",
-            IntradayEventDetail.is_ml_excluded.is_(False),
-        )
-        .count()
-    )
-    assert manifest_eligible == 0
 
 
 def test_i12_corpus_signal_identity_conflict_is_controlled_error(db_session):

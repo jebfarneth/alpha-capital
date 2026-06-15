@@ -32,11 +32,16 @@ from alpha.runtime_env import load_runtime_env
 
 
 I12_CORPUS_REQUIRED_TABLES = [
+    "evidence_datasets",
     "evidence_jobs",
     "evidence_job_runs",
+    "evidence_snapshots",
     "data_lineage",
+    "universe_scans",
+    "universe_snapshots",
     "feature_snapshots",
     "signal_registry",
+    "forward_return_observations",
     "intraday_event_details",
 ]
 DEFAULT_MINUTE_CACHE_DIR = Path.home() / ".cache" / "alpha-capital" / "i12_polygon_minute_aggs"

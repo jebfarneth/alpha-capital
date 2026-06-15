@@ -42,6 +42,7 @@ from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
     DataLineage,
     FmpDelistedCompanyRecord,
+    ForwardReturnObservation,
     HistoricalUniverseReconstruction,
     IntradayEventDetail,
     SignalRegistry,
@@ -73,6 +74,7 @@ from alpha.ml.security_type_exclusions import (
 JOB_NAME = "i12_historical_corpus"
 RECONSTRUCTION_METHOD = "historical_i12_replay_polygon_minute_fmp_eod_v1"
 FEATURE_MANIFEST_VERSION = "i12_historical_corpus_v1"
+I12_SIGNAL_HORIZON = "1d"
 OUTCOME_CONFIRMED = "confirmed_filled"
 OUTCOME_NEVER_CONFIRMED = "never_confirmed"
 OUTCOME_POISON = "poison_blocked"
@@ -85,6 +87,8 @@ I12_CONFIRMATION_MAX_MINUTE = 60
 SESSION_EXIT_TIME = time(15, 55)
 MIN_PRIOR_DAILY_SESSIONS = 20
 CANDIDATE_FULL_DAY_VR_FLOOR = 2.0
+ML_EXCLUSION_PRIMARY_LABEL_UNAVAILABLE = "primary_label_unavailable"
+ML_EXCLUSION_SPLIT_BASIS_MISMATCH = "split_basis_mismatch"
 CANDIDATE_SCREEN_STAMP = {
     "drawdown_max": -0.50,
     "gap_band": [-0.05, 0.05],
@@ -226,6 +230,8 @@ class _RunCounters:
     reused_details: int = 0
     inserted_signals: int = 0
     reused_signals: int = 0
+    forward_return_observations_inserted: int = 0
+    forward_return_observations_reused: int = 0
     minute_cache_hits: int = 0
     minute_cache_misses: int = 0
     skipped_existing: int = 0
@@ -264,6 +270,8 @@ class _RunCounters:
         self.reused_details += other.reused_details
         self.inserted_signals += other.inserted_signals
         self.reused_signals += other.reused_signals
+        self.forward_return_observations_inserted += other.forward_return_observations_inserted
+        self.forward_return_observations_reused += other.forward_return_observations_reused
         self.minute_cache_hits += other.minute_cache_hits
         self.minute_cache_misses += other.minute_cache_misses
         self.skipped_existing += other.skipped_existing
@@ -512,6 +520,12 @@ class I12HistoricalCorpusJob(BaseJob):
                         counters.reused_details += int(not persisted["inserted_detail"])
                         counters.inserted_signals += int(persisted["inserted_signal"])
                         counters.reused_signals += int(persisted["reused_signal"])
+                        counters.forward_return_observations_inserted += int(
+                            persisted.get("inserted_forward_return_observation", False)
+                        )
+                        counters.forward_return_observations_reused += int(
+                            persisted.get("reused_forward_return_observation", False)
+                        )
                         continue
                     if not screen.passed:
                         counters.candidates_screened_out += 1
@@ -549,6 +563,12 @@ class I12HistoricalCorpusJob(BaseJob):
                 counters.reused_details += int(not persisted["inserted_detail"])
                 counters.inserted_signals += int(persisted["inserted_signal"])
                 counters.reused_signals += int(persisted["reused_signal"])
+                counters.forward_return_observations_inserted += int(
+                    persisted.get("inserted_forward_return_observation", False)
+                )
+                counters.forward_return_observations_reused += int(
+                    persisted.get("reused_forward_return_observation", False)
+                )
         self._session.commit()
         return counters
 
@@ -755,16 +775,34 @@ class I12HistoricalCorpusJob(BaseJob):
                     "I12 corpus event content changed for existing identity: "
                     f"{event.ticker} {event.trading_date.isoformat()}"
                 )
+            fro_inserted = False
+            fro_reused = False
+            if existing_detail.signal_id is not None:
+                signal = self._session.get(SignalRegistry, existing_detail.signal_id)
+                if signal is None:
+                    raise RuntimeError(
+                        "I12 corpus detail references missing signal_registry row: "
+                        f"{event.ticker} {event.trading_date.isoformat()} "
+                        f"signal_id={existing_detail.signal_id}"
+                    )
+                fro_inserted, fro_reused = self._record_i12_forward_return_observation(
+                    event,
+                    signal=signal,
+                    job_run_id=job_run_id,
+                )
             return {
                 "inserted_detail": False,
                 "inserted_signal": False,
                 "reused_signal": existing_detail.signal_id is not None,
+                "inserted_forward_return_observation": fro_inserted,
+                "reused_forward_return_observation": fro_reused,
             }
 
         signal_id: str | None = None
+        signal: SignalRegistry | None = None
         inserted_signal = False
         reused_signal = False
-        if event.outcome == OUTCOME_CONFIRMED and not event.split_basis_mismatch:
+        if event.outcome == OUTCOME_CONFIRMED and not event.is_ml_excluded:
             assert event.signal_identity_hash is not None
             existing_same_date_signal = (
                 self._session.query(SignalRegistry)
@@ -822,7 +860,7 @@ class I12HistoricalCorpusJob(BaseJob):
                     raw_expected_edge=0.0,
                     feature_snapshot_id=feature_snapshot.feature_snapshot_id,
                     job_run_id=job_run_id,
-                    signal_horizon="0d",
+                    signal_horizon=I12_SIGNAL_HORIZON,
                     thesis_category="capitulation_volume_bounce",
                     route_class="i_track_intraday",
                     fidelity_tier="historical_intraday_replay",
@@ -839,12 +877,21 @@ class I12HistoricalCorpusJob(BaseJob):
                     forward_return_status="computed",
                     forward_return_attempts=0,
                 )
-                signal.forward_return = event.ret_conf
+                signal.forward_return = event.ret_next_open
                 signal_id = signal.signal_id
                 inserted_signal = True
             else:
+                signal = existing_signal
                 signal_id = existing_signal.signal_id
                 reused_signal = True
+        fro_inserted = False
+        fro_reused = False
+        if signal is not None:
+            fro_inserted, fro_reused = self._record_i12_forward_return_observation(
+                event,
+                signal=signal,
+                job_run_id=job_run_id,
+            )
 
         detail = IntradayEventDetail(
             signal_id=signal_id,
@@ -898,7 +945,99 @@ class I12HistoricalCorpusJob(BaseJob):
             "inserted_detail": True,
             "inserted_signal": inserted_signal,
             "reused_signal": reused_signal,
+            "inserted_forward_return_observation": fro_inserted,
+            "reused_forward_return_observation": fro_reused,
         }
+
+    def _record_i12_forward_return_observation(
+        self,
+        event: _I12Event,
+        *,
+        signal: SignalRegistry,
+        job_run_id: str,
+    ) -> tuple[bool, bool]:
+        if event.ret_next_open is None:
+            raise RuntimeError(
+                "I12 trainable signal is missing primary ret_next_open label: "
+                f"{event.ticker} {event.trading_date.isoformat()}"
+            )
+        input_hash = stable_hash({
+            "signal_id": signal.signal_id,
+            "label": "ret_next_open",
+            "event_input_hash": event.input_hash,
+            "reconstruction_method": RECONSTRUCTION_METHOD,
+        })
+        outcome_hash = stable_hash({
+            "signal_id": signal.signal_id,
+            "label": "ret_next_open",
+            "ret_next_open": event.ret_next_open,
+            "labels": event.labels,
+        })
+        existing = (
+            self._session.query(ForwardReturnObservation)
+            .filter(
+                ForwardReturnObservation.signal_id == signal.signal_id,
+                ForwardReturnObservation.input_hash == input_hash,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            if existing.outcome_hash != outcome_hash:
+                raise RuntimeError(
+                    "I12 forward return changed for existing signal: "
+                    f"{event.ticker} {event.trading_date.isoformat()}"
+                )
+            return False, True
+        signal_timestamp = event.signal_timestamp or event.confirmation_timestamp
+        if signal_timestamp is None:
+            raise RuntimeError(
+                "I12 confirmed signal is missing signal timestamp: "
+                f"{event.ticker} {event.trading_date.isoformat()}"
+            )
+        daily_lineage_id = event.data_lineage_ids[0] if event.data_lineage_ids else None
+        minute_lineage_id = (
+            event.data_lineage_ids[1]
+            if len(event.data_lineage_ids) > 1 else daily_lineage_id
+        )
+        exit_session = next_us_equity_session(event.trading_date + timedelta(days=1))
+        observation = ForwardReturnObservation(
+            signal_id=signal.signal_id,
+            pattern_id=I12_PATTERN_ID,
+            ticker=event.ticker,
+            direction="long",
+            signal_timestamp=signal_timestamp,
+            signal_horizon=I12_SIGNAL_HORIZON,
+            next_execution_session=event.trading_date.isoformat(),
+            entry_session_date=event.trading_date.isoformat(),
+            entry_price=event.entry_price,
+            entry_price_source="polygon_adjusted_next_minute_open",
+            entry_basis_proof="next_minute_open_after_intraday_confirmation",
+            entry_data_lineage_id=minute_lineage_id,
+            exit_session_date=exit_session.isoformat(),
+            exit_price=event.next_open_price,
+            exit_price_source="fmp_split_adjusted_next_session_open",
+            exit_basis_proof="next_session_open_label",
+            exit_data_lineage_id=daily_lineage_id,
+            forward_return=event.ret_next_open,
+            max_favorable_excursion=event.mfe_pct,
+            max_adverse_excursion=event.mae_pct,
+            status="computed",
+            reason=None,
+            attempts=0,
+            job_run_id=job_run_id,
+            input_hash=input_hash,
+            outcome_hash=outcome_hash,
+            data_lineage_ids=json.dumps(list(event.data_lineage_ids)),
+            provider="FMP+Polygon",
+            endpoint=RECONSTRUCTION_METHOD,
+            provider_request_json=json.dumps({
+                "label": "ret_next_open",
+                "label_json": event.labels,
+            }, sort_keys=True, default=str),
+        )
+        self._session.add(observation)
+        self._session.flush()
+        return True, False
 
     def _metrics(self, counters: _RunCounters, *, trading_dates: Sequence[date]) -> dict[str, Any]:
         return {
@@ -930,6 +1069,8 @@ class I12HistoricalCorpusJob(BaseJob):
             "reused_details": counters.reused_details,
             "inserted_signals": counters.inserted_signals,
             "reused_signals": counters.reused_signals,
+            "forward_return_observations_inserted": counters.forward_return_observations_inserted,
+            "forward_return_observations_reused": counters.forward_return_observations_reused,
             "minute_cache_hits": counters.minute_cache_hits,
             "minute_cache_misses": counters.minute_cache_misses,
             "skipped_existing": counters.skipped_existing,
@@ -1356,10 +1497,21 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
     artifact_flags = {
         "split_basis_mismatch": split_basis_mismatch,
         "split_basis_mismatch_excluded": split_basis_mismatch,
+        "primary_label_unavailable": (
+            event_outcome == OUTCOME_CONFIRMED and ret_next_open is None
+        ),
+        "primary_label_unavailable_excluded": (
+            event_outcome == OUTCOME_CONFIRMED and ret_next_open is None
+        ),
         "sub_dollar_at_open": sub_dollar,
         "full_day_volume_ratio_leaky_research_only": full_day_volume_ratio is not None,
         "sessions_to_delist_not_pit": True,
     }
+    event_is_ml_excluded, event_ml_exclusion_reason = _ml_exclusion_state(
+        inp.security_type,
+        split_basis_mismatch=split_basis_mismatch,
+        primary_label_unavailable=bool(artifact_flags["primary_label_unavailable"]),
+    )
     latest_gate_values = dict(latest_gate_values)
     latest_gate_values["full_day_volume_ratio"] = full_day_volume_ratio
     latest_gate_values["full_day_volume_ratio_leaky_research_only"] = (
@@ -1377,6 +1529,8 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
         gap=gap,
         sub_dollar=sub_dollar,
     )
+    feature_json["is_ml_excluded"] = event_is_ml_excluded
+    feature_json["ml_exclusion_reason"] = event_ml_exclusion_reason
     input_payload = {
         "pattern_id": I12_PATTERN_ID,
         "ticker": inp.ticker,
@@ -1394,7 +1548,7 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
             "outcome": OUTCOME_CONFIRMED,
             "reconstruction_method": RECONSTRUCTION_METHOD,
         })
-        if event_outcome == OUTCOME_CONFIRMED and not split_basis_mismatch else None
+        if event_outcome == OUTCOME_CONFIRMED and not event_is_ml_excluded else None
     )
     output_payload = {
         "outcome": event_outcome,
@@ -1443,8 +1597,8 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
         halted=halted,
         sub_dollar_at_open=sub_dollar,
         split_basis_mismatch=split_basis_mismatch,
-        is_ml_excluded=inp.security_type.ml_excluded,
-        ml_exclusion_reason=inp.security_type.reason,
+        is_ml_excluded=event_is_ml_excluded,
+        ml_exclusion_reason=event_ml_exclusion_reason,
         security_type=inp.security_type.security_type,
         sessions_to_delist=inp.sessions_to_delist,
         data_lineage_ids=(inp.daily_lineage.data_lineage_id, inp.minute_lineage.data_lineage_id),
@@ -1531,6 +1685,21 @@ def _feature_payload(
     if chase is not None:
         payload["chase_pct"] = chase
     return payload
+
+
+def _ml_exclusion_state(
+    security_type: SecurityTypeClassification,
+    *,
+    split_basis_mismatch: bool,
+    primary_label_unavailable: bool,
+) -> tuple[bool, str]:
+    if split_basis_mismatch:
+        return True, ML_EXCLUSION_SPLIT_BASIS_MISMATCH
+    if primary_label_unavailable:
+        return True, ML_EXCLUSION_PRIMARY_LABEL_UNAVAILABLE
+    if security_type.ml_excluded:
+        return True, security_type.reason
+    return False, security_type.reason
 
 
 def _clean_daily_bars(
