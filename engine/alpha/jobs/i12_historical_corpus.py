@@ -50,6 +50,12 @@ from alpha.db.models import (
 )
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
+from alpha.jobs.i12_catalysts import (
+    CatalystResult,
+    I12CatalystResolver,
+    apply_i12_catalyst_result_to_feature_payload,
+    empty_catalyst_result,
+)
 from alpha.jobs.watchdog import (
     DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
@@ -332,6 +338,7 @@ class I12HistoricalCorpusJob(BaseJob):
         progress_callback: ProgressCallback | None = None,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+        catalyst_resolver: I12CatalystResolver | None = None,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must be on or after start_date")
@@ -368,6 +375,7 @@ class I12HistoricalCorpusJob(BaseJob):
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
             max_consecutive_timeouts=max_consecutive_fetch_timeouts,
         )
+        self._catalyst_resolver = catalyst_resolver
 
     @property
     def partial_metrics(self) -> dict[str, Any]:
@@ -554,7 +562,11 @@ class I12HistoricalCorpusJob(BaseJob):
                     )
                     screen = _screen_daily_candidate(daily_input)
                     if screen.control_outcome == OUTCOME_POISON_PREMARKET:
-                        event = _evaluate_i12_poison_premarket(daily_input, screen.daily_context)
+                        event = _evaluate_i12_poison_premarket(
+                            daily_input,
+                            screen.daily_context,
+                            catalyst_resolver=self._catalyst_resolver,
+                        )
                         counters.outcomes[event.outcome] += 1
                         counters.poison_premarket += 1
                         if event.split_basis_mismatch:
@@ -588,7 +600,7 @@ class I12HistoricalCorpusJob(BaseJob):
                     counters.quarantined += 1
                     counters.errors.append(exc.payload)
                     continue
-                event = _evaluate_i12_event(inp)
+                event = _evaluate_i12_event(inp, catalyst_resolver=self._catalyst_resolver)
                 counters.outcomes[event.outcome] += 1
                 if event.outcome == OUTCOME_CONFIRMED:
                     counters.confirmed += 1
@@ -1389,6 +1401,8 @@ def _screen_daily_candidate(inp: _DailyTickerInput) -> _CandidateScreenResult:
 def _evaluate_i12_poison_premarket(
     inp: _DailyTickerInput,
     daily_context: _DailyContext,
+    *,
+    catalyst_resolver: I12CatalystResolver | None = None,
 ) -> _I12Event:
     daily_by_date = {bar.date: bar for bar in inp.daily_bars}
     context = daily_context.context
@@ -1411,6 +1425,12 @@ def _evaluate_i12_poison_premarket(
         "full_day_volume_ratio_leaky_research_only": full_day_volume_ratio is not None,
         "candidate_screen": dict(CANDIDATE_SCREEN_STAMP),
     }
+    catalyst_result = _resolve_i12_catalysts(
+        catalyst_resolver=catalyst_resolver,
+        ticker=inp.ticker,
+        trading_date=inp.trading_date,
+        cutoff_timestamp=us_equity_session_open_timestamp(inp.trading_date),
+    )
     labels = {
         "ret_conf": None,
         "ret_open_close": ret_open_close,
@@ -1441,6 +1461,7 @@ def _evaluate_i12_poison_premarket(
         chase=None,
         gap=daily_context.gap,
         sub_dollar=sub_dollar,
+        catalyst_result=catalyst_result,
     )
     input_payload = {
         "pattern_id": I12_PATTERN_ID,
@@ -1510,7 +1531,11 @@ def _evaluate_i12_poison_premarket(
     )
 
 
-def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
+def _evaluate_i12_event(
+    inp: _TickerDayInput,
+    *,
+    catalyst_resolver: I12CatalystResolver | None = None,
+) -> _I12Event:
     daily_by_date = {bar.date: bar for bar in inp.daily_bars}
     prior = [bar for bar in inp.daily_bars if bar.date < inp.trading_date]
     daily_context = _daily_context_from_bars(inp.ticker, inp.trading_date, inp.daily_bars)
@@ -1633,6 +1658,12 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
     chase = confirm_shared.chase if confirm_shared is not None else latest_gate_values.get("chase")
     gap = confirm_shared.gap if confirm_shared is not None else latest_gate_values.get("gap")
     distance = latest_gate_values.get("distance_from_max252")
+    catalyst_result = _resolve_i12_catalysts(
+        catalyst_resolver=catalyst_resolver,
+        ticker=inp.ticker,
+        trading_date=inp.trading_date,
+        cutoff_timestamp=entry_timestamp or confirm_timestamp,
+    )
     labels = {
         "ret_conf": ret_conf,
         "ret_open_close": ret_open_close,
@@ -1679,6 +1710,7 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
         chase=chase,
         gap=gap,
         sub_dollar=sub_dollar,
+        catalyst_result=catalyst_result,
     )
     feature_json["is_ml_excluded"] = event_is_ml_excluded
     feature_json["ml_exclusion_reason"] = event_ml_exclusion_reason
@@ -1760,6 +1792,22 @@ def _evaluate_i12_event(inp: _TickerDayInput) -> _I12Event:
     )
 
 
+def _resolve_i12_catalysts(
+    *,
+    catalyst_resolver: I12CatalystResolver | None,
+    ticker: str,
+    trading_date: date,
+    cutoff_timestamp: datetime | None,
+) -> CatalystResult:
+    if catalyst_resolver is None or cutoff_timestamp is None:
+        return empty_catalyst_result(cutoff_timestamp=cutoff_timestamp)
+    return catalyst_resolver.resolve(
+        ticker=ticker,
+        trading_date=trading_date,
+        cutoff_timestamp=cutoff_timestamp,
+    )
+
+
 def _feature_payload(
     *,
     inp: _TickerDayInput | _DailyTickerInput,
@@ -1772,6 +1820,7 @@ def _feature_payload(
     chase: float | None,
     gap: float | None,
     sub_dollar: bool,
+    catalyst_result: CatalystResult | None = None,
 ) -> dict[str, Any]:
     prior = [bar for bar in inp.daily_bars if bar.date < inp.trading_date]
     prior20 = prior[-20:]
@@ -1787,6 +1836,7 @@ def _feature_payload(
             "minute_bar_lineage_id": minute_lineage.data_lineage_id,
             "minute_bar_lineage_hash": minute_lineage.raw_payload_hash,
         })
+    catalyst = catalyst_result or empty_catalyst_result(cutoff_timestamp=None)
     payload = {
         "reconstructed": True,
         "reconstruction_method": RECONSTRUCTION_METHOD,
@@ -1809,8 +1859,6 @@ def _feature_payload(
         "sigma20": _sigma(prior20),
         "sub_dollar_at_open": sub_dollar,
         "halt_state": "unobserved_or_no_halt",
-        "catalyst_tags": [],
-        "catalyst_source_status": "not_implemented_pit_safe_empty",
         "spy_prior_day_return": spy_prior_day_return,
         "security_type": inp.security_type.security_type,
         "is_ml_excluded": inp.security_type.ml_excluded,
@@ -1829,6 +1877,7 @@ def _feature_payload(
             "research_only_leaky": "excluded_from_stage1_feature_allowlists",
         },
     }
+    payload = apply_i12_catalyst_result_to_feature_payload(payload, catalyst)
     if minute_lineage is not None:
         payload["minute_price_basis"] = "polygon_adjusted_minute"
     if len(prior252) < 252:

@@ -95,6 +95,10 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
         "projected_volume_at_confirmation",
         "spy_prior_day_return",
         "price_at_open",
+        "catalyst_dilution_avoid",
+        "catalyst_nt_late_filer",
+        "catalyst_fda_amplifier",
+        "catalyst_compliance_amplifier",
     }
 )
 INTRADAY_ALLOWED_SIGNAL_REGISTRY_COLUMNS = frozenset()

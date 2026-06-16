@@ -22,8 +22,12 @@ from alpha.db.models import (
     ForwardReturnObservation,
     HistoricalUniverseReconstruction,
     IntradayEventDetail,
+    SecurityIdentitySnapshot,
     SignalRegistry,
+    UniverseScan,
 )
+from alpha.jobs.i12_catalyst_backfill import I12CatalystBackfillJob
+from alpha.jobs.i12_catalysts import I12CatalystResolver
 from alpha.jobs.i12_historical_corpus import (
     CANDIDATE_SCREEN_STAMP,
     DEFAULT_FETCH_DEADLINE_SECONDS,
@@ -134,6 +138,21 @@ class InstrumentedPolygon(FakePolygon):
         return AdapterResponse(data=bars, lineage=_lineage("Polygon", ticker, bars))
 
 
+class FakeEdgarSubmissions:
+    def __init__(self, payloads_by_cik: dict[str, dict]) -> None:
+        self.payloads_by_cik = {
+            "".join(ch for ch in str(cik) if ch.isdigit()).zfill(10): payload
+            for cik, payload in payloads_by_cik.items()
+        }
+        self.calls: Counter[str] = Counter()
+
+    def get_company_submissions(self, cik, *, asof=None):
+        cik10 = "".join(ch for ch in str(cik) if ch.isdigit()).zfill(10)
+        self.calls[cik10] += 1
+        payload = self.payloads_by_cik.get(cik10, _edgar_submissions_payload([]))
+        return AdapterResponse(data=payload, lineage=_lineage("SEC", cik10, []))
+
+
 def _lineage(provider: str, ticker: str, bars: list) -> LineageMeta:
     return LineageMeta(
         provider=provider,
@@ -142,6 +161,37 @@ def _lineage(provider: str, ticker: str, bars: list) -> LineageMeta:
         asof_timestamp=datetime(2026, 6, 12, tzinfo=timezone.utc),
         raw_payload_hash=stable_hash({"ticker": ticker, "bars": [bar.__dict__ for bar in bars]}),
     )
+
+
+def _edgar_submissions_payload(rows: list[dict]) -> dict:
+    fields = (
+        "accessionNumber",
+        "filingDate",
+        "reportDate",
+        "acceptanceDateTime",
+        "act",
+        "form",
+        "fileNumber",
+        "filmNumber",
+        "items",
+        "size",
+        "isXBRL",
+        "isInlineXBRL",
+        "primaryDocument",
+        "primaryDocDescription",
+    )
+    recent = {field: [] for field in fields}
+    for idx, row in enumerate(rows, start=1):
+        for field in fields:
+            recent[field].append(row.get(field))
+        recent["accessionNumber"][-1] = row.get("accessionNumber") or f"0000000000-26-{idx:06d}"
+        recent["filingDate"][-1] = row.get("filingDate") or DAY.isoformat()
+        recent["reportDate"][-1] = row.get("reportDate") or DAY.isoformat()
+        recent["size"][-1] = row.get("size", 1)
+        recent["isXBRL"][-1] = row.get("isXBRL", False)
+        recent["isInlineXBRL"][-1] = row.get("isInlineXBRL", False)
+        recent["primaryDocument"][-1] = row.get("primaryDocument") or "primary.htm"
+    return {"filings": {"recent": recent}}
 
 
 def _classification(
@@ -187,6 +237,44 @@ def _seed_hur(db_session, ticker: str, trading_date: date = DAY) -> None:
             pit_filter_status_json="{}",
             input_hash=stable_hash({"ticker": ticker, "date": trading_date.isoformat()}),
             output_hash=stable_hash({"included": ticker, "date": trading_date.isoformat()}),
+        )
+    )
+    db_session.flush()
+
+
+def _seed_identity_cik(
+    db_session,
+    ticker: str,
+    cik: str,
+    *,
+    active: bool = True,
+) -> None:
+    scan_id = f"identity-scan-{ticker}"
+    if db_session.get(UniverseScan, scan_id) is None:
+        db_session.add(
+            UniverseScan(
+                scan_id=scan_id,
+                trading_date=DAY.isoformat(),
+                asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                provider="fixture",
+                raw_count=1,
+                deduped_count=1,
+                duplicate_symbol_count=0,
+                included_count=1,
+                excluded_count=0,
+                run_status="finished",
+            )
+        )
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id=f"identity-{ticker}-{cik}",
+            scan_id=scan_id,
+            ticker=ticker.upper(),
+            cik=cik,
+            active=active,
+            identity_status="present",
+            source_provider="fixture",
+            asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
         )
     )
     db_session.flush()
@@ -345,6 +433,42 @@ def _run_i12_with_polygon(
         progress_callback=progress_callback,
     )
     return run_job(db_session, job)
+
+
+def _run_i12_with_catalyst_filings(
+    db_session,
+    tmp_path,
+    rows: list[dict],
+    *,
+    ticker: str = "TEST",
+    active_identity: bool = True,
+):
+    cik = "0001234567"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(db_session, ticker, cik, active=active_identity)
+    edgar = FakeEdgarSubmissions({cik: _edgar_submissions_payload(rows)})
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+    result = run_job(db_session, job)
+    signal = (
+        db_session.query(SignalRegistry)
+        .filter(SignalRegistry.pattern_id == "I12", SignalRegistry.ticker == ticker)
+        .one()
+    )
+    feature = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    return result, json.loads(feature.feature_json), edgar
 
 
 def _seed_delisted(db_session, ticker: str, delisted_date: date, *, suffix: str = "") -> None:
@@ -950,6 +1074,122 @@ def test_i12_daily_fmp_fetch_watchdog_quarantines_and_continues(db_session):
     assert polygon.calls[(fast_ticker, DAY)] == 1
     assert db_session.query(IntradayEventDetail).filter_by(ticker=fast_ticker).count() == 1
     assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
+
+
+def test_i12_catalyst_before_entry_filing_is_included(db_session, tmp_path):
+    result, feature, edgar = _run_i12_with_catalyst_filings(
+        db_session,
+        tmp_path,
+        [
+            {
+                "form": "S-3",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "ATM shelf offering prospectus",
+            }
+        ],
+    )
+
+    assert result.status == "finished"
+    assert feature["catalyst_source_status"] == "implemented_pit_filtered"
+    assert "dilution_offering" in feature["catalyst_tags"]
+    assert feature["catalyst_dilution_avoid"] is True
+    assert feature["catalyst_cutoff_timestamp"].endswith("Z")
+    assert edgar.calls["0001234567"] == 1
+
+
+def test_i12_catalyst_after_entry_filing_is_excluded(db_session, tmp_path):
+    result, feature, _edgar = _run_i12_with_catalyst_filings(
+        db_session,
+        tmp_path,
+        [
+            {
+                "form": "S-3",
+                "acceptanceDateTime": "2026-06-03T10:30:00",
+                "primaryDocDescription": "ATM shelf offering prospectus",
+            }
+        ],
+    )
+
+    assert result.status == "finished"
+    assert feature["catalyst_source_status"] == "implemented_pit_filtered"
+    assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is False
+
+
+def test_i12_same_day_post_entry_catalyst_never_reaches_feature_vector(
+    db_session,
+    tmp_path,
+):
+    result, feature, _edgar = _run_i12_with_catalyst_filings(
+        db_session,
+        tmp_path,
+        [
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T11:00:00",
+                "primaryDocDescription": "Registered direct offering",
+            },
+            {
+                "form": "NT 10-Q",
+                "acceptanceDateTime": "2026-06-03T11:01:00",
+                "primaryDocDescription": "Late quarterly report notice",
+            },
+        ],
+    )
+
+    assert result.status == "finished"
+    assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is False
+    assert feature["catalyst_nt_late_filer"] is False
+
+
+def test_i12_catalyst_backfill_uses_delisted_identity_cik(
+    db_session,
+    tmp_path,
+):
+    result, feature_before, _edgar_before = _run_i12_with_catalyst_filings(
+        db_session,
+        tmp_path,
+        [],
+        ticker="DEAD",
+        active_identity=False,
+    )
+    assert result.status == "finished"
+    assert feature_before["catalyst_tags"] == []
+    edgar = FakeEdgarSubmissions({
+        "0001234567": _edgar_submissions_payload([
+            {
+                "form": "NT 10-K",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Late annual report notice",
+            }
+        ])
+    })
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "backfill-edgar",
+    )
+    backfill = I12CatalystBackfillJob(
+        session=db_session,
+        catalyst_resolver=resolver,
+        start_date=DAY,
+        end_date=DAY,
+    )
+
+    backfill_result = run_job(db_session, backfill)
+
+    assert backfill_result.status == "finished"
+    assert backfill_result.metrics["rows_updated"] == 1
+    detail = db_session.query(IntradayEventDetail).filter_by(ticker="DEAD").one()
+    detail_feature = json.loads(detail.feature_json)
+    assert detail_feature["catalyst_tags"] == ["nt_late_filer"]
+    assert detail_feature["catalyst_nt_late_filer"] is True
+    signal = db_session.get(SignalRegistry, detail.signal_id)
+    snapshot = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    snapshot_feature = json.loads(snapshot.feature_json)
+    assert snapshot_feature["catalyst_tags"] == ["nt_late_filer"]
+    assert edgar.calls["0001234567"] == 1
 
 
 def test_i12_fetch_watchdog_consecutive_timeout_streak_trips_breaker(db_session):

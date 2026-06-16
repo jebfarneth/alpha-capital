@@ -549,6 +549,28 @@ def test_leakage_audit_rejects_forward_market_path_feature_role():
         audit_feature_schema_no_leakage(schema)
 
 
+def test_leakage_audit_allows_intraday_pit_catalyst_flags():
+    schema = {
+        "pattern_id": "I12",
+        "pattern_clock": "intraday",
+        "fields": [
+            {
+                "name": name,
+                "source": "feature_snapshot_json",
+                "path": name,
+            }
+            for name in (
+                "catalyst_dilution_avoid",
+                "catalyst_nt_late_filer",
+                "catalyst_fda_amplifier",
+                "catalyst_compliance_amplifier",
+            )
+        ],
+    }
+
+    audit_feature_schema_no_leakage(schema)
+
+
 def test_signal_registry_unknown_column_fails_closed(tmp_path):
     schema = {
         "schema_version": "bad_signal_registry_column_v1",
