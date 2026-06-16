@@ -1,6 +1,6 @@
 # Alpha Capital
 
-Last materially refreshed: 2026-06-15.
+Last materially refreshed: 2026-06-16.
 
 Alpha Capital is backend-first infrastructure for systematic U.S. equities
 research, signal measurement, historical replay, and supervised ranking. It is
@@ -63,10 +63,10 @@ latest production state.
 | Database | Supabase/Postgres is the canonical target. SQLite exists for local/unit paths only and is refused by canonical write paths. |
 | Production compute | Always-on cloud VM runs scheduled jobs; large historical backfills and ML runs are treated as separate heavy jobs rather than fattening the always-on worker. |
 | Live patterns | M4, M1, and M2 have production paths. M3 exists but remains default-off. Intraday I11/I12 are research/corpus/paper lanes, not live broker execution. |
-| Historical corpus | M4 has a survivorship-correct historical replay and forward-labeling path. I11 and I12 have durable intraday corpus builders with scratch-schema guards. |
+| Historical corpus | M4 has a survivorship-correct historical replay and forward-labeling path, plus a day-0 `signal_session` layer that captures the breakout-day intraday path. I11 and I12 have durable intraday corpus builders with scratch-schema guards. |
 | ML layer | Stage-1 ranker machinery exists: manifest loader, leakage-audited feature selection, purged/embargoed walk-forward CV, GBRT trainer, shadow inference, score persistence, registry identity checks, and fail-closed fallback. |
 | Safety | Public writes are guarded; scratch schemas are explicitly bound; direct scratch writes verify `search_path`; ML manifests self-check hashes; intraday feature schemas deny known leaky roles by default. |
-| Test baseline | Recent local runs are around 2,500 passing tests, 6 skipped, with one known pre-existing Polygon adapter expected-call mismatch around `adjusted=true`. Re-run locally before relying on this number. |
+| Test baseline | Recent local runs are around 2,600 passing tests, 6 skipped. Re-run locally before relying on this number. |
 | Execution | Paper execution infrastructure exists. Live broker execution is intentionally not the current milestone. |
 
 ## What This System Is Trying To Prevent
@@ -257,7 +257,7 @@ shadow inference before any allocator is allowed to trust the scores.
 | Manifest loader | Loads frozen ML manifests, checks pinned SHA-256, validates horizon contracts, and runs leakage audit during load. |
 | Feature selector | Pulls stored features through explicit locators, preserves train/serve vector parity, hashes schema/vector identity, handles typed missing values, and rejects non-finite stored values. |
 | Leakage gate | Fails on forward-path roles, label-like names, snake-case leakage labels, forbidden intraday `signal_session` fields, and dotted leaky paths such as `research_only_leaky.*` or `exit.*`. |
-| Training loader | Reads `forward_return_observations`, filters by pattern and manifest horizon, collapses duplicate observations to latest, rejects mixed horizons, drops corrupt/non-finite feature rows. |
+| Training loader | Reads `forward_return_observations`, filters by pattern and manifest horizon, collapses duplicate observations to latest, resolves ticker renames/aliases to one security identity (so a renamed name is not double-counted across dedup, unique-name weights, and CV purge), rejects mixed horizons, drops corrupt/non-finite feature rows. |
 | CV | Purged/embargoed walk-forward splits with fold-local ticker-cluster weights. Random K-fold is explicitly forbidden for this use. |
 | Model | Initial GBRT path via scikit-learn `HistGradientBoostingRegressor`. This is ranker infrastructure, not a claim that GBRT is final. |
 | Registry | `ml_model_registry` stores model identity, manifest hash, feature schema hash, artifact URI, CV metrics, and status. |
@@ -311,6 +311,13 @@ If the corpus is dirty, no model type can save it.
 post-signal and signal-day path spine: base OHLCV, rich technicals, relative
 features, ML context fields, hashes, lineage, status flags, and pattern identity.
 
+When built with the day-0 (`signal_session`) layer, the spine also captures the
+signal day itself: the breakout-day open→close path, intraday minute-derived
+structure, and a `leakage_contract` that separates as-of-prior-close predictor
+inputs from the day-0 outcome features. Day-0 close/high/low and forward bars are
+explicitly forbidden as predictors. This layer exists because much of a breakout's
+move happens on day 0, which a next-open entry forfeits.
+
 `market_path_pre_signal_contexts` and links store setup context before a signal
 fires. This exists because the model should learn what the setup looked like
 before the event, not just what happened on the signal day.
@@ -326,9 +333,12 @@ Feature groups include:
 - benchmark and sector-relative context
 - classic technicals such as RSI, ADX/DMI, Bollinger/Keltner, MACD histogram,
   OBV, accumulation/distribution, CMF, stochastic oscillator
-- cross-pattern/catalyst placeholders
-- explicit null/status fields for future intraday, spread, short/borrow, float,
-  offering/halt, and depth sources
+- cross-pattern and catalyst features (for I12: PIT-safe EDGAR-derived
+  offering/dilution and NT-late-filer flags, FDA/compliance amplifier and
+  recent-shelf flags, tagged only within an acute entry window and failing closed
+  on unresolved or ambiguous point-in-time identity)
+- explicit null/status fields for future spread, short/borrow, float, and depth
+  sources
 
 Predictor eligibility depends on the decision clock. A field being present in a
 row is not enough to make it trainable.
@@ -342,7 +352,7 @@ Providers have roles. Convenience is not authority.
 | FMP | Universe screening, profiles, daily OHLCV, historical replay bars, some fundamentals. |
 | Polygon / Massive | Identity details, corporate actions, daily sanity checks, ticker details, short/float style data where available. |
 | Benzinga | Catalyst/news/earnings/ratings/offering context. |
-| SEC EDGAR | Official Form 4 authority and filing acceptance timestamps. |
+| SEC EDGAR | Official Form 4 authority and filing acceptance timestamps; also PIT-safe form-type catalyst tagging (offering/424B, NT late filings) from per-issuer submissions. |
 | Nasdaq | Listing, halt, and archive authority paths. |
 | Alpaca | Paper trading integration. Live broker execution is not the current promoted path. |
 
@@ -388,6 +398,7 @@ Production writes are intentionally difficult to do accidentally.
 | Public-write guard | Jobs refuse `public` unless the path is explicitly intended and confirmed. |
 | Idempotent upserts | Replay/backfill/corpus jobs should update/reuse rows rather than duplicate them. |
 | Source-gated health | Provider failures are fatal only when they invalidate certified evidence. |
+| Provider fetch watchdog | Long backfills bound each provider fetch with a daemon-thread wall-clock deadline and a circuit breaker (independent outstanding-leak and consecutive-timeout caps), so a hung socket cannot stall a job; cache hits stay neutral to the timeout streak. |
 | Non-trading day no-op | Calendar-aware jobs exit safely on weekends/holidays. |
 
 If a scratch job writes to `public`, that is an incident. Treat it as data
