@@ -474,6 +474,14 @@ class TestMarketSessionResolver:
                 assert is_us_equity_session(day)
                 assert day not in holidays
 
+    def test_juneteenth_holiday_starts_with_2022_observance(self):
+        assert is_us_equity_session(date_type(2021, 6, 18)) is True
+        assert is_us_equity_session(date_type(2022, 6, 20)) is False
+
+    def test_malformed_session_date_string_raises_guarded_runtime_error(self):
+        with pytest.raises(RuntimeError, match="invalid U.S. equity session date"):
+            is_us_equity_session("not-a-date")
+
     def test_early_close_table_extension_alarm(self):
         table_year = max(market_calendar._NYSE_EARLY_CLOSES)
         next_black_friday = _day_after_thanksgiving(table_year + 1)

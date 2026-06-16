@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +66,15 @@ def _validated_oos_quality_gate(
         raise MLManifestError(
             f"pattern {pattern_id!r} oos_quality_gate thresholds must be numeric"
         ) from exc
+    if min_top_decile_lift is not None and not math.isfinite(min_top_decile_lift):
+        raise MLManifestError(
+            f"pattern {pattern_id!r} oos_quality_gate.min_top_decile_lift "
+            "must be finite"
+        )
+    if min_rank_ic is not None and not math.isfinite(min_rank_ic):
+        raise MLManifestError(
+            f"pattern {pattern_id!r} oos_quality_gate.min_rank_ic must be finite"
+        )
     if min_top_decile_lift is not None and min_top_decile_lift < 1.0:
         raise MLManifestError(
             f"pattern {pattern_id!r} oos_quality_gate.min_top_decile_lift "

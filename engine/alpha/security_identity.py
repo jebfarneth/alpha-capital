@@ -37,9 +37,9 @@ def _identity_key(identity: SecurityIdentitySnapshot | None, ticker: str) -> str
     if identity is None:
         return f"ticker:{ticker.upper()}"
     for prefix, value in (
-        ("cik", identity.cik),
-        ("composite_figi", identity.composite_figi),
         ("share_class_figi", identity.share_class_figi),
+        ("composite_figi", identity.composite_figi),
+        ("cik", identity.cik),
         ("identity_hash", identity.identity_hash),
     ):
         if value:
@@ -78,6 +78,7 @@ def _canonical_ticker(rows: Iterable[SecurityIdentitySnapshot]) -> str | None:
             row.active is True,
             row.asof_timestamp is not None,
             row.asof_timestamp,
+            str(row.identity_hash or ""),
             str(row.ticker or ""),
         ),
         reverse=True,
@@ -102,21 +103,37 @@ def resolve_security_identities_for_tickers(
         return {}
     rows = (
         session.query(SecurityIdentitySnapshot)
-        .filter(
-            (SecurityIdentitySnapshot.ticker.in_(requested))
-            | (SecurityIdentitySnapshot.ticker_events_json.isnot(None))
-        )
+        .filter(SecurityIdentitySnapshot.ticker.in_(requested))
         .all()
     )
     groups: dict[str, list[SecurityIdentitySnapshot]] = {}
+    direct_identity_by_ticker: dict[str, str] = {}
     alias_to_identity: dict[str, str] = {}
-    for row in rows:
+
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: (
+            str(row.ticker or "").upper(),
+            row.active is True,
+            row.asof_timestamp is not None,
+            row.asof_timestamp,
+            str(row.identity_hash or ""),
+            str(row.security_identity_snapshot_id or ""),
+        ),
+        reverse=True,
+    )
+    for row in ordered_rows:
         ticker = str(row.ticker or "").upper()
         key = _identity_key(row, ticker)
         groups.setdefault(key, []).append(row)
-        aliases = {ticker, *_ticker_aliases_from_events(row.ticker_events_json)}
+        if ticker:
+            direct_identity_by_ticker.setdefault(ticker, key)
+    for row in ordered_rows:
+        ticker = str(row.ticker or "").upper()
+        key = _identity_key(row, ticker)
+        aliases = _ticker_aliases_from_events(row.ticker_events_json)
         for alias in aliases:
-            if alias:
+            if alias and alias in requested and alias not in direct_identity_by_ticker:
                 alias_to_identity.setdefault(alias, key)
     canonical_by_identity = {
         key: _canonical_ticker(group) or key.rsplit(":", 1)[-1]
@@ -124,7 +141,7 @@ def resolve_security_identities_for_tickers(
     }
     resolved: dict[str, ResolvedSecurityIdentity] = {}
     for ticker in requested:
-        key = alias_to_identity.get(ticker)
+        key = direct_identity_by_ticker.get(ticker) or alias_to_identity.get(ticker)
         if key is None:
             key = f"ticker:{ticker}"
             canonical = ticker

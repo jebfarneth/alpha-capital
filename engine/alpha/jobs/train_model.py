@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import pickle
 import sys
 from dataclasses import dataclass
@@ -60,6 +61,10 @@ DEFAULT_L2_REGULARIZATION = 0.01
 DEFAULT_EARLY_STOPPING = True
 DEFAULT_DROP_FRACTION_FLAG_THRESHOLD = 0.20
 DEFAULT_DROP_LABEL_MEAN_DELTA_THRESHOLD = 0.05
+DEFAULT_MIN_CV_TRAIN_ROWS = 2
+DEFAULT_MIN_CV_TRAIN_SECURITIES = 2
+DEFAULT_EARLY_STOPPING_MIN_TRAIN_ROWS = 20
+DEFAULT_TRAINER_DB_TIMEOUT_MS = 3_600_000
 DEFAULT_OOS_GATE = {
     "min_top_decile_lift": 1.0,
     "min_rank_ic": 0.0,
@@ -1098,35 +1103,44 @@ def _security_identity_for_row(
     return identities.get(ticker) or _fallback_security_identity(ticker)
 
 
-def _dedupe_security_identity_rows(
-    rows: list[ForwardReturnObservation],
+def _dedupe_training_candidates(
+    candidates: list[tuple[ForwardReturnObservation, TrainingExample]],
     identities: dict[str, ResolvedSecurityIdentity],
-) -> tuple[list[ForwardReturnObservation], int]:
-    selected: dict[tuple[str, date], ForwardReturnObservation] = {}
+) -> tuple[list[TrainingExample], int]:
+    selected: dict[tuple[str, date], tuple[ForwardReturnObservation, TrainingExample]] = {}
 
-    def priority(row: ForwardReturnObservation) -> tuple[bool, datetime, datetime, str]:
+    def priority(row: ForwardReturnObservation) -> tuple[
+        bool,
+        datetime,
+        datetime,
+        str,
+        str,
+        str,
+    ]:
         identity = _security_identity_for_row(row, identities)
         return (
             str(row.ticker or "").upper() == identity.canonical_ticker,
             row.updated_at or datetime.min.replace(tzinfo=timezone.utc),
             row.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            identity.security_identity,
+            str(row.ticker or "").upper(),
             str(row.forward_return_observation_id),
         )
 
-    for row in rows:
+    for row, example in candidates:
         identity = _security_identity_for_row(row, identities)
         key = (identity.security_identity, _signal_date(row.signal))
         current = selected.get(key)
-        if current is None or priority(row) > priority(current):
-            selected[key] = row
-    dropped = len(rows) - len(selected)
+        if current is None or priority(row) > priority(current[0]):
+            selected[key] = (row, example)
+    dropped = len(candidates) - len(selected)
     if dropped:
         LOGGER.warning(
-            "Stage-1 trainer dropped %s duplicate rows after security identity "
-            "collapse",
+            "Stage-1 trainer dropped %s duplicate finite rows after security "
+            "identity collapse",
             dropped,
         )
-    return list(selected.values()), dropped
+    return [example for _row, example in selected.values()], dropped
 
 
 def _apply_counted_hard_filter(
@@ -1340,12 +1354,8 @@ def _load_training_examples(
         session,
         [str(row.ticker or "") for row in rows],
     )
-    rows, security_identity_duplicate_rows_dropped = _dedupe_security_identity_rows(
-        rows,
-        identities,
-    )
     rows = sorted(rows, key=lambda row: row.signal_timestamp)
-    out: list[TrainingExample] = []
+    candidates: list[tuple[ForwardReturnObservation, TrainingExample]] = []
     dropped_non_finite = 0
     dropped_non_finite_by_feature: dict[str, int] = {}
     kept_labels: list[float] = []
@@ -1379,19 +1389,27 @@ def _load_training_examples(
             continue
         kept_labels.append(label)
         identity = _security_identity_for_row(obs, identities)
-        out.append(
-            TrainingExample(
-                signal_id=obs.signal_id,
-                ticker=identity.canonical_ticker,
-                security_identity=identity.security_identity,
-                signal_date=_signal_date(signal),
-                label=label,
-                vector=vector,
-                direction=direction,
-                raw_label=raw_label,
-                realized_label_window_sessions=_realized_label_window_sessions(obs),
+        candidates.append(
+            (
+                obs,
+                TrainingExample(
+                    signal_id=obs.signal_id,
+                    ticker=identity.canonical_ticker,
+                    security_identity=identity.security_identity,
+                    signal_date=_signal_date(signal),
+                    label=label,
+                    vector=vector,
+                    direction=direction,
+                    raw_label=raw_label,
+                    realized_label_window_sessions=_realized_label_window_sessions(obs),
+                ),
             )
         )
+    out, security_identity_duplicate_rows_dropped = _dedupe_training_candidates(
+        candidates,
+        identities,
+    )
+    out = sorted(out, key=lambda row: (row.signal_date, row.signal_id))
     if dropped_non_finite:
         LOGGER.warning(
             "Stage-1 trainer dropped %s rows with non_finite_stored_value "
@@ -1440,6 +1458,10 @@ def _fold_train_weights(
     return unique_name_weights([cv_rows[i] for i in train_indices])
 
 
+def _fold_security_count(cv_rows: list[CVExample], indices: list[int]) -> int:
+    return len({cv_rows[i].security_identity or cv_rows[i].ticker for i in indices})
+
+
 def _cross_validate(
     examples: list[TrainingExample],
     *,
@@ -1450,6 +1472,16 @@ def _cross_validate(
     random_state: int,
     model_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_model_params = dict(model_params or {})
+    min_cv_train_rows = int(
+        resolved_model_params.get("min_cv_train_rows", DEFAULT_MIN_CV_TRAIN_ROWS)
+    )
+    min_cv_train_securities = int(
+        resolved_model_params.get(
+            "min_cv_train_securities",
+            DEFAULT_MIN_CV_TRAIN_SECURITIES,
+        )
+    )
     cv_rows = _cv_examples(examples)
     folds = purged_embargoed_walk_forward_splits(
         cv_rows,
@@ -1462,15 +1494,44 @@ def _cross_validate(
     all_pred: list[float] = []
     all_fold_percentiles: list[float] = []
     all_weights: list[float] = []
+    dropped_nonviable_folds: list[dict[str, Any]] = []
     for idx, fold in enumerate(folds):
         train = [examples[i] for i in fold.train_indices]
         test = [examples[i] for i in fold.test_indices]
+        train_security_count = _fold_security_count(cv_rows, fold.train_indices)
+        nonviable_reasons: list[str] = []
+        if len(train) < min_cv_train_rows:
+            nonviable_reasons.append("train_count_below_minimum")
+        if train_security_count < min_cv_train_securities:
+            nonviable_reasons.append("train_security_count_below_minimum")
+        if nonviable_reasons:
+            dropped_nonviable_folds.append({
+                "fold": idx,
+                "train_count": len(train),
+                "test_count": len(test),
+                "train_security_count": train_security_count,
+                "test_start_date": fold.test_start_date.isoformat(),
+                "test_end_date": fold.test_end_date.isoformat(),
+                "reasons": nonviable_reasons,
+            })
+            continue
         train_weights = _fold_train_weights(cv_rows, fold.train_indices)
         test_weights = unique_name_weights([cv_rows[i] for i in fold.test_indices])
+        fold_model_params = dict(resolved_model_params)
+        early_stopping_disabled_for_fold = False
+        if (
+            _bool_model_param(
+                fold_model_params.get("early_stopping"),
+                default=DEFAULT_EARLY_STOPPING,
+            )
+            and len(train) < DEFAULT_EARLY_STOPPING_MIN_TRAIN_ROWS
+        ):
+            fold_model_params["early_stopping"] = False
+            early_stopping_disabled_for_fold = True
         model = _new_gbrt_model(
             max_iter=max_iter,
             random_state=random_state + idx,
-            model_params=model_params,
+            model_params=fold_model_params,
         )
         model.fit(
             _matrix(train),
@@ -1489,8 +1550,10 @@ def _cross_validate(
                 "fold": idx,
                 "train_count": len(train),
                 "test_count": len(test),
+                "train_security_count": train_security_count,
                 "test_start_date": fold.test_start_date.isoformat(),
                 "test_end_date": fold.test_end_date.isoformat(),
+                "early_stopping_disabled_for_fold": early_stopping_disabled_for_fold,
                 "weighted_mae": _weighted_mae(labels, preds, test_weights),
                 "pearson": value_ic,
                 "value_ic": value_ic,
@@ -1498,6 +1561,11 @@ def _cross_validate(
                 "top_quantile_unreliable": _top_quantile_unreliable(preds),
                 **_prediction_quality_metrics(labels, preds, weights=test_weights),
             }
+        )
+    if not fold_metrics:
+        raise RuntimeError(
+            "Stage-1 CV has no viable folds after train-size/security-count "
+            "guards"
         )
     raw_pooled_value_ic = _pearson(all_true, all_pred)
     raw_pooled_rank_ic = _spearman(all_true, all_pred)
@@ -1521,6 +1589,10 @@ def _cross_validate(
         "horizon_sessions": horizon_sessions,
         "embargo_sessions": embargo_sessions,
         "folds": fold_metrics,
+        "dropped_nonviable_fold_count": len(dropped_nonviable_folds),
+        "dropped_nonviable_folds": dropped_nonviable_folds,
+        "min_cv_train_rows": min_cv_train_rows,
+        "min_cv_train_securities": min_cv_train_securities,
         "mean_fold_metrics": _mean_fold_metrics(fold_metrics),
         "oos_count": len(all_true),
         **pooled_quality_metrics,
@@ -1766,11 +1838,45 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--n-splits", type=int, default=3)
     parser.add_argument("--max-iter", type=int, default=80)
     parser.add_argument("--random-state", type=int, default=7)
+    parser.add_argument(
+        "--db-statement-timeout-ms",
+        type=int,
+        default=DEFAULT_TRAINER_DB_TIMEOUT_MS,
+        help=(
+            "PostgreSQL statement_timeout for this offline trainer process; "
+            "set before opening the DB session."
+        ),
+    )
+    parser.add_argument(
+        "--db-idle-in-transaction-timeout-ms",
+        type=int,
+        default=DEFAULT_TRAINER_DB_TIMEOUT_MS,
+        help=(
+            "PostgreSQL idle_in_transaction_session_timeout for this offline "
+            "trainer process; set before opening the DB session."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _apply_trainer_db_timeout_env(args: argparse.Namespace) -> None:
+    if args.db_statement_timeout_ms is not None:
+        if args.db_statement_timeout_ms < 0:
+            raise ValueError("--db-statement-timeout-ms must be >= 0")
+        os.environ["ALPHA_DB_STATEMENT_TIMEOUT_MS"] = str(
+            args.db_statement_timeout_ms
+        )
+    if args.db_idle_in_transaction_timeout_ms is not None:
+        if args.db_idle_in_transaction_timeout_ms < 0:
+            raise ValueError("--db-idle-in-transaction-timeout-ms must be >= 0")
+        os.environ["ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS"] = str(
+            args.db_idle_in_transaction_timeout_ms
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
+    _apply_trainer_db_timeout_env(args)
     session = get_session()
     manifest = load_manifest(args.manifest_path)
     job = Stage1TrainModelJob(
@@ -1791,6 +1897,10 @@ def main(argv: list[str] | None = None) -> int:
             "pattern_id": args.pattern_id,
             "artifact_dir": args.artifact_dir,
             "status": args.status,
+            "db_statement_timeout_ms": args.db_statement_timeout_ms,
+            "db_idle_in_transaction_timeout_ms": (
+                args.db_idle_in_transaction_timeout_ms
+            ),
         },
     )
     print(json.dumps(result.metrics, sort_keys=True, default=str))

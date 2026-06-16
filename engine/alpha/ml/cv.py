@@ -68,7 +68,8 @@ def purged_embargoed_walk_forward_splits(
     date_to_position = {value: idx for idx, value in enumerate(dates)}
     embargo = max(horizon_sessions, embargo_sessions)
     fold_count = min(n_splits, max(1, len(dates) - embargo - 1))
-    test_dates = dates[embargo + 1 :]
+    warmup_date_count = max(embargo + 1, len(dates) // (fold_count + 1))
+    test_dates = dates[warmup_date_count:]
     if len(test_dates) < fold_count:
         raise CrossValidationError("embargo leaves no feasible test cohorts")
     chunk_size = max(1, len(test_dates) // fold_count)

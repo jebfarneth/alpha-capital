@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pickle
 import random
 from importlib import import_module
@@ -27,15 +28,18 @@ from alpha.jobs.contracts import JobContext
 from alpha.jobs.runner import run_job
 from alpha.jobs.train_model import (
     DEFAULT_MIN_SAMPLES_LEAF,
+    DEFAULT_TRAINER_DB_TIMEOUT_MS,
     MODEL_FAMILY,
     PREDICTION_VARIANCE_EPSILON,
     Stage1TrainModelJob,
     TrainingExample,
+    _apply_trainer_db_timeout_env,
     _cross_validate,
     _finite,
     _fold_train_weights,
     _load_training_examples,
     _mean_fold_metrics,
+    _parse_args,
     _prediction_quality_metrics,
     _prediction_weight_bins,
     _resolved_model_params,
@@ -44,7 +48,11 @@ from alpha.jobs.train_model import (
     _top_quantile_unreliable,
 )
 from alpha.market_calendar import next_us_equity_session, nth_us_equity_session
-from alpha.ml.cv import CVExample, purged_embargoed_walk_forward_splits
+from alpha.ml.cv import (
+    CVExample,
+    PurgedEmbargoedFold,
+    purged_embargoed_walk_forward_splits,
+)
 from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
 from alpha.ml.manifest_loader import PatternManifest, load_manifest, manifest_payload_hash
 from alpha.ml.model_features import (
@@ -56,6 +64,7 @@ from alpha.ml.model_features import (
     feature_vector_hash,
     select_features,
 )
+from alpha.security_identity import _canonical_ticker, resolve_security_identities_for_tickers
 
 
 class ConstantModel:
@@ -427,6 +436,33 @@ def _seed_training_corpus(db_session, *, count: int = 14) -> list[str]:
                 forward_return=returns_by_bucket[idx % 5],
             )
         )
+    if count >= 2:
+        scan = UniverseScan(
+            scan_id="scan-training-cluster",
+            trading_date="2025-01-02",
+            asof_timestamp=datetime(2025, 1, 2, tzinfo=timezone.utc),
+            provider="test",
+            raw_count=2,
+            deduped_count=2,
+            duplicate_symbol_count=0,
+            included_count=2,
+            excluded_count=0,
+            run_status="finished",
+        )
+        db_session.add(scan)
+        for ticker in ("T0", "T1"):
+            db_session.add(
+                SecurityIdentitySnapshot(
+                    security_identity_snapshot_id=f"identity-{ticker.lower()}",
+                    scan_id=scan.scan_id,
+                    ticker=ticker,
+                    cik="0007777777",
+                    active=True,
+                    identity_status="present",
+                    source_provider="test",
+                    asof_timestamp=datetime(2025, 1, 2, tzinfo=timezone.utc),
+                )
+            )
     db_session.commit()
     return signal_ids
 
@@ -1348,6 +1384,69 @@ def test_cross_validate_keeps_normalized_pooled_ic_when_raw_scores_have_fold_off
     assert metrics["top_decile_lift"] > 1.0
 
 
+def test_cross_validate_drops_one_row_train_fold_from_pooled_oos(monkeypatch):
+    train_model_module = import_module("alpha.jobs.train_model")
+    monkeypatch.setattr(
+        train_model_module,
+        "_new_gbrt_model",
+        lambda **_kwargs: FoldOffsetFitModel(0.0),
+    )
+    start = date(2025, 1, 1)
+    examples = [
+        _training_example(
+            idx,
+            label=float(idx + 1),
+            signal_date=start + timedelta(days=idx),
+        )
+        for idx in range(60)
+    ]
+
+    def forced_splits(*_args, **_kwargs):
+        return [
+            PurgedEmbargoedFold(
+                train_indices=[0],
+                test_indices=list(range(1, 20)),
+                test_start_date=examples[1].signal_date,
+                test_end_date=examples[19].signal_date,
+                embargo_sessions=0,
+                horizon_sessions=0,
+            ),
+            PurgedEmbargoedFold(
+                train_indices=list(range(10)),
+                test_indices=list(range(20, 60)),
+                test_start_date=examples[20].signal_date,
+                test_end_date=examples[59].signal_date,
+                embargo_sessions=0,
+                horizon_sessions=0,
+            ),
+        ]
+
+    monkeypatch.setattr(
+        train_model_module,
+        "purged_embargoed_walk_forward_splits",
+        forced_splits,
+    )
+
+    metrics = _cross_validate(
+        examples,
+        horizon_sessions=0,
+        embargo_sessions=0,
+        n_splits=2,
+        max_iter=1,
+        random_state=7,
+        model_params={"early_stopping": True},
+    )
+
+    assert metrics["dropped_nonviable_fold_count"] == 1
+    assert metrics["dropped_nonviable_folds"][0]["train_count"] == 1
+    assert metrics["oos_count"] == 40
+    assert len(metrics["folds"]) == 1
+    assert metrics["folds"][0]["early_stopping_disabled_for_fold"] is True
+    assert metrics["top_decile_lift"] == pytest.approx(
+        metrics["folds"][0]["top_decile_lift"]
+    )
+
+
 def test_top_quantile_mean_returns_nan_when_tie_crosses_cutoff():
     labels = [float(idx) for idx in range(100)]
     preds = [0.0 for _ in range(75)] + [1.0 for _ in range(10)] + [2.0 for _ in range(15)]
@@ -1770,7 +1869,7 @@ def test_prediction_quality_metrics_tiny_fold_falls_back_without_crashing():
 def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     db_session, tmp_path
 ):
-    signal_ids = _seed_training_corpus(db_session, count=80)
+    signal_ids = _seed_training_corpus(db_session, count=160)
     manifest = load_manifest(_write_manifest(tmp_path, signal_ids))
     artifact_dir = tmp_path / "artifacts"
     job = Stage1TrainModelJob(
@@ -1804,11 +1903,20 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     assert "top_decile_lift" in metrics["per_pattern"]["M4"]["folds"][0]
     assert "top_effective_lift" in metrics["per_pattern"]["M4"]["folds"][0]
     assert "weighted_top_decile_lift" in metrics["per_pattern"]["M4"]["folds"][0]
-    assert metrics["per_pattern"]["M4"]["training_selection"]["kept_row_count"] == 80
+    assert metrics["per_pattern"]["M4"]["training_selection"]["kept_row_count"] == 160
     assert (
         metrics["per_pattern"]["M4"]["training_selection"]["dropped_non_finite"]
         == 0
     )
+    loaded_examples = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+    )
+    assert sum(
+        1
+        for row in loaded_examples
+        if row.security_identity == "cik:0007777777"
+    ) == 2
     assert metrics["per_pattern"]["M4"]["oos_quality_gate"]["passed"] is True
     assert metrics["per_pattern"]["M4"]["model_params"]["min_samples_leaf"] == 2
     assert metrics["pooled"]["diagnostic_only"] is True
@@ -2047,11 +2155,65 @@ def test_manifest_loader_accepts_stricter_oos_quality_gate_override(tmp_path):
     assert "rank_ic" in gate["required_metrics"]
 
 
+def test_train_model_cli_sets_long_db_timeout_env():
+    original_statement_timeout = os.environ.pop(
+        "ALPHA_DB_STATEMENT_TIMEOUT_MS",
+        None,
+    )
+    original_idle_timeout = os.environ.pop(
+        "ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
+        None,
+    )
+    args = _parse_args([
+        "--manifest-path",
+        "manifest.json",
+        "--pattern-id",
+        "M4",
+        "--artifact-dir",
+        "artifacts",
+        "--db-statement-timeout-ms",
+        "7200000",
+        "--db-idle-in-transaction-timeout-ms",
+        "7300000",
+    ])
+
+    _apply_trainer_db_timeout_env(args)
+
+    try:
+        assert args.db_statement_timeout_ms == 7_200_000
+        assert args.db_idle_in_transaction_timeout_ms == 7_300_000
+        assert DEFAULT_TRAINER_DB_TIMEOUT_MS > 300_000
+        assert os.environ["ALPHA_DB_STATEMENT_TIMEOUT_MS"] == "7200000"
+        assert (
+            os.environ["ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS"]
+            == "7300000"
+        )
+    finally:
+        if original_statement_timeout is None:
+            os.environ.pop("ALPHA_DB_STATEMENT_TIMEOUT_MS", None)
+        else:
+            os.environ["ALPHA_DB_STATEMENT_TIMEOUT_MS"] = original_statement_timeout
+        if original_idle_timeout is None:
+            os.environ.pop("ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS", None)
+        else:
+            os.environ[
+                "ALPHA_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS"
+            ] = original_idle_timeout
+
+
 @pytest.mark.parametrize(
     "oos_quality_gate, message",
     [
         ({"min_top_decile_lift": 0.99}, "min_top_decile_lift"),
+        ({"min_top_decile_lift": math.nan}, "min_top_decile_lift"),
+        ({"min_top_decile_lift": "nan"}, "min_top_decile_lift"),
+        ({"min_top_decile_lift": float("inf")}, "min_top_decile_lift"),
+        ({"min_top_decile_lift": float("-inf")}, "min_top_decile_lift"),
         ({"min_rank_ic": -0.01}, "min_rank_ic"),
+        ({"min_rank_ic": math.nan}, "min_rank_ic"),
+        ({"min_rank_ic": "nan"}, "min_rank_ic"),
+        ({"min_rank_ic": float("inf")}, "min_rank_ic"),
+        ({"min_rank_ic": float("-inf")}, "min_rank_ic"),
         ({"required_metrics": ["rank_ic"]}, "required_metrics"),
         ({"required_metrics": ["top_decile_lift"]}, "required_metrics"),
         ({"reject_status": "shadow"}, "reject_status"),
@@ -2196,6 +2358,176 @@ def test_training_loader_collapses_same_security_same_date_rename_pair(
     assert metrics["security_identity_duplicate_rows_dropped"] == 1
 
 
+def test_training_loader_does_not_collapse_dual_share_classes(
+    db_session,
+    tmp_path,
+):
+    scan = UniverseScan(
+        scan_id="scan-dual-class",
+        trading_date="2025-02-04",
+        asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=2,
+        deduped_count=2,
+        duplicate_symbol_count=0,
+        included_count=2,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    for ticker, share_figi in (("GOOG", "BBG009S3NB30"), ("GOOGL", "BBG009S39JX6")):
+        db_session.add(
+            SecurityIdentitySnapshot(
+                security_identity_snapshot_id=f"identity-{ticker.lower()}",
+                scan_id=scan.scan_id,
+                ticker=ticker,
+                cik="0001652044",
+                composite_figi=f"COMP-{ticker}",
+                share_class_figi=share_figi,
+                active=True,
+                identity_status="present",
+                source_provider="test",
+                asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+            )
+        )
+    signal_date = date(2025, 2, 4)
+    goog_id = _seed_signal(db_session, idx=142, ticker="GOOG", signal_date=signal_date)
+    googl_id = _seed_signal(db_session, idx=143, ticker="GOOGL", signal_date=signal_date)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [goog_id, googl_id]))
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert {row.signal_id for row in examples} == {goog_id, googl_id}
+    assert {row.security_identity for row in examples} == {
+        "share_class_figi:BBG009S3NB30",
+        "share_class_figi:BBG009S39JX6",
+    }
+    assert metrics["security_identity_duplicate_rows_dropped"] == 0
+
+
+def test_security_identity_aliases_do_not_hijack_direct_distinct_tickers(
+    db_session,
+    tmp_path,
+):
+    scan = UniverseScan(
+        scan_id="scan-recycled-alias",
+        trading_date="2025-02-05",
+        asof_timestamp=datetime(2025, 2, 5, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=2,
+        deduped_count=2,
+        duplicate_symbol_count=0,
+        included_count=2,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    db_session.add_all([
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-foo-live",
+            scan_id=scan.scan_id,
+            ticker="FOO",
+            cik="0000000001",
+            active=True,
+            ticker_events_json=json.dumps([{"old_ticker": "BAR", "new_ticker": "FOO"}]),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 5, tzinfo=timezone.utc),
+        ),
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-bar-dead",
+            scan_id=scan.scan_id,
+            ticker="BAR",
+            cik="0000000002",
+            active=False,
+            ticker_events_json=json.dumps([{"old_ticker": "FOO", "new_ticker": "BAR"}]),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 1, tzinfo=timezone.utc),
+        ),
+    ])
+    signal_date = date(2025, 2, 5)
+    foo_id = _seed_signal(db_session, idx=144, ticker="FOO", signal_date=signal_date)
+    bar_id = _seed_signal(db_session, idx=145, ticker="BAR", signal_date=signal_date)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [foo_id, bar_id]))
+
+    resolved = resolve_security_identities_for_tickers(db_session, ["FOO", "BAR"])
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert resolved["FOO"].security_identity == "cik:0000000001"
+    assert resolved["BAR"].security_identity == "cik:0000000002"
+    assert {row.signal_id for row in examples} == {foo_id, bar_id}
+    assert metrics["security_identity_duplicate_rows_dropped"] == 0
+
+
+def test_sparse_identity_canonical_ticker_is_deterministic_when_rows_shuffle():
+    first = SecurityIdentitySnapshot(
+        ticker="SPARSEA",
+        identity_hash="sparse-hash",
+        active=True,
+        asof_timestamp=datetime(2025, 2, 6, tzinfo=timezone.utc),
+    )
+    second = SecurityIdentitySnapshot(
+        ticker="SPARSEB",
+        identity_hash="sparse-hash",
+        active=True,
+        asof_timestamp=datetime(2025, 2, 6, tzinfo=timezone.utc),
+    )
+
+    assert _canonical_ticker([first, second]) == "SPARSEB"
+    assert _canonical_ticker([second, first]) == "SPARSEB"
+
+
+def test_training_loader_dedups_after_non_finite_feature_qualification(
+    db_session,
+    tmp_path,
+):
+    _seed_rename_identity_pair(db_session)
+    signal_date = date(2025, 2, 3)
+    cep_id = _seed_signal(
+        db_session,
+        idx=146,
+        ticker="CEP",
+        signal_date=signal_date,
+        forward_return=0.02,
+    )
+    xxi_id = _seed_signal(
+        db_session,
+        idx=147,
+        ticker="XXI",
+        signal_date=signal_date,
+        forward_return=0.03,
+    )
+    corrupt_snapshot = db_session.get(FeatureSnapshot, "fs-147")
+    corrupt_json = json.loads(corrupt_snapshot.feature_json)
+    corrupt_json["signal_context"]["mom20"] = "not-a-number"
+    corrupt_json["statuses"]["mom20"] = "computed"
+    corrupt_snapshot.feature_json = json.dumps(corrupt_json, sort_keys=True)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [cep_id, xxi_id]))
+
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert [row.signal_id for row in examples] == [cep_id]
+    assert examples[0].security_identity == "cik:0001234567"
+    assert metrics["dropped_non_finite"] == 1
+    assert metrics["security_identity_duplicate_rows_dropped"] == 0
+
+
 def test_training_loader_signs_short_labels_by_direction(db_session, tmp_path):
     signal_id = _seed_signal(
         db_session,
@@ -2326,6 +2658,42 @@ def test_training_loader_fails_closed_on_missing_realized_label_dates(
     manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
 
     with pytest.raises(RuntimeError, match="missing realized label session dates"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
+def test_training_loader_rejects_non_session_realized_label_dates(
+    db_session,
+    tmp_path,
+):
+    signal_id = _seed_signal(
+        db_session,
+        idx=148,
+        signal_date=date(2025, 1, 17),
+        entry_session_date=date(2025, 1, 18),
+        exit_session_date=date(2025, 1, 21),
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="non-session realized label dates"):
+        _load_training_examples(db_session, pattern=manifest.pattern("M4"))
+
+
+def test_training_loader_rejects_exit_session_before_entry_session(
+    db_session,
+    tmp_path,
+):
+    signal_id = _seed_signal(
+        db_session,
+        idx=149,
+        signal_date=date(2025, 1, 6),
+        entry_session_date=date(2025, 1, 6),
+        exit_session_date=date(2025, 1, 3),
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [signal_id]))
+
+    with pytest.raises(RuntimeError, match="exit session before entry session"):
         _load_training_examples(db_session, pattern=manifest.pattern("M4"))
 
 

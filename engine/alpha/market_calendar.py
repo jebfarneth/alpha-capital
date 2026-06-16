@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+from typing import Any
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN_ET = time(9, 30)
@@ -81,6 +82,7 @@ def resolve_us_equity_session(run_timestamp: datetime) -> SessionResolution:
 
 def is_us_equity_session(day: date) -> bool:
     """Return True when `day` is a regular NYSE trading session."""
+    day = _coerce_session_date(day)
     return day.weekday() < 5 and day not in nyse_holidays(day.year)
 
 
@@ -102,6 +104,7 @@ def nyse_early_closes(year: int) -> set[date]:
 
 def previous_us_equity_session(day: date) -> date:
     """Return the regular NYSE session strictly before `day`."""
+    day = _coerce_session_date(day)
     cursor = day - timedelta(days=1)
     while not is_us_equity_session(cursor):
         cursor -= timedelta(days=1)
@@ -110,6 +113,7 @@ def previous_us_equity_session(day: date) -> date:
 
 def next_us_equity_session(day: date) -> date:
     """Return the first regular NYSE session on or after `day`."""
+    day = _coerce_session_date(day)
     cursor = day
     while not is_us_equity_session(cursor):
         cursor += timedelta(days=1)
@@ -124,6 +128,7 @@ def nth_us_equity_session(day: date, n: int) -> date:
     """
     if n < 1:
         raise ValueError("n must be >= 1")
+    day = _coerce_session_date(day)
     cursor = next_us_equity_session(day)
     for _ in range(n - 1):
         cursor = next_us_equity_session(cursor + timedelta(days=1))
@@ -136,6 +141,7 @@ def us_equity_session_close_timestamp(day: date) -> datetime:
     Uses audited early-close times where known and degrades future unknown
     years to the regular 16:00 ET close.
     """
+    day = _coerce_session_date(day)
     if not is_us_equity_session(day):
         raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
     return datetime.combine(
@@ -146,6 +152,7 @@ def us_equity_session_close_timestamp(day: date) -> datetime:
 def us_equity_session_close_time(day: date) -> time:
     """Return the day-specific NYSE equity close time in America/New_York."""
 
+    day = _coerce_session_date(day)
     if not is_us_equity_session(day):
         raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
     if day in nyse_early_closes(day.year):
@@ -155,6 +162,7 @@ def us_equity_session_close_time(day: date) -> time:
 
 def us_equity_session_open_timestamp(day: date) -> datetime:
     """Return the regular-session open timestamp for `day` in UTC."""
+    day = _coerce_session_date(day)
     if not is_us_equity_session(day):
         raise ValueError(f"{day.isoformat()} is not a regular U.S. equity session")
     return datetime.combine(day, MARKET_OPEN_ET, EASTERN_TZ).astimezone(ZoneInfo("UTC"))
@@ -173,13 +181,33 @@ def nyse_holidays(year: int) -> set[date]:
         _nth_weekday(year, 2, 0, 3),              # Washington's Birthday
         _good_friday(year),
         _last_weekday(year, 5, 0),                # Memorial Day
-        _observed_fixed_holiday(year, 6, 19),     # Juneteenth
         _observed_fixed_holiday(year, 7, 4),      # Independence Day
         _nth_weekday(year, 9, 0, 1),              # Labor Day
         _nth_weekday(year, 11, 3, 4),             # Thanksgiving
         _observed_fixed_holiday(year, 12, 25),    # Christmas
     }
+    if year >= 2022:
+        holidays.add(_observed_fixed_holiday(year, 6, 19))  # Juneteenth
     return {holiday for holiday in holidays if holiday.year == year}
+
+
+def _coerce_session_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise RuntimeError(
+                "invalid U.S. equity session date; expected ISO YYYY-MM-DD, "
+                f"got {value!r}"
+            ) from exc
+    raise RuntimeError(
+        "invalid U.S. equity session date; expected date or ISO YYYY-MM-DD, "
+        f"got {type(value).__name__}"
+    )
 
 
 def _observed_fixed_holiday(year: int, month: int, day: int) -> date:
