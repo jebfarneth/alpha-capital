@@ -1856,6 +1856,12 @@ class MarketPathFeatureJob(BaseJob):
             },
             **relative_features,
             **advanced_features,
+            "intraday_mfe_timestamp": _parse_event_timestamp(
+                advanced_features.get("intraday_mfe_timestamp")
+            ),
+            "intraday_mae_timestamp": _parse_event_timestamp(
+                advanced_features.get("intraday_mae_timestamp")
+            ),
             **_empty_cross_sectional_features(),
             "opening_range_json": None,
             "intraday_continuation_json": None,
@@ -3071,8 +3077,8 @@ def _intraday_features_from_minutes(
     )
     mfe_bar = max(ordered, key=lambda row: row.high)
     mae_bar = min(ordered, key=lambda row: row.low)
-    features["intraday_mfe_timestamp"] = mfe_bar.timestamp
-    features["intraday_mae_timestamp"] = mae_bar.timestamp
+    features["intraday_mfe_timestamp"] = mfe_bar.timestamp.isoformat()
+    features["intraday_mae_timestamp"] = mae_bar.timestamp.isoformat()
     features["intraday_structure_status"] = "available"
     features["missing_intraday_bars"] = False
     status = {

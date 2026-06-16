@@ -12,6 +12,7 @@ from sqlalchemy import event, inspect, text
 
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
+from alpha.data.polygon import PolygonBar
 from alpha.db.models import DataLineage, FeatureSnapshot, MarketPathFeature, SignalRegistry
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import JobResult
@@ -136,6 +137,27 @@ class EmptyMinuteAdapter:
                 request_timestamp=RUN_TS,
                 asof_timestamp=RUN_TS,
                 raw_payload_hash=stable_hash({"minute_bars": []}),
+            ),
+        )
+
+
+class StaticMinuteAdapter:
+    def __init__(self, bars: list[PolygonBar]) -> None:
+        self.bars = bars
+
+    def get_minute_aggs(self, ticker, from_date, to_date, **_kwargs):
+        return AdapterResponse(
+            data=list(self.bars),
+            lineage=LineageMeta(
+                provider="Polygon",
+                endpoint="/v2/aggs/ticker/{ticker}/range/1/minute",
+                request_timestamp=RUN_TS,
+                asof_timestamp=RUN_TS,
+                raw_payload_hash=stable_hash({
+                    "ticker": ticker,
+                    "from_date": from_date,
+                    "minute_bars": [bar.__dict__ for bar in self.bars],
+                }),
             ),
         )
 
@@ -3220,6 +3242,37 @@ def _bars_with_day0(*, close: float, high: float, low: float) -> list[FmpBar]:
     return [bars[day] for day in sorted(bars)]
 
 
+def _minute_bars_with_real_timestamps(
+    *,
+    signal_day: date = date(2026, 6, 5),
+) -> list[PolygonBar]:
+    market_open_utc = datetime(
+        signal_day.year,
+        signal_day.month,
+        signal_day.day,
+        13,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+    def bar(minute_index: int, open_: float, high: float, low: float, close: float) -> PolygonBar:
+        ts = market_open_utc + timedelta(minutes=minute_index)
+        return PolygonBar(
+            timestamp=int(ts.timestamp() * 1000),
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=10_000.0 + minute_index * 100.0,
+        )
+
+    return [
+        bar(0, 33.0, 33.2, 32.9, 33.1),
+        bar(1, 33.1, 33.3, 32.4, 32.8),
+        bar(65, 32.8, 34.6, 32.7, 34.2),
+    ]
+
+
 def _run_signal_session_backfill(
     db_session,
     *,
@@ -3298,6 +3351,24 @@ def test_m4_day0_signal_session_row_per_fire_and_skip_existing_noop(db_session):
     assert second.metrics["rows_unchanged"] == 1
     assert rerun_row.input_hash == original_hash
     assert rerun_row.updated_at == original_updated_at
+
+
+def test_m4_day0_signal_session_minute_timestamps_serialize_feature_json(db_session):
+    _signal, row, result = _run_signal_session_backfill(
+        db_session,
+        polygon_minute_adapter=StaticMinuteAdapter(_minute_bars_with_real_timestamps()),
+    )
+
+    assert result.status == "finished"
+    assert row.feature_role == "signal_session"
+    assert row.intraday_structure_status == "available"
+    payload = json.loads(row.feature_json)
+    json.dumps(payload, sort_keys=True)
+    intraday = payload["intraday_structure_features"]
+    assert intraday["intraday_mfe_timestamp"] == "2026-06-05T14:35:00+00:00"
+    assert intraday["intraday_mae_timestamp"] == "2026-06-05T13:31:00+00:00"
+    assert row.intraday_mfe_timestamp is not None
+    assert row.intraday_mae_timestamp is not None
 
 
 def test_m4_day0_predictor_contract_is_invariant_to_day0_close_high_low(db_session):
