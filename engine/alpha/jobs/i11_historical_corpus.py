@@ -39,6 +39,7 @@ from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.watchdog import ProviderOutageCircuitBreaker
 from alpha.jobs.i12_historical_corpus import (
     DEFAULT_FETCH_DEADLINE_SECONDS,
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     MIN_PRIOR_DAILY_SESSIONS,
     OUTCOME_CONFIRMED,
@@ -230,6 +231,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
         db_retry_backoff_seconds: float = 5.0,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
         progress_callback: Any | None = None,
         catalyst_tags_by_ticker_date: Mapping[tuple[str, date], Sequence[str]] | None = None,
         at_open: bool = False,
@@ -250,6 +252,7 @@ class I11HistoricalCorpusJob(I12HistoricalCorpusJob):
             db_retry_backoff_seconds=db_retry_backoff_seconds,
             fetch_deadline_seconds=fetch_deadline_seconds,
             max_outstanding_fetch_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_fetch_timeouts=max_consecutive_fetch_timeouts,
             progress_callback=progress_callback,
         )
         self._catalyst_tags_by_ticker_date = {

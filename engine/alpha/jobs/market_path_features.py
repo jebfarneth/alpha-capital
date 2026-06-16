@@ -29,6 +29,7 @@ from alpha.data.fmp import FmpAdapter, FmpBar, HISTORICAL_PRICE_FULL_ENDPOINT
 from alpha.db.models import DataLineage, MarketPathFeature, SignalRegistry
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.watchdog import (
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     ProviderOutageCircuitBreaker,
     WatchdogState,
@@ -600,6 +601,7 @@ class MarketPathFeatureJob(BaseJob):
         polygon_minute_adapter: Any | None = None,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
         skip_existing: bool = False,
     ) -> None:
         if progress_every < 1:
@@ -610,6 +612,8 @@ class MarketPathFeatureJob(BaseJob):
             raise ValueError("fetch_deadline_seconds must be > 0")
         if max_outstanding_fetch_timeouts < 1:
             raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
+        if max_consecutive_fetch_timeouts < 1:
+            raise ValueError("max_consecutive_fetch_timeouts must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._run_timestamp = run_timestamp
@@ -631,6 +635,7 @@ class MarketPathFeatureJob(BaseJob):
         self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._fetch_watchdog = WatchdogState(
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_timeouts=max_consecutive_fetch_timeouts,
         )
         self._skip_existing = skip_existing
 

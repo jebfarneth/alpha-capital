@@ -29,6 +29,7 @@ from alpha.db.engine import (
 from alpha.jobs.i11_historical_corpus import I11HistoricalCorpusJob, JOB_NAME
 from alpha.jobs.i12_historical_corpus import (
     DEFAULT_FETCH_DEADLINE_SECONDS,
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
 )
 from alpha.jobs.run_market_path_backfill import CachedHistoricalPriceFmpAdapter
@@ -137,6 +138,7 @@ def _run_live(args: argparse.Namespace) -> int:
         db_retry_backoff_seconds=args.db_retry_backoff_seconds,
         fetch_deadline_seconds=args.fetch_deadline_seconds,
         max_outstanding_fetch_timeouts=args.max_outstanding_fetch_timeouts,
+        max_consecutive_fetch_timeouts=args.max_consecutive_fetch_timeouts,
         progress_callback=progress,
         catalyst_tags_by_ticker_date=_load_catalyst_tags_artifact(args.catalyst_tags_artifact),
         at_open=args.at_open,
@@ -159,6 +161,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "db_retry_backoff_seconds": args.db_retry_backoff_seconds,
                 "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
+                "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
                 "progress_artifact": str(progress_artifact) if progress_artifact else None,
                 "catalyst_tags_artifact": args.catalyst_tags_artifact,
                 "at_open": args.at_open,
@@ -287,6 +290,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         help="Abort the shard when this many timed-out fetch workers remain outstanding.",
+    )
+    parser.add_argument(
+        "--max-consecutive-fetch-timeouts",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+        help="Abort the shard after this many consecutive provider watchdog timeouts.",
     )
     parser.add_argument(
         "--at-open",

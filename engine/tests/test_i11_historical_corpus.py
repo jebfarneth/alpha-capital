@@ -997,6 +997,8 @@ def test_i11_runner_skip_existing_and_retry_args():
         "9.5",
         "--max-outstanding-fetch-timeouts",
         "6",
+        "--max-consecutive-fetch-timeouts",
+        "8",
     ])
 
     assert args.polygon_cache_dir == "/var/tmp/i11_polygon_cache"
@@ -1006,6 +1008,7 @@ def test_i11_runner_skip_existing_and_retry_args():
     assert args.db_retry_backoff_seconds == 0.25
     assert args.fetch_deadline_seconds == 9.5
     assert args.max_outstanding_fetch_timeouts == 6
+    assert args.max_consecutive_fetch_timeouts == 8
 
 
 def test_i11_and_i12_required_tables_are_output_only():

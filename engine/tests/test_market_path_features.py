@@ -3230,6 +3230,7 @@ def _run_signal_session_backfill(
     polygon_minute_adapter=None,
     fetch_deadline_seconds: float = 120.0,
     max_outstanding_fetch_timeouts: int = 10,
+    max_consecutive_fetch_timeouts: int = 10,
     progress_callback=None,
 ):
     signal = _add_signal(
@@ -3252,6 +3253,7 @@ def _run_signal_session_backfill(
         polygon_minute_adapter=polygon_minute_adapter,
         fetch_deadline_seconds=fetch_deadline_seconds,
         max_outstanding_fetch_timeouts=max_outstanding_fetch_timeouts,
+        max_consecutive_fetch_timeouts=max_consecutive_fetch_timeouts,
         progress_callback=progress_callback,
     )
     result = run_job(db_session, job)
@@ -3445,6 +3447,64 @@ def test_m4_day0_fmp_watchdog_records_fetch_error_without_empty_row(db_session):
     assert db_session.query(MarketPathFeature).count() == 0
 
 
+def test_m4_day0_fetch_watchdog_consecutive_timeout_streak_trips_breaker(db_session):
+    first = _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    second = _add_signal(
+        db_session,
+        ticker="MCUT",
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    signal_ids = [first.signal_id, second.signal_id]
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=SleepyFmpAdapter(
+            {
+                "LCUT": _rich_bars(),
+                "MCUT": _rich_bars(),
+            },
+            delays={
+                "LCUT": 0.06,
+                "MCUT": 0.06,
+            },
+        ),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 5),
+        signal_end_date=date(2026, 6, 5),
+        through_date=date(2026, 6, 5),
+        include_signal_session=True,
+        polygon_minute_adapter=EmptyMinuteAdapter(),
+        fetch_deadline_seconds=0.01,
+        max_outstanding_fetch_timeouts=10,
+        max_consecutive_fetch_timeouts=2,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "failed"
+    assert result.metrics["watchdog_timeouts"] == 2
+    assert result.errors[0]["error"] == "provider_outage_circuit_breaker"
+    assert result.errors[0]["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert result.errors[0]["max_consecutive_fetch_timeouts"] == 2
+    assert result.errors[0]["max_outstanding_fetch_timeouts"] == 10
+    assert (
+        db_session.query(MarketPathFeature)
+        .filter(MarketPathFeature.signal_id.in_(signal_ids))
+        .count()
+    ) == 0
+
+    deadline = time_module.monotonic() + 1.0
+    while job._fetch_watchdog.outstanding_timeouts and time_module.monotonic() < deadline:
+        time_module.sleep(0.01)
+    assert job._fetch_watchdog.outstanding_timeouts == 0
+
+
 def test_m4_day0_polygon_minute_breaker_aborts_without_empty_bar_persist(
     db_session,
 ):
@@ -3576,6 +3636,7 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
         "--polygon-rate-limit-per-minute", "120",
         "--fetch-deadline-seconds", "9.5",
         "--max-outstanding-fetch-timeouts", "4",
+        "--max-consecutive-fetch-timeouts", "5",
         "--disable-polygon-minute-layer",
         "--progress-artifact", str(tmp_path / "progress.json"),
     ])
@@ -3587,3 +3648,4 @@ def test_market_path_bulk_runner_single_shard_prints_audit_sample(
     assert '"predictor_features"' in out
     assert '"fetch_deadline_seconds": 9.5' in out
     assert '"max_outstanding_fetch_timeouts": 4' in out
+    assert '"max_consecutive_fetch_timeouts": 5' in out

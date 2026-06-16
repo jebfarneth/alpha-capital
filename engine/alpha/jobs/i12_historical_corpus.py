@@ -51,6 +51,7 @@ from alpha.db.models import (
 from alpha.evidence.writer import record_data_lineage, record_feature_snapshot, record_signal
 from alpha.jobs.contracts import BaseJob, JobContext, JobResult
 from alpha.jobs.watchdog import (
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     ProviderOutageCircuitBreaker,
     WatchdogState,
@@ -330,6 +331,7 @@ class I12HistoricalCorpusJob(BaseJob):
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         progress_callback: ProgressCallback | None = None,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     ) -> None:
         if end_date < start_date:
             raise ValueError("end_date must be on or after start_date")
@@ -343,6 +345,8 @@ class I12HistoricalCorpusJob(BaseJob):
             raise ValueError("fetch_deadline_seconds must be > 0")
         if max_outstanding_fetch_timeouts < 1:
             raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
+        if max_consecutive_fetch_timeouts < 1:
+            raise ValueError("max_consecutive_fetch_timeouts must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -362,6 +366,7 @@ class I12HistoricalCorpusJob(BaseJob):
         self._latest_metrics: dict[str, Any] = {}
         self._fetch_watchdog = WatchdogState(
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_timeouts=max_consecutive_fetch_timeouts,
         )
 
     @property

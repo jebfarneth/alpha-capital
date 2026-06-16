@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 
 DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS = 10
+DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS = 10
 
 
 class ProviderOutageCircuitBreaker(RuntimeError):

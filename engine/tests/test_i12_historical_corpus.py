@@ -952,6 +952,59 @@ def test_i12_daily_fmp_fetch_watchdog_quarantines_and_continues(db_session):
     assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
 
 
+def test_i12_fetch_watchdog_consecutive_timeout_streak_trips_breaker(db_session):
+    first_ticker = "ASLOW"
+    second_ticker = "BSLOW"
+    for ticker in (first_ticker, second_ticker):
+        _seed_hur(db_session, ticker)
+    fmp = SleepyFmp(
+        {
+            first_ticker: _daily_bars(),
+            second_ticker: _daily_bars(),
+        },
+        delays={
+            first_ticker: 0.06,
+            second_ticker: 0.06,
+        },
+    )
+    polygon = FakePolygon({
+        (first_ticker, DAY): _minute_bars(),
+        (second_ticker, DAY): _minute_bars(),
+    })
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={
+            first_ticker: _classification(ticker=first_ticker),
+            second_ticker: _classification(ticker=second_ticker),
+        },
+        fetch_deadline_seconds=0.01,
+        max_outstanding_fetch_timeouts=10,
+        max_consecutive_fetch_timeouts=2,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "partial_failed"
+    assert result.metrics["watchdog_timeouts"] == 2
+    breaker = next(error for error in result.errors if error["error"] == "provider_outage_circuit_breaker")
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert breaker["max_consecutive_fetch_timeouts"] == 2
+    assert breaker["max_outstanding_fetch_timeouts"] == 10
+    assert fmp.calls[first_ticker] == 1
+    assert fmp.calls[second_ticker] == 1
+    assert polygon.calls[(first_ticker, DAY)] == 0
+    assert polygon.calls[(second_ticker, DAY)] == 0
+
+    deadline = time_module.monotonic() + 1.0
+    while job._fetch_watchdog.outstanding_timeouts and time_module.monotonic() < deadline:
+        time_module.sleep(0.01)
+    assert job._fetch_watchdog.outstanding_timeouts == 0
+
+
 def test_daemon_deadline_unit_bounds_sleeping_callable():
     state = WatchdogState(max_outstanding_timeouts=5)
 
@@ -1271,6 +1324,8 @@ def test_i12_runner_minute_cache_alias_and_skip_existing_args():
         "7.5",
         "--max-outstanding-fetch-timeouts",
         "4",
+        "--max-consecutive-fetch-timeouts",
+        "6",
     ])
 
     assert args.minute_cache_dir == "/var/tmp/i12_minutes"
@@ -1278,6 +1333,7 @@ def test_i12_runner_minute_cache_alias_and_skip_existing_args():
     assert args.max_db_retries == 5
     assert args.fetch_deadline_seconds == 7.5
     assert args.max_outstanding_fetch_timeouts == 4
+    assert args.max_consecutive_fetch_timeouts == 6
 
     alias = _parse_args([
         "--live",

@@ -47,6 +47,7 @@ from alpha.jobs.market_path_features import (
     sanitize_provider_error_message,
 )
 from alpha.jobs.watchdog import (
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
     ProviderOutageCircuitBreaker,
 )
@@ -515,6 +516,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         request_timeout_seconds: float = 30.0,
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
         max_fetch_concurrency: int = 1,
         signal_source: str = SIGNAL_SOURCE_LIVE,
         polygon_minute_adapter: Any | None = None,
@@ -533,6 +535,8 @@ class MarketPathBulkBackfillJob(BaseJob):
             raise ValueError("fetch_deadline_seconds must be > 0")
         if max_outstanding_fetch_timeouts < 1:
             raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
+        if max_consecutive_fetch_timeouts < 1:
+            raise ValueError("max_consecutive_fetch_timeouts must be >= 1")
         if max_fetch_concurrency < 1:
             raise ValueError("max_fetch_concurrency must be >= 1")
         self._session = session
@@ -553,6 +557,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         self._request_timeout_seconds = request_timeout_seconds
         self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._max_outstanding_fetch_timeouts = int(max_outstanding_fetch_timeouts)
+        self._max_consecutive_fetch_timeouts = int(max_consecutive_fetch_timeouts)
         self._max_fetch_concurrency = max_fetch_concurrency
         self._signal_source = normalize_signal_source(signal_source)
         self._polygon_minute_adapter = polygon_minute_adapter
@@ -678,6 +683,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 polygon_minute_adapter=self._polygon_minute_adapter,
                 fetch_deadline_seconds=self._fetch_deadline_seconds,
                 max_outstanding_fetch_timeouts=self._max_outstanding_fetch_timeouts,
+                max_consecutive_fetch_timeouts=self._max_consecutive_fetch_timeouts,
                 skip_existing=self._skip_existing,
                 progress_callback=batch_progress,
                 progress_every=self._progress_every,
@@ -863,6 +869,7 @@ class MarketPathBulkBackfillJob(BaseJob):
                 polygon_minute_adapter=self._polygon_minute_adapter,
                 fetch_deadline_seconds=self._fetch_deadline_seconds,
                 max_outstanding_fetch_timeouts=self._max_outstanding_fetch_timeouts,
+                max_consecutive_fetch_timeouts=self._max_consecutive_fetch_timeouts,
                 skip_existing=self._skip_existing,
                 signal_source=self._signal_source,
             )
@@ -932,6 +939,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "request_timeout_seconds": self._request_timeout_seconds,
             "fetch_deadline_seconds": self._fetch_deadline_seconds,
             "max_outstanding_fetch_timeouts": self._max_outstanding_fetch_timeouts,
+            "max_consecutive_fetch_timeouts": self._max_consecutive_fetch_timeouts,
             "watchdog_timeouts": watchdog_timeouts,
             "signal_source": self._signal_source,
             "skip_existing": self._skip_existing,
@@ -1381,6 +1389,7 @@ def _run_live(args: argparse.Namespace) -> int:
             request_timeout_seconds=args.request_timeout_seconds,
             fetch_deadline_seconds=args.fetch_deadline_seconds,
             max_outstanding_fetch_timeouts=args.max_outstanding_fetch_timeouts,
+            max_consecutive_fetch_timeouts=args.max_consecutive_fetch_timeouts,
             max_fetch_concurrency=args.max_fetch_concurrency,
             signal_source=args.signal_source,
             polygon_minute_adapter=polygon_minute_adapter,
@@ -1412,6 +1421,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "request_timeout_seconds": args.request_timeout_seconds,
                 "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
+                "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
                 "max_fetch_concurrency": args.max_fetch_concurrency,
                 "signal_source": args.signal_source,
                 "minute_cache_dir": args.minute_cache_dir,
@@ -1533,6 +1543,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         help="Abort the shard when this many timed-out fetch workers remain outstanding.",
+    )
+    parser.add_argument(
+        "--max-consecutive-fetch-timeouts",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+        help="Abort the shard after this many consecutive provider watchdog timeouts.",
     )
     parser.add_argument("--max-fetch-concurrency", type=int, default=1)
     parser.add_argument("--minute-cache-dir")
