@@ -561,7 +561,7 @@ def test_leakage_audit_allows_intraday_pit_catalyst_flags():
             }
             for name in (
                 "catalyst_dilution_avoid",
-                "catalyst_shelf_registration_on_file",
+                "catalyst_recent_shelf_filing",
                 "catalyst_nt_late_filer",
                 "catalyst_fda_amplifier",
                 "catalyst_compliance_amplifier",
@@ -570,6 +570,11 @@ def test_leakage_audit_allows_intraday_pit_catalyst_flags():
     }
 
     audit_feature_schema_no_leakage(schema)
+
+
+def test_catalyst_null_flags_are_missing_not_zero():
+    assert math.isnan(_as_float(None))
+    assert _as_float(False) == 0.0
 
 
 def test_signal_registry_unknown_column_fails_closed(tmp_path):

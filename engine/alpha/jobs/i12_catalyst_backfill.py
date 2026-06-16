@@ -123,6 +123,7 @@ class I12CatalystBackfillJob(BaseJob):
         if (
             self._skip_existing
             and payload.get("catalyst_source_status") == CATALYST_STATUS_IMPLEMENTED
+            and not payload.get("catalyst_source_errors")
         ):
             counters.rows_skipped_existing += 1
             return

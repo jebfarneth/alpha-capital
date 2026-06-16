@@ -154,6 +154,16 @@ class FakeEdgarSubmissions:
         return AdapterResponse(data=payload, lineage=_lineage("SEC", cik10, []))
 
 
+class FailingEdgarSubmissions:
+    def __init__(self) -> None:
+        self.calls: Counter[str] = Counter()
+
+    def get_company_submissions(self, cik, *, asof=None):
+        cik10 = "".join(ch for ch in str(cik) if ch.isdigit()).zfill(10)
+        self.calls[cik10] += 1
+        raise RuntimeError("fixture edgar outage")
+
+
 class FakeNewsAdapter:
     def __init__(self, articles: list[object]) -> None:
         self.articles = articles
@@ -1150,7 +1160,7 @@ def test_i12_catalyst_old_shelf_registration_does_not_set_dilution_avoid(
     assert feature["catalyst_source_status"] == "implemented_pit_filtered"
     assert feature["catalyst_tags"] == []
     assert feature["catalyst_dilution_avoid"] is False
-    assert feature["catalyst_shelf_registration_on_file"] is False
+    assert feature["catalyst_recent_shelf_filing"] is False
 
 
 def test_i12_same_day_post_entry_catalyst_never_reaches_feature_vector(
@@ -1191,6 +1201,8 @@ def test_i12_no_resolver_marks_catalysts_not_implemented(db_session):
     assert feature["catalyst_identity_status"] == "not_checked"
     assert feature["catalyst_identity_reason"] == "resolver_not_configured"
     assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is None
+    assert feature["catalyst_nt_late_filer"] is None
 
 
 def test_i12_catalyst_resolves_cik_point_in_time_at_entry_cutoff(db_session, tmp_path):
@@ -1292,9 +1304,26 @@ def test_i12_catalyst_ambiguous_pit_cik_marks_unresolved(db_session, tmp_path):
     feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
     assert feature["catalyst_cik"] is None
     assert feature["catalyst_identity_status"] == "ambiguous"
+    assert feature["catalyst_source_status"] == "pit_identity_unresolved"
     assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is None
+    assert feature["catalyst_recent_shelf_filing"] is None
+    assert feature["catalyst_fda_amplifier"] is None
     assert feature["catalyst_source_errors"][0]["reason"] == "ambiguous_pit_identity_snapshot"
     assert not edgar.calls
+    backfill = I12CatalystBackfillJob(
+        session=db_session,
+        catalyst_resolver=resolver,
+        start_date=DAY,
+        end_date=DAY,
+        skip_existing=True,
+    )
+
+    backfill_result = run_job(db_session, backfill)
+
+    assert backfill_result.status == "finished"
+    assert backfill_result.metrics["rows_skipped_existing"] == 0
+    assert backfill_result.metrics["rows_updated"] == 1
 
 
 def test_i12_catalyst_news_window_lower_bound_filters_overreturned_articles(db_session):
@@ -1336,6 +1365,77 @@ def test_i12_catalyst_news_window_lower_bound_filters_overreturned_articles(db_s
     assert feature["catalyst_fda_amplifier"] is True
     event_ids = {event["provider_id"] for event in feature["catalyst_events"]}
     assert event_ids == {"acute"}
+
+
+def test_i12_catalyst_provider_error_is_incomplete_and_resume_retags(
+    db_session,
+    tmp_path,
+):
+    ticker = "ERRS"
+    cik = "0001234567"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(db_session, ticker, cik)
+    failing_edgar = FailingEdgarSubmissions()
+    failing_resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=failing_edgar,
+        edgar_cache_dir=tmp_path / "failing-edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=failing_resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_source_status"] == "pit_retag_incomplete"
+    assert feature["catalyst_identity_status"] == "resolved"
+    assert feature["catalyst_source_errors"][0]["source"] == "sec_edgar_submissions"
+    assert feature["catalyst_dilution_avoid"] is None
+    assert feature["catalyst_nt_late_filer"] is None
+    assert failing_edgar.calls[cik] == 1
+
+    repaired_edgar = FakeEdgarSubmissions({
+        cik: _edgar_submissions_payload([
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Registered direct offering takedown",
+            }
+        ])
+    })
+    repaired_resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=repaired_edgar,
+        edgar_cache_dir=tmp_path / "repaired-edgar",
+    )
+    backfill = I12CatalystBackfillJob(
+        session=db_session,
+        catalyst_resolver=repaired_resolver,
+        start_date=DAY,
+        end_date=DAY,
+        skip_existing=True,
+    )
+
+    backfill_result = run_job(db_session, backfill)
+
+    assert backfill_result.status == "finished"
+    assert backfill_result.metrics["rows_skipped_existing"] == 0
+    assert backfill_result.metrics["rows_updated"] == 1
+    detail = db_session.query(IntradayEventDetail).filter_by(ticker=ticker).one()
+    detail_feature = json.loads(detail.feature_json)
+    assert detail_feature["catalyst_source_status"] == "implemented_pit_filtered"
+    assert detail_feature["catalyst_source_errors"] == []
+    assert detail_feature["catalyst_dilution_avoid"] is True
+    assert repaired_edgar.calls[cik] == 1
 
 
 def test_i12_catalyst_backfill_uses_delisted_identity_cik(

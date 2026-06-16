@@ -96,7 +96,7 @@ INTRADAY_ALLOWED_SNAPSHOT_PATHS = frozenset(
         "spy_prior_day_return",
         "price_at_open",
         "catalyst_dilution_avoid",
-        "catalyst_shelf_registration_on_file",
+        "catalyst_recent_shelf_filing",
         "catalyst_nt_late_filer",
         "catalyst_fda_amplifier",
         "catalyst_compliance_amplifier",

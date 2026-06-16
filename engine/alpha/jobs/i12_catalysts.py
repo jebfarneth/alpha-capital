@@ -27,6 +27,8 @@ from alpha.market_calendar import previous_us_equity_session
 
 CATALYST_STATUS_IMPLEMENTED = "implemented_pit_filtered"
 CATALYST_STATUS_NOT_IMPLEMENTED = "not_implemented_pit_safe_empty"
+CATALYST_STATUS_INCOMPLETE = "pit_retag_incomplete"
+CATALYST_STATUS_IDENTITY_UNRESOLVED = "pit_identity_unresolved"
 TAG_DILUTION_OFFERING = "dilution_offering"
 TAG_SHELF_REGISTRATION = "shelf_registration_on_file"
 TAG_NT_LATE_FILER = "nt_late_filer"
@@ -37,11 +39,12 @@ OFFERING_WINDOW_TRADING_DAYS = 5
 
 CATALYST_FEATURE_DEFAULTS = {
     "catalyst_dilution_avoid": False,
-    "catalyst_shelf_registration_on_file": False,
+    "catalyst_recent_shelf_filing": False,
     "catalyst_nt_late_filer": False,
     "catalyst_fda_amplifier": False,
     "catalyst_compliance_amplifier": False,
 }
+CATALYST_FEATURE_UNKNOWN = {key: None for key in CATALYST_FEATURE_DEFAULTS}
 
 _TAKEDOWN_FORMS = ("424B",)
 _SHELF_FORMS = ("S-1", "S-3", "F-1", "F-3")
@@ -68,7 +71,7 @@ class CatalystEvent:
 @dataclass(frozen=True)
 class CatalystResult:
     tags: tuple[str, ...]
-    features: dict[str, bool]
+    features: dict[str, bool | None]
     source_status: str
     cutoff_timestamp: datetime | None
     cik: str | None = None
@@ -113,9 +116,14 @@ def empty_catalyst_result(
     source_counts: Mapping[str, int] | None = None,
     source_errors: Sequence[Mapping[str, Any]] | None = None,
 ) -> CatalystResult:
+    features = (
+        dict(CATALYST_FEATURE_DEFAULTS)
+        if source_status == CATALYST_STATUS_IMPLEMENTED
+        else dict(CATALYST_FEATURE_UNKNOWN)
+    )
     return CatalystResult(
         tags=(),
-        features=dict(CATALYST_FEATURE_DEFAULTS),
+        features=features,
         source_status=source_status,
         cutoff_timestamp=_aware_utc_or_none(cutoff_timestamp),
         cik=cik,
@@ -481,24 +489,32 @@ def _result_from_events(
 ) -> CatalystResult:
     ordered = tuple(sorted(events, key=lambda event: (event.timestamp, event.tag, event.source)))
     tags = tuple(sorted({event.tag for event in ordered}))
-    features = {
-        "catalyst_dilution_avoid": TAG_DILUTION_OFFERING in tags,
-        "catalyst_shelf_registration_on_file": TAG_SHELF_REGISTRATION in tags,
-        "catalyst_nt_late_filer": TAG_NT_LATE_FILER in tags,
-        "catalyst_fda_amplifier": TAG_FDA_CLINICAL in tags,
-        "catalyst_compliance_amplifier": TAG_COMPLIANCE_LISTING in tags,
-    }
+    source_errors_tuple = tuple(dict(error) for error in source_errors)
+    source_status = _catalyst_source_status(
+        identity_status=identity_status,
+        source_errors=source_errors_tuple,
+    )
+    if source_status == CATALYST_STATUS_IMPLEMENTED:
+        features = {
+            "catalyst_dilution_avoid": TAG_DILUTION_OFFERING in tags,
+            "catalyst_recent_shelf_filing": TAG_SHELF_REGISTRATION in tags,
+            "catalyst_nt_late_filer": TAG_NT_LATE_FILER in tags,
+            "catalyst_fda_amplifier": TAG_FDA_CLINICAL in tags,
+            "catalyst_compliance_amplifier": TAG_COMPLIANCE_LISTING in tags,
+        }
+    else:
+        features = dict(CATALYST_FEATURE_UNKNOWN)
     return CatalystResult(
         tags=tags,
         features=features,
-        source_status=CATALYST_STATUS_IMPLEMENTED,
+        source_status=source_status,
         cutoff_timestamp=cutoff_timestamp,
         cik=cik,
         identity_status=identity_status,
         identity_reason=identity_reason,
         events=ordered,
         source_counts=dict(source_counts),
-        source_errors=tuple(dict(error) for error in source_errors),
+        source_errors=source_errors_tuple,
     )
 
 
@@ -512,6 +528,18 @@ def _tags_for_filing(form: str | None, description: str | None) -> tuple[str, ..
     if normalized.startswith(_NT_FORMS):
         tags.append(TAG_NT_LATE_FILER)
     return tuple(tags)
+
+
+def _catalyst_source_status(
+    *,
+    identity_status: str | None,
+    source_errors: Sequence[Mapping[str, Any]],
+) -> str:
+    if identity_status != "resolved":
+        return CATALYST_STATUS_IDENTITY_UNRESOLVED
+    if source_errors:
+        return CATALYST_STATUS_INCOMPLETE
+    return CATALYST_STATUS_IMPLEMENTED
 
 
 def _news_events_from_articles(
