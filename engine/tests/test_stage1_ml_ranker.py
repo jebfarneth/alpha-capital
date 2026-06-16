@@ -561,6 +561,7 @@ def test_leakage_audit_allows_intraday_pit_catalyst_flags():
             }
             for name in (
                 "catalyst_dilution_avoid",
+                "catalyst_shelf_registration_on_file",
                 "catalyst_nt_late_filer",
                 "catalyst_fda_amplifier",
                 "catalyst_compliance_amplifier",

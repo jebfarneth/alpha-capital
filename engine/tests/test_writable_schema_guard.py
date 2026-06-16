@@ -23,6 +23,7 @@ from alpha.jobs.contracts import JobResult
 from alpha.jobs import (
     run_forward_context,
     run_forward_return,
+    run_i12_catalyst_backfill,
     run_i11_historical_corpus,
     run_i12_historical_corpus,
     run_m1_daily,
@@ -323,6 +324,14 @@ def test_postgres_scratch_reads_public_references_but_writes_outputs(monkeypatch
                 "2026-06-03",
                 "--end-date",
                 "2026-06-03",
+            ],
+        ),
+        (
+            run_i12_catalyst_backfill,
+            [
+                "--live",
+                "--schema",
+                "scratch_missing",
             ],
         ),
     ],
@@ -691,6 +700,14 @@ def test_intraday_corpus_required_tables_are_output_only():
                 "2026-06-03T21:00:00+00:00",
             ],
         ),
+        (
+            run_i12_catalyst_backfill,
+            [
+                "--live",
+                "--schema",
+                "scratch_missing",
+            ],
+        ),
     ],
 )
 def test_writable_schema_entrypoints_preflight_before_session(
@@ -708,11 +725,18 @@ def test_writable_schema_entrypoints_preflight_before_session(
             SchemaTargetError("schema 'scratch_missing' does not exist")
         ),
     )
-    monkeypatch.setattr(
-        module,
-        "get_session",
-        lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
-    )
+    if hasattr(module, "get_session"):
+        monkeypatch.setattr(
+            module,
+            "get_session",
+            lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+        )
+    if hasattr(module, "open_writable_session"):
+        monkeypatch.setattr(
+            module,
+            "open_writable_session",
+            lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+        )
 
     rc = module.main(argv)
     captured = capsys.readouterr()
@@ -814,6 +838,12 @@ def test_market_path_schema_preflight_does_not_require_m3_tables(monkeypatch, ca
                 "2026-06-03T21:00:00+00:00",
             ],
         ),
+        (
+            run_i12_catalyst_backfill,
+            [
+                "--live",
+            ],
+        ),
     ],
 )
 def test_writable_schema_entrypoints_preflight_env_only_schema_before_session(
@@ -832,11 +862,18 @@ def test_writable_schema_entrypoints_preflight_env_only_schema_before_session(
             SchemaTargetError("schema 'scratch_env_missing' does not exist")
         ),
     )
-    monkeypatch.setattr(
-        module,
-        "get_session",
-        lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
-    )
+    if hasattr(module, "get_session"):
+        monkeypatch.setattr(
+            module,
+            "get_session",
+            lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+        )
+    if hasattr(module, "open_writable_session"):
+        monkeypatch.setattr(
+            module,
+            "open_writable_session",
+            lambda *args, **kwargs: pytest.fail("session opened before schema guard"),
+        )
 
     rc = module.main(argv)
     captured = capsys.readouterr()

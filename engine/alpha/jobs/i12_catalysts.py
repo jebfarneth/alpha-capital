@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -22,28 +22,38 @@ from alpha.jobs.watchdog import (
     WatchdogState,
     call_with_daemon_deadline,
 )
+from alpha.market_calendar import previous_us_equity_session
 
 
 CATALYST_STATUS_IMPLEMENTED = "implemented_pit_filtered"
+CATALYST_STATUS_NOT_IMPLEMENTED = "not_implemented_pit_safe_empty"
 TAG_DILUTION_OFFERING = "dilution_offering"
+TAG_SHELF_REGISTRATION = "shelf_registration_on_file"
 TAG_NT_LATE_FILER = "nt_late_filer"
 TAG_FDA_CLINICAL = "fda_clinical"
 TAG_COMPLIANCE_LISTING = "compliance_listing"
 TAG_MNA_STRATEGIC = "mna_strategic"
+OFFERING_WINDOW_TRADING_DAYS = 5
 
 CATALYST_FEATURE_DEFAULTS = {
     "catalyst_dilution_avoid": False,
+    "catalyst_shelf_registration_on_file": False,
     "catalyst_nt_late_filer": False,
     "catalyst_fda_amplifier": False,
     "catalyst_compliance_amplifier": False,
 }
 
-_DILUTION_FORMS = ("424B", "S-1", "S-3", "F-1", "F-3")
+_TAKEDOWN_FORMS = ("424B",)
+_SHELF_FORMS = ("S-1", "S-3", "F-1", "F-3")
 _NT_FORMS = ("NT 10-K", "NT 10-Q")
 _FDA_RE = re.compile(r"\b(fda|clinical|trial|phase\s*[123]|pdufa|crl|approval)\b", re.I)
 _COMPLIANCE_RE = re.compile(r"\b(nasdaq|nyse|listing|compliance|deficien|delist|minimum bid)\b", re.I)
 _MNA_RE = re.compile(r"\b(merger|acquisition|strategic alternatives|buyout|takeover)\b", re.I)
-_OFFERING_RE = re.compile(r"\b(atm|registered direct|offering|shelf|prospectus|warrant)\b", re.I)
+_OFFERING_RE = re.compile(
+    r"\b(atm|registered direct|public offering|priced offering|offering|dilution|"
+    r"capital raise|raise|warrant|unit offering)\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,8 @@ class CatalystResult:
     source_status: str
     cutoff_timestamp: datetime | None
     cik: str | None = None
+    identity_status: str | None = None
+    identity_reason: str | None = None
     events: tuple[CatalystEvent, ...] = ()
     source_counts: dict[str, int] = field(default_factory=dict)
     source_errors: tuple[dict[str, Any], ...] = ()
@@ -72,6 +84,8 @@ class CatalystResult:
             "catalyst_source_status": self.source_status,
             "catalyst_cutoff_timestamp": _iso_utc(self.cutoff_timestamp),
             "catalyst_cik": self.cik,
+            "catalyst_identity_status": self.identity_status,
+            "catalyst_identity_reason": self.identity_reason,
             "catalyst_source_counts": dict(self.source_counts),
             "catalyst_events": [
                 {
@@ -93,15 +107,20 @@ def empty_catalyst_result(
     *,
     cutoff_timestamp: datetime | None,
     cik: str | None = None,
+    source_status: str = CATALYST_STATUS_NOT_IMPLEMENTED,
+    identity_status: str = "not_checked",
+    identity_reason: str = "resolver_not_configured",
     source_counts: Mapping[str, int] | None = None,
     source_errors: Sequence[Mapping[str, Any]] | None = None,
 ) -> CatalystResult:
     return CatalystResult(
         tags=(),
         features=dict(CATALYST_FEATURE_DEFAULTS),
-        source_status=CATALYST_STATUS_IMPLEMENTED,
+        source_status=source_status,
         cutoff_timestamp=_aware_utc_or_none(cutoff_timestamp),
         cik=cik,
+        identity_status=identity_status,
+        identity_reason=identity_reason,
         events=(),
         source_counts=dict(source_counts or {}),
         source_errors=tuple(dict(error) for error in (source_errors or ())),
@@ -128,12 +147,15 @@ class I12CatalystResolver:
         polygon_news_adapter: Any | None = None,
         benzinga_news_adapter: Any | None = None,
         edgar_cache_dir: str | Path | None = None,
-        lookback_days: int = 5,
+        offering_window_trading_days: int = OFFERING_WINDOW_TRADING_DAYS,
+        lookback_days: int | None = None,
         fetch_deadline_seconds: float | None = None,
         watchdog_state: WatchdogState | None = None,
     ) -> None:
-        if lookback_days < 0:
-            raise ValueError("lookback_days must be >= 0")
+        if lookback_days is not None:
+            offering_window_trading_days = lookback_days
+        if offering_window_trading_days < 0:
+            raise ValueError("offering_window_trading_days must be >= 0")
         if fetch_deadline_seconds is not None and fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
         self._session = session
@@ -141,7 +163,7 @@ class I12CatalystResolver:
         self._polygon_news = polygon_news_adapter
         self._benzinga_news = benzinga_news_adapter
         self._edgar_cache_dir = Path(edgar_cache_dir) if edgar_cache_dir else None
-        self._lookback_days = int(lookback_days)
+        self._offering_window_trading_days = int(offering_window_trading_days)
         self._fetch_deadline_seconds = fetch_deadline_seconds
         self._watchdog_state = watchdog_state
 
@@ -154,16 +176,22 @@ class I12CatalystResolver:
     ) -> CatalystResult:
         cutoff = _aware_utc_or_none(cutoff_timestamp)
         if cutoff is None:
-            return empty_catalyst_result(cutoff_timestamp=None)
+            return empty_catalyst_result(
+                cutoff_timestamp=None,
+                identity_status="unresolved",
+                identity_reason="missing_cutoff_timestamp",
+                source_errors=[{
+                    "source": "security_identity",
+                    "error": "cik_unresolved",
+                    "reason": "missing_cutoff_timestamp",
+                }],
+            )
         ticker = ticker.upper()
-        cik = self._resolve_cik(ticker)
-        window_start = datetime.combine(
-            trading_date - timedelta(days=self._lookback_days),
-            time.min,
-            tzinfo=timezone.utc,
-        )
+        identity = self._resolve_cik(ticker, cutoff=cutoff)
+        cik = identity["cik"]
+        window_start = _trading_window_start(trading_date, self._offering_window_trading_days)
         events: list[CatalystEvent] = []
-        errors: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = list(identity["errors"])
         counts: dict[str, int] = {
             "edgar_filings_considered": 0,
             "edgar_filings_included": 0,
@@ -202,24 +230,46 @@ class I12CatalystResolver:
             events,
             cutoff_timestamp=cutoff,
             cik=cik,
+            identity_status=identity["identity_status"],
+            identity_reason=identity["identity_reason"],
             source_counts=counts,
             source_errors=errors,
         )
 
-    def _resolve_cik(self, ticker: str) -> str | None:
-        row = (
+    def _resolve_cik(self, ticker: str, *, cutoff: datetime) -> dict[str, Any]:
+        rows = (
             self._session.query(SecurityIdentitySnapshot)
-            .filter(SecurityIdentitySnapshot.ticker == ticker.upper())
+            .filter(
+                SecurityIdentitySnapshot.ticker == ticker.upper(),
+                SecurityIdentitySnapshot.asof_timestamp.isnot(None),
+                SecurityIdentitySnapshot.asof_timestamp <= cutoff,
+            )
             .order_by(
-                SecurityIdentitySnapshot.active.desc(),
-                SecurityIdentitySnapshot.asof_timestamp.desc().nullslast(),
+                SecurityIdentitySnapshot.asof_timestamp.desc(),
                 SecurityIdentitySnapshot.security_identity_snapshot_id.desc(),
             )
-            .first()
+            .all()
         )
-        if row is None:
-            return None
-        return _cik10(row.cik)
+        if not rows:
+            return _unresolved_identity("no_pit_identity_snapshot")
+        latest_asof = rows[0].asof_timestamp
+        latest_rows = [row for row in rows if row.asof_timestamp == latest_asof]
+        ciks = sorted({_cik10(row.cik) for row in latest_rows if _cik10(row.cik)})
+        if len(ciks) != 1:
+            return _unresolved_identity(
+                "ambiguous_pit_identity_snapshot",
+                identity_status="ambiguous",
+                extra={
+                    "asof_timestamp": _iso_utc(_aware_utc_or_none(latest_asof)),
+                    "cik_count": len(ciks),
+                },
+            )
+        return {
+            "cik": ciks[0],
+            "identity_status": "resolved",
+            "identity_reason": None,
+            "errors": [],
+        }
 
     def _edgar_events(
         self,
@@ -356,6 +406,7 @@ class I12CatalystResolver:
             resp.data or (),
             source="polygon_news",
             cutoff=cutoff,
+            window_start=window_start,
             published_attr="published_utc",
         )
 
@@ -396,6 +447,7 @@ class I12CatalystResolver:
             resp.data or (),
             source="benzinga_news",
             cutoff=cutoff,
+            window_start=window_start,
             published_attr="published",
         )
 
@@ -422,6 +474,8 @@ def _result_from_events(
     *,
     cutoff_timestamp: datetime,
     cik: str | None,
+    identity_status: str | None,
+    identity_reason: str | None,
     source_counts: Mapping[str, int],
     source_errors: Sequence[Mapping[str, Any]],
 ) -> CatalystResult:
@@ -429,6 +483,7 @@ def _result_from_events(
     tags = tuple(sorted({event.tag for event in ordered}))
     features = {
         "catalyst_dilution_avoid": TAG_DILUTION_OFFERING in tags,
+        "catalyst_shelf_registration_on_file": TAG_SHELF_REGISTRATION in tags,
         "catalyst_nt_late_filer": TAG_NT_LATE_FILER in tags,
         "catalyst_fda_amplifier": TAG_FDA_CLINICAL in tags,
         "catalyst_compliance_amplifier": TAG_COMPLIANCE_LISTING in tags,
@@ -439,6 +494,8 @@ def _result_from_events(
         source_status=CATALYST_STATUS_IMPLEMENTED,
         cutoff_timestamp=cutoff_timestamp,
         cik=cik,
+        identity_status=identity_status,
+        identity_reason=identity_reason,
         events=ordered,
         source_counts=dict(source_counts),
         source_errors=tuple(dict(error) for error in source_errors),
@@ -447,10 +504,11 @@ def _result_from_events(
 
 def _tags_for_filing(form: str | None, description: str | None) -> tuple[str, ...]:
     normalized = str(form or "").strip().upper()
-    text = f"{normalized} {description or ''}"
     tags: list[str] = []
-    if normalized.startswith(_DILUTION_FORMS) or _OFFERING_RE.search(text):
+    if normalized.startswith(_TAKEDOWN_FORMS):
         tags.append(TAG_DILUTION_OFFERING)
+    if normalized.startswith(_SHELF_FORMS):
+        tags.append(TAG_SHELF_REGISTRATION)
     if normalized.startswith(_NT_FORMS):
         tags.append(TAG_NT_LATE_FILER)
     return tuple(tags)
@@ -461,13 +519,14 @@ def _news_events_from_articles(
     *,
     source: str,
     cutoff: datetime,
+    window_start: datetime,
     published_attr: str,
 ) -> tuple[list[CatalystEvent], dict[str, int], list[dict[str, Any]]]:
     events: list[CatalystEvent] = []
     considered = 0
     for article in articles:
         published = _article_published_at(article, published_attr)
-        if published is None or not published < cutoff:
+        if published is None or not (window_start <= published < cutoff):
             continue
         considered += 1
         text = _article_text(article)
@@ -490,6 +549,8 @@ def _news_events_from_articles(
 
 def _tags_for_news_text(text: str) -> tuple[str, ...]:
     tags: list[str] = []
+    if _OFFERING_RE.search(text):
+        tags.append(TAG_DILUTION_OFFERING)
     if _FDA_RE.search(text):
         tags.append(TAG_FDA_CLINICAL)
     if _COMPLIANCE_RE.search(text):
@@ -535,6 +596,34 @@ def _article_published_at(article: Any, attr: str) -> datetime | None:
             return None
         return _aware_utc_or_none(parsed)
     return None
+
+
+def _trading_window_start(trading_date: date, trading_days: int) -> datetime:
+    window_session = trading_date
+    for _idx in range(trading_days):
+        window_session = previous_us_equity_session(window_session)
+    return datetime.combine(window_session, time.min, tzinfo=timezone.utc)
+
+
+def _unresolved_identity(
+    reason: str,
+    *,
+    identity_status: str = "unresolved",
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    error = {
+        "source": "security_identity",
+        "error": "cik_unresolved",
+        "reason": reason,
+    }
+    if extra:
+        error.update(dict(extra))
+    return {
+        "cik": None,
+        "identity_status": identity_status,
+        "identity_reason": reason,
+        "errors": [error],
+    }
 
 
 def _aware_utc_or_none(value: datetime | None) -> datetime | None:

@@ -7,6 +7,7 @@ import time as time_module
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -153,6 +154,16 @@ class FakeEdgarSubmissions:
         return AdapterResponse(data=payload, lineage=_lineage("SEC", cik10, []))
 
 
+class FakeNewsAdapter:
+    def __init__(self, articles: list[object]) -> None:
+        self.articles = articles
+        self.calls: Counter[str] = Counter()
+
+    def get_news(self, ticker, **kwargs):
+        self.calls[ticker.upper()] += 1
+        return AdapterResponse(data=list(self.articles), lineage=_lineage("Polygon", ticker, []))
+
+
 def _lineage(provider: str, ticker: str, bars: list) -> LineageMeta:
     return LineageMeta(
         provider=provider,
@@ -248,14 +259,16 @@ def _seed_identity_cik(
     cik: str,
     *,
     active: bool = True,
+    asof_timestamp: datetime | None = None,
+    suffix: str = "",
 ) -> None:
-    scan_id = f"identity-scan-{ticker}"
+    scan_id = f"identity-scan-{ticker}{suffix}"
     if db_session.get(UniverseScan, scan_id) is None:
         db_session.add(
             UniverseScan(
                 scan_id=scan_id,
                 trading_date=DAY.isoformat(),
-                asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                asof_timestamp=asof_timestamp or datetime(2026, 6, 1, tzinfo=timezone.utc),
                 provider="fixture",
                 raw_count=1,
                 deduped_count=1,
@@ -267,14 +280,14 @@ def _seed_identity_cik(
         )
     db_session.add(
         SecurityIdentitySnapshot(
-            security_identity_snapshot_id=f"identity-{ticker}-{cik}",
+            security_identity_snapshot_id=f"identity-{ticker}-{cik}{suffix}",
             scan_id=scan_id,
             ticker=ticker.upper(),
             cik=cik,
             active=active,
             identity_status="present",
             source_provider="fixture",
-            asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            asof_timestamp=asof_timestamp or datetime(2026, 6, 1, tzinfo=timezone.utc),
         )
     )
     db_session.flush()
@@ -1076,36 +1089,37 @@ def test_i12_daily_fmp_fetch_watchdog_quarantines_and_continues(db_session):
     assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
 
 
-def test_i12_catalyst_before_entry_filing_is_included(db_session, tmp_path):
+def test_i12_catalyst_before_entry_424b_takedown_sets_dilution_avoid(db_session, tmp_path):
     result, feature, edgar = _run_i12_with_catalyst_filings(
         db_session,
         tmp_path,
         [
             {
-                "form": "S-3",
+                "form": "424B5",
                 "acceptanceDateTime": "2026-06-03T09:29:00",
-                "primaryDocDescription": "ATM shelf offering prospectus",
+                "primaryDocDescription": "Registered direct offering takedown",
             }
         ],
     )
 
     assert result.status == "finished"
     assert feature["catalyst_source_status"] == "implemented_pit_filtered"
+    assert feature["catalyst_identity_status"] == "resolved"
     assert "dilution_offering" in feature["catalyst_tags"]
     assert feature["catalyst_dilution_avoid"] is True
     assert feature["catalyst_cutoff_timestamp"].endswith("Z")
     assert edgar.calls["0001234567"] == 1
 
 
-def test_i12_catalyst_after_entry_filing_is_excluded(db_session, tmp_path):
+def test_i12_catalyst_after_entry_424b_takedown_is_excluded(db_session, tmp_path):
     result, feature, _edgar = _run_i12_with_catalyst_filings(
         db_session,
         tmp_path,
         [
             {
-                "form": "S-3",
+                "form": "424B5",
                 "acceptanceDateTime": "2026-06-03T10:30:00",
-                "primaryDocDescription": "ATM shelf offering prospectus",
+                "primaryDocDescription": "Registered direct offering takedown",
             }
         ],
     )
@@ -1114,6 +1128,29 @@ def test_i12_catalyst_after_entry_filing_is_excluded(db_session, tmp_path):
     assert feature["catalyst_source_status"] == "implemented_pit_filtered"
     assert feature["catalyst_tags"] == []
     assert feature["catalyst_dilution_avoid"] is False
+
+
+def test_i12_catalyst_old_shelf_registration_does_not_set_dilution_avoid(
+    db_session,
+    tmp_path,
+):
+    result, feature, _edgar = _run_i12_with_catalyst_filings(
+        db_session,
+        tmp_path,
+        [
+            {
+                "form": "S-3",
+                "acceptanceDateTime": "2026-04-03T09:00:00",
+                "primaryDocDescription": "Shelf registration statement",
+            }
+        ],
+    )
+
+    assert result.status == "finished"
+    assert feature["catalyst_source_status"] == "implemented_pit_filtered"
+    assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is False
+    assert feature["catalyst_shelf_registration_on_file"] is False
 
 
 def test_i12_same_day_post_entry_catalyst_never_reaches_feature_vector(
@@ -1143,6 +1180,164 @@ def test_i12_same_day_post_entry_catalyst_never_reaches_feature_vector(
     assert feature["catalyst_nt_late_filer"] is False
 
 
+def test_i12_no_resolver_marks_catalysts_not_implemented(db_session):
+    result = _run_i12(db_session)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker="TEST").one()
+    snapshot = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
+    feature = json.loads(snapshot.feature_json)
+    assert feature["catalyst_source_status"] == "not_implemented_pit_safe_empty"
+    assert feature["catalyst_identity_status"] == "not_checked"
+    assert feature["catalyst_identity_reason"] == "resolver_not_configured"
+    assert feature["catalyst_tags"] == []
+
+
+def test_i12_catalyst_resolves_cik_point_in_time_at_entry_cutoff(db_session, tmp_path):
+    ticker = "RCYC"
+    old_cik = "0001111111"
+    current_cik = "0002222222"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(
+        db_session,
+        ticker,
+        old_cik,
+        asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        suffix="-old",
+    )
+    _seed_identity_cik(
+        db_session,
+        ticker,
+        current_cik,
+        asof_timestamp=datetime(2026, 6, 4, tzinfo=timezone.utc),
+        suffix="-current",
+    )
+    edgar = FakeEdgarSubmissions({
+        old_cik: _edgar_submissions_payload([
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Registered direct offering takedown",
+            }
+        ]),
+        current_cik: _edgar_submissions_payload([
+            {
+                "form": "NT 10-Q",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Late quarterly report notice",
+            }
+        ]),
+    })
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_cik"] == old_cik
+    assert feature["catalyst_identity_status"] == "resolved"
+    assert feature["catalyst_dilution_avoid"] is True
+    assert edgar.calls[old_cik] == 1
+    assert edgar.calls[current_cik] == 0
+
+
+def test_i12_catalyst_ambiguous_pit_cik_marks_unresolved(db_session, tmp_path):
+    ticker = "AMBIG"
+    _seed_hur(db_session, ticker)
+    asof = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    _seed_identity_cik(db_session, ticker, "0001111111", asof_timestamp=asof, suffix="-a")
+    _seed_identity_cik(db_session, ticker, "0002222222", asof_timestamp=asof, suffix="-b")
+    edgar = FakeEdgarSubmissions({
+        "0001111111": _edgar_submissions_payload([
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Registered direct offering takedown",
+            }
+        ])
+    })
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_cik"] is None
+    assert feature["catalyst_identity_status"] == "ambiguous"
+    assert feature["catalyst_tags"] == []
+    assert feature["catalyst_source_errors"][0]["reason"] == "ambiguous_pit_identity_snapshot"
+    assert not edgar.calls
+
+
+def test_i12_catalyst_news_window_lower_bound_filters_overreturned_articles(db_session):
+    ticker = "NEWS"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(db_session, ticker, "0001234567")
+    news = FakeNewsAdapter([
+        SimpleNamespace(
+            id="stale",
+            published_utc="2026-04-03T13:00:00Z",
+            title="Company announces FDA clinical trial update and public offering",
+            description="stale over-returned article",
+        ),
+        SimpleNamespace(
+            id="acute",
+            published_utc="2026-06-02T13:00:00Z",
+            title="Company prices public offering after FDA update",
+            description="acute article",
+        ),
+    ])
+    resolver = I12CatalystResolver(session=db_session, polygon_news_adapter=news)
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_source_counts"]["news_articles_considered"] == 1
+    assert feature["catalyst_dilution_avoid"] is True
+    assert feature["catalyst_fda_amplifier"] is True
+    event_ids = {event["provider_id"] for event in feature["catalyst_events"]}
+    assert event_ids == {"acute"}
+
+
 def test_i12_catalyst_backfill_uses_delisted_identity_cik(
     db_session,
     tmp_path,
@@ -1156,6 +1351,19 @@ def test_i12_catalyst_backfill_uses_delisted_identity_cik(
     )
     assert result.status == "finished"
     assert feature_before["catalyst_tags"] == []
+    preserved_keys = (
+        "gap",
+        "prev_day_return",
+        "prev_day_green",
+        "mom20",
+        "off_low252",
+        "sigma20",
+        "distance_from_max252",
+        "drawdown_from_max252",
+        "projected_volume_ratio_at_confirmation",
+        "projected_volume_at_confirmation",
+    )
+    preserved_before = {key: feature_before[key] for key in preserved_keys}
     edgar = FakeEdgarSubmissions({
         "0001234567": _edgar_submissions_payload([
             {
@@ -1185,9 +1393,11 @@ def test_i12_catalyst_backfill_uses_delisted_identity_cik(
     detail_feature = json.loads(detail.feature_json)
     assert detail_feature["catalyst_tags"] == ["nt_late_filer"]
     assert detail_feature["catalyst_nt_late_filer"] is True
+    assert {key: detail_feature[key] for key in preserved_keys} == preserved_before
     signal = db_session.get(SignalRegistry, detail.signal_id)
     snapshot = db_session.get(FeatureSnapshot, signal.feature_snapshot_id)
     snapshot_feature = json.loads(snapshot.feature_json)
+    assert snapshot_feature == detail_feature
     assert snapshot_feature["catalyst_tags"] == ["nt_late_filer"]
     assert edgar.calls["0001234567"] == 1
 

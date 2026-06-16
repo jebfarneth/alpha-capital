@@ -14,13 +14,14 @@ from alpha.data.config import BenzingaConfig, ConfigError, PolygonConfig, SecEdg
 from alpha.data.edgar import SecEdgarAdapter
 from alpha.data.polygon import PolygonAdapter
 from alpha.db.engine import (
+    SchemaTargetError,
     create_all_tables,
     open_writable_session,
     prepare_writable_schema_target,
     reset_globals,
 )
 from alpha.jobs.i12_catalyst_backfill import I12CatalystBackfillJob, JOB_NAME
-from alpha.jobs.i12_catalysts import I12CatalystResolver
+from alpha.jobs.i12_catalysts import I12CatalystResolver, OFFERING_WINDOW_TRADING_DAYS
 from alpha.jobs.i12_historical_corpus import DEFAULT_FETCH_DEADLINE_SECONDS
 from alpha.jobs.runner import run_job
 from alpha.jobs.watchdog import (
@@ -60,11 +61,15 @@ def _run_live(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}")
         return 1
     if target_schema is not None:
-        prepare_writable_schema_target(
-            schema=target_schema,
-            create_tables=args.create_tables,
-            required_tables=I12_CATALYST_REQUIRED_TABLES,
-        )
+        try:
+            prepare_writable_schema_target(
+                schema=target_schema,
+                create_tables=args.create_tables,
+                required_tables=I12_CATALYST_REQUIRED_TABLES,
+            )
+        except (SchemaTargetError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
     elif args.create_tables:
         create_all_tables()
 
@@ -97,7 +102,7 @@ def _run_live(args: argparse.Namespace) -> int:
         polygon_news_adapter=polygon_news_adapter,
         benzinga_news_adapter=benzinga_news_adapter,
         edgar_cache_dir=args.edgar_cache_dir,
-        lookback_days=args.lookback_days,
+        offering_window_trading_days=args.offering_window_trading_days,
         fetch_deadline_seconds=args.fetch_deadline_seconds,
         watchdog_state=watchdog,
     )
@@ -123,7 +128,7 @@ def _run_live(args: argparse.Namespace) -> int:
                 "skip_existing": args.skip_existing,
                 "batch_size": args.batch_size,
                 "edgar_cache_dir": args.edgar_cache_dir,
-                "lookback_days": args.lookback_days,
+                "offering_window_trading_days": args.offering_window_trading_days,
                 "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
                 "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
@@ -166,7 +171,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--edgar-cache-dir", default=str(DEFAULT_EDGAR_CACHE_DIR))
-    parser.add_argument("--lookback-days", type=int, default=5)
+    parser.add_argument(
+        "--offering-window-trading-days",
+        type=int,
+        default=OFFERING_WINDOW_TRADING_DAYS,
+        help="Trading-session lookback window for acute catalyst tags before entry.",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        dest="offering_window_trading_days",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--fetch-deadline-seconds",
         type=float,
