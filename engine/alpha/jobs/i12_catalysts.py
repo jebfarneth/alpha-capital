@@ -248,16 +248,23 @@ class I12CatalystResolver:
         )
 
     def _resolve_cik(self, ticker: str, *, cutoff: datetime) -> dict[str, Any]:
+        normalized_ticker = ticker.upper()
         candidates = load_security_identity_candidates_for_tickers(
             self._session,
-            [ticker.upper()],
+            [normalized_ticker],
             asof_timestamp=cutoff,
         )
+        direct_rows = [
+            row for row in candidates
+            if str(row.ticker or "").upper() == normalized_ticker
+        ]
+        alias_rows = [
+            row for row in candidates
+            if str(row.ticker or "").upper() != normalized_ticker
+            and security_identity_snapshot_matches_ticker(row, normalized_ticker)
+        ]
         rows = sorted(
-            [
-                row for row in candidates
-                if security_identity_snapshot_matches_ticker(row, ticker)
-            ],
+            direct_rows or alias_rows,
             key=lambda row: (
                 row.asof_timestamp is not None,
                 row.asof_timestamp,

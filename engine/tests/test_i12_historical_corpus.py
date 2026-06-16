@@ -1343,6 +1343,76 @@ def test_i12_catalyst_resolves_cik_from_pit_alias_snapshot(db_session, tmp_path)
     assert edgar.calls[cik] == 1
 
 
+def test_i12_catalyst_direct_pit_cik_takes_precedence_over_newer_alias(
+    db_session,
+    tmp_path,
+):
+    ticker = "FB"
+    current_ticker = "META"
+    direct_cik = "0001111111"
+    alias_cik = "0001326801"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(
+        db_session,
+        ticker,
+        direct_cik,
+        asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        suffix="-direct",
+    )
+    _seed_identity_cik(
+        db_session,
+        current_ticker,
+        alias_cik,
+        asof_timestamp=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        suffix="-alias",
+        ticker_events_json=json.dumps(
+            [{"old_ticker": ticker, "new_ticker": current_ticker, "event_date": "2022-06-09"}],
+            sort_keys=True,
+        ),
+    )
+    edgar = FakeEdgarSubmissions({
+        direct_cik: _edgar_submissions_payload([
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Direct CIK offering takedown",
+            }
+        ]),
+        alias_cik: _edgar_submissions_payload([
+            {
+                "form": "NT 10-Q",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Alias CIK late filing",
+            }
+        ]),
+    })
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_cik"] == direct_cik
+    assert feature["catalyst_identity_status"] == "resolved"
+    assert feature["catalyst_dilution_avoid"] is True
+    assert edgar.calls[direct_cik] == 1
+    assert edgar.calls[alias_cik] == 0
+
+
 def test_i12_catalyst_ambiguous_pit_cik_marks_unresolved(db_session, tmp_path):
     ticker = "AMBIG"
     _seed_hur(db_session, ticker)
