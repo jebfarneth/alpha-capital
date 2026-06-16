@@ -65,6 +65,31 @@ class FakeFmp:
         return AdapterResponse(data=bars, lineage=_lineage("FMP", ticker, bars))
 
 
+class SleepyFmp(FakeFmp):
+    def __init__(
+        self,
+        bars_by_ticker: dict[str, list[FmpBar]],
+        *,
+        delays: dict[str, float],
+    ) -> None:
+        super().__init__(bars_by_ticker)
+        self.delays = {ticker.upper(): delay for ticker, delay in delays.items()}
+        self.calls: Counter[str] = Counter()
+
+    def get_historical_price(self, ticker, from_date=None, to_date=None, **kwargs):
+        ticker = ticker.upper()
+        self.calls[ticker] += 1
+        delay = self.delays.get(ticker, 0.0)
+        if delay > 0:
+            time_module.sleep(delay)
+        return super().get_historical_price(
+            ticker,
+            from_date=from_date,
+            to_date=to_date,
+            **kwargs,
+        )
+
+
 class FakePolygon:
     def __init__(self, bars_by_ticker_date: dict[tuple[str, date], list[PolygonBar]]) -> None:
         self.bars_by_ticker_date = {
@@ -877,6 +902,56 @@ def test_i12_minute_fetch_watchdog_quarantines_and_continues(db_session):
     assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
 
 
+def test_i12_daily_fmp_fetch_watchdog_quarantines_and_continues(db_session):
+    slow_ticker = "ASLOW"
+    fast_ticker = "BFAST"
+    _seed_hur(db_session, slow_ticker)
+    _seed_hur(db_session, fast_ticker)
+    fmp = SleepyFmp(
+        {
+            slow_ticker: _daily_bars(),
+            fast_ticker: _daily_bars(),
+        },
+        delays={slow_ticker: 0.8},
+    )
+    polygon = FakePolygon({
+        (slow_ticker, DAY): _minute_bars(),
+        (fast_ticker, DAY): _minute_bars(),
+    })
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={
+            slow_ticker: _classification(ticker=slow_ticker),
+            fast_ticker: _classification(ticker=fast_ticker),
+        },
+        fetch_deadline_seconds=0.05,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    assert result.metrics["watchdog_timeouts"] == 1
+    assert result.metrics["fetch_errors"] == 1
+    assert result.metrics["quarantined"] == 1
+    assert result.metrics["confirmed"] == 1
+    assert result.errors[0] | {
+        "ticker": slow_ticker,
+        "trading_date": DAY.isoformat(),
+        "error": "daily_fetch_watchdog_timeout",
+        "deadline_seconds": 0.05,
+    } == result.errors[0]
+    assert fmp.calls[slow_ticker] == 1
+    assert fmp.calls[fast_ticker] == 1
+    assert polygon.calls[(slow_ticker, DAY)] == 0
+    assert polygon.calls[(fast_ticker, DAY)] == 1
+    assert db_session.query(IntradayEventDetail).filter_by(ticker=fast_ticker).count() == 1
+    assert db_session.query(IntradayEventDetail).filter_by(ticker=slow_ticker).count() == 0
+
+
 def test_daemon_deadline_unit_bounds_sleeping_callable():
     state = WatchdogState(max_outstanding_timeouts=5)
 
@@ -940,6 +1015,73 @@ def test_daemon_deadline_thread_start_failure_trips_breaker(monkeypatch):
     assert excinfo.value.payload["error"] == "provider_outage_circuit_breaker"
     assert state.thread_start_failures == 1
     assert state.circuit_open is True
+
+
+def test_daemon_deadline_late_worker_decrements_outstanding_timeout():
+    state = WatchdogState(max_outstanding_timeouts=2)
+    finished = threading.Event()
+
+    def slow_finish():
+        time_module.sleep(0.04)
+        finished.set()
+        return "late"
+
+    with pytest.raises(FuturesTimeoutError):
+        call_with_daemon_deadline(
+            slow_finish,
+            timeout_seconds=0.01,
+            thread_name="unit-late-finish-watchdog",
+            state=state,
+        )
+
+    assert finished.wait(0.5)
+    assert state.total_timeouts == 1
+    assert state.outstanding_timeouts == 0
+    assert state.circuit_open is False
+
+
+def test_daemon_deadline_cache_hit_resets_recoverable_timeout_streak():
+    state = WatchdogState(max_outstanding_timeouts=2, max_consecutive_timeouts=2)
+
+    for _idx in range(3):
+        with pytest.raises(FuturesTimeoutError):
+            call_with_daemon_deadline(
+                lambda: time_module.sleep(0.03),
+                timeout_seconds=0.01,
+                thread_name="unit-recoverable-watchdog",
+                state=state,
+            )
+        time_module.sleep(0.05)
+        assert state.outstanding_timeouts == 0
+        state.record_success()
+
+    assert state.total_timeouts == 3
+    assert state.consecutive_timeouts == 0
+    assert state.circuit_open is False
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])
+def test_daemon_deadline_process_control_start_exceptions_propagate(
+    monkeypatch,
+    exc_type,
+):
+    state = WatchdogState(max_outstanding_timeouts=10)
+
+    def interrupt_start(self):  # noqa: ANN001
+        raise exc_type()
+
+    monkeypatch.setattr(threading.Thread, "start", interrupt_start)
+
+    with pytest.raises(exc_type):
+        call_with_daemon_deadline(
+            lambda: None,
+            timeout_seconds=0.01,
+            thread_name="unit-process-control",
+            state=state,
+        )
+
+    assert state.thread_start_failures == 0
+    assert state.circuit_open is False
 
 
 def test_i12_progress_records_uncached_fetch_heartbeat_before_fetch(db_session):

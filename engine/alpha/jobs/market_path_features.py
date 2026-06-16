@@ -631,7 +631,6 @@ class MarketPathFeatureJob(BaseJob):
         self._fetch_deadline_seconds = float(fetch_deadline_seconds)
         self._fetch_watchdog = WatchdogState(
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
-            max_consecutive_timeouts=max_outstanding_fetch_timeouts,
         )
         self._skip_existing = skip_existing
 
@@ -647,6 +646,8 @@ class MarketPathFeatureJob(BaseJob):
         try:
             collection = self.collect_feature_rows(ctx)
         except ProviderOutageCircuitBreaker as exc:
+            self._session.rollback()
+            self._session.expunge_all()
             return JobResult(
                 status="failed",
                 metrics={

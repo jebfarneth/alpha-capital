@@ -473,7 +473,8 @@ def test_alembic_env_validates_schema_and_removes_public_fallback():
     env_py = Path("migrations/env.py").read_text()
 
     assert "_validate_schema_name(schema)" in env_py
-    assert "schema_connect_args(url, schema)" in env_py
+    assert "schema_connect_args(" in env_py
+    assert "include_statement_timeouts=False" in env_py
     assert 'SET search_path TO "{schema}", public' not in env_py
     assert 'SET search_path TO "{schema}"' in env_py
 
@@ -539,6 +540,11 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
     assert create_all_calls == [
         (engines[1], "scratch_ready", tuple(db_engine.Base.metadata.tables.keys()))
     ]
+    assert create_engine_calls[0][1]["connect_args"]["connect_timeout"] == 10
+    assert create_engine_calls[0][1]["connect_args"]["options"] == (
+        "-cstatement_timeout=300000 "
+        "-cidle_in_transaction_session_timeout=300000"
+    )
     assert create_engine_calls[1][1]["connect_args"]["options"] == (
         "-csearch_path=scratch_ready "
         "-cstatement_timeout=300000 "
@@ -546,6 +552,18 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
     )
     assert engines[0].disposed is True
     assert engines[1].disposed is True
+
+
+def test_migration_connect_args_drop_statement_timeouts():
+    kwargs = schema_connect_args(
+        "postgresql+psycopg://user:pass@example.com/db",
+        "scratch_migrations",
+        include_statement_timeouts=False,
+    )
+
+    assert kwargs["connect_args"]["connect_timeout"] == 10
+    assert kwargs["connect_args"]["keepalives"] == 1
+    assert kwargs["connect_args"]["options"] == "-csearch_path=scratch_migrations"
 
 
 def test_prepare_writable_schema_target_create_tables_uses_required_subset(

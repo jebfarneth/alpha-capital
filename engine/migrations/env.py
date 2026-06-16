@@ -47,13 +47,27 @@ def run_migrations_online():
     schema = os.environ.get("ALPHA_DB_SCHEMA")
     if schema:
         schema = _validate_schema_name(schema)
-        admin = create_engine(url)
+        admin = create_engine(
+            url,
+            **schema_connect_args(
+                url,
+                None,
+                include_statement_timeouts=False,
+            ),
+        )
         try:
             with admin.begin() as connection:
                 connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         finally:
             admin.dispose()
-    connectable = create_engine(url, **schema_connect_args(url, schema))
+    connectable = create_engine(
+        url,
+        **schema_connect_args(
+            url,
+            schema,
+            include_statement_timeouts=False,
+        ),
+    )
     with connectable.connect() as connection:
         if schema:
             connection.exec_driver_sql(f'SET search_path TO "{schema}"')

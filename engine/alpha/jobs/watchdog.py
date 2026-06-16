@@ -107,7 +107,12 @@ def call_with_daemon_deadline(
     if watchdog_state.circuit_open:
         raise _circuit_breaker_error(watchdog_state, call_context)
     results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-    status = {"timed_out": False}
+    call_lock = threading.Lock()
+    call_state = {
+        "timed_out": False,
+        "finished": False,
+        "decremented_after_timeout": False,
+    }
 
     def _target() -> None:
         try:
@@ -115,22 +120,41 @@ def call_with_daemon_deadline(
         except BaseException as exc:  # noqa: BLE001 - propagate worker failure to caller
             results.put_nowait((False, exc))
         finally:
-            if status["timed_out"]:
+            should_decrement = False
+            with call_lock:
+                call_state["finished"] = True
+                if (
+                    call_state["timed_out"]
+                    and not call_state["decremented_after_timeout"]
+                ):
+                    call_state["decremented_after_timeout"] = True
+                    should_decrement = True
+            if should_decrement:
                 watchdog_state.record_thread_finished_after_timeout()
 
     try:
         thread = threading.Thread(target=_target, name=thread_name, daemon=True)
         thread.start()
         thread.join(timeout_seconds)
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as exc:  # noqa: BLE001 - convert start/join failure to breaker
         watchdog_state.record_thread_start_failure(exc)
         raise _circuit_breaker_error(watchdog_state, call_context) from exc
 
     if thread.is_alive():
-        status["timed_out"] = True
-        if watchdog_state.record_timeout():
+        with call_lock:
+            if call_state["finished"]:
+                timed_out = False
+                circuit_open = False
+            else:
+                call_state["timed_out"] = True
+                timed_out = True
+                circuit_open = watchdog_state.record_timeout()
+        if timed_out and circuit_open:
             raise _circuit_breaker_error(watchdog_state, call_context)
-        raise FuturesTimeoutError()
+        if timed_out:
+            raise FuturesTimeoutError()
 
     ok, value = results.get_nowait()
     watchdog_state.record_success()

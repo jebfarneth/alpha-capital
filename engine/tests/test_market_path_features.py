@@ -108,6 +108,24 @@ class FakeFmpAdapter:
         )
 
 
+class SleepyFmpAdapter(FakeFmpAdapter):
+    def __init__(self, bars_by_ticker, *, delays: dict[str, float]) -> None:
+        super().__init__(bars_by_ticker)
+        self.delays = {ticker.upper(): delay for ticker, delay in delays.items()}
+
+    def get_historical_price(self, ticker, from_date=None, to_date=None, asof=None, **kwargs):
+        delay = self.delays.get(str(ticker).upper(), 0.0)
+        if delay > 0:
+            time_module.sleep(delay)
+        return super().get_historical_price(
+            ticker,
+            from_date=from_date,
+            to_date=to_date,
+            asof=asof,
+            **kwargs,
+        )
+
+
 class EmptyMinuteAdapter:
     def get_minute_aggs(self, *_args, **_kwargs):
         return AdapterResponse(
@@ -149,10 +167,10 @@ class DateRecordingMinuteAdapter(EmptyMinuteAdapter):
 
     def get_minute_aggs(self, *_args, **kwargs):
         from_date = kwargs["from_date"]
-        self.calls.append(from_date)
         delay = self.delay_by_date.get(from_date, 0.0)
         if delay > 0:
             time_module.sleep(delay)
+        self.calls.append(from_date)
         return super().get_minute_aggs(*_args, **kwargs)
 
 
@@ -2147,6 +2165,49 @@ def test_market_path_bulk_failed_fetch_artifact_preserves_retry_metadata(
         assert "?" not in dumped
 
 
+def test_market_path_bulk_breaker_merges_watchdog_payload_metrics(
+    db_session,
+    tmp_path,
+):
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    artifact_path = tmp_path / "bulk_breaker.json"
+
+    result = run_job(
+        db_session,
+        MarketPathBulkBackfillJob(
+            session=db_session,
+            fmp_adapter=FakeFmpAdapter({"LCUT": _rich_bars()}),
+            pattern_ids=("M4",),
+            signal_start_date=date(2026, 6, 5),
+            signal_end_date=date(2026, 6, 5),
+            through_date=date(2026, 6, 5),
+            run_timestamp=RUN_TS,
+            batch_days=1,
+            include_signal_session=True,
+            polygon_minute_adapter=SleepyMinuteAdapter(delay_seconds=2.0),
+            fetch_deadline_seconds=0.05,
+            max_outstanding_fetch_timeouts=1,
+            progress_artifact=artifact_path,
+            schema="scratch_test",
+        ),
+    )
+
+    assert result.status == "partial_failed"
+    assert result.errors[0]["error"] == "provider_outage_circuit_breaker"
+    assert result.metrics["watchdog_timeouts"] == result.errors[0]["watchdog_timeouts"]
+    assert result.metrics["outstanding_fetch_timeouts"] == 1
+    assert result.metrics["circuit_open"] is True
+    assert db_session.query(MarketPathFeature).count() == 0
+    artifact = json.loads(artifact_path.read_text())
+    assert artifact["summary"]["watchdog_timeouts"] == result.errors[0]["watchdog_timeouts"]
+    assert artifact["summary"]["outstanding_fetch_timeouts"] == 1
+
+
 def test_market_path_v3_rank_pass_isolates_date_pattern_and_version(db_session):
     m4_a = _add_signal(db_session, ticker="AAAA")
     m4_b = _add_signal(db_session, ticker="BBBB")
@@ -3352,6 +3413,38 @@ def test_m4_day0_polygon_minute_watchdog_counts_timeout_and_persists_row(db_sess
     assert row.intraday_structure_status == "minute_bars_missing"
 
 
+def test_m4_day0_fmp_watchdog_records_fetch_error_without_empty_row(db_session):
+    _add_signal(
+        db_session,
+        ticker="LCUT",
+        signal_day=date(2026, 6, 5),
+        entry_day=date(2026, 6, 8),
+    )
+    job = MarketPathFeatureJob(
+        session=db_session,
+        fmp_adapter=SleepyFmpAdapter(
+            {"LCUT": _rich_bars()},
+            delays={"LCUT": 2.0},
+        ),
+        run_timestamp=RUN_TS,
+        pattern_ids=("M4",),
+        signal_start_date=date(2026, 6, 5),
+        signal_end_date=date(2026, 6, 5),
+        through_date=date(2026, 6, 5),
+        include_signal_session=True,
+        polygon_minute_adapter=EmptyMinuteAdapter(),
+        fetch_deadline_seconds=0.05,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "partial_failed"
+    assert result.metrics["watchdog_timeouts"] == 1
+    assert result.errors[0]["stage"] == "fmp_historical_price"
+    assert result.errors[0]["error_type"] == "watchdog_timeout"
+    assert db_session.query(MarketPathFeature).count() == 0
+
+
 def test_m4_day0_polygon_minute_breaker_aborts_without_empty_bar_persist(
     db_session,
 ):
@@ -3411,7 +3504,9 @@ def test_m4_day0_polygon_minute_timeout_binds_each_worker_date(db_session):
     assert timeouts == 1
     assert out[first] == ()
     assert out[second] == ()
-    assert adapter.calls[:2] == [first.isoformat(), second.isoformat()]
+    assert adapter.calls == [second.isoformat()]
+    time_module.sleep(0.25)
+    assert adapter.calls == [second.isoformat(), first.isoformat()]
 
 
 def test_m4_day0_polygon_minute_heartbeat_written_before_fetch(db_session):

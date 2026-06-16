@@ -40,10 +40,16 @@ def _validate_schema_name(schema: str) -> str:
     return schema
 
 
-def _postgres_timeout_options(schema: str | None) -> str:
+def _postgres_timeout_options(
+    schema: str | None,
+    *,
+    include_statement_timeouts: bool = True,
+) -> str:
     options: list[str] = []
     if schema:
         options.append(f"-csearch_path={schema}")
+    if not include_statement_timeouts:
+        return " ".join(options)
     statement_timeout = int(
         os.environ.get(
             "ALPHA_DB_STATEMENT_TIMEOUT_MS",
@@ -61,7 +67,11 @@ def _postgres_timeout_options(schema: str | None) -> str:
     return " ".join(options)
 
 
-def _postgres_connect_args(schema: str | None = None) -> dict:
+def _postgres_connect_args(
+    schema: str | None = None,
+    *,
+    include_statement_timeouts: bool = True,
+) -> dict:
     return {
         "connect_timeout": int(
             os.environ.get(
@@ -88,11 +98,19 @@ def _postgres_connect_args(schema: str | None = None) -> dict:
                 str(DEFAULT_POSTGRES_KEEPALIVES_COUNT),
             )
         ),
-        "options": _postgres_timeout_options(schema),
+        "options": _postgres_timeout_options(
+            schema,
+            include_statement_timeouts=include_statement_timeouts,
+        ),
     }
 
 
-def schema_connect_args(url: str, schema: str | None = None) -> dict:
+def schema_connect_args(
+    url: str,
+    schema: str | None = None,
+    *,
+    include_statement_timeouts: bool = True,
+) -> dict:
     """Return SQLAlchemy kwargs that route PostgreSQL connections to schema.
 
     Startup options also set statement timeouts so a stuck DB operation cannot
@@ -106,7 +124,12 @@ def schema_connect_args(url: str, schema: str | None = None) -> dict:
         return {}
     if schema:
         schema = _validate_schema_name(schema)
-    return {"connect_args": _postgres_connect_args(schema)}
+    return {
+        "connect_args": _postgres_connect_args(
+            schema,
+            include_statement_timeouts=include_statement_timeouts,
+        )
+    }
 
 
 def _bind_schema_search_path(engine, url: str, schema: str | None) -> None:
@@ -281,7 +304,11 @@ def prepare_writable_schema_target(
         raise SchemaTargetError("scratch schema writes require a PostgreSQL DATABASE_URL")
 
     required = tuple(required_tables or Base.metadata.tables.keys())
-    admin_engine = create_engine(url, echo=False)
+    admin_engine = create_engine(
+        url,
+        echo=False,
+        **schema_connect_args(url, None),
+    )
     try:
         if create_tables:
             create_schema_if_missing(engine=admin_engine, schema=schema)

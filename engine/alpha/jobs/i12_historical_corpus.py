@@ -362,7 +362,6 @@ class I12HistoricalCorpusJob(BaseJob):
         self._latest_metrics: dict[str, Any] = {}
         self._fetch_watchdog = WatchdogState(
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
-            max_consecutive_timeouts=max_outstanding_fetch_timeouts,
         )
 
     @property
@@ -736,6 +735,8 @@ class I12HistoricalCorpusJob(BaseJob):
                 run_timestamp=self._run_timestamp,
             )
             daily_cache[ticker] = (tuple(bars), lineage)
+        else:
+            self._fetch_watchdog.record_success()
         daily_bars, daily_lineage = daily_cache[ticker]
         sessions_to_delist = self._sessions_to_delist(ticker, trading_date)
         return _DailyTickerInput(
@@ -780,6 +781,7 @@ class I12HistoricalCorpusJob(BaseJob):
                 self._store_cached_polygon_minutes(ticker, trading_date, raw_minutes)
             else:
                 counters.minute_cache_hits += 1
+                self._fetch_watchdog.record_success()
             minutes = _clean_minute_bars(trading_date, raw_minutes)
             if not minutes:
                 raise _Quarantine({
@@ -801,6 +803,8 @@ class I12HistoricalCorpusJob(BaseJob):
                 run_timestamp=self._run_timestamp,
             )
             minute_cache[minute_key] = (tuple(minutes), lineage)
+        else:
+            self._fetch_watchdog.record_success()
         minute_bars, minute_lineage = minute_cache[minute_key]
 
         return _TickerDayInput(

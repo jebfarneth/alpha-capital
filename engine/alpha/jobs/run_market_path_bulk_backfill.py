@@ -633,6 +633,7 @@ class MarketPathBulkBackfillJob(BaseJob):
         ticker_fetch_finished_total = 0
         ticker_fetch_error_total = 0
         watchdog_timeouts = 0
+        watchdog_breaker_state: dict[str, Any] = {}
         max_stage_batch_size = 0
         stage_tables: list[str] = []
 
@@ -688,6 +689,25 @@ class MarketPathBulkBackfillJob(BaseJob):
                 collection = feature_job.collect_feature_rows(ctx)
             except ProviderOutageCircuitBreaker as exc:
                 fetch_errors.append(exc.payload)
+                watchdog_timeouts += int(exc.payload.get("watchdog_timeouts") or 0)
+                watchdog_breaker_state.update(
+                    {
+                        key: exc.payload.get(key)
+                        for key in (
+                            "watchdog_timeouts",
+                            "consecutive_watchdog_timeouts",
+                            "outstanding_fetch_timeouts",
+                            "thread_start_failures",
+                            "circuit_open",
+                            "circuit_reason",
+                            "max_outstanding_fetch_timeouts",
+                            "max_consecutive_fetch_timeouts",
+                        )
+                        if key in exc.payload
+                    }
+                )
+                self._session.rollback()
+                self._session.expunge_all()
                 batch_record["status"] = "failed"
                 batch_record["errors"] = [exc.payload]
                 batch_progress(
@@ -937,6 +957,7 @@ class MarketPathBulkBackfillJob(BaseJob):
             "stage_tables": stage_tables,
             "stage_timing_seconds": stage_timings,
             "dominant_stage": dominant_stage,
+            **watchdog_breaker_state,
             **validation,
         }
         artifact["summary"] = metrics
