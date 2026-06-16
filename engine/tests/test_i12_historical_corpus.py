@@ -1005,6 +1005,63 @@ def test_i12_fetch_watchdog_consecutive_timeout_streak_trips_breaker(db_session)
     assert job._fetch_watchdog.outstanding_timeouts == 0
 
 
+def test_i12_daily_cache_hit_does_not_reset_provider_timeout_streak(db_session):
+    cache_ticker = "BCACHE"
+    first_timeout_ticker = "ASLOW"
+    second_timeout_ticker = "CSLOW"
+    next_day = next_us_equity_session(DAY + timedelta(days=1))
+    _seed_hur(db_session, cache_ticker, trading_date=DAY)
+    for ticker in (first_timeout_ticker, cache_ticker, second_timeout_ticker):
+        _seed_hur(db_session, ticker, trading_date=next_day)
+    fmp = SleepyFmp(
+        {
+            cache_ticker: _daily_bars(volume=100),
+            first_timeout_ticker: _daily_bars(),
+            second_timeout_ticker: _daily_bars(),
+        },
+        delays={
+            first_timeout_ticker: 0.06,
+            second_timeout_ticker: 0.06,
+        },
+    )
+    polygon = FakePolygon({
+        (first_timeout_ticker, next_day): _minute_bars(),
+        (second_timeout_ticker, next_day): _minute_bars(),
+    })
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        start_date=DAY,
+        end_date=next_day,
+        classification_records={
+            first_timeout_ticker: _classification(ticker=first_timeout_ticker),
+            cache_ticker: _classification(ticker=cache_ticker),
+            second_timeout_ticker: _classification(ticker=second_timeout_ticker),
+        },
+        fetch_deadline_seconds=0.01,
+        max_outstanding_fetch_timeouts=10,
+        max_consecutive_fetch_timeouts=2,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "partial_failed"
+    assert result.metrics["watchdog_timeouts"] == 2
+    assert fmp.calls[cache_ticker] == 1
+    assert fmp.calls[first_timeout_ticker] == 1
+    assert fmp.calls[second_timeout_ticker] == 1
+    breaker = next(error for error in result.errors if error["error"] == "provider_outage_circuit_breaker")
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert breaker["consecutive_watchdog_timeouts"] == 2
+    assert breaker["max_consecutive_fetch_timeouts"] == 2
+
+    deadline = time_module.monotonic() + 1.0
+    while job._fetch_watchdog.outstanding_timeouts and time_module.monotonic() < deadline:
+        time_module.sleep(0.01)
+    assert job._fetch_watchdog.outstanding_timeouts == 0
+
+
 def test_daemon_deadline_unit_bounds_sleeping_callable():
     state = WatchdogState(max_outstanding_timeouts=5)
 
