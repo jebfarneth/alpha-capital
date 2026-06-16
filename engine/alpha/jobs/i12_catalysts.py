@@ -16,13 +16,16 @@ from alpha.data.edgar import (
     _cik10,
     _parse_recent_filings,
 )
-from alpha.db.models import SecurityIdentitySnapshot
 from alpha.jobs.watchdog import (
     ProviderOutageCircuitBreaker,
     WatchdogState,
     call_with_daemon_deadline,
 )
 from alpha.market_calendar import previous_us_equity_session
+from alpha.security_identity import (
+    load_security_identity_candidates_for_tickers,
+    security_identity_snapshot_matches_ticker,
+)
 
 
 CATALYST_STATUS_IMPLEMENTED = "implemented_pit_filtered"
@@ -30,7 +33,7 @@ CATALYST_STATUS_NOT_IMPLEMENTED = "not_implemented_pit_safe_empty"
 CATALYST_STATUS_INCOMPLETE = "pit_retag_incomplete"
 CATALYST_STATUS_IDENTITY_UNRESOLVED = "pit_identity_unresolved"
 TAG_DILUTION_OFFERING = "dilution_offering"
-TAG_SHELF_REGISTRATION = "shelf_registration_on_file"
+TAG_SHELF_REGISTRATION = "recent_shelf_filing"
 TAG_NT_LATE_FILER = "nt_late_filer"
 TAG_FDA_CLINICAL = "fda_clinical"
 TAG_COMPLIANCE_LISTING = "compliance_listing"
@@ -245,18 +248,22 @@ class I12CatalystResolver:
         )
 
     def _resolve_cik(self, ticker: str, *, cutoff: datetime) -> dict[str, Any]:
-        rows = (
-            self._session.query(SecurityIdentitySnapshot)
-            .filter(
-                SecurityIdentitySnapshot.ticker == ticker.upper(),
-                SecurityIdentitySnapshot.asof_timestamp.isnot(None),
-                SecurityIdentitySnapshot.asof_timestamp <= cutoff,
-            )
-            .order_by(
-                SecurityIdentitySnapshot.asof_timestamp.desc(),
-                SecurityIdentitySnapshot.security_identity_snapshot_id.desc(),
-            )
-            .all()
+        candidates = load_security_identity_candidates_for_tickers(
+            self._session,
+            [ticker.upper()],
+            asof_timestamp=cutoff,
+        )
+        rows = sorted(
+            [
+                row for row in candidates
+                if security_identity_snapshot_matches_ticker(row, ticker)
+            ],
+            key=lambda row: (
+                row.asof_timestamp is not None,
+                row.asof_timestamp,
+                str(row.security_identity_snapshot_id or ""),
+            ),
+            reverse=True,
         )
         if not rows:
             return _unresolved_identity("no_pit_identity_snapshot")
@@ -495,6 +502,7 @@ def _result_from_events(
         source_errors=source_errors_tuple,
     )
     if source_status == CATALYST_STATUS_IMPLEMENTED:
+        result_tags = tags
         features = {
             "catalyst_dilution_avoid": TAG_DILUTION_OFFERING in tags,
             "catalyst_recent_shelf_filing": TAG_SHELF_REGISTRATION in tags,
@@ -503,9 +511,10 @@ def _result_from_events(
             "catalyst_compliance_amplifier": TAG_COMPLIANCE_LISTING in tags,
         }
     else:
+        result_tags = ()
         features = dict(CATALYST_FEATURE_UNKNOWN)
     return CatalystResult(
-        tags=tags,
+        tags=result_tags,
         features=features,
         source_status=source_status,
         cutoff_timestamp=cutoff_timestamp,

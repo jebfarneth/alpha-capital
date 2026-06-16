@@ -52,6 +52,7 @@ from alpha.ml.cv import (
     CVExample,
     PurgedEmbargoedFold,
     purged_embargoed_walk_forward_splits,
+    unique_name_weights,
 )
 from alpha.ml.inference import _raw_strength_fallback_score, score_signal_shadow
 from alpha.ml.manifest_loader import PatternManifest, load_manifest, manifest_payload_hash
@@ -2384,6 +2385,89 @@ def test_training_loader_collapses_same_security_same_date_rename_pair(
     assert examples[0].ticker == "XXI"
     assert examples[0].security_identity == "cik:0001234567"
     assert metrics["security_identity_duplicate_rows_dropped"] == 1
+
+
+def test_security_identity_resolves_alias_only_rename_for_dedup_and_cv_purge(
+    db_session,
+    tmp_path,
+):
+    scan = UniverseScan(
+        scan_id="scan-alias-only-meta",
+        trading_date="2025-02-04",
+        asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=1,
+        deduped_count=1,
+        duplicate_symbol_count=0,
+        included_count=1,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-meta-only",
+            scan_id=scan.scan_id,
+            ticker="META",
+            cik="0001326801",
+            active=True,
+            ticker_events_json=json.dumps(
+                [{"old_ticker": "FB", "new_ticker": "META", "event_date": "2022-06-09"}],
+                sort_keys=True,
+            ),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+        )
+    )
+    signal_date = date(2025, 2, 4)
+    fb_id = _seed_signal(
+        db_session,
+        idx=148,
+        ticker="FB",
+        signal_date=signal_date,
+        forward_return=0.01,
+    )
+    meta_id = _seed_signal(
+        db_session,
+        idx=149,
+        ticker="META",
+        signal_date=signal_date,
+        forward_return=0.05,
+    )
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [fb_id, meta_id]))
+
+    resolved = resolve_security_identities_for_tickers(db_session, ["FB", "META"])
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert resolved["FB"].security_identity == "cik:0001326801"
+    assert resolved["META"].security_identity == "cik:0001326801"
+    assert resolved["FB"].canonical_ticker == "META"
+    assert [row.signal_id for row in examples] == [meta_id]
+    assert examples[0].security_identity == "cik:0001326801"
+    assert metrics["security_identity_duplicate_rows_dropped"] == 1
+
+    rows = [
+        CVExample("old-meta", "META", resolved["META"].security_identity, date(2025, 1, 1)),
+        CVExample("other-train", "OTHER", "ticker:OTHER", date(2025, 1, 2)),
+        CVExample("old-fb", "FB", resolved["FB"].security_identity, date(2025, 1, 3)),
+        CVExample("other-test", "OTHR2", "ticker:OTHR2", date(2025, 1, 4)),
+    ]
+    assert unique_name_weights([rows[0], rows[2]]) == [0.5, 0.5]
+    fold = purged_embargoed_walk_forward_splits(
+        rows,
+        n_splits=1,
+        horizon_sessions=0,
+        embargo_sessions=0,
+    )[0]
+    assert 0 not in fold.train_indices
+    assert 1 in fold.train_indices
+    assert 2 in fold.test_indices
 
 
 def test_training_loader_does_not_collapse_dual_share_classes(
