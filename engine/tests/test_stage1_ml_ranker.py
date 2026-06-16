@@ -2470,6 +2470,158 @@ def test_security_identity_resolves_alias_only_rename_for_dedup_and_cv_purge(
     assert 2 in fold.test_indices
 
 
+def test_security_identity_large_alias_candidate_set_does_not_build_or_explosion(
+    db_session,
+):
+    scan = UniverseScan(
+        scan_id="scan-large-alias-set",
+        trading_date="2025-02-04",
+        asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=1,
+        deduped_count=1,
+        duplicate_symbol_count=0,
+        included_count=1,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-large-meta",
+            scan_id=scan.scan_id,
+            ticker="META",
+            cik="0001326801",
+            active=True,
+            ticker_events_json=json.dumps(
+                [{"old_ticker": "T1100", "new_ticker": "META"}],
+                sort_keys=True,
+            ),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 4, tzinfo=timezone.utc),
+        )
+    )
+    db_session.commit()
+
+    tickers = [f"T{idx}" for idx in range(1200)]
+    resolved = resolve_security_identities_for_tickers(db_session, tickers)
+
+    assert len(resolved) == 1200
+    assert resolved["T1100"].security_identity == "cik:0001326801"
+    assert resolved["T1100"].canonical_ticker == "META"
+    assert resolved["T999"].security_identity == "ticker:T999"
+
+
+def test_security_identity_alias_ambiguous_between_two_snapshots_splits(
+    db_session,
+    tmp_path,
+):
+    scan = UniverseScan(
+        scan_id="scan-ambiguous-alias",
+        trading_date="2025-02-05",
+        asof_timestamp=datetime(2025, 2, 5, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=2,
+        deduped_count=2,
+        duplicate_symbol_count=0,
+        included_count=2,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    db_session.add_all([
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-newa",
+            scan_id=scan.scan_id,
+            ticker="NEWA",
+            cik="0000000010",
+            active=True,
+            ticker_events_json=json.dumps([{"old_ticker": "ABC", "new_ticker": "NEWA"}]),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 5, tzinfo=timezone.utc),
+        ),
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-newb",
+            scan_id=scan.scan_id,
+            ticker="NEWB",
+            cik="0000000020",
+            active=True,
+            ticker_events_json=json.dumps([{"old_ticker": "ABC", "new_ticker": "NEWB"}]),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 5, tzinfo=timezone.utc),
+        ),
+    ])
+    signal_date = date(2025, 2, 5)
+    abc_id = _seed_signal(db_session, idx=150, ticker="ABC", signal_date=signal_date)
+    newa_id = _seed_signal(db_session, idx=151, ticker="NEWA", signal_date=signal_date)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [abc_id, newa_id]))
+
+    resolved = resolve_security_identities_for_tickers(db_session, ["ABC", "NEWA"])
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert resolved["ABC"].security_identity == "ticker:ABC"
+    assert resolved["ABC"].canonical_ticker == "ABC"
+    assert resolved["NEWA"].security_identity == "cik:0000000010"
+    assert {row.signal_id for row in examples} == {abc_id, newa_id}
+    assert metrics["security_identity_duplicate_rows_dropped"] == 0
+
+
+def test_security_identity_snapshotless_new_ticker_alias_from_stale_row_splits(
+    db_session,
+    tmp_path,
+):
+    scan = UniverseScan(
+        scan_id="scan-stale-new-ticker-alias",
+        trading_date="2025-02-06",
+        asof_timestamp=datetime(2025, 2, 6, tzinfo=timezone.utc),
+        provider="test",
+        raw_count=1,
+        deduped_count=1,
+        duplicate_symbol_count=0,
+        included_count=1,
+        excluded_count=0,
+        run_status="finished",
+    )
+    db_session.add(scan)
+    db_session.add(
+        SecurityIdentitySnapshot(
+            security_identity_snapshot_id="identity-oldx-delisted",
+            scan_id=scan.scan_id,
+            ticker="OLDX",
+            cik="0000000030",
+            active=False,
+            delisted_utc="2024-12-31T00:00:00Z",
+            ticker_events_json=json.dumps([{"old_ticker": "OLDX", "new_ticker": "NEWX"}]),
+            identity_status="present",
+            source_provider="test",
+            asof_timestamp=datetime(2025, 2, 1, tzinfo=timezone.utc),
+        )
+    )
+    signal_date = date(2025, 2, 6)
+    newx_id = _seed_signal(db_session, idx=152, ticker="NEWX", signal_date=signal_date)
+    db_session.commit()
+    manifest = load_manifest(_write_manifest(tmp_path, [newx_id]))
+
+    resolved = resolve_security_identities_for_tickers(db_session, ["NEWX"])
+    examples, metrics = _load_training_examples(
+        db_session,
+        pattern=manifest.pattern("M4"),
+        return_metrics=True,
+    )
+
+    assert resolved["NEWX"].security_identity == "ticker:NEWX"
+    assert examples[0].security_identity == "ticker:NEWX"
+    assert metrics["security_identity_duplicate_rows_dropped"] == 0
+
+
 def test_training_loader_does_not_collapse_dual_share_classes(
     db_session,
     tmp_path,

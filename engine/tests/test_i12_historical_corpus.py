@@ -1343,6 +1343,68 @@ def test_i12_catalyst_resolves_cik_from_pit_alias_snapshot(db_session, tmp_path)
     assert edgar.calls[cik] == 1
 
 
+def test_i12_catalyst_does_not_resolve_stale_new_ticker_alias(
+    db_session,
+    tmp_path,
+):
+    ticker = "NEWX"
+    stale_ticker = "OLDX"
+    stale_cik = "0007654321"
+    _seed_hur(db_session, ticker)
+    _seed_identity_cik(
+        db_session,
+        stale_ticker,
+        stale_cik,
+        active=False,
+        asof_timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        suffix="-stale-new-ticker",
+        ticker_events_json=json.dumps(
+            [{"old_ticker": stale_ticker, "new_ticker": ticker, "event_date": "2026-01-15"}],
+            sort_keys=True,
+        ),
+    )
+    edgar = FakeEdgarSubmissions({
+        stale_cik: _edgar_submissions_payload([
+            {
+                "form": "424B5",
+                "acceptanceDateTime": "2026-06-03T09:29:00",
+                "primaryDocDescription": "Stale identity offering takedown",
+            }
+        ])
+    })
+    resolver = I12CatalystResolver(
+        session=db_session,
+        edgar_adapter=edgar,
+        edgar_cache_dir=tmp_path / "edgar",
+    )
+    job = I12HistoricalCorpusJob(
+        session=db_session,
+        fmp_adapter=FakeFmp({ticker: _daily_bars()}),
+        polygon_adapter=FakePolygon({(ticker, DAY): _minute_bars()}),
+        start_date=DAY,
+        end_date=DAY,
+        classification_records={ticker: _classification(ticker=ticker)},
+        catalyst_resolver=resolver,
+    )
+
+    result = run_job(db_session, job)
+
+    assert result.status == "finished"
+    signal = db_session.query(SignalRegistry).filter_by(pattern_id="I12", ticker=ticker).one()
+    feature = json.loads(db_session.get(FeatureSnapshot, signal.feature_snapshot_id).feature_json)
+    assert feature["catalyst_cik"] is None
+    assert feature["catalyst_identity_status"] == "unresolved"
+    assert feature["catalyst_source_status"] == "pit_identity_unresolved"
+    assert feature["catalyst_tags"] == []
+    assert feature["catalyst_dilution_avoid"] is None
+    assert feature["catalyst_recent_shelf_filing"] is None
+    assert feature["catalyst_nt_late_filer"] is None
+    assert feature["catalyst_fda_amplifier"] is None
+    assert feature["catalyst_compliance_amplifier"] is None
+    assert feature["catalyst_source_errors"][0]["reason"] == "no_pit_identity_snapshot"
+    assert edgar.calls[stale_cik] == 0
+
+
 def test_i12_catalyst_direct_pit_cik_takes_precedence_over_newer_alias(
     db_session,
     tmp_path,

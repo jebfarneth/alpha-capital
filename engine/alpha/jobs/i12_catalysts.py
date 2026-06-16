@@ -23,8 +23,9 @@ from alpha.jobs.watchdog import (
 )
 from alpha.market_calendar import previous_us_equity_session
 from alpha.security_identity import (
+    identity_snapshot_sort_key,
     load_security_identity_candidates_for_tickers,
-    security_identity_snapshot_matches_ticker,
+    security_identity_snapshot_matches_prior_ticker_alias,
 )
 
 
@@ -261,21 +262,27 @@ class I12CatalystResolver:
         alias_rows = [
             row for row in candidates
             if str(row.ticker or "").upper() != normalized_ticker
-            and security_identity_snapshot_matches_ticker(row, normalized_ticker)
+            and security_identity_snapshot_matches_prior_ticker_alias(
+                row,
+                normalized_ticker,
+            )
         ]
         rows = sorted(
             direct_rows or alias_rows,
             key=lambda row: (
-                row.asof_timestamp is not None,
-                row.asof_timestamp,
+                *identity_snapshot_sort_key(row),
                 str(row.security_identity_snapshot_id or ""),
             ),
             reverse=True,
         )
         if not rows:
             return _unresolved_identity("no_pit_identity_snapshot")
+        latest_asof_key = identity_snapshot_sort_key(rows[0])
         latest_asof = rows[0].asof_timestamp
-        latest_rows = [row for row in rows if row.asof_timestamp == latest_asof]
+        latest_rows = [
+            row for row in rows
+            if identity_snapshot_sort_key(row) == latest_asof_key
+        ]
         ciks = sorted({_cik10(row.cik) for row in latest_rows if _cik10(row.cik)})
         if len(ciks) != 1:
             return _unresolved_identity(

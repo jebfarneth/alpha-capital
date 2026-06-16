@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Sequence
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from alpha.db.models import SecurityIdentitySnapshot
@@ -72,11 +72,54 @@ def _ticker_aliases_from_events(events_json: str | None) -> set[str]:
     return aliases
 
 
-def _escape_like(value: str) -> str:
+def _old_ticker_aliases_from_events(events_json: str | None) -> set[str]:
+    """Return aliases that explicitly represent prior ticker symbols."""
+
+    if not events_json:
+        return set()
+    try:
+        parsed = json.loads(events_json)
+    except json.JSONDecodeError:
+        return set()
+    aliases: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized_key = str(key).lower()
+                if normalized_key in {
+                    "old_ticker",
+                    "previous_ticker",
+                    "prior_ticker",
+                    "from_ticker",
+                } and isinstance(child, str) and child:
+                    aliases.add(child.upper())
+                else:
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(parsed)
+    return aliases
+
+
+def _asof_sort_value(value: Any | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def identity_snapshot_sort_key(row: SecurityIdentitySnapshot) -> tuple[bool, datetime]:
+    """Timezone-normalized PIT sort key for identity snapshot timestamps."""
+
     return (
-        value.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
+        row.asof_timestamp is not None,
+        _asof_sort_value(row.asof_timestamp),
     )
 
 
@@ -88,33 +131,42 @@ def load_security_identity_candidates_for_tickers(
 ) -> list[SecurityIdentitySnapshot]:
     """Load identity rows whose direct ticker or persisted aliases match.
 
-    The alias predicate is intentionally a bounded text search over the JSON
-    blob. It works on both PostgreSQL and SQLite, and the parsed alias scan
-    below remains the authority for whether a candidate row is actually used.
+    Alias rows are loaded with one bounded broad query and then filtered by
+    parsed event JSON in Python. This avoids constructing one leading-wildcard
+    SQL predicate per requested ticker, which can exceed SQLite's expression
+    depth and forces large non-sargable OR plans in PostgreSQL.
     """
 
     requested = sorted({str(ticker).upper() for ticker in tickers if ticker})
     if not requested:
         return []
-    alias_predicates = [
-        SecurityIdentitySnapshot.ticker_events_json.ilike(
-            f'%"{_escape_like(ticker)}"%',
-            escape="\\",
-        )
-        for ticker in requested
-    ]
+    rows_by_id: dict[str, SecurityIdentitySnapshot] = {}
+
     query = session.query(SecurityIdentitySnapshot).filter(
-        or_(
-            SecurityIdentitySnapshot.ticker.in_(requested),
-            *alias_predicates,
-        )
+        SecurityIdentitySnapshot.ticker.in_(requested),
     )
     if asof_timestamp is not None:
         query = query.filter(
             SecurityIdentitySnapshot.asof_timestamp.isnot(None),
             SecurityIdentitySnapshot.asof_timestamp <= asof_timestamp,
         )
-    return list(query.all())
+    for row in query.all():
+        rows_by_id[str(row.security_identity_snapshot_id)] = row
+
+    alias_query = session.query(SecurityIdentitySnapshot).filter(
+        SecurityIdentitySnapshot.ticker_events_json.isnot(None),
+    )
+    if asof_timestamp is not None:
+        alias_query = alias_query.filter(
+            SecurityIdentitySnapshot.asof_timestamp.isnot(None),
+            SecurityIdentitySnapshot.asof_timestamp <= asof_timestamp,
+        )
+    requested_set = set(requested)
+    for row in alias_query.all():
+        if _ticker_aliases_from_events(row.ticker_events_json).intersection(requested_set):
+            rows_by_id[str(row.security_identity_snapshot_id)] = row
+
+    return list(rows_by_id.values())
 
 
 def security_identity_snapshot_matches_ticker(
@@ -129,13 +181,22 @@ def security_identity_snapshot_matches_ticker(
     return normalized in _ticker_aliases_from_events(row.ticker_events_json)
 
 
+def security_identity_snapshot_matches_prior_ticker_alias(
+    row: SecurityIdentitySnapshot,
+    ticker: str,
+) -> bool:
+    normalized = str(ticker or "").upper()
+    return bool(normalized) and normalized in _old_ticker_aliases_from_events(
+        row.ticker_events_json
+    )
+
+
 def _canonical_ticker(rows: Iterable[SecurityIdentitySnapshot]) -> str | None:
     ordered = sorted(
         rows,
         key=lambda row: (
             row.active is True,
-            row.asof_timestamp is not None,
-            row.asof_timestamp,
+            *identity_snapshot_sort_key(row),
             str(row.identity_hash or ""),
             str(row.ticker or ""),
         ),
@@ -169,8 +230,7 @@ def resolve_security_identities_for_tickers(
         key=lambda row: (
             str(row.ticker or "").upper(),
             row.active is True,
-            row.asof_timestamp is not None,
-            row.asof_timestamp,
+            *identity_snapshot_sort_key(row),
             str(row.identity_hash or ""),
             str(row.security_identity_snapshot_id or ""),
         ),
@@ -182,13 +242,17 @@ def resolve_security_identities_for_tickers(
         groups.setdefault(key, []).append(row)
         if ticker:
             direct_identity_by_ticker.setdefault(ticker, key)
+    alias_candidates_by_ticker: dict[str, set[str]] = {}
     for row in ordered_rows:
         ticker = str(row.ticker or "").upper()
         key = _identity_key(row, ticker)
-        aliases = _ticker_aliases_from_events(row.ticker_events_json)
+        aliases = _old_ticker_aliases_from_events(row.ticker_events_json)
         for alias in aliases:
             if alias and alias in requested and alias not in direct_identity_by_ticker:
-                alias_to_identity.setdefault(alias, key)
+                alias_candidates_by_ticker.setdefault(alias, set()).add(key)
+    for alias, keys in alias_candidates_by_ticker.items():
+        if len(keys) == 1:
+            alias_to_identity[alias] = next(iter(keys))
     canonical_by_identity = {
         key: _canonical_ticker(group) or key.rsplit(":", 1)[-1]
         for key, group in groups.items()
