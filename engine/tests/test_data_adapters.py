@@ -2021,6 +2021,31 @@ class TestAlpacaAdapter:
         assert session.request.call_args.args[1].startswith("https://data.alpaca.markets")
         assert session.request.call_args.kwargs["params"] == {"feed": "iex"}
 
+    def test_get_latest_quote_preserves_zero_sizes(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.return_value = _mock_response(
+            200,
+            {
+                "quote": {
+                    "bp": 10.0,
+                    "ap": 10.05,
+                    "bs": 0,
+                    "as": 0,
+                    "bid_size": 100,
+                    "ask_size": 200,
+                    "t": "2026-06-16T13:40:00Z",
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_latest_quote("acme", feed="iex")
+
+        assert resp.ok
+        assert resp.data.bid_size == 0.0
+        assert resp.data.ask_size == 0.0
+
     def test_get_stock_snapshots_parses_intraday_snapshot(self):
         session = MagicMock(spec=requests.Session)
         session.headers = {}

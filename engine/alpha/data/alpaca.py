@@ -657,10 +657,10 @@ def _parse_alpaca_quote(symbol: str, payload: Any) -> Optional[AlpacaQuote]:
         conditions = []
     return AlpacaQuote(
         symbol=str(symbol).upper(),
-        bid_price=_optional_float(payload.get("bp") or payload.get("bid_price")),
-        ask_price=_optional_float(payload.get("ap") or payload.get("ask_price")),
-        bid_size=_optional_float(payload.get("bs") or payload.get("bid_size")),
-        ask_size=_optional_float(payload.get("as") or payload.get("ask_size")),
+        bid_price=_optional_float(_first_present(payload, "bp", "bid_price")),
+        ask_price=_optional_float(_first_present(payload, "ap", "ask_price")),
+        bid_size=_optional_float(_first_present(payload, "bs", "bid_size")),
+        ask_size=_optional_float(_first_present(payload, "as", "ask_size")),
         timestamp=payload.get("t") or payload.get("timestamp"),
         conditions=[str(value) for value in conditions],
         tape=payload.get("z") or payload.get("tape"),
@@ -747,6 +747,13 @@ def _optional_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(payload: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
 
 
 def _validate_order_request(
