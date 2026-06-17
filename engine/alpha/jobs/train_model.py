@@ -22,9 +22,11 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import joinedload
 
 from alpha.db.engine import get_session
 from alpha.db.models import (
+    FeatureSnapshot,
     ForwardReturnObservation,
     MLModelRegistry,
     SignalRegistry,
@@ -65,6 +67,7 @@ DEFAULT_MIN_CV_TRAIN_ROWS = 2
 DEFAULT_MIN_CV_TRAIN_SECURITIES = 2
 DEFAULT_EARLY_STOPPING_MIN_TRAIN_ROWS = 20
 DEFAULT_TRAINER_DB_TIMEOUT_MS = 3_600_000
+FEATURE_SNAPSHOT_PRELOAD_CHUNK_SIZE = 500
 DEFAULT_OOS_GATE = {
     "min_top_decile_lift": 1.0,
     "min_rank_ic": 0.0,
@@ -930,6 +933,12 @@ def _resolved_model_params(pattern: PatternManifest) -> dict[str, Any]:
             raw.get("early_stopping"),
             default=DEFAULT_EARLY_STOPPING,
         ),
+        "min_cv_train_rows": int(
+            raw.get("min_cv_train_rows", DEFAULT_MIN_CV_TRAIN_ROWS)
+        ),
+        "min_cv_train_securities": int(
+            raw.get("min_cv_train_securities", DEFAULT_MIN_CV_TRAIN_SECURITIES)
+        ),
     }
 
 
@@ -953,6 +962,26 @@ def _new_gbrt_model(
             default=DEFAULT_EARLY_STOPPING,
         ),
         random_state=random_state,
+    )
+
+
+def _strict_json_ready(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _strict_json_ready(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_ready(child) for child in value]
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _strict_json_dumps(payload: Any) -> str:
+    return json.dumps(
+        _strict_json_ready(payload),
+        sort_keys=True,
+        allow_nan=False,
     )
 
 
@@ -1241,6 +1270,26 @@ def _canonical_observation_rows(
     return out
 
 
+def _preload_feature_snapshots(
+    session: Session,
+    rows: list[ForwardReturnObservation],
+) -> None:
+    """Warm the session identity map for feature snapshots used by the cohort."""
+
+    snapshot_ids = sorted(
+        {
+            str(row.signal.feature_snapshot_id)
+            for row in rows
+            if row.signal is not None and row.signal.feature_snapshot_id
+        }
+    )
+    for start in range(0, len(snapshot_ids), FEATURE_SNAPSHOT_PRELOAD_CHUNK_SIZE):
+        chunk = snapshot_ids[start : start + FEATURE_SNAPSHOT_PRELOAD_CHUNK_SIZE]
+        session.query(FeatureSnapshot).filter(
+            FeatureSnapshot.feature_snapshot_id.in_(chunk)
+        ).all()
+
+
 def _load_training_examples(
     session: Session,
     *,
@@ -1264,6 +1313,7 @@ def _load_training_examples(
     statuses = [raw_statuses] if isinstance(raw_statuses, str) else list(raw_statuses)
     query = (
         session.query(ForwardReturnObservation)
+        .options(joinedload(ForwardReturnObservation.signal))
         .join(SignalRegistry, ForwardReturnObservation.signal_id == SignalRegistry.signal_id)
         .filter(ForwardReturnObservation.pattern_id == pattern.pattern_id)
         .filter(ForwardReturnObservation.status.in_(list(statuses)))
@@ -1334,6 +1384,7 @@ def _load_training_examples(
         ForwardReturnObservation.forward_return_observation_id.desc(),
     ).all()
     rows = _canonical_observation_rows(rows)
+    _preload_feature_snapshots(session, rows)
     _assert_single_observation_horizon(
         rows,
         expected_horizon=pattern.signal_horizon,
@@ -1738,6 +1789,7 @@ class Stage1TrainModelJob(BaseJob):
             random_state=self.random_state,
             model_params=model_params,
         )
+        cv_metrics["signal_horizon"] = pattern.signal_horizon
         cv_metrics["training_selection"] = selection_metrics
         cv_metrics["model_params"] = model_params
         gate_decision = _evaluate_oos_quality_gate(
@@ -1758,6 +1810,15 @@ class Stage1TrainModelJob(BaseJob):
         model_id = f"stage1_{self.pattern_id.lower()}_{schema_hash[:12]}_{uuid4().hex[:8]}"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = self.artifact_dir / f"{model_id}.pkl"
+        training_params = {
+            "max_iter": self.max_iter,
+            "random_state": self.random_state,
+            "n_splits": self.n_splits,
+            "signal_horizon": pattern.signal_horizon,
+            "horizon_sessions": horizon,
+            "sample_weight": "unique_name_cluster_by_security_identity",
+            "model_params": model_params,
+        }
         artifact_payload = {
             "model_id": model_id,
             "model_family": MODEL_FAMILY,
@@ -1768,6 +1829,7 @@ class Stage1TrainModelJob(BaseJob):
             "feature_schema_hash": schema_hash,
             "feature_names": examples[0].vector.feature_names,
             "training_feature_ranges": _feature_ranges(matrix),
+            "training_params": training_params,
             "model_params": model_params,
             "model": model,
         }
@@ -1785,25 +1847,14 @@ class Stage1TrainModelJob(BaseJob):
             manifest_sha256=self.manifest.manifest_sha256,
             feature_schema_hash=schema_hash,
             feature_code_git_sha=ctx.app_commit_sha or "unknown",
-            training_params_json=json.dumps(
-                {
-                    "max_iter": self.max_iter,
-                    "random_state": self.random_state,
-                    "n_splits": self.n_splits,
-                    "sample_weight": "unique_name_cluster_by_security_identity",
-                    "model_params": model_params,
-                },
-                sort_keys=True,
-            ),
-            cv_metrics_json=json.dumps(
+            training_params_json=_strict_json_dumps(training_params),
+            cv_metrics_json=_strict_json_dumps(
                 {
                     "per_pattern": {self.pattern_id: cv_metrics},
                     "pooled": {"diagnostic_only": True, "computed": False},
                 },
-                sort_keys=True,
-                default=str,
             ),
-            feature_schema_json=json.dumps(feature_schema, sort_keys=True),
+            feature_schema_json=_strict_json_dumps(feature_schema),
             artifact_uri=str(artifact_path),
             status=registry_status,
         )
@@ -1903,7 +1954,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         },
     )
-    print(json.dumps(result.metrics, sort_keys=True, default=str))
+    print(_strict_json_dumps(result.metrics))
     return 0 if result.ok else 1
 
 

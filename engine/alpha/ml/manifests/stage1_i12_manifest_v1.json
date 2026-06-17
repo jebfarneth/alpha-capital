@@ -1,0 +1,121 @@
+{
+    "manifest_version": "stage1_i12_research_shadow_v2",
+    "manifest_sha256": "6032ff99ce5b8d12c24f6b4b7967e170cf07d710c6b695e7e5b0fcecd46ed0e4",
+    "description": "Research-shadow Stage-1 GBRT I12 manifest for the Stage-0 read-only fill test. This pins the 9 finite training features from the i12_rebuild_20260615_codex corpus; spy_prior_day_return remains logged live as diagnostic context but is excluded because it is 100% null historically.",
+    "patterns": {
+        "I12": {
+            "signal_horizon": "1d",
+            "direction": "long",
+            "min_graded_cohorts": 80,
+            "embargo_sessions": 1,
+            "selection": {
+                "source": "forward_return_observations",
+                "statuses": [
+                    "computed"
+                ],
+                "horizon_sessions": 1,
+                "allow_deferred_pit": true
+            },
+            "label": {
+                "field": "forward_return",
+                "kind": "graded_forward_outcome",
+                "forward_path_fields_are_labels_not_predictors": true
+            },
+            "feature_schema": {
+                "schema_version": "stage1_i12_live_features_9f_v2",
+                "pattern_id": "I12",
+                "pattern_clock": "intraday",
+                "fields": [
+                    {
+                        "name": "mom20",
+                        "source": "feature_snapshot_json",
+                        "path": "mom20",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "off_low252",
+                        "source": "feature_snapshot_json",
+                        "path": "off_low252",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "sigma20",
+                        "source": "feature_snapshot_json",
+                        "path": "sigma20",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "distance_from_max252",
+                        "source": "feature_snapshot_json",
+                        "path": "distance_from_max252",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "drawdown_from_max252",
+                        "source": "feature_snapshot_json",
+                        "path": "drawdown_from_max252",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "gap",
+                        "source": "feature_snapshot_json",
+                        "path": "gap",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "prev_day_return",
+                        "source": "feature_snapshot_json",
+                        "path": "prev_day_return",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "prev_day_green",
+                        "source": "feature_snapshot_json",
+                        "path": "prev_day_green",
+                        "role": "feature",
+                        "dtype": "float"
+                    },
+                    {
+                        "name": "projected_volume_ratio_at_confirmation",
+                        "source": "feature_snapshot_json",
+                        "path": "projected_volume_ratio_at_confirmation",
+                        "role": "feature",
+                        "dtype": "float"
+                    }
+                ]
+            },
+            "oos_quality_gate": {
+                "min_top_decile_lift": 1.0,
+                "min_rank_ic": 0.0,
+                "required_metrics": [
+                    "top_decile_lift",
+                    "rank_ic"
+                ],
+                "reject_status": "rejected"
+            },
+            "model_params": {
+                "min_samples_leaf": 20,
+                "l2_regularization": 0.01,
+                "early_stopping": true,
+                "min_cv_train_rows": 20,
+                "min_cv_train_securities": 20
+            },
+            "diagnostics": {
+                "stage0_live_contract": true,
+                "pooled_metrics_primary_for_gate": true,
+                "score_orders_book": true,
+                "deferred_pit_research_shadow_only": true,
+                "excluded_diagnostic_live_fields": [
+                    "spy_prior_day_return"
+                ]
+            }
+        }
+    }
+}

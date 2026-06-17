@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import pickle
 from datetime import date, datetime, timedelta, timezone
@@ -8,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from alpha.data.alpaca import AlpacaClock, AlpacaQuote, AlpacaStockSnapshot
-from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError
+from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.db.models import (
     Base,
     FeatureSnapshot,
@@ -20,6 +21,9 @@ from alpha.db.models import (
 from alpha.jobs.i12_live_fill_test import (
     ALPACA_QUOTE_SIZE_BASIS,
     EXPECTED_I12_LIVE_FEATURES,
+    FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH,
+    FROZEN_I12_STAGE0_MANIFEST_SHA256,
+    FROZEN_I12_STAGE0_MANIFEST_VERSION,
     I12LiveFillConfig,
     I12LiveFillTestJob,
     assert_i12_live_feature_payload_leakage_clean,
@@ -1724,21 +1728,523 @@ def test_i12_stage0_iex_feed_is_diagnostic_not_promotable(db_session, monkeypatc
     assert "diagnostic_feed" in report["non_promotable_reasons"]
 
 
+def test_i12_stage0_deferred_pit_model_is_research_shadow_only(db_session):
+    model = _add_model(db_session, model_id="deferred-pit-model")
+    model.cv_metrics_json = json.dumps(
+        {
+            "per_pattern": {
+                "I12": {
+                    "horizon_sessions": 1,
+                    "signal_horizon": "1d",
+                    "training_selection": {
+                        "pit_deferred": True,
+                        "pit_failed_row_count": 10012,
+                    },
+                }
+            }
+        },
+        sort_keys=True,
+    )
+
+    contract = select_i12_model(
+        db_session,
+        model_id=model.model_id,
+        allow_latest_model=False,
+    )
+
+    assert contract.promotable_run is False
+    assert "deferred_pit_model" in contract.non_promotable_reasons
+
+
+def test_i12_stage0_missing_pit_provenance_is_non_promotable(db_session):
+    model = _add_model(db_session, model_id="missing-pit-selection")
+    model.cv_metrics_json = json.dumps(
+        {
+            "top_decile_lift": 2.0,
+            "rank_ic": 0.1,
+            "horizon_sessions": 1,
+            "signal_horizon": "1d",
+        },
+        sort_keys=True,
+    )
+
+    contract = select_i12_model(
+        db_session,
+        model_id=model.model_id,
+        allow_latest_model=False,
+    )
+
+    assert contract.promotable_run is False
+    assert "invalid_pit_provenance" in contract.non_promotable_reasons
+    assert "deferred_pit_model" not in contract.non_promotable_reasons
+
+
+@pytest.mark.parametrize(
+    ("pit_deferred", "pit_failed_row_count", "expected_reason"),
+    [
+        (False, -1, "pit_failed_row_count_negative"),
+        (False, "0", "pit_failed_row_count_not_integer"),
+        ("false", 0, "pit_deferred_not_boolean"),
+    ],
+)
+def test_i12_gate0_report_fails_closed_on_invalid_pit_provenance(
+    db_session,
+    pit_deferred,
+    pit_failed_row_count,
+    expected_reason,
+):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    model = _add_model(db_session, model_id=f"invalid-pit-{expected_reason}")
+    model.cv_metrics_json = json.dumps(
+        {
+            "top_decile_lift": 2.0,
+            "rank_ic": 0.1,
+            "horizon_sessions": 1,
+            "signal_horizon": "1d",
+            "training_selection": {
+                "pit_deferred": pit_deferred,
+                "pit_failed_row_count": pit_failed_row_count,
+            },
+        },
+        sort_keys=True,
+    )
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["invalid_pit_provenance_count"] == 1
+    assert report["invalid_pit_provenance_model_ids"] == [model.model_id]
+    assert report["invalid_pit_provenance_errors"] == {
+        model.model_id: expected_reason
+    }
+    assert report["deferred_pit_model_ids"] == []
+    assert "invalid_pit_provenance" in report["non_promotable_reasons"]
+    assert "deferred_pit_model" not in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_fails_closed_on_missing_pit_provenance(db_session):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    model = _add_model(db_session, model_id="missing-pit-gate0")
+    model.cv_metrics_json = json.dumps(
+        {
+            "top_decile_lift": 2.0,
+            "rank_ic": 0.1,
+            "horizon_sessions": 1,
+            "signal_horizon": "1d",
+        },
+        sort_keys=True,
+    )
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["invalid_pit_provenance_count"] == 1
+    assert report["invalid_pit_provenance_model_ids"] == [model.model_id]
+    assert report["invalid_pit_provenance_errors"] == {
+        model.model_id: "missing_pit_deferred"
+    }
+    assert "invalid_pit_provenance" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_surfaces_deferred_pit_model(db_session):
+    model = _add_model(db_session, model_id="deferred-pit-gate0")
+    model.cv_metrics_json = json.dumps(
+        {
+            "per_pattern": {
+                "I12": {
+                    "horizon_sessions": 1,
+                    "signal_horizon": "1d",
+                    "training_selection": {
+                        "pit_deferred": True,
+                        "pit_failed_row_count": 10012,
+                    },
+                }
+            }
+        },
+        sort_keys=True,
+    )
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    row = _add_gate0_trade_row(
+        db_session,
+        ticker="DPIT",
+        day=TRADING_DATE,
+        asof=asof,
+    )
+    row.model_id = model.model_id
+
+    report = i12_gate0_report(
+        db_session,
+        decision_date=TRADING_DATE,
+        asof=asof,
+        min_gate0_intended_count=1,
+        min_gate0_distinct_trading_days=1,
+    )
+
+    assert report["deferred_pit_model"] is True
+    assert report["deferred_pit_model_ids"] == [model.model_id]
+    assert report["invalid_pit_provenance_count"] == 0
+    assert "deferred_pit_model" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_surfaces_positive_pit_failed_count_as_deferred(
+    db_session,
+):
+    model = _add_model(db_session, model_id="positive-pit-failed-gate0")
+    model.cv_metrics_json = json.dumps(
+        {
+            "per_pattern": {
+                "I12": {
+                    "horizon_sessions": 1,
+                    "signal_horizon": "1d",
+                    "training_selection": {
+                        "pit_deferred": False,
+                        "pit_failed_row_count": 3,
+                    },
+                }
+            }
+        },
+        sort_keys=True,
+    )
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["deferred_pit_model_ids"] == [model.model_id]
+    assert report["invalid_pit_provenance_count"] == 0
+    assert "deferred_pit_model" in report["non_promotable_reasons"]
+    assert "invalid_pit_provenance" not in report["non_promotable_reasons"]
+    assert report["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "training_selection",
+    [
+        {"pit_deferred": True},
+        {"pit_failed_row_count": 3},
+        {"pit_deferred": True, "pit_failed_row_count": -1},
+    ],
+)
+def test_i12_gate0_report_explicit_deferred_evidence_wins_reason(
+    db_session,
+    training_selection,
+):
+    model = _add_model(db_session, model_id=f"explicit-deferred-{len(training_selection)}")
+    model.cv_metrics_json = json.dumps(
+        {
+            "per_pattern": {
+                "I12": {
+                    "horizon_sessions": 1,
+                    "signal_horizon": "1d",
+                    "training_selection": training_selection,
+                }
+            }
+        },
+        sort_keys=True,
+    )
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["deferred_pit_model_ids"] == [model.model_id]
+    assert report["invalid_pit_provenance_count"] == 0
+    assert "deferred_pit_model" in report["non_promotable_reasons"]
+    assert "invalid_pit_provenance" not in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_fails_closed_on_missing_intended_model_id(db_session):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    _add_gate0_promotion_sample(
+        db_session,
+        asof=asof,
+        model_id=None,
+        ensure_model_row=False,
+    )
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["intended_count"] == 20
+    assert report["intended_model_ids"] == []
+    assert report["missing_model_id_count"] == 20
+    assert "missing_model_id" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_fails_closed_on_missing_registry_model():
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    engine, session = _new_memory_session()
+    try:
+        _add_gate0_promotion_sample(
+            session,
+            asof=asof,
+            model_id="ghost-model",
+            ensure_model_row=False,
+        )
+
+        report = i12_gate0_report(session, asof=asof)
+    finally:
+        session.close()
+        engine.dispose()
+
+    assert report["intended_model_ids"] == ["ghost-model"]
+    assert report["missing_model_id_count"] == 0
+    assert report["missing_model_registry_row_count"] == 1
+    assert report["missing_model_registry_row_ids"] == ["ghost-model"]
+    assert "missing_model_registry_row" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "json_field",
+    ["training_params_json", "cv_metrics_json", "feature_schema_json"],
+)
+def test_i12_gate0_report_fails_closed_on_invalid_registry_json(
+    db_session,
+    json_field,
+):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    model = _add_model(db_session, model_id=f"bad-json-{json_field}")
+    setattr(model, json_field, "{not-json")
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["intended_model_ids"] == [model.model_id]
+    assert report["invalid_model_registry_json_count"] == 1
+    assert report["invalid_model_registry_json_model_ids"] == [model.model_id]
+    assert "invalid_model_registry_json" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_valid_non_deferred_model_passes_provenance(db_session):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    model = _add_model(db_session, model_id="clean-model")
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["intended_model_ids"] == [model.model_id]
+    assert report["missing_model_id_count"] == 0
+    assert report["missing_model_registry_row_count"] == 0
+    assert report["invalid_model_registry_json_count"] == 0
+    assert report["invalid_pit_provenance_count"] == 0
+    assert report["invalid_pit_provenance_model_ids"] == []
+    assert report["deferred_pit_model_ids"] == []
+    assert "missing_model_id" not in report["non_promotable_reasons"]
+    assert "missing_model_registry_row" not in report["non_promotable_reasons"]
+    assert "invalid_model_registry_json" not in report["non_promotable_reasons"]
+    assert "invalid_pit_provenance" not in report["non_promotable_reasons"]
+    assert "deferred_pit_model" not in report["non_promotable_reasons"]
+    assert report["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("manifest_version", "manifest_version mismatch"),
+        ("manifest_sha256", "manifest_sha256 mismatch"),
+        ("rejected", "is rejected"),
+        ("wrong_pattern", "not I12"),
+        ("schema_hash_mismatch", "frozen feature_schema_hash mismatch"),
+        ("wrong_feature_list", "frozen feature_schema_hash mismatch"),
+        ("wrong_horizon", "non-one-session horizon_sessions"),
+    ],
+)
+def test_i12_gate0_report_fails_closed_on_invalid_model_contract(
+    db_session,
+    case,
+    expected_error,
+):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    model = _add_model(db_session, model_id=f"bad-contract-{case}")
+    if case == "manifest_version":
+        model.manifest_version = "stage1_i12_manifest_v1"
+    elif case == "manifest_sha256":
+        model.manifest_sha256 = "not-the-frozen-manifest-sha"
+    elif case == "rejected":
+        model.status = "rejected"
+    elif case == "wrong_pattern":
+        model.pattern_id = "M4"
+    elif case == "schema_hash_mismatch":
+        model.feature_schema_hash = "not-the-schema-hash"
+    elif case == "wrong_feature_list":
+        schema = {
+            "pattern_id": "I12",
+            "pattern_clock": "intraday",
+            "fields": [
+                {
+                    "name": "gap",
+                    "source": "feature_snapshot_json",
+                    "path": "gap",
+                    "role": "feature",
+                    "dtype": "float",
+                }
+            ],
+        }
+        model.feature_schema_json = json.dumps(schema, sort_keys=True)
+        model.feature_schema_hash = feature_schema_hash(schema)
+    elif case == "wrong_horizon":
+        model.training_params_json = json.dumps(
+            {"horizon_sessions": 2, "signal_horizon": "1d"},
+            sort_keys=True,
+        )
+    else:  # pragma: no cover - defensive for future cases
+        raise AssertionError(case)
+    _add_gate0_promotion_sample(db_session, asof=asof, model_id=model.model_id)
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["intended_model_ids"] == [model.model_id]
+    assert report["invalid_model_registry_json_count"] == 0
+    assert report["invalid_model_contract_count"] == 1
+    assert report["invalid_model_contract_ids"] == [model.model_id]
+    assert expected_error in report["invalid_model_contract_errors"][model.model_id]
+    assert "invalid_model_contract" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
+def test_i12_gate0_report_audits_all_intended_model_ids(db_session):
+    asof = datetime(2026, 6, 19, 14, 0, tzinfo=timezone.utc)
+    clean = _add_model(db_session, model_id="clean-mixed-model")
+    deferred = _add_model(db_session, model_id="deferred-mixed-model")
+    deferred.cv_metrics_json = json.dumps(
+        {
+            "per_pattern": {
+                "I12": {
+                    "horizon_sessions": 1,
+                    "signal_horizon": "1d",
+                    "training_selection": {
+                        "pit_deferred": True,
+                        "pit_failed_row_count": 10012,
+                    },
+                }
+            }
+        },
+        sort_keys=True,
+    )
+    rows = _add_gate0_promotion_sample(db_session, asof=asof, model_id=clean.model_id)
+    for row in rows[::2]:
+        row.model_id = deferred.model_id
+
+    report = i12_gate0_report(db_session, asof=asof)
+
+    assert report["intended_model_ids"] == [clean.model_id, deferred.model_id]
+    assert report["deferred_pit_model_ids"] == [deferred.model_id]
+    assert "deferred_pit_model" in report["non_promotable_reasons"]
+    assert report["promotable"] is False
+    assert report["passed"] is False
+
+
 def test_i12_stage0_model_contract_rejects_schema_or_horizon_mismatch(db_session):
     model = _add_model(db_session)
     assert validate_i12_stage0_model_contract(model) == EXPECTED_I12_LIVE_FEATURES
+
+    bad_manifest_version = _add_model(db_session, model_id="bad-manifest-version")
+    bad_manifest_version.manifest_version = "stage1_i12_manifest_v1"
+    with pytest.raises(RuntimeError, match="manifest_version mismatch"):
+        select_i12_model(
+            db_session,
+            model_id=bad_manifest_version.model_id,
+            allow_latest_model=False,
+        )
+
+    bad_manifest_sha = _add_model(db_session, model_id="bad-manifest-sha")
+    bad_manifest_sha.manifest_sha256 = "not-the-frozen-manifest-sha"
+    with pytest.raises(RuntimeError, match="manifest_sha256 mismatch"):
+        select_i12_model(
+            db_session,
+            model_id=bad_manifest_sha.model_id,
+            allow_latest_model=False,
+        )
 
     bad_schema = _add_model(db_session, model_id="bad-schema")
     schema = {"fields": [{"name": "gap", "source": "feature_snapshot.gap"}]}
     bad_schema.feature_schema_json = json.dumps(schema, sort_keys=True)
     bad_schema.feature_schema_hash = feature_schema_hash(schema)
-    with pytest.raises(RuntimeError, match="feature list"):
+    with pytest.raises(RuntimeError, match="frozen feature_schema_hash mismatch"):
         validate_i12_stage0_model_contract(bad_schema)
 
     bad_horizon = _add_model(db_session, model_id="bad-horizon")
     bad_horizon.training_params_json = json.dumps({"horizon_sessions": 2})
-    with pytest.raises(RuntimeError, match="one-session"):
+    with pytest.raises(RuntimeError, match="non-one-session horizon_sessions"):
         validate_i12_stage0_model_contract(bad_horizon)
+
+
+@pytest.mark.parametrize("json_field", ["training_params_json", "cv_metrics_json"])
+@pytest.mark.parametrize("horizon_value", [True, False, "1", 1.0, 0, 2])
+def test_i12_stage0_model_contract_rejects_malformed_horizon_values(
+    db_session,
+    json_field,
+    horizon_value,
+):
+    model = _add_model(
+        db_session,
+        model_id=f"bad-horizon-{json_field}-{type(horizon_value).__name__}-{horizon_value}",
+    )
+    payload = json.loads(getattr(model, json_field))
+    payload["horizon_sessions"] = horizon_value
+    setattr(model, json_field, json.dumps(payload, sort_keys=True))
+
+    with pytest.raises(RuntimeError, match="non-one-session horizon_sessions"):
+        validate_i12_stage0_model_contract(model)
+
+
+def test_i12_stage0_model_contract_requires_horizon_sessions(db_session):
+    model = _add_model(db_session, model_id="missing-horizon")
+    training_params = json.loads(model.training_params_json)
+    cv_metrics = json.loads(model.cv_metrics_json)
+    training_params.pop("horizon_sessions", None)
+    cv_metrics.pop("horizon_sessions", None)
+    model.training_params_json = json.dumps(training_params, sort_keys=True)
+    model.cv_metrics_json = json.dumps(cv_metrics, sort_keys=True)
+
+    with pytest.raises(RuntimeError, match="missing horizon_sessions"):
+        validate_i12_stage0_model_contract(model)
+
+
+@pytest.mark.parametrize("json_field", ["training_params_json", "cv_metrics_json"])
+@pytest.mark.parametrize("signal_horizon", [None, 1, "2d", ""])
+def test_i12_stage0_model_contract_rejects_malformed_signal_horizon(
+    db_session,
+    json_field,
+    signal_horizon,
+):
+    model = _add_model(
+        db_session,
+        model_id=f"bad-signal-horizon-{json_field}-{signal_horizon!r}",
+    )
+    payload = json.loads(getattr(model, json_field))
+    payload["signal_horizon"] = signal_horizon
+    setattr(model, json_field, json.dumps(payload, sort_keys=True))
+
+    with pytest.raises(RuntimeError, match="invalid signal_horizon"):
+        validate_i12_stage0_model_contract(model)
+
+
+def test_i12_stage0_model_contract_requires_signal_horizon(db_session):
+    model = _add_model(db_session, model_id="missing-signal-horizon")
+    training_params = json.loads(model.training_params_json)
+    cv_metrics = json.loads(model.cv_metrics_json)
+    training_params.pop("signal_horizon", None)
+    cv_metrics.pop("signal_horizon", None)
+    model.training_params_json = json.dumps(training_params, sort_keys=True)
+    model.cv_metrics_json = json.dumps(cv_metrics, sort_keys=True)
+
+    with pytest.raises(RuntimeError, match="missing signal_horizon"):
+        validate_i12_stage0_model_contract(model)
 
 
 def test_i12_stage0_model_contract_requires_promotable_status(db_session):
@@ -1754,13 +2260,50 @@ def test_i12_stage0_model_contract_requires_promotable_status(db_session):
 
 def test_i12_stage0_artifact_preflight_validates_identity_and_scores(
     db_session,
+    monkeypatch,
     tmp_path,
 ):
     good_path = tmp_path / "good.pkl"
     model = _add_model(db_session, artifact_uri=str(good_path))
     _write_stage0_artifact(good_path, model)
 
+    _trust_test_artifact(monkeypatch, good_path)
     validate_i12_stage0_artifact_preflight(model, session=db_session)
+
+    bad_registry_manifest_path = tmp_path / "bad-registry-manifest.pkl"
+    bad_registry_manifest = _add_model(
+        db_session,
+        model_id="bad-registry-manifest",
+        artifact_uri=str(bad_registry_manifest_path),
+    )
+    bad_registry_manifest.manifest_version = "stage1_i12_manifest_v1"
+    _write_stage0_artifact(bad_registry_manifest_path, bad_registry_manifest)
+    with pytest.raises(RuntimeError, match="registry manifest_version mismatch"):
+        validate_i12_stage0_artifact_preflight(
+            bad_registry_manifest,
+            session=db_session,
+        )
+
+    bad_artifact_manifest_path = tmp_path / "bad-artifact-manifest.pkl"
+    bad_artifact_manifest = _add_model(
+        db_session,
+        model_id="bad-artifact-manifest",
+        artifact_uri=str(bad_artifact_manifest_path),
+    )
+    _write_stage0_artifact(
+        bad_artifact_manifest_path,
+        bad_artifact_manifest,
+        artifact_overrides={
+            "manifest_version": "stage1_i12_manifest_v1",
+            "manifest_sha256": "not-the-frozen-manifest-sha",
+        },
+    )
+    _trust_test_artifact(monkeypatch, bad_artifact_manifest_path)
+    with pytest.raises(RuntimeError, match="artifact identity mismatch"):
+        validate_i12_stage0_artifact_preflight(
+            bad_artifact_manifest,
+            session=db_session,
+        )
 
     mismatch_path = tmp_path / "mismatch.pkl"
     mismatch = _add_model(
@@ -1773,6 +2316,7 @@ def test_i12_stage0_artifact_preflight_validates_identity_and_scores(
         mismatch,
         model_id="different-model",
     )
+    _trust_test_artifact(monkeypatch, mismatch_path)
     with pytest.raises(RuntimeError, match="artifact identity mismatch"):
         validate_i12_stage0_artifact_preflight(mismatch, session=db_session)
 
@@ -1783,6 +2327,7 @@ def test_i12_stage0_artifact_preflight_validates_identity_and_scores(
         artifact_uri=str(unscorable_path),
     )
     _write_stage0_artifact(unscorable_path, unscorable, model=object())
+    _trust_test_artifact(monkeypatch, unscorable_path)
     with pytest.raises(RuntimeError, match="does not contain a scoring model"):
         validate_i12_stage0_artifact_preflight(unscorable, session=db_session)
 
@@ -1797,7 +2342,7 @@ def test_i12_stage0_artifact_preflight_validates_identity_and_scores(
     bad_schema.feature_schema_json = json.dumps(schema, sort_keys=True)
     bad_schema.feature_schema_hash = feature_schema_hash(schema)
     _write_stage0_artifact(bad_schema_path, bad_schema)
-    with pytest.raises(RuntimeError, match="feature source"):
+    with pytest.raises(RuntimeError, match="registry feature_schema_hash mismatch"):
         validate_i12_stage0_artifact_preflight(bad_schema, session=db_session)
 
     bad_ranges_path = tmp_path / "bad-ranges.pkl"
@@ -1807,12 +2352,83 @@ def test_i12_stage0_artifact_preflight_validates_identity_and_scores(
         artifact_uri=str(bad_ranges_path),
     )
     _write_stage0_artifact(bad_ranges_path, bad_ranges, training_feature_ranges=[])
+    _trust_test_artifact(monkeypatch, bad_ranges_path)
     with pytest.raises(RuntimeError, match="training_feature_ranges"):
         validate_i12_stage0_artifact_preflight(bad_ranges, session=db_session)
 
 
+def test_i12_stage0_artifact_preflight_rejects_tampered_artifact_sha(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    path = tmp_path / "tampered.pkl"
+    model = _add_model(db_session, model_id="tampered-artifact", artifact_uri=str(path))
+    _write_stage0_artifact(path, model)
+    _trust_test_artifact(monkeypatch, path)
+    with open(path, "ab") as f:
+        f.write(b"tampered")
+
+    with pytest.raises(RuntimeError, match="artifact SHA256 mismatch"):
+        validate_i12_stage0_artifact_preflight(model, session=db_session)
+
+
+@pytest.mark.parametrize(
+    "training_params,error",
+    [
+        ({"horizon_sessions": True, "signal_horizon": "1d"}, "horizon_sessions"),
+        ({"horizon_sessions": "1", "signal_horizon": "1d"}, "horizon_sessions"),
+        ({"horizon_sessions": 1.0, "signal_horizon": "1d"}, "horizon_sessions"),
+        ({"horizon_sessions": 1}, "signal_horizon"),
+        ({"horizon_sessions": 1, "signal_horizon": "2d"}, "signal_horizon"),
+        ("not-a-dict", "training_params must be an object"),
+    ],
+)
+def test_i12_stage0_artifact_preflight_rejects_bad_training_params(
+    db_session,
+    monkeypatch,
+    tmp_path,
+    training_params,
+    error,
+):
+    path = tmp_path / f"bad-training-params-{stable_hash(str(training_params))}.pkl"
+    model = _add_model(
+        db_session,
+        model_id=f"bad-training-params-{stable_hash(str(training_params))[:8]}",
+        artifact_uri=str(path),
+    )
+    _write_stage0_artifact(
+        path,
+        model,
+        artifact_overrides={"training_params": training_params},
+    )
+    _trust_test_artifact(monkeypatch, path)
+
+    with pytest.raises(RuntimeError, match=error):
+        validate_i12_stage0_artifact_preflight(model, session=db_session)
+
+
+def test_i12_stage0_artifact_preflight_requires_training_params(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    path = tmp_path / "missing-training-params.pkl"
+    model = _add_model(
+        db_session,
+        model_id="missing-training-params",
+        artifact_uri=str(path),
+    )
+    _write_stage0_artifact(path, model, omit_training_params=True)
+    _trust_test_artifact(monkeypatch, path)
+
+    with pytest.raises(RuntimeError, match="training_params must be an object"):
+        validate_i12_stage0_artifact_preflight(model, session=db_session)
+
+
 def test_i12_stage0_artifact_preflight_uses_in_range_smoke_vector(
     db_session,
+    monkeypatch,
     tmp_path,
 ):
     path = tmp_path / "range-smoke.pkl"
@@ -1833,6 +2449,7 @@ def test_i12_stage0_artifact_preflight_uses_in_range_smoke_vector(
         ),
     )
 
+    _trust_test_artifact(monkeypatch, path)
     validate_i12_stage0_artifact_preflight(model, session=db_session)
     assert db_session.query(FeatureSnapshot).count() == 0
     assert db_session.query(SignalRegistry).count() == 0
@@ -1847,6 +2464,7 @@ def test_i12_stage0_model_copy_smoke_scores_only_in_scratch_session(
     path = tmp_path / "scratch-smoke.pkl"
     source = _add_model(db_session, model_id="scratch-smoke", artifact_uri=str(path))
     _write_stage0_artifact(path, source)
+    _trust_test_artifact(monkeypatch, path)
     scratch_engine, scratch_session = _new_memory_session()
 
     class CanonicalSession:
@@ -1859,7 +2477,7 @@ def test_i12_stage0_model_copy_smoke_scores_only_in_scratch_session(
     monkeypatch.setattr(
         run_i12_live_fill_test,
         "_open_canonical_session",
-        lambda url: CanonicalSession(),
+        lambda url, schema=None: CanonicalSession(),
     )
 
     try:
@@ -1882,6 +2500,72 @@ def test_i12_stage0_model_copy_smoke_scores_only_in_scratch_session(
     finally:
         scratch_session.close()
         scratch_engine.dispose()
+
+
+def test_i12_stage0_model_copy_reads_explicit_source_schema(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    path = tmp_path / "source-schema-smoke.pkl"
+    source = _add_model(
+        db_session,
+        model_id="source-schema-smoke",
+        artifact_uri=str(path),
+    )
+    _write_stage0_artifact(path, source)
+    _trust_test_artifact(monkeypatch, path)
+    scratch_engine, scratch_session = _new_memory_session()
+    opened: list[str | None] = []
+
+    class SourceSession:
+        def __getattr__(self, name):
+            return getattr(db_session, name)
+
+        def close(self):
+            pass
+
+    def open_source(url, schema=None):
+        del url
+        opened.append(schema)
+        return SourceSession()
+
+    monkeypatch.setattr(
+        run_i12_live_fill_test,
+        "_open_canonical_session",
+        open_source,
+    )
+
+    try:
+        copied_model_id = ensure_model_registry_row_in_scratch(
+            database_url="postgresql://example.invalid/db",
+            scratch_session=scratch_session,
+            model_id=source.model_id,
+            allow_latest_model=False,
+            feed="sip",
+            model_registry_schema="i12_rebuild_20260615_codex",
+            scratch_schema="scratch_i12_stage0_test",
+        )
+
+        assert copied_model_id == source.model_id
+        assert opened == ["i12_rebuild_20260615_codex"]
+        assert scratch_session.get(MLModelRegistry, source.model_id) is not None
+    finally:
+        scratch_session.close()
+        scratch_engine.dispose()
+
+
+def test_i12_stage0_model_registry_source_schema_must_not_be_scratch(db_session):
+    with pytest.raises(SchemaTargetError, match="distinct"):
+        ensure_model_registry_row_in_scratch(
+            database_url="postgresql://example.invalid/db",
+            scratch_session=db_session,
+            model_id="unused",
+            allow_latest_model=False,
+            feed="sip",
+            model_registry_schema="scratch_i12_stage0_test",
+            scratch_schema="scratch_i12_stage0_test",
+        )
 
 
 def test_i12_stage0_exit_quote_missing_and_stale_are_reported(db_session, monkeypatch):
@@ -1925,6 +2609,9 @@ def test_i12_stage0_exit_quote_missing_and_stale_are_reported(db_session, monkey
 
 def test_i12_stage0_required_tables_include_scratch_model_registry():
     assert "ml_model_registry" in I12_FILL_TEST_REQUIRED_TABLES
+    assert "evidence_snapshots" in I12_FILL_TEST_REQUIRED_TABLES
+    assert "universe_scans" in I12_FILL_TEST_REQUIRED_TABLES
+    assert "universe_snapshots" in I12_FILL_TEST_REQUIRED_TABLES
 
 
 def test_i12_stage0_create_tables_preflights_empty_scratch(monkeypatch, capsys):
@@ -1972,6 +2659,9 @@ def test_i12_stage0_create_tables_preflights_empty_scratch(monkeypatch, capsys):
     assert captured["schema"] == "scratch_stage0"
     assert captured["create_tables"] is True
     assert "ml_model_registry" in captured["required_tables"]
+    assert "evidence_snapshots" in captured["required_tables"]
+    assert "universe_scans" in captured["required_tables"]
+    assert "universe_snapshots" in captured["required_tables"]
     assert json.loads(capsys.readouterr().out)["rows"] == 0
 
 
@@ -2400,9 +3090,9 @@ def _add_model(
         model_family="hist_gradient_boosting",
         training_window_start=date(2025, 1, 1),
         training_window_end=date(2026, 6, 15),
-        manifest_version="i12_test",
-        manifest_sha256="manifest-sha",
-        feature_schema_hash=feature_schema_hash(schema),
+        manifest_version=FROZEN_I12_STAGE0_MANIFEST_VERSION,
+        manifest_sha256=FROZEN_I12_STAGE0_MANIFEST_SHA256,
+        feature_schema_hash=FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH,
         training_params_json=json.dumps({
             "horizon_sessions": 1,
             "signal_horizon": "1d",
@@ -2412,6 +3102,10 @@ def _add_model(
             "rank_ic": 0.1,
             "horizon_sessions": 1,
             "signal_horizon": "1d",
+            "training_selection": {
+                "pit_deferred": False,
+                "pit_failed_row_count": 0,
+            },
         }),
         feature_schema_json=json.dumps(schema, sort_keys=True),
         artifact_uri=artifact_uri,
@@ -2428,11 +3122,15 @@ def _add_gate0_trade_row(
     ticker,
     day,
     asof,
+    model_id="i12-live-test-model",
+    ensure_model_row=True,
     config_hash="gate0-config",
     context_hash="context-hash",
 ):
+    if model_id is not None and ensure_model_row and db_session.get(MLModelRegistry, model_id) is None:
+        _add_model(db_session, model_id=model_id)
     row = I12FillLog(
-        model_id=None,
+        model_id=model_id,
         ticker=ticker,
         decision_date=day,
         decision_ts=DECISION_TS + timedelta(days=(day - TRADING_DATE).days),
@@ -2472,6 +3170,33 @@ def _add_gate0_trade_row(
     db_session.add(row)
     db_session.flush()
     return row
+
+
+def _add_gate0_promotion_sample(
+    db_session,
+    *,
+    asof,
+    model_id="i12-live-test-model",
+    ensure_model_row=True,
+):
+    days = [
+        TRADING_DATE,
+        TRADING_DATE + timedelta(days=1),
+        TRADING_DATE + timedelta(days=2),
+    ]
+    rows = []
+    for idx in range(20):
+        rows.append(
+            _add_gate0_trade_row(
+                db_session,
+                ticker=f"P{idx:03d}",
+                day=days[idx % len(days)],
+                asof=asof,
+                model_id=model_id,
+                ensure_model_row=ensure_model_row,
+            )
+        )
+    return rows
 
 
 def _spread_bps(bid, ask):
@@ -2550,6 +3275,7 @@ def _add_gate0_context_row(
 
 def _i12_feature_schema():
     return {
+        "schema_version": "stage1_i12_live_features_9f_v2",
         "pattern_id": "I12",
         "pattern_clock": "intraday",
         "fields": [
@@ -2572,6 +3298,8 @@ def _write_stage0_artifact(
     model_id=None,
     model=None,
     training_feature_ranges=None,
+    artifact_overrides=None,
+    omit_training_params=False,
 ):
     schema = json.loads(model_row.feature_schema_json)
     payload = {
@@ -2590,8 +3318,27 @@ def _write_stage0_artifact(
         ),
         "model": model or DummyPredictModel(),
     }
+    if not omit_training_params:
+        payload["training_params"] = {
+            "horizon_sessions": 1,
+            "signal_horizon": "1d",
+        }
+    if artifact_overrides:
+        payload.update(artifact_overrides)
     with open(path, "wb") as f:
         pickle.dump(payload, f)
+
+
+def _trust_test_artifact(monkeypatch, path):
+    monkeypatch.setattr(
+        run_i12_live_fill_test,
+        "FROZEN_I12_STAGE0_ARTIFACT_SHA256",
+        _artifact_sha256(path),
+    )
+
+
+def _artifact_sha256(path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _lineage(endpoint):

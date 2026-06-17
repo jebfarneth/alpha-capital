@@ -1919,6 +1919,8 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     metrics = json.loads(model.cv_metrics_json)
     assert metrics["per_pattern"]["M4"]["cv_type"] == "purged_embargoed_walk_forward"
     assert metrics["per_pattern"]["M4"]["random_kfold_forbidden"] is True
+    assert metrics["per_pattern"]["M4"]["signal_horizon"] == "2d"
+    assert metrics["per_pattern"]["M4"]["horizon_sessions"] == 2
     assert "value_ic" in metrics["per_pattern"]["M4"]
     assert "rank_ic" in metrics["per_pattern"]["M4"]
     assert "top_decile_lift" in metrics["per_pattern"]["M4"]
@@ -1949,6 +1951,9 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     assert metrics["per_pattern"]["M4"]["oos_quality_gate"]["passed"] is True
     assert metrics["per_pattern"]["M4"]["model_params"]["min_samples_leaf"] == 2
     assert metrics["pooled"]["diagnostic_only"] is True
+    training_params = json.loads(model.training_params_json)
+    assert training_params["signal_horizon"] == "2d"
+    assert training_params["horizon_sessions"] == 2
 
     train_vector = select_features(db_session, signal_ids[0], _feature_schema())
     score = score_signal_shadow(db_session, signal_id=signal_ids[0], model_id=model.model_id)
@@ -1962,6 +1967,34 @@ def test_train_model_end_to_end_writes_artifact_registry_and_shadow_score(
     assert score.score_source == "model_shadow"
     assert score.score_metadata_json is not None
     assert json.loads(score.score_metadata_json)["acts_on_book"] is False
+
+
+def test_train_model_registry_metrics_are_strict_json_when_metrics_have_nan(
+    db_session, tmp_path
+):
+    signal_ids = _seed_training_corpus(db_session, count=160)
+    manifest = load_manifest(_write_manifest(tmp_path, signal_ids))
+    job = Stage1TrainModelJob(
+        session=db_session,
+        manifest=manifest,
+        pattern_id="M4",
+        artifact_dir=tmp_path / "artifacts",
+        n_splits=2,
+        max_iter=3,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    model = db_session.query(MLModelRegistry).one()
+
+    def fail_constant(value):
+        raise AssertionError(f"non-standard JSON constant stored: {value}")
+
+    metrics = json.loads(model.cv_metrics_json, parse_constant=fail_constant)
+    assert metrics["per_pattern"]["M4"]["per_decile_mean_label"] == [
+        None for _ in range(10)
+    ]
 
 
 def test_train_model_rejected_when_pooled_oos_gate_fails(
@@ -2051,7 +2084,112 @@ def test_cv_and_final_fit_use_identical_resolved_model_params(
         "min_samples_leaf": 7,
         "l2_regularization": 0.2,
         "early_stopping": False,
+        "min_cv_train_rows": 2,
+        "min_cv_train_securities": 2,
     }
+
+
+def test_manifest_cv_minimums_are_preserved_in_registered_metrics(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    train_model_module = import_module("alpha.jobs.train_model")
+    signal_ids = _seed_training_corpus(db_session, count=80)
+    payload = _manifest_payload(
+        signal_ids,
+        model_params={
+            "min_samples_leaf": 2,
+            "l2_regularization": 0.0,
+            "early_stopping": False,
+            "min_cv_train_rows": 20,
+            "min_cv_train_securities": 20,
+        },
+    )
+    path = tmp_path / "cv-minimums.json"
+    path.write_text(json.dumps(payload, sort_keys=True))
+    manifest = load_manifest(path)
+    examples = [
+        TrainingExample(
+            signal_id=signal_id,
+            ticker=f"T{idx}",
+            security_identity=f"ticker:T{idx}",
+            signal_date=date(2025, 1, 2) + timedelta(days=idx),
+            label=float(idx % 5) / 100.0,
+            vector=SelectedFeatureVector(
+                signal_id=signal_id,
+                pattern_id="M4",
+                feature_names=["mom20", "volume_ratio", "gap", "raw_signal_strength"],
+                values=[float(idx), float(idx + 1), 0.01, float(idx + 2)],
+                feature_schema_hash="schema",
+                feature_vector_hash=f"vector-{idx}",
+                missing_statuses={},
+            ),
+        )
+        for idx, signal_id in enumerate(signal_ids)
+    ]
+
+    def fake_load_training_examples(*_args, **kwargs):
+        metrics = {
+            "kept_row_count": len(examples),
+            "dropped_non_finite": 0,
+            "pit_deferred": False,
+            "pit_failed_row_count": 0,
+            "hard_filter_drop_counts": {},
+        }
+        return (examples, metrics) if kwargs.get("return_metrics") else examples
+
+    def forced_splits(*_args, **_kwargs):
+        return [
+            PurgedEmbargoedFold(
+                train_indices=list(range(10)),
+                test_indices=list(range(10, 30)),
+                test_start_date=examples[10].signal_date,
+                test_end_date=examples[29].signal_date,
+                embargo_sessions=0,
+                horizon_sessions=0,
+            ),
+            PurgedEmbargoedFold(
+                train_indices=list(range(40)),
+                test_indices=list(range(40, 80)),
+                test_start_date=examples[40].signal_date,
+                test_end_date=examples[79].signal_date,
+                embargo_sessions=0,
+                horizon_sessions=0,
+            ),
+        ]
+
+    monkeypatch.setattr(
+        train_model_module,
+        "_load_training_examples",
+        fake_load_training_examples,
+    )
+    monkeypatch.setattr(
+        train_model_module,
+        "purged_embargoed_walk_forward_splits",
+        forced_splits,
+    )
+    job = Stage1TrainModelJob(
+        session=db_session,
+        manifest=manifest,
+        pattern_id="M4",
+        artifact_dir=tmp_path / "artifacts",
+        n_splits=2,
+        max_iter=3,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    model = db_session.query(MLModelRegistry).one()
+    metrics = json.loads(model.cv_metrics_json)["per_pattern"]["M4"]
+    params = json.loads(model.training_params_json)["model_params"]
+    assert metrics["min_cv_train_rows"] == 20
+    assert metrics["min_cv_train_securities"] == 20
+    assert metrics["dropped_nonviable_fold_count"] == 1
+    assert metrics["dropped_nonviable_folds"][0]["train_count"] == 10
+    assert params["min_cv_train_rows"] == 20
+    assert params["min_cv_train_securities"] == 20
 
 
 def test_default_model_params_raise_min_samples_leaf():

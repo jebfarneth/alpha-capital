@@ -46,6 +46,13 @@ DEFAULT_INTENDED_ORDER_USD = 250.0
 DEFAULT_MAX_SPREAD_BPS = 200.0
 ALPACA_QUOTE_SIZE_BASIS = "shares_post_2025_11_03"
 SUPPORTED_ALPACA_QUOTE_SIZE_BASES = frozenset({ALPACA_QUOTE_SIZE_BASIS})
+FROZEN_I12_STAGE0_MANIFEST_VERSION = "stage1_i12_research_shadow_v2"
+FROZEN_I12_STAGE0_MANIFEST_SHA256 = (
+    "6032ff99ce5b8d12c24f6b4b7967e170cf07d710c6b695e7e5b0fcecd46ed0e4"
+)
+FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH = (
+    "403a5ae359cddc5a4927db8bf874addb209b17fc5d82415f134357adef748ee1"
+)
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 60.0
 DEFAULT_MAX_SNAPSHOT_AGE_SECONDS = 120.0
 DEFAULT_MIN_CONTEXT_COUNT = 1
@@ -77,7 +84,6 @@ EXPECTED_I12_LIVE_FEATURES = (
     "gap",
     "prev_day_return",
     "prev_day_green",
-    "spy_prior_day_return",
     "projected_volume_ratio_at_confirmation",
 )
 LIVE_I12_ALLOWED_FEATURES = frozenset(EXPECTED_I12_LIVE_FEATURES)
@@ -892,6 +898,7 @@ def i12_gate0_report(
         for day, hashes in context_artifact_hashes_by_day.items()
         if len(hashes) > 1
     ]
+    model_provenance = _audit_intended_model_provenance(session, intended_rows)
     non_promotable_reasons = []
     if any(feed not in PROMOTION_FEEDS for feed in feeds):
         non_promotable_reasons.append("diagnostic_feed")
@@ -915,6 +922,18 @@ def i12_gate0_report(
         non_promotable_reasons.append("entry_integrity_conflict")
     if any(row.half_day is True for row in rows):
         non_promotable_reasons.append("half_day_diagnostic")
+    if model_provenance.missing_model_id_count:
+        non_promotable_reasons.append("missing_model_id")
+    if model_provenance.missing_model_registry_row_count:
+        non_promotable_reasons.append("missing_model_registry_row")
+    if model_provenance.invalid_model_registry_json_count:
+        non_promotable_reasons.append("invalid_model_registry_json")
+    if model_provenance.invalid_model_contract_count:
+        non_promotable_reasons.append("invalid_model_contract")
+    if model_provenance.invalid_pit_provenance_count:
+        non_promotable_reasons.append("invalid_pit_provenance")
+    if model_provenance.deferred_pit_model_ids:
+        non_promotable_reasons.append("deferred_pit_model")
     promotable = not non_promotable_reasons and bool(rows)
     snapshot_ok = _count(rows, "snapshot_status", "ok")
     snapshot_error_or_missing = len([
@@ -1056,6 +1075,30 @@ def i12_gate0_report(
         "stage0_run_config_hash": run_config_hashes[0] if len(run_config_hashes) == 1 else None,
         "stage0_run_config_hashes": run_config_hashes,
         "missing_stage0_run_config_count": missing_run_config_count,
+        "intended_model_ids": list(model_provenance.intended_model_ids),
+        "missing_model_id_count": model_provenance.missing_model_id_count,
+        "missing_model_registry_row_count": model_provenance.missing_model_registry_row_count,
+        "missing_model_registry_row_ids": list(
+            model_provenance.missing_model_registry_row_ids
+        ),
+        "invalid_model_registry_json_count": model_provenance.invalid_model_registry_json_count,
+        "invalid_model_registry_json_model_ids": list(
+            model_provenance.invalid_model_registry_json_model_ids
+        ),
+        "invalid_model_contract_count": model_provenance.invalid_model_contract_count,
+        "invalid_model_contract_ids": list(model_provenance.invalid_model_contract_ids),
+        "invalid_model_contract_errors": dict(
+            model_provenance.invalid_model_contract_errors
+        ),
+        "invalid_pit_provenance_count": model_provenance.invalid_pit_provenance_count,
+        "invalid_pit_provenance_model_ids": list(
+            model_provenance.invalid_pit_provenance_model_ids
+        ),
+        "invalid_pit_provenance_errors": dict(
+            model_provenance.invalid_pit_provenance_errors
+        ),
+        "deferred_pit_model": bool(model_provenance.deferred_pit_model_ids),
+        "deferred_pit_model_ids": list(model_provenance.deferred_pit_model_ids),
         "quote_size_basis": quote_size_bases[0] if len(quote_size_bases) == 1 else None,
         "quote_size_bases": quote_size_bases,
         "missing_quote_size_basis_count": missing_quote_size_basis_count,
@@ -1108,6 +1151,11 @@ def select_i12_model(
         non_promotable_reasons.append("latest_model_diagnostic")
     if feed not in PROMOTION_FEEDS:
         non_promotable_reasons.append("diagnostic_feed")
+    pit_provenance = _model_pit_provenance(model)
+    if pit_provenance.invalid:
+        non_promotable_reasons.append("invalid_pit_provenance")
+    if pit_provenance.deferred:
+        non_promotable_reasons.append("deferred_pit_model")
     return Stage0ModelContract(
         model=model,
         feature_names=feature_names,
@@ -1127,10 +1175,23 @@ def validate_i12_stage0_model_contract(model: MLModelRegistry) -> tuple[str, ...
             f"model {model.model_id!r} status {model.status!r} is not in "
             f"Stage-0 promotable allowlist {sorted(PROMOTABLE_MODEL_STATUSES)!r}"
         )
-    if not model.manifest_sha256:
-        raise RuntimeError(f"model {model.model_id!r} missing manifest_sha256")
+    if model.manifest_version != FROZEN_I12_STAGE0_MANIFEST_VERSION:
+        raise RuntimeError(
+            f"model {model.model_id!r} manifest_version mismatch: "
+            f"{model.manifest_version!r} != {FROZEN_I12_STAGE0_MANIFEST_VERSION!r}"
+        )
+    if model.manifest_sha256 != FROZEN_I12_STAGE0_MANIFEST_SHA256:
+        raise RuntimeError(
+            f"model {model.model_id!r} manifest_sha256 mismatch: "
+            f"{model.manifest_sha256!r} != {FROZEN_I12_STAGE0_MANIFEST_SHA256!r}"
+        )
     if not model.feature_schema_hash:
         raise RuntimeError(f"model {model.model_id!r} missing feature_schema_hash")
+    if model.feature_schema_hash != FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH:
+        raise RuntimeError(
+            f"model {model.model_id!r} frozen feature_schema_hash mismatch: "
+            f"{model.feature_schema_hash!r} != {FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH!r}"
+        )
     feature_schema = _loads_json_object(model.feature_schema_json, "feature_schema_json")
     actual_schema_hash = feature_schema_hash(feature_schema)
     if actual_schema_hash != model.feature_schema_hash:
@@ -1146,14 +1207,223 @@ def validate_i12_stage0_model_contract(model: MLModelRegistry) -> tuple[str, ...
         )
     training_params = _loads_json_object(model.training_params_json or "{}", "training_params_json")
     cv_metrics = _loads_json_object(model.cv_metrics_json or "{}", "cv_metrics_json")
-    if _first_recursive_value((training_params, cv_metrics), "horizon_sessions") != 1:
-        raise RuntimeError(f"model {model.model_id!r} is not a one-session horizon model")
-    signal_horizon = _first_recursive_value((training_params, cv_metrics), "signal_horizon")
-    if signal_horizon not in (None, "1d"):
-        raise RuntimeError(
-            f"model {model.model_id!r} signal_horizon is {signal_horizon!r}, not '1d'"
-        )
+    _validate_one_session_horizon_contract(model, training_params, cv_metrics)
     return feature_names
+
+
+def _validate_one_session_horizon_contract(
+    model: MLModelRegistry,
+    training_params: Mapping[str, Any],
+    cv_metrics: Mapping[str, Any],
+) -> None:
+    horizon_values = _recursive_values(
+        (training_params, cv_metrics),
+        "horizon_sessions",
+    )
+    if not horizon_values:
+        raise RuntimeError(f"model {model.model_id!r} missing horizon_sessions")
+    bad_horizon_values = [
+        value
+        for value in horizon_values
+        if isinstance(value, bool) or not isinstance(value, int) or value != 1
+    ]
+    if bad_horizon_values:
+        raise RuntimeError(
+            f"model {model.model_id!r} has non-one-session horizon_sessions "
+            f"values: {bad_horizon_values!r}"
+        )
+    signal_horizon_values = _recursive_values(
+        (training_params, cv_metrics),
+        "signal_horizon",
+    )
+    if not signal_horizon_values:
+        raise RuntimeError(f"model {model.model_id!r} missing signal_horizon")
+    bad_signal_horizon_values = [
+        value
+        for value in signal_horizon_values
+        if not isinstance(value, str) or value != "1d"
+    ]
+    if bad_signal_horizon_values:
+        raise RuntimeError(
+            f"model {model.model_id!r} has invalid signal_horizon values: "
+            f"{bad_signal_horizon_values!r}"
+        )
+
+
+@dataclass(frozen=True)
+class PitProvenance:
+    clean: bool
+    deferred: bool
+    invalid: bool
+    reason: str | None
+
+
+def _model_pit_provenance(model: MLModelRegistry | None) -> PitProvenance:
+    if model is None:
+        return PitProvenance(
+            clean=False,
+            deferred=False,
+            invalid=True,
+            reason="missing_model",
+        )
+    try:
+        cv_metrics = _loads_json_object(model.cv_metrics_json or "{}", "cv_metrics_json")
+    except RuntimeError as exc:
+        return PitProvenance(
+            clean=False,
+            deferred=False,
+            invalid=True,
+            reason=f"invalid_cv_metrics_json:{exc}",
+        )
+    return _pit_provenance_from_metrics(cv_metrics)
+
+
+def _pit_provenance_from_metrics(cv_metrics: Mapping[str, Any]) -> PitProvenance:
+    deferred_values = _recursive_values((cv_metrics,), "pit_deferred")
+    failed_values = _recursive_values((cv_metrics,), "pit_failed_row_count")
+
+    valid_deferred_values = [
+        value for value in deferred_values if isinstance(value, bool)
+    ]
+    valid_failed_values = [
+        value
+        for value in failed_values
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if any(valid_deferred_values):
+        return PitProvenance(False, True, False, "pit_deferred_true")
+    if any(value > 0 for value in valid_failed_values):
+        return PitProvenance(False, True, False, "pit_failed_row_count_positive")
+
+    if not deferred_values:
+        return PitProvenance(False, False, True, "missing_pit_deferred")
+    if len(deferred_values) > 1:
+        return PitProvenance(False, False, True, "ambiguous_pit_deferred")
+    pit_deferred = deferred_values[0]
+    if not isinstance(pit_deferred, bool):
+        return PitProvenance(False, False, True, "pit_deferred_not_boolean")
+    if not failed_values:
+        return PitProvenance(False, False, True, "missing_pit_failed_row_count")
+    if len(failed_values) > 1:
+        return PitProvenance(False, False, True, "ambiguous_pit_failed_row_count")
+    pit_failed = failed_values[0]
+    if isinstance(pit_failed, bool) or not isinstance(pit_failed, int):
+        return PitProvenance(False, False, True, "pit_failed_row_count_not_integer")
+    if pit_failed < 0:
+        return PitProvenance(False, False, True, "pit_failed_row_count_negative")
+    return PitProvenance(True, False, False, None)
+
+
+@dataclass(frozen=True)
+class Stage0ModelProvenanceAudit:
+    intended_model_ids: tuple[str, ...]
+    missing_model_id_count: int
+    missing_model_registry_row_ids: tuple[str, ...]
+    invalid_model_registry_json_model_ids: tuple[str, ...]
+    invalid_model_contract_ids: tuple[str, ...]
+    invalid_model_contract_errors: Mapping[str, str]
+    invalid_pit_provenance_model_ids: tuple[str, ...]
+    invalid_pit_provenance_errors: Mapping[str, str]
+    deferred_pit_model_ids: tuple[str, ...]
+
+    @property
+    def missing_model_registry_row_count(self) -> int:
+        return len(self.missing_model_registry_row_ids)
+
+    @property
+    def invalid_model_registry_json_count(self) -> int:
+        return len(self.invalid_model_registry_json_model_ids)
+
+    @property
+    def invalid_model_contract_count(self) -> int:
+        return len(self.invalid_model_contract_ids)
+
+    @property
+    def invalid_pit_provenance_count(self) -> int:
+        return len(self.invalid_pit_provenance_model_ids)
+
+
+def _audit_intended_model_provenance(
+    session: Session,
+    rows: Sequence[I12FillLog],
+) -> Stage0ModelProvenanceAudit:
+    missing_model_id_count = len([
+        row for row in rows if not _normalized_model_id(row.model_id)
+    ])
+    model_ids = sorted({
+        normalized
+        for row in rows
+        if (normalized := _normalized_model_id(row.model_id)) is not None
+    })
+    if not model_ids:
+        return Stage0ModelProvenanceAudit(
+            intended_model_ids=(),
+            missing_model_id_count=missing_model_id_count,
+            missing_model_registry_row_ids=(),
+            invalid_model_registry_json_model_ids=(),
+            invalid_model_contract_ids=(),
+            invalid_model_contract_errors={},
+            invalid_pit_provenance_model_ids=(),
+            invalid_pit_provenance_errors={},
+            deferred_pit_model_ids=(),
+        )
+    models = (
+        session.query(MLModelRegistry)
+        .filter(MLModelRegistry.model_id.in_(model_ids))
+        .all()
+    )
+    models_by_id = {model.model_id: model for model in models}
+    missing_registry_ids = tuple(
+        model_id for model_id in model_ids if model_id not in models_by_id
+    )
+    invalid_json_ids: list[str] = []
+    invalid_contract_errors: dict[str, str] = {}
+    invalid_pit_errors: dict[str, str] = {}
+    deferred_pit_ids: list[str] = []
+    for model_id in model_ids:
+        model = models_by_id.get(model_id)
+        if model is None:
+            continue
+        try:
+            _loads_json_object(model.training_params_json or "{}", "training_params_json")
+            cv_metrics = _loads_json_object(model.cv_metrics_json or "{}", "cv_metrics_json")
+            _loads_json_object(model.feature_schema_json or "{}", "feature_schema_json")
+        except RuntimeError:
+            invalid_json_ids.append(model_id)
+            continue
+        pit_provenance = _pit_provenance_from_metrics(cv_metrics)
+        if pit_provenance.invalid:
+            invalid_pit_errors[model_id] = pit_provenance.reason or "invalid_pit_provenance"
+        if pit_provenance.deferred:
+            deferred_pit_ids.append(model_id)
+        try:
+            validate_i12_stage0_model_contract(model)
+        except RuntimeError as exc:
+            invalid_contract_errors[model_id] = str(exc)
+    return Stage0ModelProvenanceAudit(
+        intended_model_ids=tuple(model_ids),
+        missing_model_id_count=missing_model_id_count,
+        missing_model_registry_row_ids=missing_registry_ids,
+        invalid_model_registry_json_model_ids=tuple(sorted(invalid_json_ids)),
+        invalid_model_contract_ids=tuple(sorted(invalid_contract_errors)),
+        invalid_model_contract_errors={
+            model_id: invalid_contract_errors[model_id]
+            for model_id in sorted(invalid_contract_errors)
+        },
+        invalid_pit_provenance_model_ids=tuple(sorted(invalid_pit_errors)),
+        invalid_pit_provenance_errors={
+            model_id: invalid_pit_errors[model_id]
+            for model_id in sorted(invalid_pit_errors)
+        },
+        deferred_pit_model_ids=tuple(sorted(deferred_pit_ids)),
+    )
+
+
+def _normalized_model_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def assert_live_payload_matches_model_schema(
@@ -1611,8 +1881,11 @@ def _optional_float(value: Any) -> float | None:
 
 
 def _loads_json_object(raw: str, field_name: str) -> dict[str, Any]:
+    def fail_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant {value}")
+
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, parse_constant=fail_constant)
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"model {field_name} is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
@@ -1632,33 +1905,22 @@ def _feature_names_from_schema(feature_schema: Mapping[str, Any]) -> tuple[str, 
     return tuple(names)
 
 
-def _first_recursive_value(payloads: Sequence[Any], key: str) -> Any:
+def _recursive_values(payloads: Sequence[Any], key: str) -> list[Any]:
+    values: list[Any] = []
     for payload in payloads:
-        found = _recursive_value(payload, key)
-        if found is not None:
-            if key == "horizon_sessions":
-                try:
-                    return int(found)
-                except (TypeError, ValueError):
-                    return found
-            return found
-    return None
+        _collect_recursive_values(payload, key, values)
+    return values
 
 
-def _recursive_value(payload: Any, key: str) -> Any:
+def _collect_recursive_values(payload: Any, key: str, values: list[Any]) -> None:
     if isinstance(payload, dict):
         if key in payload:
-            return payload[key]
+            values.append(payload[key])
         for value in payload.values():
-            found = _recursive_value(value, key)
-            if found is not None:
-                return found
+            _collect_recursive_values(value, key, values)
     elif isinstance(payload, list):
         for value in payload:
-            found = _recursive_value(value, key)
-            if found is not None:
-                return found
-    return None
+            _collect_recursive_values(value, key, values)
 
 
 def _json_dumps(payload: Mapping[str, Any]) -> str:

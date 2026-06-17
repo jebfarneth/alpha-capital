@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -45,6 +47,9 @@ from alpha.jobs.i12_live_fill_test import (
     DEFAULT_MIN_SNAPSHOT_OK_RATE,
     DEFAULT_TOP_K,
     EXPECTED_I12_LIVE_FEATURES,
+    FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH,
+    FROZEN_I12_STAGE0_MANIFEST_SHA256,
+    FROZEN_I12_STAGE0_MANIFEST_VERSION,
     I12LiveFillConfig,
     I12LiveFillTestJob,
     capture_i12_exit_quotes,
@@ -59,9 +64,15 @@ from alpha.runtime_env import load_runtime_env
 
 
 EASTERN = ZoneInfo("America/New_York")
+FROZEN_I12_STAGE0_ARTIFACT_SHA256 = (
+    "c8d104a664a27455c9e0e1b3677ea0c97f0030cca23e7d833a92538216362416"
+)
 I12_FILL_TEST_REQUIRED_TABLES = (
     "evidence_jobs",
     "evidence_job_runs",
+    "evidence_snapshots",
+    "universe_scans",
+    "universe_snapshots",
     "feature_snapshots",
     "signal_registry",
     "signal_ml_scores",
@@ -155,6 +166,8 @@ def _run(args: argparse.Namespace) -> int:
             model_id=args.model_id,
             allow_latest_model=args.allow_latest_model,
             feed=args.feed,
+            model_registry_schema=args.model_registry_schema,
+            scratch_schema=schema,
         )
         config = I12LiveFillConfig(
             model_id=args.model_id,
@@ -219,6 +232,7 @@ def _run(args: argparse.Namespace) -> int:
                     "min_exit_quote_ok_rate": args.min_exit_quote_ok_rate,
                     "context_artifact_hash": context_artifact_hash,
                     "feed": args.feed,
+                    "model_registry_schema": args.model_registry_schema,
                     "read_only": True,
                     "schema": schema,
                 },
@@ -270,9 +284,15 @@ def ensure_model_registry_row_in_scratch(
     model_id: str | None,
     allow_latest_model: bool,
     feed: str,
+    model_registry_schema: str | None = None,
+    scratch_schema: str | None = None,
 ) -> str:
     url = database_url or os.environ.get("DATABASE_URL", "sqlite:///alpha_capital.db")
-    canonical = _open_canonical_session(url)
+    source_schema = _validate_model_registry_source_schema(
+        model_registry_schema,
+        scratch_schema=scratch_schema,
+    )
+    canonical = _open_canonical_session(url, schema=source_schema)
     try:
         contract = select_i12_model(
             canonical,
@@ -305,6 +325,18 @@ def validate_i12_stage0_artifact_preflight(
     *,
     session: Any | None = None,
 ) -> None:
+    if model.manifest_version != FROZEN_I12_STAGE0_MANIFEST_VERSION:
+        raise RuntimeError("I12 Stage-0 model registry manifest_version mismatch")
+    if model.manifest_sha256 != FROZEN_I12_STAGE0_MANIFEST_SHA256:
+        raise RuntimeError("I12 Stage-0 model registry manifest_sha256 mismatch")
+    if model.feature_schema_hash != FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH:
+        raise RuntimeError("I12 Stage-0 model registry feature_schema_hash mismatch")
+    artifact_sha256 = _artifact_file_sha256(model.artifact_uri)
+    if artifact_sha256 != FROZEN_I12_STAGE0_ARTIFACT_SHA256:
+        raise RuntimeError(
+            "I12 Stage-0 model artifact SHA256 mismatch: "
+            f"{artifact_sha256} != {FROZEN_I12_STAGE0_ARTIFACT_SHA256}"
+        )
     artifact = _load_artifact(model.artifact_uri)
     mismatches = _artifact_identity_mismatch(artifact, model)
     if mismatches:
@@ -321,6 +353,15 @@ def validate_i12_stage0_artifact_preflight(
     feature_schema = artifact.get("feature_schema")
     if not isinstance(feature_schema, dict):
         raise RuntimeError("I12 Stage-0 model artifact missing feature_schema object")
+    if artifact.get("manifest_version") != FROZEN_I12_STAGE0_MANIFEST_VERSION:
+        raise RuntimeError("I12 Stage-0 model artifact manifest_version mismatch")
+    if artifact.get("manifest_sha256") != FROZEN_I12_STAGE0_MANIFEST_SHA256:
+        raise RuntimeError("I12 Stage-0 model artifact manifest_sha256 mismatch")
+    if artifact.get("feature_schema_hash") != FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH:
+        raise RuntimeError("I12 Stage-0 model artifact feature_schema_hash mismatch")
+    _validate_artifact_training_params_horizon_contract(
+        artifact.get("training_params"),
+    )
     audit_feature_schema_no_leakage(feature_schema)
     if feature_schema_hash(feature_schema) != model.feature_schema_hash:
         raise RuntimeError("I12 Stage-0 model artifact feature_schema_hash mismatch")
@@ -336,6 +377,37 @@ def validate_i12_stage0_artifact_preflight(
     if session is None:
         return
     _score_stage0_artifact_smoke(session, model, feature_names, ranges)
+
+
+def _artifact_file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_artifact_training_params_horizon_contract(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            "I12 Stage-0 model artifact training_params must be an object"
+        )
+    horizon_sessions = value.get("horizon_sessions")
+    if (
+        isinstance(horizon_sessions, bool)
+        or not isinstance(horizon_sessions, int)
+        or horizon_sessions != 1
+    ):
+        raise RuntimeError(
+            "I12 Stage-0 model artifact training_params horizon_sessions "
+            f"must be exact int 1, got {horizon_sessions!r}"
+        )
+    signal_horizon = value.get("signal_horizon")
+    if not isinstance(signal_horizon, str) or signal_horizon != "1d":
+        raise RuntimeError(
+            "I12 Stage-0 model artifact training_params signal_horizon "
+            f"must be exact '1d', got {signal_horizon!r}"
+        )
 
 
 def _score_stage0_artifact_smoke(
@@ -474,12 +546,32 @@ def _finite_optional_bound(value: Any, feature_name: str, bound_name: str) -> fl
     return float(value)
 
 
-def _open_canonical_session(url: str) -> Any:
+_MODEL_REGISTRY_SCHEMA_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _validate_model_registry_source_schema(
+    schema: str | None,
+    *,
+    scratch_schema: str | None,
+) -> str | None:
+    if not schema:
+        return None
+    normalized = schema.strip()
+    if not _MODEL_REGISTRY_SCHEMA_RE.fullmatch(normalized):
+        raise SchemaTargetError(f"Invalid model registry schema name: {schema!r}")
+    if scratch_schema and normalized == scratch_schema.strip():
+        raise SchemaTargetError(
+            "--model-registry-schema must be distinct from the Stage-0 scratch schema"
+        )
+    return normalized
+
+
+def _open_canonical_session(url: str, schema: str | None = None) -> Any:
     engine = create_engine(
         url,
         echo=False,
         pool_pre_ping=True,
-        **schema_connect_args(url, None),
+        **schema_connect_args(url, schema),
     )
     Session = sessionmaker(bind=engine)
     session = Session()
@@ -553,6 +645,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--context-artifact")
     parser.add_argument("--trading-date")
     parser.add_argument("--model-id")
+    parser.add_argument(
+        "--model-registry-schema",
+        help=(
+            "Explicit source schema for ml_model_registry; the selected row is "
+            "read from there and copied into the Stage-0 scratch schema."
+        ),
+    )
     parser.add_argument("--allow-latest-model", action="store_true")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--intended-order-usd", type=float, default=DEFAULT_INTENDED_ORDER_USD)
