@@ -83,6 +83,10 @@ class PremarketContext:
     avg20_volume: float
     mom20: Optional[float] = None
     off_low252: Optional[float] = None
+    sigma20: Optional[float] = None
+    prev_day_return: Optional[float] = None
+    prev_day_green: Optional[bool] = None
+    spy_prior_day_return: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -93,6 +97,10 @@ class PremarketContext:
             "avg20_volume": self.avg20_volume,
             "mom20": self.mom20,
             "off_low252": self.off_low252,
+            "sigma20": self.sigma20,
+            "prev_day_return": self.prev_day_return,
+            "prev_day_green": self.prev_day_green,
+            "spy_prior_day_return": self.spy_prior_day_return,
         }
 
     @classmethod
@@ -105,6 +113,14 @@ class PremarketContext:
             avg20_volume=float(payload["avg20_volume"]),
             mom20=_optional_float(payload.get("mom20")),
             off_low252=_optional_float(payload.get("off_low252")),
+            sigma20=_optional_float(payload.get("sigma20")),
+            prev_day_return=_optional_float(payload.get("prev_day_return")),
+            prev_day_green=(
+                bool(payload["prev_day_green"])
+                if payload.get("prev_day_green") is not None
+                else None
+            ),
+            spy_prior_day_return=_optional_float(payload.get("spy_prior_day_return")),
         )
 
 
@@ -1031,6 +1047,24 @@ class PremarketContextBuilder:
             context = _context_from_daily_rows(ticker, context_date, rows)
             if context is not None:
                 contexts[ticker] = context
+        spy_return = contexts.get("SPY").prev_day_return if contexts.get("SPY") else None
+        if spy_return is not None:
+            contexts = {
+                ticker: PremarketContext(
+                    ticker=context.ticker,
+                    context_date=context.context_date,
+                    prior_close=context.prior_close,
+                    max_prior_252_closes=context.max_prior_252_closes,
+                    avg20_volume=context.avg20_volume,
+                    mom20=context.mom20,
+                    off_low252=context.off_low252,
+                    sigma20=context.sigma20,
+                    prev_day_return=context.prev_day_return,
+                    prev_day_green=context.prev_day_green,
+                    spy_prior_day_return=spy_return,
+                )
+                for ticker, context in contexts.items()
+            }
         save_premarket_context_artifact(output_path, context_date, contexts)
         return contexts
 
@@ -1125,6 +1159,15 @@ def _context_from_daily_rows(
     mom20 = (prior_close / closes[-21] - 1.0) if len(closes) >= 21 and closes[-21] > 0 else None
     low252 = min(lows[-252:]) if lows[-252:] else None
     off_low252 = (prior_close / low252 - 1.0) if low252 and low252 > 0 else None
+    returns = [
+        closes[idx] / closes[idx - 1] - 1.0
+        for idx in range(1, len(closes))
+        if closes[idx - 1] > 0
+    ]
+    trailing_returns = returns[-20:]
+    sigma20 = _stddev(trailing_returns) if len(trailing_returns) >= 2 else None
+    prev_day_return = returns[-1] if returns else None
+    prev_day_green = prev_day_return is not None and prev_day_return > 0
     if max_prior <= 0 or avg20_volume <= 0:
         return None
     return PremarketContext(
@@ -1135,6 +1178,9 @@ def _context_from_daily_rows(
         avg20_volume=avg20_volume,
         mom20=mom20,
         off_low252=off_low252,
+        sigma20=sigma20,
+        prev_day_return=prev_day_return,
+        prev_day_green=prev_day_green,
     )
 
 
@@ -1250,6 +1296,15 @@ def _optional_float(value: Any) -> Optional[float]:
     if not math.isfinite(parsed):
         return None
     return parsed
+
+
+def _stddev(values: Sequence[float]) -> Optional[float]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if len(finite) < 2:
+        return None
+    mean = sum(finite) / len(finite)
+    variance = sum((value - mean) ** 2 for value in finite) / (len(finite) - 1)
+    return math.sqrt(variance)
 
 
 def _aware_utc(value: datetime) -> datetime:

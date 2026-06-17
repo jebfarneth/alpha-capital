@@ -56,6 +56,7 @@ class AlpacaConfig:
     api_key: str
     secret_key: str
     base_url: str  # paper or live
+    market_data_base_url: str = "https://data.alpaca.markets"
 
     @classmethod
     def from_env(cls) -> AlpacaConfig:
@@ -66,6 +67,10 @@ class AlpacaConfig:
             secret_key=_require("ALPACA_SECRET_KEY"),
             base_url=_optional(
                 "ALPACA_BASE_URL", "https://paper-api.alpaca.markets"
+            ),
+            market_data_base_url=_optional(
+                "ALPACA_MARKET_DATA_BASE_URL",
+                cls.market_data_base_url,
             ),
         )
 

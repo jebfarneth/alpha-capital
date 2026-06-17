@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import requests
 
@@ -119,6 +119,43 @@ class AlpacaClock:
     next_close: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class AlpacaQuote:
+    """Normalized latest stock quote from Alpaca market data."""
+
+    symbol: str
+    bid_price: Optional[float] = None
+    ask_price: Optional[float] = None
+    bid_size: Optional[float] = None
+    ask_size: Optional[float] = None
+    timestamp: Optional[str] = None
+    conditions: List[str] = field(default_factory=list)
+    tape: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AlpacaStockSnapshot:
+    """Normalized stock snapshot used by read-only live detectors."""
+
+    symbol: str
+    daily_open: Optional[float] = None
+    daily_high: Optional[float] = None
+    daily_low: Optional[float] = None
+    daily_close: Optional[float] = None
+    daily_volume: Optional[float] = None
+    minute_open: Optional[float] = None
+    minute_high: Optional[float] = None
+    minute_low: Optional[float] = None
+    minute_close: Optional[float] = None
+    minute_volume: Optional[float] = None
+    minute_timestamp: Optional[str] = None
+    latest_trade_price: Optional[float] = None
+    latest_trade_timestamp: Optional[str] = None
+    latest_quote: Optional[AlpacaQuote] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
 # --- Adapter ---
 
 class AlpacaAdapter:
@@ -143,8 +180,9 @@ class AlpacaAdapter:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
         asof: Optional[datetime] = None,
+        base_url: Optional[str] = None,
     ) -> AdapterResponse[Any]:
-        url = f"{self._config.base_url}{endpoint}"
+        url = f"{base_url or self._config.base_url}{endpoint}"
         request_ts = utcnow()
         if asof is None:
             asof_ts = request_ts
@@ -511,8 +549,154 @@ class AlpacaAdapter:
         )
         return AdapterResponse(data=clock, lineage=resp.lineage, rate_limit=resp.rate_limit)
 
+    # --- Market data (read-only) ---
+
+    def get_latest_quote(
+        self,
+        symbol: str,
+        *,
+        feed: str = "iex",
+    ) -> AdapterResponse[Optional[AlpacaQuote]]:
+        """Fetch one latest stock quote from Alpaca market data."""
+
+        normalized = symbol.upper().strip()
+        resp = self._request(
+            "GET",
+            f"/v2/stocks/{normalized}/quotes/latest",
+            params={"feed": feed},
+            base_url=self._config.market_data_base_url,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        quote = _parse_alpaca_quote(normalized, (resp.data or {}).get("quote"))
+        return AdapterResponse(
+            data=quote,
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
+    def get_latest_quotes(
+        self,
+        symbols: Sequence[str],
+        *,
+        feed: str = "iex",
+    ) -> AdapterResponse[Dict[str, AlpacaQuote]]:
+        """Fetch latest stock quotes for a bounded symbol batch."""
+
+        normalized = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        if not normalized:
+            return _validation_error_response(
+                "/v2/stocks/quotes/latest",
+                {},
+                "symbols are required",
+            )  # type: ignore[return-value]
+        resp = self._request(
+            "GET",
+            "/v2/stocks/quotes/latest",
+            params={"symbols": ",".join(normalized), "feed": feed},
+            base_url=self._config.market_data_base_url,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        raw_quotes = (resp.data or {}).get("quotes") or {}
+        quotes = {
+            symbol.upper(): quote
+            for symbol, payload in raw_quotes.items()
+            if (quote := _parse_alpaca_quote(symbol, payload)) is not None
+        }
+        return AdapterResponse(
+            data=quotes,
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
+    def get_stock_snapshots(
+        self,
+        symbols: Sequence[str],
+        *,
+        feed: str = "iex",
+    ) -> AdapterResponse[Dict[str, AlpacaStockSnapshot]]:
+        """Fetch read-only stock snapshots for detector inputs."""
+
+        normalized = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        if not normalized:
+            return _validation_error_response(
+                "/v2/stocks/snapshots",
+                {},
+                "symbols are required",
+            )  # type: ignore[return-value]
+        resp = self._request(
+            "GET",
+            "/v2/stocks/snapshots",
+            params={"symbols": ",".join(normalized), "feed": feed},
+            base_url=self._config.market_data_base_url,
+        )
+        if not resp.ok:
+            return resp  # type: ignore[return-value]
+        snapshots = {
+            symbol.upper(): snapshot
+            for symbol, payload in (resp.data or {}).items()
+            if (snapshot := _parse_stock_snapshot(symbol, payload)) is not None
+        }
+        return AdapterResponse(
+            data=snapshots,
+            lineage=resp.lineage,
+            rate_limit=resp.rate_limit,
+        )
+
 
 # --- helpers ---
+
+def _parse_alpaca_quote(symbol: str, payload: Any) -> Optional[AlpacaQuote]:
+    if not isinstance(payload, dict):
+        return None
+    conditions = payload.get("c") or payload.get("conditions") or []
+    if isinstance(conditions, str):
+        conditions = [conditions]
+    if not isinstance(conditions, list):
+        conditions = []
+    return AlpacaQuote(
+        symbol=str(symbol).upper(),
+        bid_price=_optional_float(payload.get("bp") or payload.get("bid_price")),
+        ask_price=_optional_float(payload.get("ap") or payload.get("ask_price")),
+        bid_size=_optional_float(payload.get("bs") or payload.get("bid_size")),
+        ask_size=_optional_float(payload.get("as") or payload.get("ask_size")),
+        timestamp=payload.get("t") or payload.get("timestamp"),
+        conditions=[str(value) for value in conditions],
+        tape=payload.get("z") or payload.get("tape"),
+        raw=payload,
+    )
+
+
+def _parse_stock_snapshot(symbol: str, payload: Any) -> Optional[AlpacaStockSnapshot]:
+    if not isinstance(payload, dict):
+        return None
+    daily = payload.get("dailyBar") or payload.get("daily_bar") or {}
+    minute = payload.get("minuteBar") or payload.get("minute_bar") or {}
+    trade = payload.get("latestTrade") or payload.get("latest_trade") or {}
+    quote = _parse_alpaca_quote(
+        symbol,
+        payload.get("latestQuote") or payload.get("latest_quote"),
+    )
+    return AlpacaStockSnapshot(
+        symbol=str(symbol).upper(),
+        daily_open=_optional_float(daily.get("o")),
+        daily_high=_optional_float(daily.get("h")),
+        daily_low=_optional_float(daily.get("l")),
+        daily_close=_optional_float(daily.get("c")),
+        daily_volume=_optional_float(daily.get("v")),
+        minute_open=_optional_float(minute.get("o")),
+        minute_high=_optional_float(minute.get("h")),
+        minute_low=_optional_float(minute.get("l")),
+        minute_close=_optional_float(minute.get("c")),
+        minute_volume=_optional_float(minute.get("v")),
+        minute_timestamp=minute.get("t"),
+        latest_trade_price=_optional_float(trade.get("p") or trade.get("price")),
+        latest_trade_timestamp=trade.get("t") or trade.get("timestamp"),
+        latest_quote=quote,
+        raw=payload,
+    )
+
 
 def _parse_order(r: dict) -> AlpacaOrder:
     return AlpacaOrder(
@@ -554,6 +738,15 @@ def _parse_position(r: dict) -> AlpacaPosition:
         lastday_price=r.get("lastday_price"),
         change_today=r.get("change_today"),
     )
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _validate_order_request(

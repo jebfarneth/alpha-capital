@@ -1993,6 +1993,78 @@ class TestAlpacaAdapter:
         assert resp.data.status == "filled"
         assert resp.data.filled_avg_price == "5.25"
 
+    def test_get_latest_quote_uses_market_data_base_url(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.return_value = _mock_response(
+            200,
+            {
+                "quote": {
+                    "bp": 10.0,
+                    "ap": 10.05,
+                    "bs": 100,
+                    "as": 200,
+                    "t": "2026-06-16T13:40:00Z",
+                    "c": ["R"],
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_latest_quote("acme", feed="iex")
+
+        assert resp.ok
+        assert resp.data.symbol == "ACME"
+        assert resp.data.bid_price == 10.0
+        assert resp.data.ask_size == 200.0
+        session.request.assert_called_once()
+        assert session.request.call_args.args[1].startswith("https://data.alpaca.markets")
+        assert session.request.call_args.kwargs["params"] == {"feed": "iex"}
+
+    def test_get_stock_snapshots_parses_intraday_snapshot(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.return_value = _mock_response(
+            200,
+            {
+                "ACME": {
+                    "dailyBar": {"o": 10.1, "h": 10.2, "l": 9.9, "c": 10.0, "v": 13000},
+                    "minuteBar": {
+                        "o": 10.08,
+                        "h": 10.12,
+                        "l": 10.01,
+                        "c": 10.08,
+                        "v": 2000,
+                        "t": "2026-06-16T13:40:00Z",
+                    },
+                    "latestTrade": {"p": 10.08, "t": "2026-06-16T13:40:00Z"},
+                    "latestQuote": {
+                        "bp": 10.0,
+                        "ap": 10.05,
+                        "bs": 100,
+                        "as": 200,
+                        "t": "2026-06-16T13:40:00Z",
+                    },
+                }
+            },
+        )
+        adapter = self._adapter(session)
+
+        resp = adapter.get_stock_snapshots(["ACME"], feed="iex")
+
+        assert resp.ok
+        snapshot = resp.data["ACME"]
+        assert snapshot.daily_open == 10.1
+        assert snapshot.daily_volume == 13000.0
+        assert snapshot.minute_timestamp == "2026-06-16T13:40:00Z"
+        assert snapshot.latest_quote.ask_price == 10.05
+        session.request.assert_called_once()
+        assert session.request.call_args.args[1].startswith("https://data.alpaca.markets")
+        assert session.request.call_args.kwargs["params"] == {
+            "symbols": "ACME",
+            "feed": "iex",
+        }
+
     def test_cancel_order_ok(self):
         session = MagicMock(spec=requests.Session)
         session.headers = {}

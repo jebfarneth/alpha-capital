@@ -2393,6 +2393,77 @@ class PaperExecutionEvent(Base):
 
 
 # ---------------------------------------------------------------------------
+# i12_fill_log (scratch-only Stage-0 read-only fill test)
+# ---------------------------------------------------------------------------
+class I12FillLog(Base):
+    """Read-only I12 intended-trade quote and liquidity telemetry.
+
+    This table is intentionally owned by scratch-schema Stage-0 runs. It logs
+    names the live recipe intended to trade, including liquidity skips as cash,
+    without placing broker orders.
+    """
+
+    __tablename__ = "i12_fill_log"
+    __table_args__ = (
+        UniqueConstraint(
+            "content_hash",
+            name="ux_i12_fill_log_content_hash",
+        ),
+        Index(
+            "ix_i12_fill_log_decision_date",
+            "decision_date",
+            "skipped_reason",
+        ),
+        Index(
+            "ix_i12_fill_log_signal",
+            "signal_id",
+        ),
+        Index(
+            "ix_i12_fill_log_ticker_decision",
+            "ticker",
+            "decision_ts",
+        ),
+    )
+
+    i12_fill_log_id = Column(String, primary_key=True, default=_uuid)
+    signal_id = Column(String, ForeignKey("signal_registry.signal_id"), nullable=True)
+    score_id = Column(String, ForeignKey("signal_ml_scores.score_id"), nullable=True)
+    model_id = Column(String, ForeignKey("ml_model_registry.model_id"), nullable=True)
+    ticker = Column(String, nullable=False)
+    decision_date = Column(Date, nullable=False)
+    decision_ts = Column(DateTime(timezone=True), nullable=False)
+    exit_capture_due_ts = Column(DateTime(timezone=True), nullable=True)
+    ml_score = Column(Float, nullable=True)
+    score_source = Column(String, nullable=True)
+    score_status = Column(String, nullable=True)
+    fallback_reason = Column(String, nullable=True)
+    projected_vol_ratio = Column(Float, nullable=True)
+    gap = Column(Float, nullable=True)
+    off_52w_high = Column(Float, nullable=True)
+    bid = Column(Float, nullable=True)
+    ask = Column(Float, nullable=True)
+    spread_bps = Column(Float, nullable=True)
+    top_of_book_size = Column(Float, nullable=True)
+    intended_order_usd = Column(Float, nullable=False)
+    size_sufficient = Column(Boolean, nullable=True)
+    halted = Column(Boolean, nullable=True)
+    skipped_reason = Column(String, nullable=False, default="none")
+    exit_bid = Column(Float, nullable=True)
+    exit_ask = Column(Float, nullable=True)
+    exit_quote_ts = Column(DateTime(timezone=True), nullable=True)
+    modeled_return = Column(Float, nullable=True)
+    feature_json = Column(Text, nullable=False)
+    gate_values_json = Column(Text, nullable=False)
+    quote_json = Column(Text, nullable=True)
+    exit_quote_json = Column(Text, nullable=True)
+    content_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
 # intraday_event_details
 # ---------------------------------------------------------------------------
 class IntradayEventDetail(Base):
