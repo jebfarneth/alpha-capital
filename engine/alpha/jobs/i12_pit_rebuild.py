@@ -70,6 +70,12 @@ NEXT_OPEN_EXIT_OFFSET_MINUTES = 1
 MIN_PRIOR_DAILY_SESSIONS = 20
 REQUIRED_QUOTE_ROLES = ("entry", "same_day_exit", "next_open_exit")
 EXIT_ROLES = ("same_day_exit", "next_open_exit")
+STRICT_MINUTE_PATH_MODE = "strict_contiguous"
+SPARSE_ZERO_FILL_MINUTE_PATH_MODE = "sparse_zero_fill"
+MINUTE_PATH_MODES = (
+    STRICT_MINUTE_PATH_MODE,
+    SPARSE_ZERO_FILL_MINUTE_PATH_MODE,
+)
 LEAKY_FEATURE_TOKENS = (
     "full_day",
     "same_day_close",
@@ -92,6 +98,7 @@ class PitCandidateResult:
     decision_date: date
     decision_ts: datetime
     decision_time_label: str
+    path_mode: str
     candidate_status: str
     coverage_status: str
     fail_reason: str | None
@@ -190,6 +197,7 @@ class I12PitRebuildJob(BaseJob):
         max_quote_age_seconds: float = DEFAULT_MAX_QUOTE_AGE_SECONDS,
         slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
         feed: str = "sip",
+        minute_path_mode: str = STRICT_MINUTE_PATH_MODE,
         skip_existing: bool = True,
         replace_existing: bool = False,
         quote_replay: bool = True,
@@ -204,12 +212,13 @@ class I12PitRebuildJob(BaseJob):
         self._alpaca = alpaca_adapter
         self._start_date = start_date
         self._end_date = end_date
-        self._decision_times = tuple(decision_times)
+        self._decision_times = _normalize_decision_time_labels(decision_times)
         self._intended_order_usd = float(intended_order_usd)
         self._max_spread_bps = float(max_spread_bps)
         self._max_quote_age_seconds = float(max_quote_age_seconds)
         self._slippage_bps = float(slippage_bps)
         self._feed = feed
+        self._minute_path_mode = _validate_minute_path_mode(minute_path_mode)
         self._skip_existing = skip_existing
         self._replace_existing = replace_existing
         self._quote_replay = quote_replay
@@ -274,6 +283,7 @@ class I12PitRebuildJob(BaseJob):
                             minute_error=None,
                             source_hur_identity_hash=hur_row.source_hur_identity_hash,
                             source_hur=hur_row.source_hur_payload,
+                            path_mode=self._minute_path_mode,
                         )
                         self._persist_candidate(result, ctx.job_run_id)
                         counters[f"candidate_{result.candidate_status}"] += 1
@@ -305,6 +315,7 @@ class I12PitRebuildJob(BaseJob):
                             minute_error=minute_error,
                             source_hur_identity_hash=hur_row.source_hur_identity_hash,
                             source_hur=hur_row.source_hur_payload,
+                            path_mode=self._minute_path_mode,
                         )
                         self._persist_candidate(result, ctx.job_run_id)
                         counters[f"candidate_{result.candidate_status}"] += 1
@@ -322,11 +333,15 @@ class I12PitRebuildJob(BaseJob):
                         daily_bars=daily_bars,
                         minute_bars=minute_bars,
                         daily_source_hash=getattr(daily_resp.lineage, "raw_payload_hash", None),
-                        minute_source_hash=getattr(minute_resp.lineage, "raw_payload_hash", None)
-                        if minute_resp.ok else None,
+                        minute_source_hash=(
+                            getattr(minute_resp.lineage, "raw_payload_hash", None)
+                            if minute_resp.ok
+                            else None
+                        ),
                         minute_error=None if minute_resp.ok else _provider_error_payload(minute_resp),
                         source_hur_identity_hash=hur_row.source_hur_identity_hash,
                         source_hur=hur_row.source_hur_payload,
+                        path_mode=self._minute_path_mode,
                     )
                     candidate = self._persist_candidate(result, ctx.job_run_id)
                     counters[f"candidate_{result.candidate_status}"] += 1
@@ -351,8 +366,10 @@ class I12PitRebuildJob(BaseJob):
             source_hur_schema=self._source_hur_schema,
             hur_rows_loaded=hur_rows_loaded,
             decision_time_count=len(self._decision_times),
+            decision_time_labels=self._decision_times,
             start_date=self._start_date,
             end_date=self._end_date,
+            path_mode=self._minute_path_mode,
         )
         metrics = {"counters": dict(counters), **report}
         self.partial_metrics = metrics
@@ -454,6 +471,7 @@ class I12PitRebuildJob(BaseJob):
             decision_date=result.decision_date,
             decision_ts=result.decision_ts,
             decision_time_label=result.decision_time_label,
+            path_mode=result.path_mode,
             feature_asof_ts=result.feature_asof_ts,
             candidate_status=result.candidate_status,
             coverage_status=result.coverage_status,
@@ -830,23 +848,170 @@ class I12PitRebuildJob(BaseJob):
         event: str,
         trading_date: date | None = None,
     ) -> None:
+        progress_start_date = self._start_date
+        progress_end_date = trading_date if trading_date is not None else self._end_date
+        if progress_end_date is not None and self._end_date is not None:
+            progress_end_date = min(progress_end_date, self._end_date)
+        active_candidate_query = self._session.query(I12PitCandidate).filter(
+            I12PitCandidate.is_active.is_(True),
+            I12PitCandidate.path_mode == self._minute_path_mode,
+        )
+        historical_candidate_query = self._session.query(I12PitCandidate).filter(
+            I12PitCandidate.path_mode == self._minute_path_mode,
+        )
+        if self._start_date is not None:
+            active_candidate_query = active_candidate_query.filter(
+                I12PitCandidate.decision_date >= self._start_date
+            )
+            historical_candidate_query = historical_candidate_query.filter(
+                I12PitCandidate.decision_date >= self._start_date
+            )
+        if progress_end_date is not None:
+            active_candidate_query = active_candidate_query.filter(
+                I12PitCandidate.decision_date <= progress_end_date
+            )
+            historical_candidate_query = historical_candidate_query.filter(
+                I12PitCandidate.decision_date <= progress_end_date
+            )
+        active_candidate_query = active_candidate_query.filter(
+            I12PitCandidate.decision_time_label.in_(self._decision_times)
+        )
+        historical_candidate_query = historical_candidate_query.filter(
+            I12PitCandidate.decision_time_label.in_(self._decision_times)
+        )
+        active_candidates = active_candidate_query.all()
+        historical_candidates = historical_candidate_query.all()
+        active_candidate_ids = [row.i12_pit_candidate_id for row in active_candidates]
+        historical_candidate_ids = [
+            row.i12_pit_candidate_id for row in historical_candidates
+        ]
+        quote_replay_row_count = (
+            self._session.query(I12PitQuoteReplay)
+            .filter(
+                I12PitQuoteReplay.is_active.is_(True),
+                I12PitQuoteReplay.i12_pit_candidate_id.in_(active_candidate_ids),
+            )
+            .count()
+            if active_candidate_ids else 0
+        )
+        historical_quote_replay_row_count = (
+            self._session.query(I12PitQuoteReplay)
+            .filter(I12PitQuoteReplay.i12_pit_candidate_id.in_(historical_candidate_ids))
+            .count()
+            if historical_candidate_ids else 0
+        )
+        cost_replay_row_count = (
+            self._session.query(I12PitCostReplay)
+            .filter(
+                I12PitCostReplay.is_active.is_(True),
+                I12PitCostReplay.i12_pit_candidate_id.in_(active_candidate_ids),
+            )
+            .count()
+            if active_candidate_ids else 0
+        )
+        historical_cost_replay_row_count = (
+            self._session.query(I12PitCostReplay)
+            .filter(I12PitCostReplay.i12_pit_candidate_id.in_(historical_candidate_ids))
+            .count()
+            if historical_candidate_ids else 0
+        )
+        expected_candidate_attempts = hur_rows_loaded * len(self._decision_times)
+        missing_source_attempt_count = max(expected_candidate_attempts - len(active_candidate_ids), 0)
+        extra_source_attempt_count = max(len(active_candidate_ids) - expected_candidate_attempts, 0)
+        source_attempt_count_exact = (
+            missing_source_attempt_count == 0 and extra_source_attempt_count == 0
+        )
+        identity_audit = _source_attempt_identity_audit(
+            self._session,
+            source_hur_schema=self._source_hur_schema,
+            start_date=progress_start_date,
+            end_date=progress_end_date,
+            decision_time_labels=self._decision_times,
+            path_modes=(self._minute_path_mode,),
+            candidates=active_candidates,
+        )
+        path_identity_audit = identity_audit["path_mode_identity_audits"].get(
+            self._minute_path_mode,
+            _empty_source_identity_audit(known=False),
+        )
+        source_attempt_identity_exact = (
+            bool(path_identity_audit.get("source_identity_denominator_known"))
+            and not path_identity_audit.get("source_identity_denominator_error")
+            and path_identity_audit.get("missing_source_attempt_identity_count") == 0
+            and path_identity_audit.get("extra_source_attempt_identity_count") == 0
+        )
         self.partial_metrics = {
             "source_hur_schema": self._source_hur_schema,
             "hur_rows_loaded": hur_rows_loaded,
+            "progress_source_start_date": (
+                progress_start_date.isoformat() if progress_start_date else None
+            ),
+            "progress_source_end_date": (
+                progress_end_date.isoformat() if progress_end_date else None
+            ),
+            "progress_source_scope": (
+                "processed_through_trading_date"
+                if trading_date is not None
+                else "configured_full_window"
+            ),
             "decision_time_count": len(self._decision_times),
-            "expected_candidate_attempts": hur_rows_loaded * len(self._decision_times),
-            "candidate_row_count": self._session.query(I12PitCandidate)
+            "minute_path_mode": self._minute_path_mode,
+            "expected_candidate_attempts": expected_candidate_attempts,
+            "candidate_row_count": len(active_candidate_ids),
+            "active_candidate_row_count_for_path_mode": len(active_candidate_ids),
+            "missing_source_attempt_count_for_path_mode": missing_source_attempt_count,
+            "extra_source_attempt_count_for_path_mode": extra_source_attempt_count,
+            "source_attempt_count_exact_for_path_mode": source_attempt_count_exact,
+            "source_identity_denominator_known_for_path_mode": path_identity_audit.get(
+                "source_identity_denominator_known",
+                False,
+            ),
+            "source_identity_denominator_error_for_path_mode": path_identity_audit.get(
+                "source_identity_denominator_error",
+            ),
+            "missing_source_attempt_identity_count_for_path_mode": (
+                path_identity_audit.get("missing_source_attempt_identity_count")
+            ),
+            "extra_source_attempt_identity_count_for_path_mode": (
+                path_identity_audit.get("extra_source_attempt_identity_count")
+            ),
+            "source_attempt_identity_exact_for_path_mode": source_attempt_identity_exact,
+            "historical_candidate_row_count": len(historical_candidate_ids),
+            "historical_candidate_row_count_for_path_mode": len(historical_candidate_ids),
+            "quote_replay_row_count": quote_replay_row_count,
+            "quote_replay_row_count_for_path_mode": quote_replay_row_count,
+            "historical_quote_replay_row_count": historical_quote_replay_row_count,
+            "historical_quote_replay_row_count_for_path_mode": (
+                historical_quote_replay_row_count
+            ),
+            "cost_replay_row_count": cost_replay_row_count,
+            "cost_replay_row_count_for_path_mode": cost_replay_row_count,
+            "historical_cost_replay_row_count": historical_cost_replay_row_count,
+            "historical_cost_replay_row_count_for_path_mode": (
+                historical_cost_replay_row_count
+            ),
+            "schema_total_active_candidate_row_count": self._session.query(I12PitCandidate)
             .filter(I12PitCandidate.is_active.is_(True))
             .count(),
-            "historical_candidate_row_count": self._session.query(I12PitCandidate).count(),
-            "quote_replay_row_count": self._session.query(I12PitQuoteReplay)
+            "schema_total_historical_candidate_row_count": self._session.query(
+                I12PitCandidate
+            ).count(),
+            "schema_total_active_quote_replay_row_count": self._session.query(
+                I12PitQuoteReplay
+            )
             .filter(I12PitQuoteReplay.is_active.is_(True))
             .count(),
-            "historical_quote_replay_row_count": self._session.query(I12PitQuoteReplay).count(),
-            "cost_replay_row_count": self._session.query(I12PitCostReplay)
+            "schema_total_historical_quote_replay_row_count": self._session.query(
+                I12PitQuoteReplay
+            ).count(),
+            "schema_total_active_cost_replay_row_count": self._session.query(
+                I12PitCostReplay
+            )
             .filter(I12PitCostReplay.is_active.is_(True))
             .count(),
-            "historical_cost_replay_row_count": self._session.query(I12PitCostReplay).count(),
+            "schema_total_historical_cost_replay_row_count": self._session.query(
+                I12PitCostReplay
+            ).count(),
             "daily_fetch_error_count": counters.get("coverage_daily_fetch_error", 0),
             "minute_fetch_error_count": counters.get("coverage_minute_fetch_error", 0),
             "counters": dict(counters),
@@ -882,8 +1047,10 @@ def build_i12_pit_candidate(
     minute_error: dict[str, Any] | None = None,
     source_hur_identity_hash: str | None = None,
     source_hur: Mapping[str, Any] | None = None,
+    path_mode: str = STRICT_MINUTE_PATH_MODE,
 ) -> PitCandidateResult:
     ticker = ticker.upper()
+    path_mode = _validate_minute_path_mode(path_mode)
     try:
         prior_ctx = _prior_context(ticker, trading_date, daily_bars)
     except RuntimeError as exc:
@@ -899,6 +1066,7 @@ def build_i12_pit_candidate(
             minute_error=minute_error,
             source_hur_identity_hash=source_hur_identity_hash,
             source_hur=source_hur,
+            path_mode=path_mode,
         )
     eligible_minutes = sorted(
         (
@@ -909,6 +1077,13 @@ def build_i12_pit_candidate(
         key=lambda bar: bar.timestamp,
     )
     if not eligible_minutes:
+        path_diagnostics = _minute_path_diagnostics(
+            trading_date=trading_date,
+            decision_ts=decision_ts,
+            minute_bars=eligible_minutes,
+            prior_ctx=prior_ctx,
+            path_mode=path_mode,
+        )
         return _candidate_error(
             ticker=ticker,
             trading_date=trading_date,
@@ -922,9 +1097,21 @@ def build_i12_pit_candidate(
             prior_ctx=prior_ctx,
             source_hur_identity_hash=source_hur_identity_hash,
             source_hur=source_hur,
+            path_mode=path_mode,
+            path_diagnostics=path_diagnostics,
         )
     duplicate_minute_starts = _duplicate_minute_start_timestamps(eligible_minutes)
     if duplicate_minute_starts:
+        path_diagnostics = _minute_path_diagnostics(
+            trading_date=trading_date,
+            decision_ts=decision_ts,
+            minute_bars=eligible_minutes,
+            prior_ctx=prior_ctx,
+            path_mode=path_mode,
+        )
+        path_diagnostics["duplicate_minute_timestamps"] = [
+            ts.isoformat() for ts in duplicate_minute_starts
+        ]
         return _candidate_error(
             ticker=ticker,
             trading_date=trading_date,
@@ -938,13 +1125,22 @@ def build_i12_pit_candidate(
             prior_ctx=prior_ctx,
             source_hur_identity_hash=source_hur_identity_hash,
             source_hur=source_hur,
+            path_mode=path_mode,
+            path_diagnostics=path_diagnostics,
         )
+    path_diagnostics = _minute_path_diagnostics(
+        trading_date=trading_date,
+        decision_ts=decision_ts,
+        minute_bars=eligible_minutes,
+        prior_ctx=prior_ctx,
+        path_mode=path_mode,
+    )
     minute_path_error = _minute_path_coverage_error(
         trading_date=trading_date,
         decision_ts=decision_ts,
         minute_bars=eligible_minutes,
     )
-    if minute_path_error is not None:
+    if minute_path_error is not None and path_mode == STRICT_MINUTE_PATH_MODE:
         coverage_status, fail_reason = minute_path_error
         return _candidate_error(
             ticker=ticker,
@@ -959,10 +1155,41 @@ def build_i12_pit_candidate(
             prior_ctx=prior_ctx,
             source_hur_identity_hash=source_hur_identity_hash,
             source_hur=source_hur,
+            path_mode=path_mode,
+            path_diagnostics=path_diagnostics,
         )
+    if path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE:
+        if minute_path_error is not None and minute_path_error[0] != "partial_minute_path":
+            coverage_status, fail_reason = minute_path_error
+            return _candidate_error(
+                ticker=ticker,
+                trading_date=trading_date,
+                decision_ts=decision_ts,
+                decision_time_label=decision_time_label,
+                coverage_status=coverage_status,
+                fail_reason=fail_reason,
+                daily_source_hash=daily_source_hash,
+                minute_source_hash=minute_source_hash,
+                minute_error=minute_error,
+                prior_ctx=prior_ctx,
+                source_hur_identity_hash=source_hur_identity_hash,
+                source_hur=source_hur,
+                path_mode=path_mode,
+                path_diagnostics=path_diagnostics,
+            )
+        eligible_minutes, imputation_diagnostics = _sparse_zero_fill_minutes(
+            trading_date=trading_date,
+            decision_ts=decision_ts,
+            minute_bars=eligible_minutes,
+        )
+        path_diagnostics.update(imputation_diagnostics)
 
     last_minute = eligible_minutes[-1]
-    source_minute_bars_max_start_ts = _minute_floor_utc(last_minute.timestamp)
+    computed_source_minute_bars_max_start_ts = _minute_floor_utc(last_minute.timestamp)
+    source_minute_bars_max_start_ts = (
+        _parse_optional_datetime(path_diagnostics.get("source_minute_bars_max_start_ts"))
+        or computed_source_minute_bars_max_start_ts
+    )
     completed_through_ts = _minute_floor_utc(_aware_utc(decision_ts))
     day_open = eligible_minutes[0].open
     session_minutes = _session_minutes(trading_date)
@@ -1000,6 +1227,7 @@ def build_i12_pit_candidate(
     feature_json = {
         "feature_manifest_version": FEATURE_MANIFEST_VERSION,
         "reconstruction_method": REBUILD_METHOD,
+        "path_mode": path_mode,
         "pattern_id": I12_PATTERN_ID,
         "ticker": ticker,
         "decision_date": trading_date.isoformat(),
@@ -1026,6 +1254,37 @@ def build_i12_pit_candidate(
         "decision_elapsed_minutes": completed_minutes,
         "completed_minute_count": completed_minutes,
         "session_minutes": session_minutes,
+        "expected_minute_count_before_decision": (
+            path_diagnostics["expected_minute_count_before_decision"]
+        ),
+        "observed_minute_count_before_decision": (
+            path_diagnostics["observed_minute_count_before_decision"]
+        ),
+        "missing_minute_count_before_decision": (
+            path_diagnostics["missing_minute_count_before_decision"]
+        ),
+        "path_coverage_ratio": path_diagnostics["path_coverage_ratio"],
+        "opening_bar_present": path_diagnostics["opening_bar_present"],
+        "last_observed_before_decision_age_seconds": (
+            path_diagnostics["last_observed_before_decision_age_seconds"]
+        ),
+        "observed_cumulative_volume_before_decision": (
+            path_diagnostics["observed_cumulative_volume_before_decision"]
+        ),
+        "observed_open_to_decision_return": (
+            path_diagnostics["observed_open_to_decision_return"]
+        ),
+        "zero_fill_projected_volume_ratio": (
+            path_diagnostics["zero_fill_projected_volume_ratio"]
+        ),
+        "zero_fill_imputed_minute_count": path_diagnostics.get(
+            "zero_fill_imputed_minute_count",
+            0,
+        ),
+        "zero_fill_imputed_minute_ratio": path_diagnostics.get(
+            "zero_fill_imputed_minute_ratio",
+            0.0,
+        ),
     }
     leakage_guard = {
         "decision_ts": decision_ts.isoformat(),
@@ -1040,7 +1299,13 @@ def build_i12_pit_candidate(
         "decision_time_semantics": (
             "decision_after_prior_completed_minute_start_stamped_bars"
         ),
+        "path_mode": path_mode,
         "predictor_time_basis": "prior_daily_bars_plus_minutes_lt_decision_ts",
+        "minute_imputation_policy": (
+            "zero_volume_forward_fill_prices_from_prior_observed_minute"
+            if path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE
+            else "none_strict_contiguous_required"
+        ),
     }
     assert_i12_pit_feature_payload_leakage_clean(feature_json, leakage_guard)
     gate_values = {
@@ -1050,6 +1315,7 @@ def build_i12_pit_candidate(
         "decision_elapsed_minutes": completed_minutes,
         "completed_minute_count": completed_minutes,
         "session_minutes": session_minutes,
+        "path_mode": path_mode,
         "candidate_passed": candidate_passed,
         "fail_reasons": fail_reasons,
     }
@@ -1066,6 +1332,8 @@ def build_i12_pit_candidate(
         "source_hur": dict(source_hur or {}),
         "prior_daily_sessions": prior_ctx["prior_count"],
         "minute_bar_count_before_decision": len(eligible_minutes),
+        "path_mode": path_mode,
+        "path_diagnostics": path_diagnostics,
         "completed_minute_count": completed_minutes,
         "expected_minute_bar_count_before_decision": _expected_minute_count_before_decision(
             trading_date,
@@ -1083,6 +1351,7 @@ def build_i12_pit_candidate(
         "daily_source_hash": daily_source_hash,
         "minute_source_hash": minute_source_hash,
         "source_bars": source_bars,
+        "path_mode": path_mode,
         "reconstruction_method": REBUILD_METHOD,
     })
     candidate_attempt_hash = _candidate_attempt_hash(
@@ -1091,6 +1360,7 @@ def build_i12_pit_candidate(
         decision_ts=decision_ts,
         decision_time_label=decision_time_label,
         source_hur_identity_hash=source_hur_identity_hash,
+        path_mode=path_mode,
     )
     candidate_identity_hash = stable_hash({
         "input_hash": input_hash,
@@ -1104,6 +1374,7 @@ def build_i12_pit_candidate(
         decision_date=trading_date,
         decision_ts=decision_ts,
         decision_time_label=decision_time_label,
+        path_mode=path_mode,
         candidate_status="passed" if candidate_passed else "failed",
         coverage_status="ok",
         fail_reason=",".join(fail_reasons) if fail_reasons else None,
@@ -1293,10 +1564,24 @@ def i12_pit_rebuild_report(
     source_hur_schema: str | None = None,
     hur_rows_loaded: int | None = None,
     decision_time_count: int | None = None,
+    decision_time_labels: Sequence[str] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     job_run_id: str | None = None,
+    path_mode: str | None = STRICT_MINUTE_PATH_MODE,
+    compare_path_modes: bool = False,
 ) -> dict[str, Any]:
+    if compare_path_modes:
+        report_path_mode = None
+        requested_path_modes = tuple(MINUTE_PATH_MODES)
+    else:
+        report_path_mode = _validate_minute_path_mode(path_mode or STRICT_MINUTE_PATH_MODE)
+        requested_path_modes = (report_path_mode,)
+    report_decision_time_labels = (
+        _normalize_decision_time_labels(decision_time_labels)
+        if decision_time_labels is not None
+        else None
+    )
     base_candidate_query = session.query(I12PitCandidate)
     candidate_query = base_candidate_query.filter(I12PitCandidate.is_active.is_(True))
     if start_date is not None:
@@ -1308,8 +1593,30 @@ def i12_pit_rebuild_report(
     if job_run_id is not None:
         candidate_query = candidate_query.filter(I12PitCandidate.job_run_id == job_run_id)
         base_candidate_query = base_candidate_query.filter(I12PitCandidate.job_run_id == job_run_id)
+    unfiltered_scoped_candidates = base_candidate_query.all()
+    available_path_modes = sorted({row.path_mode for row in unfiltered_scoped_candidates})
+    mixed_path_modes_present = len(available_path_modes) > 1
+    available_decision_time_labels = sorted(
+        {row.decision_time_label for row in unfiltered_scoped_candidates}
+    )
+    mixed_decision_times_present = len(available_decision_time_labels) > 1
+    if report_path_mode is not None:
+        candidate_query = candidate_query.filter(I12PitCandidate.path_mode == report_path_mode)
+        base_candidate_query = base_candidate_query.filter(
+            I12PitCandidate.path_mode == report_path_mode
+        )
+    if report_decision_time_labels is not None:
+        candidate_query = candidate_query.filter(
+            I12PitCandidate.decision_time_label.in_(report_decision_time_labels)
+        )
+        base_candidate_query = base_candidate_query.filter(
+            I12PitCandidate.decision_time_label.in_(report_decision_time_labels)
+        )
     candidates = candidate_query.all()
     scoped_candidates = base_candidate_query.all()
+    available_decision_time_labels_for_report_scope = sorted(
+        {row.decision_time_label for row in scoped_candidates}
+    )
     historical_candidate_row_count = len(scoped_candidates)
     candidate_ids = [row.i12_pit_candidate_id for row in candidates]
     scoped_candidate_ids = [row.i12_pit_candidate_id for row in scoped_candidates]
@@ -1354,14 +1661,20 @@ def i12_pit_rebuild_report(
         active_quote_rows_with_inactive_candidate_count > 0
         or active_cost_rows_with_inactive_candidate_count > 0
     )
+    source_identity_denominator_error: str | None = None
     if hur_rows_loaded is None and start_date is not None and end_date is not None:
-        hur_rows_loaded = _count_hur_rows(
-            session,
-            source_hur_schema or "public",
-            start_date=start_date,
-            end_date=end_date,
-        )
-    if decision_time_count is None:
+        try:
+            hur_rows_loaded = _count_hur_rows(
+                session,
+                source_hur_schema or "public",
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as exc:
+            source_identity_denominator_error = f"{type(exc).__name__}: {exc}"
+    if report_decision_time_labels is not None:
+        decision_time_count = len(report_decision_time_labels)
+    elif decision_time_count is None:
         decision_time_count = (
             len({row.decision_time_label for row in candidates})
             if candidates else None
@@ -1439,13 +1752,37 @@ def i12_pit_rebuild_report(
     else:
         quote_replay_status = "complete" if quote_complete else "incomplete"
         cost_replay_status = "complete" if cost_complete else "incomplete"
-    expected_candidate_attempts = (
+    expected_candidate_attempts_per_path_mode = (
         hur_rows_loaded * decision_time_count
         if hur_rows_loaded is not None and decision_time_count is not None
         else None
     )
+    expected_candidate_attempts = (
+        expected_candidate_attempts_per_path_mode * len(requested_path_modes)
+        if expected_candidate_attempts_per_path_mode is not None
+        else None
+    )
+    identity_audit = _source_attempt_identity_audit(
+        session,
+        source_hur_schema=source_hur_schema or "public",
+        start_date=start_date,
+        end_date=end_date,
+        decision_time_labels=report_decision_time_labels,
+        path_modes=requested_path_modes,
+        candidates=candidates,
+    )
+    if source_identity_denominator_error is not None:
+        identity_audit = _source_identity_error_audit(
+            source_identity_denominator_error,
+            requested_path_modes,
+        )
     missing_source_attempt_count = (
         max(expected_candidate_attempts - len(candidates), 0)
+        if expected_candidate_attempts is not None
+        else None
+    )
+    extra_source_attempt_count = (
+        max(len(candidates) - expected_candidate_attempts, 0)
         if expected_candidate_attempts is not None
         else None
     )
@@ -1453,10 +1790,47 @@ def i12_pit_rebuild_report(
     minute_fetch_error_count = candidate_coverage_counts.get("minute_fetch_error", 0)
     source_provider_error_count = daily_fetch_error_count + minute_fetch_error_count
     source_denominator_known = expected_candidate_attempts is not None
-    source_attempts_complete = (
+    identity_denominator_error = identity_audit.get("source_identity_denominator_error")
+    aggregate_source_attempts_complete = (
         source_denominator_known
         and missing_source_attempt_count == 0
+        and extra_source_attempt_count == 0
+        and identity_audit["source_identity_denominator_known"]
+        and identity_audit["missing_source_attempt_identity_count"] == 0
+        and identity_audit["extra_source_attempt_identity_count"] == 0
         and source_provider_error_count == 0
+    )
+    path_mode_metrics = _path_mode_report_metrics(
+        candidates,
+        quotes,
+        costs,
+        requested_path_modes=requested_path_modes,
+        expected_candidate_attempts=expected_candidate_attempts_per_path_mode,
+        identity_audits_by_mode=identity_audit["path_mode_identity_audits"],
+        source_denominator_known=source_denominator_known,
+        zero_hur_source_blocked=hur_rows_loaded == 0 if hur_rows_loaded is not None else False,
+        child_evidence_parent_inactive=child_evidence_parent_inactive,
+        compare_path_modes=compare_path_modes,
+    )
+    strict_partial_rows_that_would_pass_sparse_zero_fill = (
+        _strict_partial_rows_that_would_pass_sparse_zero_fill(candidates)
+    )
+    comparison_conclusions_final = (
+        all(
+            path_mode_metrics.get(mode, {}).get("conclusions_final") is True
+            for mode in requested_path_modes
+        )
+        if compare_path_modes else None
+    )
+    path_mode_source_attempts_complete = (
+        all(
+            _path_mode_source_attempts_complete(path_mode_metrics.get(mode, {}))
+            for mode in requested_path_modes
+        )
+        if compare_path_modes else True
+    )
+    source_attempts_complete = (
+        aggregate_source_attempts_complete and path_mode_source_attempts_complete
     )
     zero_hur_source_blocked = hur_rows_loaded == 0 if hur_rows_loaded is not None else False
     data_integrity_passed = (
@@ -1466,15 +1840,32 @@ def i12_pit_rebuild_report(
         and cost_complete
         and not child_evidence_parent_inactive
         and not zero_hur_source_blocked
+        and (comparison_conclusions_final is not False)
     )
-    if not source_denominator_known:
+    if identity_denominator_error:
+        training_status = "blocked_source_identity_denominator_error"
+    elif not source_denominator_known:
         training_status = "blocked_source_denominator_unknown"
     elif child_evidence_parent_inactive:
         training_status = "blocked_child_evidence_parent_inactive"
     elif zero_hur_source_blocked:
         training_status = "blocked_zero_hur_source"
+    elif source_denominator_known and not identity_audit["source_identity_denominator_known"]:
+        training_status = "blocked_source_identity_denominator_unknown"
     elif missing_source_attempt_count not in {None, 0}:
         training_status = "blocked_source_replay_incomplete"
+    elif extra_source_attempt_count not in {None, 0}:
+        training_status = "blocked_source_replay_extra_active_attempts"
+    elif (
+        identity_audit["source_identity_denominator_known"]
+        and (
+            identity_audit["missing_source_attempt_identity_count"] > 0
+            or identity_audit["extra_source_attempt_identity_count"] > 0
+        )
+    ):
+        training_status = "blocked_source_identity_mismatch"
+    elif compare_path_modes and not path_mode_source_attempts_complete:
+        training_status = "blocked_path_mode_comparison_incomplete"
     elif source_provider_error_count > 0:
         training_status = "blocked_source_provider_errors"
     elif zero_pit_candidates:
@@ -1485,7 +1876,25 @@ def i12_pit_rebuild_report(
         training_status = "blocked_cost_replay_incomplete"
     else:
         training_status = "eligible_for_retrain_evaluation"
+    if (
+        compare_path_modes
+        and training_status == "eligible_for_retrain_evaluation"
+        and comparison_conclusions_final is not True
+    ):
+        training_status = "blocked_path_mode_comparison_incomplete"
     return {
+        "report_path_mode": report_path_mode,
+        "compare_path_modes": compare_path_modes,
+        "comparison_path_modes": list(requested_path_modes) if compare_path_modes else [],
+        "available_path_modes": available_path_modes,
+        "mixed_path_modes_present": mixed_path_modes_present,
+        "report_decision_time_labels": list(report_decision_time_labels or []),
+        "available_decision_time_labels": available_decision_time_labels,
+        "available_decision_time_labels_for_report_scope": (
+            available_decision_time_labels_for_report_scope
+        ),
+        "mixed_decision_times_present": mixed_decision_times_present,
+        "comparison_conclusions_final": comparison_conclusions_final,
         "source_hur_schema": source_hur_schema,
         "hur_rows_loaded": hur_rows_loaded,
         "zero_hur_source_blocked": zero_hur_source_blocked,
@@ -1496,6 +1905,29 @@ def i12_pit_rebuild_report(
         "active_candidate_row_count": len(candidates),
         "historical_candidate_row_count": historical_candidate_row_count,
         "missing_source_attempt_count": missing_source_attempt_count,
+        "extra_source_attempt_count": extra_source_attempt_count,
+        "source_identity_denominator_known": identity_audit[
+            "source_identity_denominator_known"
+        ],
+        "source_identity_denominator_error": identity_denominator_error,
+        "expected_source_attempt_identity_count": identity_audit[
+            "expected_source_attempt_identity_count"
+        ],
+        "actual_source_attempt_identity_count": identity_audit[
+            "actual_source_attempt_identity_count"
+        ],
+        "missing_source_attempt_identity_count": identity_audit[
+            "missing_source_attempt_identity_count"
+        ],
+        "extra_source_attempt_identity_count": identity_audit[
+            "extra_source_attempt_identity_count"
+        ],
+        "missing_source_attempt_identities_sample": identity_audit[
+            "missing_source_attempt_identities_sample"
+        ],
+        "extra_source_attempt_identities_sample": identity_audit[
+            "extra_source_attempt_identities_sample"
+        ],
         "daily_fetch_error_count": daily_fetch_error_count,
         "minute_fetch_error_count": minute_fetch_error_count,
         "source_provider_error_count": source_provider_error_count,
@@ -1504,6 +1936,17 @@ def i12_pit_rebuild_report(
         "pit_candidate_count": len(passed),
         "candidate_status_counts": dict(Counter(row.candidate_status for row in candidates)),
         "candidate_coverage_status_counts": dict(candidate_coverage_counts),
+        "candidate_counts_by_path_mode": dict(Counter(row.path_mode for row in candidates)),
+        "coverage_status_by_path_mode": _coverage_status_by_path_mode(candidates),
+        "passed_candidates_by_path_mode": dict(Counter(row.path_mode for row in passed)),
+        "passed_candidates_by_path_mode_decision_time": (
+            _passed_candidates_by_path_mode_decision_time(passed)
+        ),
+        "strict_partial_rows_that_would_pass_sparse_zero_fill": (
+            strict_partial_rows_that_would_pass_sparse_zero_fill
+        ),
+        "sparse_imputation_distributions": _sparse_imputation_distributions(candidates),
+        "path_mode_metrics": path_mode_metrics,
         "quote_replay_row_count": len(quotes),
         "historical_quote_replay_row_count": len(all_quotes),
         "active_quote_rows_with_inactive_candidate_count": (
@@ -1545,6 +1988,7 @@ def i12_pit_rebuild_report(
                 or training_status == "blocked_zero_hur_source"
                 or training_status == "blocked_child_evidence_parent_inactive"
                 or training_status == "blocked_zero_pit_candidates"
+                or training_status == "blocked_path_mode_comparison_incomplete"
                 else "blocked_until_quote_replay_complete"
             )
         ),
@@ -1732,6 +2176,475 @@ def _decision_time_buckets(
     return buckets
 
 
+def _coverage_status_by_path_mode(
+    candidates: Sequence[I12PitCandidate],
+) -> dict[str, dict[str, int]]:
+    out: dict[str, Counter[str]] = defaultdict(Counter)
+    for candidate in candidates:
+        out[candidate.path_mode][candidate.coverage_status] += 1
+    return {mode: dict(counter) for mode, counter in sorted(out.items())}
+
+
+def _passed_candidates_by_path_mode_decision_time(
+    passed: Sequence[I12PitCandidate],
+) -> dict[str, dict[str, int]]:
+    out: dict[str, Counter[str]] = defaultdict(Counter)
+    for candidate in passed:
+        out[candidate.path_mode][candidate.decision_time_label] += 1
+    return {mode: dict(counter) for mode, counter in sorted(out.items())}
+
+
+def _source_attempt_identity_audit(
+    session: Session,
+    *,
+    source_hur_schema: str,
+    start_date: date | None,
+    end_date: date | None,
+    decision_time_labels: Sequence[str] | None,
+    path_modes: Sequence[str],
+    candidates: Sequence[I12PitCandidate],
+) -> dict[str, Any]:
+    known = (
+        bool(source_hur_schema)
+        and start_date is not None
+        and end_date is not None
+        and bool(decision_time_labels)
+        and bool(path_modes)
+    )
+    empty = _empty_source_identity_audit(known=False)
+    if not known:
+        empty["path_mode_identity_audits"] = {
+            mode: _empty_source_identity_audit(known=False) for mode in path_modes
+        }
+        return empty
+
+    try:
+        expected_by_mode = {
+            mode: _expected_source_attempt_hashes_for_mode(
+                session,
+                source_hur_schema=source_hur_schema,
+                start_date=start_date,
+                end_date=end_date,
+                decision_time_labels=decision_time_labels or (),
+                path_mode=mode,
+            )
+            for mode in path_modes
+        }
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return _source_identity_error_audit(error, path_modes)
+    actual_by_mode: dict[str, set[str]] = {
+        mode: {
+            row.candidate_attempt_hash for row in candidates if row.path_mode == mode
+        }
+        for mode in path_modes
+    }
+    path_mode_identity_audits = {
+        mode: _source_identity_set_diff(expected_by_mode[mode], actual_by_mode[mode])
+        for mode in path_modes
+    }
+    expected_all = set().union(*expected_by_mode.values()) if expected_by_mode else set()
+    actual_all = set().union(*actual_by_mode.values()) if actual_by_mode else set()
+    out = _source_identity_set_diff(expected_all, actual_all)
+    out["path_mode_identity_audits"] = path_mode_identity_audits
+    return out
+
+
+def _source_identity_error_audit(
+    error: str,
+    path_modes: Sequence[str],
+) -> dict[str, Any]:
+    out = _empty_source_identity_audit(known=False, error=error)
+    out["path_mode_identity_audits"] = {
+        mode: _empty_source_identity_audit(known=False, error=error)
+        for mode in path_modes
+    }
+    return out
+
+
+def _empty_source_identity_audit(
+    *,
+    known: bool,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "source_identity_denominator_known": known,
+        "source_identity_denominator_error": error,
+        "expected_source_attempt_identity_count": None,
+        "actual_source_attempt_identity_count": None,
+        "missing_source_attempt_identity_count": None,
+        "extra_source_attempt_identity_count": None,
+        "missing_source_attempt_identities_sample": [],
+        "extra_source_attempt_identities_sample": [],
+    }
+
+
+def _source_identity_set_diff(
+    expected: set[str],
+    actual: set[str],
+) -> dict[str, Any]:
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    return {
+        "source_identity_denominator_known": True,
+        "source_identity_denominator_error": None,
+        "expected_source_attempt_identity_count": len(expected),
+        "actual_source_attempt_identity_count": len(actual),
+        "missing_source_attempt_identity_count": len(missing),
+        "extra_source_attempt_identity_count": len(extra),
+        "missing_source_attempt_identities_sample": missing[:20],
+        "extra_source_attempt_identities_sample": extra[:20],
+    }
+
+
+def _expected_source_attempt_hashes_for_mode(
+    session: Session,
+    *,
+    source_hur_schema: str,
+    start_date: date,
+    end_date: date,
+    decision_time_labels: Sequence[str],
+    path_mode: str,
+) -> set[str]:
+    hashes: set[str] = set()
+    for trading_date in _session_dates(start_date, end_date):
+        for hur_row in _load_hur_source_rows_for_report(
+            session,
+            source_hur_schema=source_hur_schema,
+            trading_date=trading_date,
+        ):
+            for label in decision_time_labels:
+                hashes.add(_candidate_attempt_hash(
+                    ticker=hur_row.ticker,
+                    trading_date=trading_date,
+                    decision_ts=_decision_timestamp(trading_date, label),
+                    decision_time_label=label,
+                    source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                    path_mode=path_mode,
+                ))
+    return hashes
+
+
+def _session_dates(start_date: date, end_date: date) -> list[date]:
+    return [
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+        if is_us_equity_session(start_date + timedelta(days=offset))
+    ]
+
+
+def _load_hur_source_rows_for_report(
+    session: Session,
+    *,
+    source_hur_schema: str,
+    trading_date: date,
+) -> list[HurSourceRow]:
+    if _should_schema_qualify_hur(session, source_hur_schema):
+        rows = session.execute(
+            text(
+                "SELECT * "
+                f"FROM {_quote_ident(source_hur_schema)}."
+                "historical_universe_reconstructions "
+                "WHERE replay_date = :trading_date "
+                "AND inclusion_status = 'included' "
+                "ORDER BY normalized_symbol"
+            ),
+            {"trading_date": trading_date},
+        ).all()
+        return [
+            _hur_source_row_from_mapping(
+                row._mapping,
+                source_schema=source_hur_schema,
+                fallback_date=trading_date,
+            )
+            for row in rows
+        ]
+    rows = (
+        session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == trading_date,
+            HistoricalUniverseReconstruction.inclusion_status == "included",
+        )
+        .order_by(HistoricalUniverseReconstruction.normalized_symbol)
+        .all()
+    )
+    return [
+        _hur_source_row_from_model(row, source_schema=source_hur_schema)
+        for row in rows
+    ]
+
+
+def _strict_partial_rows_that_would_pass_sparse_zero_fill(
+    candidates: Sequence[I12PitCandidate],
+) -> int:
+    sparse_pass_keys = {
+        _candidate_attempt_comparison_key(row)
+        for row in candidates
+        if row.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE
+        and row.candidate_status == "passed"
+    }
+    return sum(
+        1
+        for row in candidates
+        if row.path_mode == STRICT_MINUTE_PATH_MODE
+        and row.coverage_status == "partial_minute_path"
+        and _candidate_attempt_comparison_key(row) in sparse_pass_keys
+    )
+
+
+def _candidate_attempt_comparison_key(
+    row: I12PitCandidate,
+) -> tuple[str, date, str, str | None]:
+    return (
+        row.ticker,
+        row.decision_date,
+        row.decision_time_label,
+        _candidate_source_hur_identity_hash(row),
+    )
+
+
+def _candidate_source_hur_identity_hash(row: I12PitCandidate) -> str | None:
+    return _json_loads(row.source_bars_json).get("source_hur_identity_hash")
+
+
+def _sparse_imputation_distributions(
+    candidates: Sequence[I12PitCandidate],
+) -> dict[str, Any]:
+    sparse = [
+        row for row in candidates
+        if row.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE
+    ]
+    return {
+        "candidate_count": len(sparse),
+        "missing_minute_count": _numeric_summary(
+            _candidate_path_diagnostic_value(row, "missing_minute_count_before_decision")
+            for row in sparse
+        ),
+        "path_coverage_ratio": _numeric_summary(
+            _candidate_path_diagnostic_value(row, "path_coverage_ratio") for row in sparse
+        ),
+        "last_observed_age_seconds": _numeric_summary(
+            _candidate_path_diagnostic_value(row, "last_observed_before_decision_age_seconds")
+            for row in sparse
+        ),
+        "observed_cumulative_volume": _numeric_summary(
+            _candidate_path_diagnostic_value(row, "observed_cumulative_volume_before_decision")
+            for row in sparse
+        ),
+        "projected_volume_ratio": _numeric_summary(
+            _candidate_path_diagnostic_value(row, "zero_fill_projected_volume_ratio")
+            for row in sparse
+        ),
+    }
+
+
+def _path_mode_report_metrics(
+    candidates: Sequence[I12PitCandidate],
+    quotes: Sequence[I12PitQuoteReplay],
+    costs: Sequence[I12PitCostReplay],
+    *,
+    requested_path_modes: Sequence[str],
+    expected_candidate_attempts: int | None,
+    identity_audits_by_mode: Mapping[str, Mapping[str, Any]],
+    source_denominator_known: bool,
+    zero_hur_source_blocked: bool,
+    child_evidence_parent_inactive: bool,
+    compare_path_modes: bool,
+) -> dict[str, Any]:
+    modes = list(requested_path_modes)
+    metrics: dict[str, Any] = {}
+    for mode in modes:
+        mode_candidates = [row for row in candidates if row.path_mode == mode]
+        mode_passed = [row for row in mode_candidates if row.candidate_status == "passed"]
+        mode_candidate_ids = {row.i12_pit_candidate_id for row in mode_candidates}
+        mode_quotes = [row for row in quotes if row.i12_pit_candidate_id in mode_candidate_ids]
+        mode_costs = [row for row in costs if row.i12_pit_candidate_id in mode_candidate_ids]
+        quote_audit = _quote_completeness_audit(mode_passed, mode_quotes)
+        cost_audit = _cost_completeness_audit(mode_passed, mode_costs)
+        mode_not_run = (
+            compare_path_modes
+            and not mode_candidates
+            and not source_denominator_known
+        )
+        mode_missing_attempts = (
+            max(expected_candidate_attempts - len(mode_candidates), 0)
+            if expected_candidate_attempts is not None
+            else None
+        )
+        mode_extra_attempts = (
+            max(len(mode_candidates) - expected_candidate_attempts, 0)
+            if expected_candidate_attempts is not None
+            else None
+        )
+        provider_errors = sum(
+            1
+            for row in mode_candidates
+            if row.coverage_status in {"daily_fetch_error", "minute_fetch_error"}
+        )
+        identity_audit = dict(identity_audits_by_mode.get(mode, {}))
+        identity_error = identity_audit.get("source_identity_denominator_error")
+        identity_mismatch = (
+            bool(identity_audit.get("source_identity_denominator_known"))
+            and (
+                int(identity_audit.get("missing_source_attempt_identity_count") or 0) > 0
+                or int(identity_audit.get("extra_source_attempt_identity_count") or 0) > 0
+            )
+        )
+        if mode_not_run:
+            training_status = "not_run"
+        elif identity_error:
+            training_status = "blocked_source_identity_denominator_error"
+        elif not source_denominator_known:
+            training_status = "blocked_source_denominator_unknown"
+        elif child_evidence_parent_inactive:
+            training_status = "blocked_child_evidence_parent_inactive"
+        elif zero_hur_source_blocked:
+            training_status = "blocked_zero_hur_source"
+        elif source_denominator_known and not identity_audit.get(
+            "source_identity_denominator_known",
+            False,
+        ):
+            training_status = "blocked_source_identity_denominator_unknown"
+        elif mode_missing_attempts not in {None, 0}:
+            training_status = "blocked_source_replay_incomplete"
+        elif mode_extra_attempts not in {None, 0}:
+            training_status = "blocked_source_replay_extra_active_attempts"
+        elif identity_mismatch:
+            training_status = "blocked_source_identity_mismatch"
+        elif provider_errors > 0:
+            training_status = "blocked_source_provider_errors"
+        elif not mode_passed:
+            training_status = "blocked_zero_pit_candidates"
+        elif not quote_audit["quote_replay_complete"]:
+            training_status = "blocked_quote_replay_incomplete"
+        elif not cost_audit["cost_replay_complete"]:
+            training_status = "blocked_cost_replay_incomplete"
+        else:
+            training_status = "eligible_for_retrain_evaluation"
+        metrics[mode] = {
+            "candidate_count": len(mode_candidates),
+            "expected_candidate_attempts": expected_candidate_attempts,
+            "missing_source_attempt_count": mode_missing_attempts,
+            "extra_source_attempt_count": mode_extra_attempts,
+            "source_identity_denominator_known": identity_audit.get(
+                "source_identity_denominator_known",
+                False,
+            ),
+            "source_identity_denominator_error": identity_error,
+            "expected_source_attempt_identity_count": identity_audit.get(
+                "expected_source_attempt_identity_count"
+            ),
+            "actual_source_attempt_identity_count": identity_audit.get(
+                "actual_source_attempt_identity_count"
+            ),
+            "missing_source_attempt_identity_count": identity_audit.get(
+                "missing_source_attempt_identity_count"
+            ),
+            "extra_source_attempt_identity_count": identity_audit.get(
+                "extra_source_attempt_identity_count"
+            ),
+            "missing_source_attempt_identities_sample": identity_audit.get(
+                "missing_source_attempt_identities_sample",
+                [],
+            ),
+            "extra_source_attempt_identities_sample": identity_audit.get(
+                "extra_source_attempt_identities_sample",
+                [],
+            ),
+            "candidate_status_counts": dict(Counter(row.candidate_status for row in mode_candidates)),
+            "coverage_status_counts": dict(Counter(row.coverage_status for row in mode_candidates)),
+            "passed_candidate_count": len(mode_passed),
+            "quote_replay_status": (
+                "not_applicable"
+                if mode_not_run or not mode_passed else (
+                    "complete" if quote_audit["quote_replay_complete"] else "incomplete"
+                )
+            ),
+            "quote_replay_complete": quote_audit["quote_replay_complete"],
+            "cost_replay_status": (
+                "not_applicable"
+                if mode_not_run or not mode_passed else (
+                    "complete" if cost_audit["cost_replay_complete"] else "incomplete"
+                )
+            ),
+            "cost_replay_complete": cost_audit["cost_replay_complete"],
+            "training_status": training_status,
+            "conclusions_final": training_status == "eligible_for_retrain_evaluation",
+            "exit_metrics": _exit_metrics_for_candidates(mode_passed, mode_costs),
+        }
+    return metrics
+
+
+def _path_mode_source_attempts_complete(metrics: Mapping[str, Any]) -> bool:
+    if not metrics:
+        return False
+    if metrics.get("training_status") == "not_run":
+        return False
+    if metrics.get("missing_source_attempt_count") not in {0, None}:
+        return False
+    if metrics.get("extra_source_attempt_count") not in {0, None}:
+        return False
+    coverage_counts = metrics.get("coverage_status_counts") or {}
+    provider_errors = (
+        int(coverage_counts.get("daily_fetch_error") or 0)
+        + int(coverage_counts.get("minute_fetch_error") or 0)
+    )
+    if provider_errors:
+        return False
+    if metrics.get("source_identity_denominator_error"):
+        return False
+    if not metrics.get("source_identity_denominator_known"):
+        return False
+    if metrics.get("missing_source_attempt_identity_count") != 0:
+        return False
+    if metrics.get("extra_source_attempt_identity_count") != 0:
+        return False
+    return True
+
+
+def _exit_metrics_for_candidates(
+    passed: Sequence[I12PitCandidate],
+    costs: Sequence[I12PitCostReplay],
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for exit_role in EXIT_ROLES:
+        rows = [row for row in costs if row.exit_role == exit_role]
+        tradeable = [row for row in rows if row.tradeability_status == "tradeable"]
+        modeled = [row.modeled_return for row in rows]
+        out[exit_role] = {
+            "candidates": len(passed),
+            "row_count": len(rows),
+            "tradeable_count": len(tradeable),
+            "tradeable_rate": len(tradeable) / len(passed) if passed else None,
+            "skipped_cash_count": len(rows) - len(tradeable),
+            "skipped_cash_by_reason": dict(Counter(row.skipped_reason for row in rows)),
+            "mean_modeled_return_skips_as_cash": _mean(modeled),
+            "win_rate_skips_as_cash": (
+                sum(1 for value in modeled if value > 0.0) / len(modeled)
+                if modeled else None
+            ),
+        }
+    return out
+
+
+def _candidate_path_diagnostic_value(
+    candidate: I12PitCandidate,
+    key: str,
+) -> float | None:
+    source_bars = _json_loads(candidate.source_bars_json)
+    path_diagnostics = source_bars.get("path_diagnostics") or {}
+    value = path_diagnostics.get(key)
+    if value is None:
+        value = _json_loads(candidate.feature_json).get(key)
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def _prior_context(
     ticker: str,
     trading_date: date,
@@ -1794,10 +2707,16 @@ def _candidate_error(
     prior_ctx: Mapping[str, Any] | None = None,
     source_hur_identity_hash: str | None = None,
     source_hur: Mapping[str, Any] | None = None,
+    path_mode: str = STRICT_MINUTE_PATH_MODE,
+    path_diagnostics: Mapping[str, Any] | None = None,
 ) -> PitCandidateResult:
+    path_mode = _validate_minute_path_mode(path_mode)
+    path_diagnostics = dict(path_diagnostics or {})
+    feature_asof_value = _parse_optional_datetime(path_diagnostics.get("feature_asof_ts"))
     feature_json = {
         "feature_manifest_version": FEATURE_MANIFEST_VERSION,
         "reconstruction_method": REBUILD_METHOD,
+        "path_mode": path_mode,
         "pattern_id": I12_PATTERN_ID,
         "ticker": ticker,
         "decision_date": trading_date.isoformat(),
@@ -1808,6 +2727,39 @@ def _candidate_error(
         "coverage_status": coverage_status,
         "missing_minute_bars": coverage_status == "missing_minute_bars",
     }
+    if path_diagnostics:
+        feature_json.update({
+            "feature_asof_ts": path_diagnostics.get("feature_asof_ts"),
+            "completed_through_ts": path_diagnostics.get("completed_through_ts"),
+            "source_minute_bars_max_start_ts": path_diagnostics.get(
+                "source_minute_bars_max_start_ts"
+            ),
+            "expected_minute_count_before_decision": path_diagnostics.get(
+                "expected_minute_count_before_decision"
+            ),
+            "observed_minute_count_before_decision": path_diagnostics.get(
+                "observed_minute_count_before_decision"
+            ),
+            "missing_minute_count_before_decision": path_diagnostics.get(
+                "missing_minute_count_before_decision"
+            ),
+            "path_coverage_ratio": path_diagnostics.get("path_coverage_ratio"),
+            "opening_bar_present": path_diagnostics.get("opening_bar_present"),
+            "first_observed_minute_ts": path_diagnostics.get("first_observed_minute_ts"),
+            "last_observed_minute_ts": path_diagnostics.get("last_observed_minute_ts"),
+            "last_observed_before_decision_age_seconds": path_diagnostics.get(
+                "last_observed_before_decision_age_seconds"
+            ),
+            "observed_cumulative_volume_before_decision": path_diagnostics.get(
+                "observed_cumulative_volume_before_decision"
+            ),
+            "observed_open_to_decision_return": path_diagnostics.get(
+                "observed_open_to_decision_return"
+            ),
+            "zero_fill_projected_volume_ratio": path_diagnostics.get(
+                "zero_fill_projected_volume_ratio"
+            ),
+        })
     if prior_ctx:
         feature_json.update({
             "lookback_end": prior_ctx.get("lookback_end"),
@@ -1827,9 +2779,22 @@ def _candidate_error(
         "decision_time_semantics": (
             "decision_after_prior_completed_minute_start_stamped_bars"
         ),
+        "path_mode": path_mode,
         "predictor_time_basis": "failed_before_feature_materialization",
     }
-    gate_values = {"candidate_passed": False, "fail_reasons": [fail_reason]}
+    if path_diagnostics:
+        leakage_guard.update({
+            "feature_asof_ts": path_diagnostics.get("feature_asof_ts"),
+            "completed_through_ts": path_diagnostics.get("completed_through_ts"),
+            "source_minute_bars_max_start_ts": path_diagnostics.get(
+                "source_minute_bars_max_start_ts"
+            ),
+        })
+    gate_values = {
+        "candidate_passed": False,
+        "fail_reasons": [fail_reason],
+        "path_mode": path_mode,
+    }
     source_bars = {
         "daily_source_hash": daily_source_hash,
         "minute_source_hash": minute_source_hash,
@@ -1837,6 +2802,8 @@ def _candidate_error(
         "source_hur": dict(source_hur or {}),
         "daily_error": daily_error,
         "minute_error": minute_error,
+        "path_mode": path_mode,
+        "path_diagnostics": path_diagnostics,
     }
     source_errors = {
         key: value
@@ -1853,6 +2820,7 @@ def _candidate_error(
         "decision_ts": decision_ts.isoformat(),
         "coverage_status": coverage_status,
         "source_bars": source_bars,
+        "path_mode": path_mode,
     })
     candidate_attempt_hash = _candidate_attempt_hash(
         ticker=ticker,
@@ -1860,6 +2828,7 @@ def _candidate_error(
         decision_ts=decision_ts,
         decision_time_label=decision_time_label,
         source_hur_identity_hash=source_hur_identity_hash,
+        path_mode=path_mode,
     )
     candidate_identity_hash = stable_hash({
         "input_hash": input_hash,
@@ -1873,6 +2842,7 @@ def _candidate_error(
         decision_date=trading_date,
         decision_ts=decision_ts,
         decision_time_label=decision_time_label,
+        path_mode=path_mode,
         candidate_status="failed",
         coverage_status=coverage_status,
         fail_reason=fail_reason,
@@ -1881,7 +2851,7 @@ def _candidate_error(
         leakage_guard=leakage_guard,
         source_bars=source_bars,
         label_json={},
-        feature_asof_ts=None,
+        feature_asof_ts=feature_asof_value,
         candidate_attempt_hash=candidate_attempt_hash,
         input_hash=input_hash,
         candidate_identity_hash=candidate_identity_hash,
@@ -2143,6 +3113,125 @@ def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None
     }
 
 
+def _validate_minute_path_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in MINUTE_PATH_MODES:
+        raise ValueError(
+            f"minute_path_mode must be one of {', '.join(MINUTE_PATH_MODES)}"
+        )
+    return normalized
+
+
+def _minute_path_diagnostics(
+    *,
+    trading_date: date,
+    decision_ts: datetime,
+    minute_bars: Sequence[_MinuteBar],
+    prior_ctx: Mapping[str, Any] | None,
+    path_mode: str,
+) -> dict[str, Any]:
+    expected = _expected_minute_timestamps_before_decision(trading_date, decision_ts)
+    expected_set = set(expected)
+    observed_by_ts = {
+        _minute_floor_utc(bar.timestamp): bar
+        for bar in minute_bars
+        if _minute_floor_utc(bar.timestamp) in expected_set
+    }
+    observed_ts = sorted(observed_by_ts)
+    missing = [ts for ts in expected if ts not in observed_by_ts]
+    session_open = us_equity_session_open_timestamp(trading_date)
+    completed_through_ts = _minute_floor_utc(_aware_utc(decision_ts))
+    first = observed_by_ts[observed_ts[0]] if observed_ts else None
+    last = observed_by_ts[observed_ts[-1]] if observed_ts else None
+    cumulative_volume = sum(bar.volume for bar in observed_by_ts.values())
+    completed_minutes = _completed_minutes_before_decision(trading_date, decision_ts)
+    session_minutes = _session_minutes(trading_date)
+    zero_fill_projected_volume = (
+        cumulative_volume / completed_minutes * session_minutes
+        if completed_minutes > 0 else None
+    )
+    avg20_volume = prior_ctx.get("avg20_volume") if prior_ctx else None
+    zero_fill_projected_volume_ratio = (
+        zero_fill_projected_volume / avg20_volume
+        if zero_fill_projected_volume is not None
+        and avg20_volume is not None
+        and avg20_volume > 0
+        else None
+    )
+    return {
+        "path_mode": path_mode,
+        "expected_minute_count_before_decision": len(expected),
+        "observed_minute_count_before_decision": len(observed_ts),
+        "missing_minute_count_before_decision": len(missing),
+        "path_coverage_ratio": len(observed_ts) / len(expected) if expected else None,
+        "missing_minute_offsets": [
+            int((ts - session_open).total_seconds() // 60) for ts in missing
+        ],
+        "missing_minute_timestamps": [ts.isoformat() for ts in missing],
+        "first_observed_minute_ts": observed_ts[0].isoformat() if observed_ts else None,
+        "last_observed_minute_ts": observed_ts[-1].isoformat() if observed_ts else None,
+        "opening_bar_present": bool(observed_ts and observed_ts[0] == session_open),
+        "last_observed_before_decision_age_seconds": (
+            (completed_through_ts - observed_ts[-1] - timedelta(minutes=1)).total_seconds()
+            if observed_ts else None
+        ),
+        "observed_cumulative_volume_before_decision": cumulative_volume,
+        "observed_open_to_decision_return": (
+            _safe_return(last.close, first.open) if first and last else None
+        ),
+        "zero_fill_projected_volume_at_decision": zero_fill_projected_volume,
+        "zero_fill_projected_volume_ratio": zero_fill_projected_volume_ratio,
+        "source_minute_bars_max_start_ts": observed_ts[-1].isoformat()
+        if observed_ts else None,
+        "feature_asof_ts": completed_through_ts.isoformat(),
+        "completed_through_ts": completed_through_ts.isoformat(),
+    }
+
+
+def _sparse_zero_fill_minutes(
+    *,
+    trading_date: date,
+    decision_ts: datetime,
+    minute_bars: Sequence[_MinuteBar],
+) -> tuple[list[_MinuteBar], dict[str, Any]]:
+    expected = _expected_minute_timestamps_before_decision(trading_date, decision_ts)
+    by_ts = {_minute_floor_utc(bar.timestamp): bar for bar in minute_bars}
+    session_open = us_equity_session_open_timestamp(trading_date)
+    filled: list[_MinuteBar] = []
+    last_observed_close: float | None = None
+    imputed: list[datetime] = []
+    for ts in expected:
+        bar = by_ts.get(ts)
+        if bar is not None:
+            filled.append(bar)
+            last_observed_close = bar.close
+            continue
+        if last_observed_close is None:
+            raise RuntimeError("sparse_zero_fill_requires_prior_observed_trade")
+        idx = int((ts - session_open).total_seconds() // 60)
+        filled.append(_MinuteBar(
+            timestamp=ts,
+            minute_index=idx,
+            open=last_observed_close,
+            high=last_observed_close,
+            low=last_observed_close,
+            close=last_observed_close,
+            volume=0.0,
+        ))
+        imputed.append(ts)
+    return filled, {
+        "zero_fill_imputed_minute_count": len(imputed),
+        "zero_fill_imputed_minute_ratio": len(imputed) / len(expected) if expected else None,
+        "zero_fill_imputed_minute_offsets": [
+            int((ts - session_open).total_seconds() // 60) for ts in imputed
+        ],
+        "zero_fill_imputed_minute_timestamps": [ts.isoformat() for ts in imputed],
+        "minute_imputation_policy": (
+            "zero_volume_forward_fill_prices_from_prior_observed_minute"
+        ),
+    }
+
+
 def _candidate_attempt_hash(
     *,
     ticker: str,
@@ -2150,12 +3239,15 @@ def _candidate_attempt_hash(
     decision_ts: datetime,
     decision_time_label: str,
     source_hur_identity_hash: str | None,
+    path_mode: str = STRICT_MINUTE_PATH_MODE,
 ) -> str:
+    path_mode = _validate_minute_path_mode(path_mode)
     return stable_hash({
         "ticker": ticker.upper(),
         "decision_date": trading_date.isoformat(),
         "decision_ts": _aware_utc(decision_ts).isoformat(),
         "decision_time_label": decision_time_label,
+        "path_mode": path_mode,
         "reconstruction_method": REBUILD_METHOD,
         "feature_manifest_version": FEATURE_MANIFEST_VERSION,
         "source_hur_identity_hash": source_hur_identity_hash,
@@ -2364,8 +3456,28 @@ def _quote_ident(identifier: str) -> str:
 
 
 def _decision_timestamp(trading_date: date, label: str) -> datetime:
-    hour, minute = [int(part) for part in label.split(":", 1)]
+    hour, minute = [int(part) for part in _normalize_decision_time_label(label).split(":", 1)]
     return _eastern_timestamp(trading_date, time(hour, minute))
+
+
+def _normalize_decision_time_labels(labels: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(dict.fromkeys(_normalize_decision_time_label(label) for label in labels))
+    if not normalized:
+        raise ValueError("at least one decision time is required")
+    return normalized
+
+
+def _normalize_decision_time_label(label: str) -> str:
+    raw = str(label or "").strip()
+    try:
+        hour_text, minute_text = raw.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid decision time label: {label!r}") from None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError(f"invalid decision time label: {label!r}")
+    return f"{hour:02d}:{minute:02d}"
 
 
 def _eastern_timestamp(trading_date: date, value: time) -> datetime:
@@ -2382,6 +3494,18 @@ def _coerce_persisted_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _parse_optional_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return _coerce_persisted_utc(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _coerce_persisted_utc(parsed)
 
 
 def _finite_positive(value: float | None) -> float | None:

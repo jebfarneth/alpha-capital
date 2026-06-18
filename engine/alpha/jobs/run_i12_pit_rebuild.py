@@ -10,6 +10,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from sqlalchemy import inspect
+
 from alpha.data.alpaca import AlpacaAdapter
 from alpha.data.config import AlpacaConfig, ConfigError, FmpConfig, PolygonConfig
 from alpha.data.fmp import FmpAdapter
@@ -28,6 +30,8 @@ from alpha.jobs.i12_pit_rebuild import (
     DEFAULT_SLIPPAGE_BPS,
     I12PitRebuildJob,
     JOB_NAME,
+    MINUTE_PATH_MODES,
+    STRICT_MINUTE_PATH_MODE,
     i12_pit_rebuild_report,
 )
 from alpha.jobs.runner import run_job
@@ -41,6 +45,10 @@ I12_PIT_REBUILD_REQUIRED_TABLES = (
     "i12_pit_quote_replays",
     "i12_pit_cost_replays",
 )
+
+I12_PIT_REBUILD_REQUIRED_COLUMNS = {
+    "i12_pit_candidates": ("path_mode",),
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,14 +75,22 @@ def main(argv: list[str] | None = None) -> int:
 
     session = open_writable_session(schema=target_schema)
     try:
+        try:
+            _assert_required_pit_columns(session, target_schema)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
         if args.report_only:
             report = i12_pit_rebuild_report(
                 session,
                 source_hur_schema=args.source_hur_schema,
                 decision_time_count=len(args.decision_time or list(DEFAULT_DECISION_TIMES)),
+                decision_time_labels=args.decision_time or list(DEFAULT_DECISION_TIMES),
                 start_date=_parse_date(args.start_date) if args.start_date else None,
                 end_date=_parse_date(args.end_date) if args.end_date else None,
                 job_run_id=args.job_run_id,
+                path_mode=None if args.compare_path_modes else args.minute_path_mode,
+                compare_path_modes=args.compare_path_modes,
             )
             print(json.dumps(report, indent=2, sort_keys=True, default=str))
             _write_json_artifact(args.report_artifact, report)
@@ -99,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             max_quote_age_seconds=args.max_quote_age_seconds,
             slippage_bps=args.slippage_bps,
             feed=args.feed,
+            minute_path_mode=args.minute_path_mode,
             skip_existing=not args.replace_existing,
             replace_existing=args.replace_existing,
             quote_replay=not args.no_quote_replay,
@@ -118,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                 "end_date": args.end_date,
                 "decision_times": args.decision_time or list(DEFAULT_DECISION_TIMES),
                 "feed": args.feed,
+                "minute_path_mode": args.minute_path_mode,
                 "quote_replay": not args.no_quote_replay,
                 "intended_order_usd": args.intended_order_usd,
                 "max_spread_bps": args.max_spread_bps,
@@ -140,6 +158,25 @@ def _validate_write_target(schema: str | None) -> None:
         raise ValueError("I12 PIT rebuild requires --schema SCRATCH_SCHEMA")
     if normalized in {"public", "canonical", "main", "default"}:
         raise ValueError(f"I12 PIT rebuild refuses non-scratch schema: {schema}")
+
+
+def _assert_required_pit_columns(session, schema: str | None) -> None:
+    inspector = inspect(session.get_bind())
+    for table_name, required_columns in I12_PIT_REBUILD_REQUIRED_COLUMNS.items():
+        try:
+            columns = {
+                column["name"]
+                for column in inspector.get_columns(table_name, schema=schema)
+            }
+        except Exception:
+            columns = {column["name"] for column in inspector.get_columns(table_name)}
+        missing = [column for column in required_columns if column not in columns]
+        if missing:
+            missing_text = ", ".join(missing)
+            raise ValueError(
+                f"schema {schema} has old {table_name} table without {missing_text}; "
+                "create a fresh scratch schema or migrate it"
+            )
 
 
 def _parse_date(value: str) -> date:
@@ -180,6 +217,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Decision time in HH:MM ET; repeatable.",
     )
     parser.add_argument("--feed", default="sip", choices=("sip", "iex", "otc"))
+    parser.add_argument(
+        "--minute-path-mode",
+        default=STRICT_MINUTE_PATH_MODE,
+        choices=MINUTE_PATH_MODES,
+        help="Minute path policy for candidate construction.",
+    )
     parser.add_argument("--intended-order-usd", type=float, default=DEFAULT_INTENDED_ORDER_USD)
     parser.add_argument("--max-spread-bps", type=float, default=DEFAULT_MAX_SPREAD_BPS)
     parser.add_argument("--max-quote-age-seconds", type=float, default=DEFAULT_MAX_QUOTE_AGE_SECONDS)
@@ -191,6 +234,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--no-quote-replay", action="store_true")
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--compare-path-modes",
+        action="store_true",
+        help="Report strict and sparse path modes together with comparison finality.",
+    )
     parser.add_argument("--job-run-id", help="Optional report-only filter.")
     parser.add_argument("--report-artifact")
     parser.add_argument("--progress-artifact")

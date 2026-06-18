@@ -26,6 +26,12 @@ def upgrade() -> None:
         sa.Column("decision_date", sa.Date(), nullable=False),
         sa.Column("decision_ts", sa.DateTime(timezone=True), nullable=False),
         sa.Column("decision_time_label", sa.String(), nullable=False),
+        sa.Column(
+            "path_mode",
+            sa.String(),
+            nullable=False,
+            server_default="strict_contiguous",
+        ),
         sa.Column("feature_asof_ts", sa.DateTime(timezone=True), nullable=True),
         sa.Column("candidate_status", sa.String(), nullable=False),
         sa.Column("coverage_status", sa.String(), nullable=False),

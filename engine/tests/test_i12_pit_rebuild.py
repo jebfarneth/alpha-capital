@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -22,6 +22,8 @@ from alpha.db.models import (
 )
 from alpha.jobs.i12_pit_rebuild import (
     I12PitRebuildJob,
+    _candidate_attempt_hash,
+    _hur_source_row_from_model,
     build_i12_pit_candidate,
     evaluate_quote_cost_replay,
     i12_pit_rebuild_report,
@@ -47,6 +49,11 @@ from alpha.market_calendar import (
 
 DAY = date(2026, 6, 16)
 DECISION_TS = datetime(2026, 6, 16, 13, 40, tzinfo=timezone.utc)
+
+
+def _decision_ts_for_label(label: str) -> datetime:
+    hour, minute = [int(part) for part in label.split(":", 1)]
+    return datetime.combine(DAY, time(hour, minute), tzinfo=EASTERN).astimezone(timezone.utc)
 
 
 class FakeFmp:
@@ -343,6 +350,139 @@ def test_duplicate_minute_bars_fail_closed_before_projection():
     assert result.coverage_status == "duplicate_minute_bars"
     assert result.fail_reason == "duplicate_minute_bars_before_decision"
     assert "early_cumulative_volume" not in result.feature_json
+
+
+def test_strict_mode_still_fails_partial_minute_paths():
+    result = build_i12_pit_candidate(
+        ticker="STRICT",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_sparse_minute_bars(),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="strict_contiguous",
+    )
+
+    assert result.candidate_status == "failed"
+    assert result.coverage_status == "partial_minute_path"
+    assert result.feature_json["path_mode"] == "strict_contiguous"
+    assert result.feature_json["missing_minute_count_before_decision"] == 8
+    assert result.feature_asof_ts == DECISION_TS
+
+
+def test_sparse_zero_fill_mode_passes_partial_no_trade_path():
+    result = build_i12_pit_candidate(
+        ticker="SPARSE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_sparse_minute_bars(),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+
+    assert result.candidate_status == "passed"
+    assert result.coverage_status == "ok"
+    assert result.feature_json["path_mode"] == "sparse_zero_fill"
+    assert result.feature_json["early_cumulative_volume"] == 200
+    assert result.feature_json["projected_volume_ratio_at_decision"] == pytest.approx(7.8)
+    assert result.feature_json["zero_fill_projected_volume_ratio"] == pytest.approx(7.8)
+    assert result.feature_json["zero_fill_imputed_minute_count"] == 8
+    assert result.feature_json["path_coverage_ratio"] == pytest.approx(0.2)
+    assert result.source_bars["path_diagnostics"]["missing_minute_offsets"] == [
+        1, 2, 3, 4, 6, 7, 8, 9
+    ]
+
+
+def test_sparse_zero_fill_uses_only_past_observed_prices():
+    sparse = build_i12_pit_candidate(
+        ticker="SPARSE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_sparse_minute_bars(include_decision_bar=True, decision_close=999.0),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+    baseline = build_i12_pit_candidate(
+        ticker="SPARSE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_sparse_minute_bars(include_decision_bar=True, decision_close=4.0),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+
+    assert sparse.feature_json == baseline.feature_json
+    assert sparse.gate_values == baseline.gate_values
+    assert sparse.source_bars["path_diagnostics"] == baseline.source_bars["path_diagnostics"]
+
+
+def test_sparse_zero_fill_still_fails_duplicate_and_no_predecision_bars():
+    duplicate = _sparse_minute_bars()
+    duplicate = duplicate + [duplicate[0]]
+    duplicate_result = build_i12_pit_candidate(
+        ticker="DUPSPARSE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=duplicate,
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+    no_bar_result = build_i12_pit_candidate(
+        ticker="NOSPARSE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=[],
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+
+    assert duplicate_result.coverage_status == "duplicate_minute_bars"
+    assert no_bar_result.coverage_status == "missing_minute_bars"
+
+
+def test_candidate_content_hash_differs_between_strict_and_sparse_modes():
+    strict = build_i12_pit_candidate(
+        ticker="HASH",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_minute_bars(),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="strict_contiguous",
+    )
+    sparse = build_i12_pit_candidate(
+        ticker="HASH",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_minute_bars(),
+        daily_source_hash="daily",
+        minute_source_hash="minute",
+        path_mode="sparse_zero_fill",
+    )
+
+    assert strict.content_hash != sparse.content_hash
+    assert strict.candidate_attempt_hash != sparse.candidate_attempt_hash
 
 
 def test_quote_replay_selects_candidate_event_window_and_fails_closed():
@@ -762,8 +902,9 @@ def test_daily_fetch_error_recovery_supersedes_failed_attempt(db_session):
     scoped_report = i12_pit_rebuild_report(
         db_session,
         source_hur_schema="public",
-        hur_rows_loaded=2,
-        decision_time_count=1,
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
         job_run_id=next(iter(current_run_ids)),
     )
     assert scoped_report["expected_candidate_attempts"] == 2
@@ -1245,6 +1386,836 @@ def test_clean_quote_and_cost_rows_are_reused_without_provider_calls(db_session)
     assert second.metrics["historical_cost_replay_row_count"] == 2
 
 
+def test_strict_and_sparse_modes_report_separately_and_sparse_replays_quotes(db_session):
+    _add_hur(db_session, "MODE", output_hash="hur-mode")
+    quotes = _complete_quotes()
+
+    strict = run_job(
+        db_session,
+            I12PitRebuildJob(
+                session=db_session,
+                fmp_adapter=FakeFmp(_fmp_bars()),
+                polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+                alpaca_adapter=FakeAlpaca(quotes),
+                start_date=DAY,
+                end_date=DAY,
+            decision_times=["09:40"],
+            intended_order_usd=250,
+            quote_replay=True,
+            minute_path_mode="strict_contiguous",
+        ),
+        params={"test": True},
+    )
+    assert strict.metrics["training_status"] == "blocked_zero_pit_candidates"
+
+    sparse = run_job(
+        db_session,
+            I12PitRebuildJob(
+                session=db_session,
+                fmp_adapter=FakeFmp(_fmp_bars()),
+                polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+                alpaca_adapter=FakeAlpaca(quotes),
+                start_date=DAY,
+                end_date=DAY,
+            decision_times=["09:40"],
+            intended_order_usd=250,
+            quote_replay=True,
+            minute_path_mode="sparse_zero_fill",
+        ),
+        params={"test": True},
+    )
+
+    assert sparse.ok
+    assert sparse.metrics["report_path_mode"] == "sparse_zero_fill"
+    assert sparse.metrics["available_path_modes"] == [
+        "sparse_zero_fill",
+        "strict_contiguous",
+    ]
+    assert sparse.metrics["mixed_path_modes_present"] is True
+    assert sparse.metrics["candidate_counts_by_path_mode"] == {
+        "sparse_zero_fill": 1,
+    }
+    assert "strict_contiguous" not in sparse.metrics["coverage_status_by_path_mode"]
+    assert sparse.metrics["passed_candidates_by_path_mode"] == {"sparse_zero_fill": 1}
+    assert sparse.metrics["strict_partial_rows_that_would_pass_sparse_zero_fill"] == 0
+    assert "strict_contiguous" not in sparse.metrics["path_mode_metrics"]
+    assert sparse.metrics["path_mode_metrics"]["sparse_zero_fill"]["training_status"] == (
+        "eligible_for_retrain_evaluation"
+    )
+    assert sparse.metrics["path_mode_metrics"]["sparse_zero_fill"]["quote_replay_status"] == (
+        "complete"
+    )
+    assert sparse.metrics["path_mode_metrics"]["sparse_zero_fill"]["cost_replay_status"] == (
+        "complete"
+    )
+    assert sparse.metrics["sparse_imputation_distributions"]["missing_minute_count"]["mean"] == 8
+    assert sparse.metrics["quote_replay_row_count"] == 3
+    assert sparse.metrics["cost_replay_row_count"] == 2
+    assert sparse.metrics["conclusions_final"] is True
+
+    strict_report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="strict_contiguous",
+    )
+    assert strict_report["report_path_mode"] == "strict_contiguous"
+    assert strict_report["candidate_counts_by_path_mode"] == {"strict_contiguous": 1}
+    assert strict_report["training_status"] == "blocked_zero_pit_candidates"
+    assert strict_report["conclusions_final"] is False
+
+    default_report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+    assert default_report["report_path_mode"] == "strict_contiguous"
+    assert default_report["training_status"] == "blocked_zero_pit_candidates"
+
+    compare_report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+    assert compare_report["compare_path_modes"] is True
+    assert compare_report["report_path_mode"] is None
+    assert compare_report["expected_candidate_attempts"] == 2
+    assert compare_report["candidate_counts_by_path_mode"] == {
+        "sparse_zero_fill": 1,
+        "strict_contiguous": 1,
+    }
+    assert compare_report["strict_partial_rows_that_would_pass_sparse_zero_fill"] == 1
+    assert compare_report["path_mode_metrics"]["strict_contiguous"]["training_status"] == (
+        "blocked_zero_pit_candidates"
+    )
+    assert compare_report["path_mode_metrics"]["sparse_zero_fill"]["training_status"] == (
+        "eligible_for_retrain_evaluation"
+    )
+    assert compare_report["comparison_conclusions_final"] is False
+    assert compare_report["conclusions_final"] is False
+    assert compare_report["training_status"] == "blocked_path_mode_comparison_incomplete"
+
+
+def test_sparse_mode_rerun_is_idempotent_per_path_mode(db_session):
+    _add_hur(db_session, "SPARSERERUN", output_hash="hur-sparse-rerun")
+    quotes = _complete_quotes()
+    for adapter in (FakeAlpaca(quotes), FailingAlpaca()):
+        result = run_job(
+            db_session,
+                I12PitRebuildJob(
+                    session=db_session,
+                    fmp_adapter=FakeFmp(_fmp_bars()),
+                    polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+                    alpaca_adapter=adapter,
+                    start_date=DAY,
+                    end_date=DAY,
+                decision_times=["09:40"],
+                intended_order_usd=250,
+                quote_replay=True,
+                minute_path_mode="sparse_zero_fill",
+            ),
+            params={"test": True},
+        )
+        assert result.ok
+
+    assert (
+        db_session.query(I12PitCandidate)
+        .filter(I12PitCandidate.path_mode == "sparse_zero_fill")
+        .count()
+        == 1
+    )
+    assert db_session.query(I12PitQuoteReplay).count() == 3
+    assert db_session.query(I12PitCostReplay).count() == 2
+
+
+def test_compare_path_modes_can_be_final_only_when_each_mode_is_complete(db_session):
+    _add_hur(db_session, "BOTH", output_hash="hur-both")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(HistoricalUniverseReconstruction.normalized_symbol == "BOTH")
+        .one()
+    )
+    source_hur = _hur_source_row_from_model(hur_row, source_schema="public")
+    _persist_complete_candidate_replay(
+        db_session,
+        "BOTH",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=source_hur.source_hur_identity_hash,
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "BOTH",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=source_hur.source_hur_identity_hash,
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    assert report["expected_candidate_attempts"] == 2
+    assert report["path_mode_metrics"]["strict_contiguous"]["training_status"] == (
+        "eligible_for_retrain_evaluation"
+    )
+    assert report["path_mode_metrics"]["sparse_zero_fill"]["training_status"] == (
+        "eligible_for_retrain_evaluation"
+    )
+    assert report["comparison_conclusions_final"] is True
+    assert report["conclusions_final"] is True
+
+
+def test_count_only_report_cannot_be_final(db_session):
+    _persist_complete_candidate_replay(db_session, "COUNTONLY", path_mode="sparse_zero_fill")
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        hur_rows_loaded=1,
+        decision_time_count=1,
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["source_denominator_known"] is True
+    assert report["source_identity_denominator_known"] is False
+    assert report["source_replay_complete"] is False
+    assert report["training_status"] == "blocked_source_identity_denominator_unknown"
+    assert report["conclusions_final"] is False
+
+
+def test_count_only_compare_report_cannot_be_final(db_session):
+    _persist_complete_candidate_replay(db_session, "COUNTBOTH", path_mode="strict_contiguous")
+    _persist_complete_candidate_replay(db_session, "COUNTBOTH", path_mode="sparse_zero_fill")
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        hur_rows_loaded=1,
+        decision_time_count=1,
+        compare_path_modes=True,
+    )
+
+    assert report["source_denominator_known"] is True
+    assert report["source_identity_denominator_known"] is False
+    assert report["source_replay_complete"] is False
+    assert report["comparison_conclusions_final"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_source_identity_denominator_unknown"
+
+
+def test_report_bad_hur_source_returns_structured_blocked_report(db_session):
+    _persist_complete_candidate_replay(db_session, "BADHUR", path_mode="sparse_zero_fill")
+    db_session.execute(text("ATTACH DATABASE ':memory:' AS missing_hur"))
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="missing_hur",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["source_identity_denominator_known"] is False
+    assert report["source_identity_denominator_error"]
+    assert report["source_replay_complete"] is False
+    assert report["training_status"] == "blocked_source_identity_denominator_error"
+    assert report["conclusions_final"] is False
+
+
+def test_compare_path_modes_marks_expected_empty_mode_as_incomplete(db_session):
+    _add_hur(db_session, "SPARSEONLY", output_hash="hur-sparse-only")
+    _persist_complete_candidate_replay(
+        db_session,
+        "SPARSEONLY",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "SPARSEONLY"),
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    assert report["path_mode_metrics"]["strict_contiguous"]["training_status"] == (
+        "blocked_source_replay_incomplete"
+    )
+    assert report["path_mode_metrics"]["strict_contiguous"]["missing_source_attempt_count"] == 1
+    assert (
+        report["path_mode_metrics"]["strict_contiguous"][
+            "missing_source_attempt_identity_count"
+        ]
+        == 1
+    )
+    assert report["path_mode_metrics"]["strict_contiguous"]["quote_replay_status"] == (
+        "not_applicable"
+    )
+    assert report["path_mode_metrics"]["sparse_zero_fill"]["training_status"] == (
+        "eligible_for_retrain_evaluation"
+    )
+    assert report["comparison_conclusions_final"] is False
+    assert report["conclusions_final"] is False
+
+
+def test_extra_active_candidate_blocks_finality(db_session):
+    _add_hur(db_session, "EXTRA1", output_hash="hur-extra-1")
+    _persist_complete_candidate_replay(
+        db_session,
+        "EXTRA1",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "EXTRA1"),
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "EXTRA2",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-extra-b",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["expected_candidate_attempts"] == 1
+    assert report["candidate_row_count"] == 2
+    assert report["missing_source_attempt_count"] == 0
+    assert report["extra_source_attempt_count"] == 1
+    assert report["source_replay_complete"] is False
+    assert report["data_integrity_passed"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_source_replay_extra_active_attempts"
+
+
+def test_extra_active_candidate_blocks_path_mode_finality(db_session):
+    _add_hur(db_session, "PATHEXTRA", output_hash="hur-path-extra")
+    _persist_complete_candidate_replay(
+        db_session,
+        "PATHEXTRA",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "PATHEXTRA"),
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "PATHEXTRA",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "PATHEXTRA"),
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "SPARSEEXTRA2",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-sparse-b",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    sparse_metrics = report["path_mode_metrics"]["sparse_zero_fill"]
+    assert sparse_metrics["extra_source_attempt_count"] == 1
+    assert sparse_metrics["conclusions_final"] is False
+    assert sparse_metrics["training_status"] == "blocked_source_replay_extra_active_attempts"
+    assert report["comparison_conclusions_final"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_source_replay_extra_active_attempts"
+
+
+def test_compare_path_modes_offsetting_missing_and_extra_not_source_complete(db_session):
+    _add_hur(db_session, "OFFSET1", output_hash="hur-offset-1")
+    _persist_complete_candidate_replay(
+        db_session,
+        "OFFSET1",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "OFFSET1"),
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "OFFSET2",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-offset-b",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    assert report["expected_candidate_attempts"] == 2
+    assert report["candidate_row_count"] == 2
+    assert report["missing_source_attempt_count"] == 0
+    assert report["extra_source_attempt_count"] == 0
+    assert report["path_mode_metrics"]["strict_contiguous"]["missing_source_attempt_count"] == 1
+    assert report["path_mode_metrics"]["sparse_zero_fill"]["extra_source_attempt_count"] == 1
+    assert report["source_replay_complete"] is False
+    assert report["comparison_conclusions_final"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_source_identity_mismatch"
+
+
+def test_same_count_wrong_hur_identity_blocks_source_replay(db_session):
+    _add_hur(db_session, "STALEID", output_hash="hur-current")
+    _persist_complete_candidate_replay(
+        db_session,
+        "STALEID",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="stale-hur-identity",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["expected_candidate_attempts"] == 1
+    assert report["candidate_row_count"] == 1
+    assert report["missing_source_attempt_count"] == 0
+    assert report["extra_source_attempt_count"] == 0
+    assert report["source_identity_denominator_known"] is True
+    assert report["expected_source_attempt_identity_count"] == 1
+    assert report["actual_source_attempt_identity_count"] == 1
+    assert report["missing_source_attempt_identity_count"] == 1
+    assert report["extra_source_attempt_identity_count"] == 1
+    assert report["source_replay_complete"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_source_identity_mismatch"
+
+
+def test_exact_hur_identity_source_replay_passes(db_session):
+    _add_hur(db_session, "EXACTID", output_hash="hur-exact")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(HistoricalUniverseReconstruction.normalized_symbol == "EXACTID")
+        .one()
+    )
+    source_hur = _hur_source_row_from_model(hur_row, source_schema="public")
+    _persist_complete_candidate_replay(
+        db_session,
+        "EXACTID",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=source_hur.source_hur_identity_hash,
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["source_identity_denominator_known"] is True
+    assert report["missing_source_attempt_identity_count"] == 0
+    assert report["extra_source_attempt_identity_count"] == 0
+    assert report["source_replay_complete"] is True
+    assert report["training_status"] == "eligible_for_retrain_evaluation"
+    assert report["conclusions_final"] is True
+
+
+def test_path_mode_identity_mismatch_blocks_only_stale_mode(db_session):
+    _add_hur(db_session, "PMID", output_hash="hur-pm")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(HistoricalUniverseReconstruction.normalized_symbol == "PMID")
+        .one()
+    )
+    source_hur = _hur_source_row_from_model(hur_row, source_schema="public")
+    _persist_complete_candidate_replay(
+        db_session,
+        "PMID",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=source_hur.source_hur_identity_hash,
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "PMID",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="stale-sparse-hur",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    assert report["path_mode_metrics"]["strict_contiguous"]["conclusions_final"] is True
+    sparse = report["path_mode_metrics"]["sparse_zero_fill"]
+    assert sparse["missing_source_attempt_identity_count"] == 1
+    assert sparse["extra_source_attempt_identity_count"] == 1
+    assert sparse["conclusions_final"] is False
+    assert sparse["training_status"] == "blocked_source_identity_mismatch"
+    assert report["comparison_conclusions_final"] is False
+    assert report["conclusions_final"] is False
+
+def test_report_scopes_to_requested_decision_time_labels(db_session):
+    _add_hur(db_session, "TIME", output_hash="hur-time")
+    _persist_complete_candidate_replay(
+        db_session,
+        "TIME",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "TIME"),
+        decision_time_label="09:35",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "TIME",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "TIME"),
+        decision_time_label="09:40",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert report["report_decision_time_labels"] == ["09:40"]
+    assert report["available_decision_time_labels"] == ["09:35", "09:40"]
+    assert report["available_decision_time_labels_for_report_scope"] == ["09:40"]
+    assert report["mixed_decision_times_present"] is True
+    assert report["decision_time_count"] == 1
+    assert report["expected_candidate_attempts"] == 1
+    assert report["candidate_row_count"] == 1
+    assert report["quote_replay_row_count"] == 3
+    assert report["cost_replay_row_count"] == 2
+    assert report["conclusions_final"] is True
+
+
+def test_compare_path_modes_respects_decision_time_labels(db_session):
+    _add_hur(db_session, "TIMECMP", output_hash="hur-time-cmp")
+    for label in ("09:35", "09:40"):
+        _persist_complete_candidate_replay(
+            db_session,
+            "TIMECMP",
+            path_mode="strict_contiguous",
+            source_hur_identity_hash=_hur_identity_hash(db_session, "TIMECMP"),
+            decision_time_label=label,
+        )
+        _persist_complete_candidate_replay(
+            db_session,
+            "TIMECMP",
+            path_mode="sparse_zero_fill",
+            source_hur_identity_hash=_hur_identity_hash(db_session, "TIMECMP"),
+            decision_time_label=label,
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+
+    assert report["report_decision_time_labels"] == ["09:40"]
+    assert report["available_decision_time_labels"] == ["09:35", "09:40"]
+    assert report["available_decision_time_labels_for_report_scope"] == ["09:40"]
+    assert report["expected_candidate_attempts"] == 2
+    assert report["candidate_counts_by_path_mode"] == {
+        "sparse_zero_fill": 1,
+        "strict_contiguous": 1,
+    }
+    assert report["quote_replay_row_count"] == 6
+    assert report["cost_replay_row_count"] == 4
+    assert report["comparison_conclusions_final"] is True
+    assert report["conclusions_final"] is True
+
+
+def test_progress_metrics_are_scoped_to_path_mode(db_session):
+    _persist_complete_candidate_replay(db_session, "STRICTPROGRESS", path_mode="strict_contiguous")
+    _persist_complete_candidate_replay(db_session, "SPARSEPROGRESS", path_mode="sparse_zero_fill")
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="probe",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["minute_path_mode"] == "sparse_zero_fill"
+    assert job.partial_metrics["active_candidate_row_count_for_path_mode"] == 1
+    assert job.partial_metrics["quote_replay_row_count_for_path_mode"] == 3
+    assert job.partial_metrics["cost_replay_row_count_for_path_mode"] == 2
+    assert job.partial_metrics["schema_total_active_candidate_row_count"] == 2
+    assert job.partial_metrics["schema_total_active_quote_replay_row_count"] == 6
+
+
+def test_progress_metrics_are_scoped_to_decision_time_labels(db_session):
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESS0935",
+        path_mode="sparse_zero_fill",
+        decision_time_label="09:35",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESS0940",
+        path_mode="sparse_zero_fill",
+        decision_time_label="09:40",
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="probe",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["decision_time_count"] == 1
+    assert job.partial_metrics["active_candidate_row_count_for_path_mode"] == 1
+    assert job.partial_metrics["quote_replay_row_count_for_path_mode"] == 3
+    assert job.partial_metrics["cost_replay_row_count_for_path_mode"] == 2
+    assert job.partial_metrics["schema_total_active_candidate_row_count"] == 2
+    assert job.partial_metrics["schema_total_active_quote_replay_row_count"] == 6
+
+
+def test_progress_metrics_expose_count_exactness(db_session):
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESSEXTRA1",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-progress-a",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESSEXTRA2",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-progress-b",
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="probe",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["active_candidate_row_count_for_path_mode"] == 2
+    assert job.partial_metrics["missing_source_attempt_count_for_path_mode"] == 0
+    assert job.partial_metrics["extra_source_attempt_count_for_path_mode"] == 1
+    assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is False
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 2
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is False
+
+
+def test_progress_metrics_expose_identity_exactness(db_session):
+    _add_hur(db_session, "PROGRESSID", output_hash="hur-progress-id")
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESSID",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "PROGRESSID"),
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="probe",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
+    assert job.partial_metrics["source_identity_denominator_error_for_path_mode"] is None
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 0
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+
+
+def test_progress_identity_scope_uses_processed_dates_not_full_window(db_session):
+    next_day = next_us_equity_session(DAY + timedelta(days=1))
+    _add_hur(db_session, "PROGRESSWINDOW", day=DAY, output_hash="hur-progress-window-1")
+    _add_hur(
+        db_session,
+        "PROGRESSWINDOW",
+        day=next_day,
+        output_hash="hur-progress-window-2",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "PROGRESSWINDOW",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(
+            db_session,
+            "PROGRESSWINDOW",
+            day=DAY,
+        ),
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=next_day,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["progress_source_scope"] == "processed_through_trading_date"
+    assert job.partial_metrics["progress_source_end_date"] == DAY.isoformat()
+    assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 0
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+
+    final_report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=next_day,
+        decision_time_labels=["09:40"],
+        path_mode="sparse_zero_fill",
+    )
+
+    assert final_report["expected_candidate_attempts"] == 2
+    assert final_report["actual_candidate_row_count"] == 1
+    assert final_report["missing_source_attempt_count"] == 1
+    assert final_report["source_identity_denominator_known"] is True
+    assert final_report["missing_source_attempt_identity_count"] == 1
+    assert final_report["source_replay_complete"] is False
+    assert final_report["conclusions_final"] is False
+
+
+def test_candidate_attempt_hash_includes_decision_time_label():
+    first = _candidate_row(
+        "SAMEHASH",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-same",
+        decision_time_label="09:35",
+    )
+    second = _candidate_row(
+        "SAMEHASH",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-same",
+        decision_time_label="09:40",
+    )
+
+    assert first.candidate_attempt_hash != second.candidate_attempt_hash
+
+
+def test_sparse_would_pass_diagnostic_uses_source_hur_identity(db_session):
+    _persist_candidate(
+        db_session,
+        "MATCH",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash="hur-a",
+        candidate_status="failed",
+        coverage_status="partial_minute_path",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "MATCH",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash="hur-b",
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        hur_rows_loaded=2,
+        decision_time_count=1,
+        compare_path_modes=True,
+    )
+
+    assert report["strict_partial_rows_that_would_pass_sparse_zero_fill"] == 0
+    assert report["training_status"] == "blocked_source_identity_denominator_unknown"
+
+
 def test_duplicate_active_quote_and_cost_rows_fail_closed(db_session):
     candidate = _persist_candidate(db_session, "DUPACTIVE")
     entry = _persist_quote(db_session, candidate, role="entry", status="ok")
@@ -1297,7 +2268,7 @@ def test_duplicate_active_quote_and_cost_rows_fail_closed(db_session):
     assert report["duplicate_cost_role_count"] == 1
     assert report["quote_replay_complete"] is False
     assert report["cost_replay_complete"] is False
-    assert report["training_status"] == "blocked_quote_replay_incomplete"
+    assert report["training_status"] == "blocked_source_identity_denominator_unknown"
     assert report["conclusions_final"] is False
 
 
@@ -1355,7 +2326,7 @@ def test_interrupted_rerun_preserves_committed_dates_without_duplicates(db_sessi
         source_hur_schema="public",
         start_date=DAY,
         end_date=next_day,
-        decision_time_count=1,
+        decision_time_labels=["09:40"],
     )
     assert interrupted_report["expected_candidate_attempts"] == 2
     assert interrupted_report["actual_candidate_row_count"] == 1
@@ -1382,14 +2353,21 @@ def test_interrupted_rerun_preserves_committed_dates_without_duplicates(db_sessi
 
 
 def test_report_marks_incomplete_quote_replay_non_final(db_session):
-    candidate = _persist_candidate(db_session, "INCOMP")
+    _add_hur(db_session, "INCOMP", output_hash="hur-incomp")
+    candidate = _persist_candidate(
+        db_session,
+        "INCOMP",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "INCOMP"),
+    )
     _persist_quote(db_session, candidate, role="entry", status="ok")
     _persist_quote(db_session, candidate, role="same_day_exit", status="missing")
 
     report = i12_pit_rebuild_report(
         db_session,
-        hur_rows_loaded=1,
-        decision_time_count=1,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
     )
 
     assert report["quote_replay_complete"] is False
@@ -1399,15 +2377,22 @@ def test_report_marks_incomplete_quote_replay_non_final(db_session):
 
 
 def test_report_blocks_when_quotes_complete_but_cost_rows_missing(db_session):
-    candidate = _persist_candidate(db_session, "NOCOST")
+    _add_hur(db_session, "NOCOST", output_hash="hur-nocost")
+    candidate = _persist_candidate(
+        db_session,
+        "NOCOST",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "NOCOST"),
+    )
     _persist_quote(db_session, candidate, role="entry", status="ok")
     _persist_quote(db_session, candidate, role="same_day_exit", status="ok")
     _persist_quote(db_session, candidate, role="next_open_exit", status="ok")
 
     report = i12_pit_rebuild_report(
         db_session,
-        hur_rows_loaded=1,
-        decision_time_count=1,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
     )
 
     assert report["quote_replay_complete"] is True
@@ -1505,13 +2490,18 @@ def test_report_only_does_not_require_date_range(monkeypatch, capsys):
             pass
 
     session = FakeSession()
+    captured = {}
     monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
     monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
     monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: session)
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         run_i12_pit_rebuild,
         "i12_pit_rebuild_report",
-        lambda *args, **kwargs: {"report": "ok", "start_date": kwargs.get("start_date")},
+        lambda *args, **kwargs: captured.update(kwargs) or {
+            "report": "ok",
+            "start_date": kwargs.get("start_date"),
+        },
     )
 
     code = run_i12_pit_rebuild.main([
@@ -1521,7 +2511,94 @@ def test_report_only_does_not_require_date_range(monkeypatch, capsys):
     ])
 
     assert code == 0
+    assert captured["path_mode"] == "strict_contiguous"
+    assert captured["compare_path_modes"] is False
+    assert captured["decision_time_labels"] == list(run_i12_pit_rebuild.DEFAULT_DECISION_TIMES)
     assert '"report": "ok"' in capsys.readouterr().out
+
+
+def test_report_only_passes_requested_decision_time_labels(monkeypatch):
+    class FakeSession:
+        def close(self):
+            pass
+
+    captured = {}
+    monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: FakeSession())
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_i12_pit_rebuild,
+        "i12_pit_rebuild_report",
+        lambda *args, **kwargs: captured.update(kwargs) or {"report": "ok"},
+    )
+
+    code = run_i12_pit_rebuild.main([
+        "--schema",
+        "scratch_report",
+        "--report-only",
+        "--decision-time",
+        "09:40",
+    ])
+
+    assert code == 0
+    assert captured["decision_time_labels"] == ["09:40"]
+
+
+def test_report_only_compare_path_modes_passes_compare_flag(monkeypatch):
+    class FakeSession:
+        def close(self):
+            pass
+
+    captured = {}
+    monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: FakeSession())
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_i12_pit_rebuild,
+        "i12_pit_rebuild_report",
+        lambda *args, **kwargs: captured.update(kwargs) or {"report": "ok"},
+    )
+
+    code = run_i12_pit_rebuild.main([
+        "--schema",
+        "scratch_report",
+        "--report-only",
+        "--compare-path-modes",
+    ])
+
+    assert code == 0
+    assert captured["path_mode"] is None
+    assert captured["compare_path_modes"] is True
+    assert captured["decision_time_labels"] == list(run_i12_pit_rebuild.DEFAULT_DECISION_TIMES)
+
+
+def test_runner_fails_old_schema_missing_path_mode(monkeypatch, capsys):
+    class FakeSession:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: FakeSession())
+
+    def fail_columns(*args, **kwargs):
+        raise ValueError(
+            "schema scratch_old has old i12_pit_candidates table without path_mode; "
+            "create a fresh scratch schema or migrate it"
+        )
+
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", fail_columns)
+
+    code = run_i12_pit_rebuild.main([
+        "--schema",
+        "scratch_old",
+        "--report-only",
+    ])
+
+    assert code == 1
+    assert "without path_mode" in capsys.readouterr().out
 
 
 def test_runner_refuses_no_schema_writes(monkeypatch, capsys):
@@ -1696,6 +2773,22 @@ def _add_hur(db_session, ticker, *, day=DAY, output_hash):
     )
 
 
+def _hur_identity_hash(db_session, ticker, *, day=DAY, source_schema="public"):
+    row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == day,
+            HistoricalUniverseReconstruction.normalized_symbol == ticker,
+            HistoricalUniverseReconstruction.inclusion_status == "included",
+        )
+        .one()
+    )
+    return _hur_source_row_from_model(
+        row,
+        source_schema=source_schema,
+    ).source_hur_identity_hash
+
+
 def _minute_bars():
     return _clean_minute_bars(DAY, _polygon_bars())
 
@@ -1727,6 +2820,50 @@ def _polygon_bars(volume=25):
         )
     )
     return bars
+
+
+def _sparse_polygon_bars(*, include_decision_bar=False, decision_close=999.0):
+    market_open = us_equity_session_open_timestamp(DAY)
+    raw = [
+        PolygonBar(
+            timestamp=int(market_open.timestamp() * 1000),
+            open=4.02,
+            high=4.05,
+            low=4.00,
+            close=4.03,
+            volume=100,
+        ),
+        PolygonBar(
+            timestamp=int((market_open + timedelta(minutes=5)).timestamp() * 1000),
+            open=4.07,
+            high=4.10,
+            low=4.06,
+            close=4.08,
+            volume=100,
+        ),
+    ]
+    if include_decision_bar:
+        raw.append(
+            PolygonBar(
+                timestamp=int(DECISION_TS.timestamp() * 1000),
+                open=decision_close,
+                high=decision_close,
+                low=decision_close,
+                close=decision_close,
+                volume=1_000_000,
+            )
+        )
+    return raw
+
+
+def _sparse_minute_bars(*, include_decision_bar=False, decision_close=999.0):
+    return _clean_minute_bars(
+        DAY,
+        _sparse_polygon_bars(
+            include_decision_bar=include_decision_bar,
+            decision_close=decision_close,
+        ),
+    )
 
 
 def _quote(ts, bid=10.0, ask=10.05, ask_size=100, bid_size=100):
@@ -1774,22 +2911,49 @@ def _provider_error_response(provider, ticker, error_type):
     )
 
 
-def _candidate_row(ticker="PIT"):
-    identity_hash = f"content-{ticker}"
+def _candidate_row(
+    ticker="PIT",
+    *,
+    path_mode="strict_contiguous",
+    source_hur_identity_hash=None,
+    decision_time_label="09:40",
+    candidate_status="passed",
+    coverage_status="ok",
+):
+    source_hur_identity_hash = source_hur_identity_hash or f"hur-{ticker}"
+    identity_hash = (
+        f"content-{ticker}-{path_mode}-{source_hur_identity_hash}-{decision_time_label}"
+    )
+    suffix = stable_hash({
+        "ticker": ticker,
+        "path_mode": path_mode,
+        "source_hur_identity_hash": source_hur_identity_hash,
+        "decision_time_label": decision_time_label,
+    })[:12]
     return I12PitCandidate(
-        i12_pit_candidate_id=f"cand-{ticker}",
+        i12_pit_candidate_id=f"cand-{ticker}-{suffix}",
         ticker=ticker,
         decision_date=DAY,
-        decision_ts=DECISION_TS,
-        decision_time_label="09:40",
+        decision_ts=_decision_ts_for_label(decision_time_label),
+        decision_time_label=decision_time_label,
+        path_mode=path_mode,
         feature_asof_ts=DECISION_TS,
-        candidate_status="passed",
-        coverage_status="ok",
+        candidate_status=candidate_status,
+        coverage_status=coverage_status,
         feature_json="{}",
         gate_values_json="{}",
         leakage_guard_json="{}",
-        source_bars_json="{}",
-        candidate_attempt_hash=f"attempt-{ticker}",
+        source_bars_json=json.dumps({
+            "source_hur_identity_hash": source_hur_identity_hash,
+        }),
+        candidate_attempt_hash=_candidate_attempt_hash(
+            ticker=ticker,
+            trading_date=DAY,
+            decision_ts=_decision_ts_for_label(decision_time_label),
+            decision_time_label=decision_time_label,
+            source_hur_identity_hash=source_hur_identity_hash,
+            path_mode=path_mode,
+        ),
         is_active=True,
         input_hash=f"input-{ticker}",
         candidate_identity_hash=identity_hash,
@@ -1798,10 +2962,44 @@ def _candidate_row(ticker="PIT"):
     )
 
 
-def _persist_candidate(db_session, ticker):
-    candidate = _candidate_row(ticker)
+def _persist_candidate(db_session, ticker, **kwargs):
+    candidate = _candidate_row(ticker, **kwargs)
     db_session.add(candidate)
     db_session.flush()
+    return candidate
+
+
+def _persist_complete_candidate_replay(
+    db_session,
+    ticker,
+    *,
+    path_mode="strict_contiguous",
+    source_hur_identity_hash=None,
+    decision_time_label="09:40",
+):
+    candidate = _persist_candidate(
+        db_session,
+        ticker,
+        path_mode=path_mode,
+        source_hur_identity_hash=source_hur_identity_hash,
+        decision_time_label=decision_time_label,
+    )
+    entry = _persist_quote(db_session, candidate, role="entry")
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid=10.5, ask=10.55)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid=10.2, ask=10.25)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        result = evaluate_quote_cost_replay(
+            entry_quote=entry,
+            exit_quote=exit_quote,
+            exit_role=exit_role,
+            intended_order_usd=50,
+            max_spread_bps=200,
+            slippage_bps=0,
+        )
+        _persist_cost(db_session, candidate, exit_role, result)
     return candidate
 
 

@@ -2533,6 +2533,7 @@ class I12PitCandidate(Base):
     decision_date = Column(Date, nullable=False)
     decision_ts = Column(DateTime(timezone=True), nullable=False)
     decision_time_label = Column(String, nullable=False)
+    path_mode = Column(String, nullable=False, default="strict_contiguous")
     feature_asof_ts = Column(DateTime(timezone=True), nullable=True)
     candidate_status = Column(String, nullable=False)
     coverage_status = Column(String, nullable=False)
