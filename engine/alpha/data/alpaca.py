@@ -610,6 +610,111 @@ class AlpacaAdapter:
             rate_limit=resp.rate_limit,
         )
 
+    def get_historical_quotes(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        feed: str = "sip",
+        limit: int = 10000,
+        max_pages: int = 3,
+    ) -> AdapterResponse[List[AlpacaQuote]]:
+        """Fetch a compact historical stock quote window for one symbol."""
+
+        normalized = str(symbol).upper().strip()
+        start_ts = aware_utc_or_none(start)
+        end_ts = aware_utc_or_none(end)
+        if not normalized:
+            return _validation_error_response(
+                "/v2/stocks/{symbol}/quotes",
+                {},
+                "symbol is required",
+            )  # type: ignore[return-value]
+        if start_ts is None or end_ts is None:
+            return _validation_error_response(
+                f"/v2/stocks/{normalized}/quotes",
+                {"start": str(start), "end": str(end)},
+                "historical quote start/end must be timezone-aware datetimes",
+            )  # type: ignore[return-value]
+        if end_ts <= start_ts:
+            return _validation_error_response(
+                f"/v2/stocks/{normalized}/quotes",
+                {"start": start_ts.isoformat(), "end": end_ts.isoformat()},
+                "historical quote end must be after start",
+            )  # type: ignore[return-value]
+
+        endpoint = f"/v2/stocks/{normalized}/quotes"
+        quotes: List[AlpacaQuote] = []
+        next_page_token: str | None = None
+        lineage: LineageMeta | None = None
+        rate_limit = None
+        for _ in range(max(1, int(max_pages))):
+            params: Dict[str, Any] = {
+                "start": start_ts.isoformat().replace("+00:00", "Z"),
+                "end": end_ts.isoformat().replace("+00:00", "Z"),
+                "feed": feed,
+                "limit": int(limit),
+            }
+            if next_page_token:
+                params["page_token"] = next_page_token
+            resp = self._request(
+                "GET",
+                endpoint,
+                params=params,
+                base_url=self._config.market_data_base_url,
+            )
+            lineage = resp.lineage
+            rate_limit = resp.rate_limit
+            if not resp.ok:
+                return resp  # type: ignore[return-value]
+            payload = resp.data or {}
+            rows = payload.get("quotes") or []
+            if isinstance(rows, dict):
+                rows = rows.get(normalized) or rows.get(normalized.upper()) or []
+            if isinstance(rows, list):
+                for row in rows:
+                    quote = _parse_alpaca_quote(normalized, row)
+                    if quote is not None:
+                        quotes.append(quote)
+            next_page_token = payload.get("next_page_token")
+            if not next_page_token:
+                break
+        if next_page_token:
+            return AdapterResponse(
+                data=None,
+                lineage=lineage or _local_lineage(endpoint, {
+                    "symbol": normalized,
+                    "start": start_ts.isoformat(),
+                    "end": end_ts.isoformat(),
+                    "feed": feed,
+                    "limit": int(limit),
+                    "max_pages": int(max_pages),
+                }),
+                rate_limit=rate_limit,
+                error=ProviderError(
+                    provider=PROVIDER,
+                    endpoint=endpoint,
+                    status_code=None,
+                    error_type="historical_quote_window_truncated",
+                    message=(
+                        "historical quote window still had next_page_token "
+                        "after max_pages was exhausted"
+                    ),
+                    retryable=True,
+                ),
+            )
+        return AdapterResponse(
+            data=quotes,
+            lineage=lineage or _local_lineage(endpoint, {
+                "symbol": normalized,
+                "start": start_ts.isoformat(),
+                "end": end_ts.isoformat(),
+                "feed": feed,
+            }),
+            rate_limit=rate_limit,
+        )
+
     def get_stock_snapshots(
         self,
         symbols: Sequence[str],
@@ -806,6 +911,18 @@ def _validation_error_response(
             message=message,
             retryable=False,
         ),
+    )
+
+
+def _local_lineage(endpoint: str, payload: dict) -> LineageMeta:
+    request_ts = utcnow()
+    return LineageMeta(
+        provider=PROVIDER,
+        endpoint=endpoint,
+        request_timestamp=request_ts,
+        asof_timestamp=request_ts,
+        raw_payload_hash=stable_hash(payload),
+        source_authority="local",
     )
 
 

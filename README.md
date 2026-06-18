@@ -1,6 +1,6 @@
 # Alpha Capital
 
-Last materially refreshed: 2026-06-16.
+Last materially refreshed: 2026-06-17.
 
 Alpha Capital is backend-first infrastructure for systematic U.S. equities
 research, signal measurement, historical replay, and supervised ranking. It is
@@ -62,12 +62,54 @@ latest production state.
 | Runtime | Python engine in `engine/alpha`, SQLAlchemy 2.x, Alembic, pytest, scikit-learn, Postgres/Supabase, provider adapters, and guarded CLI jobs. |
 | Database | Supabase/Postgres is the canonical target. SQLite exists for local/unit paths only and is refused by canonical write paths. |
 | Production compute | Always-on cloud VM runs scheduled jobs; large historical backfills and ML runs are treated as separate heavy jobs rather than fattening the always-on worker. |
-| Live patterns | M4, M1, and M2 have production paths. M3 exists but remains default-off. Intraday I11/I12 are research/corpus/paper lanes, not live broker execution. |
+| Live patterns | I12 is the lead economic lane and the focus of the path-to-live. The Stage-0 read-only fill-test machine exists, Alpaca SIP quotes are entitled, and it places no orders. The current I12 frozen model is loadable as research-shadow only and explicitly non-promotable because the training corpus is deferred-PIT. M4/M1/M2 have production paths. M3 default-off. |
 | Historical corpus | M4 has a survivorship-correct historical replay and forward-labeling path, plus a day-0 `signal_session` layer that captures the breakout-day intraday path. I11 and I12 have durable intraday corpus builders with scratch-schema guards. |
-| ML layer | Stage-1 ranker machinery exists: manifest loader, leakage-audited feature selection, purged/embargoed walk-forward CV, GBRT trainer, shadow inference, score persistence, registry identity checks, and fail-closed fallback. |
+| ML layer | Stage-1 ranker machinery exists: manifest loader, leakage-audited feature selection, purged/embargoed walk-forward CV, GBRT trainer, shadow inference, score persistence, registry identity checks, and fail-closed fallback. I12 has a validated research-shadow ranker with exact manifest/schema pins; it is not production-promotable until a PIT-clean I12 corpus is rebuilt and revalidated. |
 | Safety | Public writes are guarded; scratch schemas are explicitly bound; direct scratch writes verify `search_path`; ML manifests self-check hashes; intraday feature schemas deny known leaky roles by default. |
 | Test baseline | Recent local runs are around 2,600 passing tests, 6 skipped. Re-run locally before relying on this number. |
-| Execution | Paper execution infrastructure exists. Live broker execution is intentionally not the current milestone. |
+| Execution | Paper execution infrastructure exists, but the active I12 gate is Stage-0 read-only logging: detect, score, rank, quote, skip/log, and later capture exit quote. No paper orders and no live capital until Gate 0 passes. |
+
+### Strategy Direction (2026-06)
+
+Research has converged from a broad multi-pattern catalog onto a concrete plan.
+This section is the current strategic intent; older "17-pattern / KOTH optimizer"
+framing in planning docs is superseded.
+
+- **I12 (capitulation volume bounce) is the lead research engine, not yet a live
+  rule.** Its Stage-1 ML ranker is validated out-of-sample on the research corpus
+  (~2x top-decile lift), and the frozen model is loadable for read-only Stage-0
+  logging. It is deliberately non-promotable because the corpus selected fires with
+  a full-day volume condition. Full-day volume is unknowable at the entry minute, so
+  the current model is a research-shadow/teacher artifact, not a production model.
+- **The next real gate is a PIT-clean I12 rebuild.** Reconstruct historical
+  candidate rows at live decision times (9:35/9:40/9:45/10:00), using only
+  as-of-entry features: prior closed-bar drawdown, opening gap, early cumulative
+  volume, intraday-volume pace, projected volume, early return, liquidity/spread,
+  and PIT-safe catalyst/hazard flags. Label both exits — same-day near-close and
+  next-session open — then retrain and re-evaluate top-K books with real SIP spread
+  costs.
+- **Complexity must be earned.** First test the simple PIT-clean live-visible
+  candidate set, including false positives and skips-as-cash. If it is weak,
+  study early-volume/price/quote signatures only inside that live-visible set:
+  eventual winners versus eventual losers. Then feed engineered early-curve
+  features into the existing GBRT before considering any raw-tape neural net.
+  A neural net is a last rung, not the next step.
+- **The book is one pattern today, and its drawdown is idiosyncratic small-cap
+  clustering, not market beta.** An index hedge does almost nothing; a liquidity filter
+  and a light defensive trend overlay trim the tail, but the structural fix is
+  independence, not a market hedge.
+- **Target architecture: a K≈20 ML-ranked cross-pattern queue across ~3 independent
+  patterns.** Independence (not more alpha) is what collapses drawdown and earns the
+  right to lever; adding ~2 uncorrelated sleeves (lead candidate: market-neutral
+  cross-sectional / pairs) is the remaining strategic work. I12's own position count is
+  ~10; it is one sleeve, not the whole book.
+- **Stage-0 remains read-only instrumentation.** It should measure live candidate
+  coverage, SIP spreads, top-of-book size, skips-as-cash, and both exit quotes. It
+  is not a promotion test for the deferred-PIT model.
+- **Leverage is not available at small starting capital** (sub-$5 names are
+  non-marginable). The PDT $25k/day-trade-count framework is eliminated (SEC-approved
+  FINRA Rule 4210 amendment, effective 2026-06-04), which removes the day-trade/
+  capital-recycling constraint at $2k — but not name-level marginability.
 
 ## What This System Is Trying To Prevent
 
@@ -196,7 +238,7 @@ was fetched.
 | I1 | Gap-and-go intraday/day-0 continuation. | Spec variants have been researched; do not assume production readiness. |
 | I8 | Opening range breakout. | Detector exists; production viability depends on intraday data and execution assumptions. |
 | I11 | Intraday 52-week-high breakout, day-0 twin of M4. | Durable corpus builder exists. Minute-bar work showed real but smaller edge than daily proxies; overnight exit research matters. |
-| I12 | Capitulation volume bounce. | Durable corpus builder exists and is a key intraday research lane. Clean corpus rebuilds must use current code and scratch schemas before any training copy. |
+| I12 | Capitulation volume bounce research family: deeply damaged stocks, small opening gap, abnormal early volume/liquidity context, short hold. | **Lead research engine, not yet live.** Stage-1 ML ranker validated OOS on the deferred-PIT research corpus (~2x top-decile lift). Stage-0 read-only fill-test is built. Current frozen model is research-shadow only and non-promotable; next step is a PIT-clean as-of-entry rebuild. |
 
 Pattern status is intentionally conservative. "Code exists" does not mean
 "tradable".
@@ -228,6 +270,16 @@ I11 and I12 are intraday corpus builders, not casual backtests. They persist
 events into `intraday_event_details`; confirmed trainable events also get
 `signal_registry`, `feature_snapshots`, and, for I12 current code,
 `forward_return_observations`.
+
+Important I12 caveat as of 2026-06-17: the `i12_rebuild_20260615_codex`
+training corpus intentionally stamped confirmed registry rows and feature
+snapshots with `point_in_time_passed=false` because the historical candidate
+screen used a full-day volume floor for tractability. Independent rechecks showed
+that only a small fraction of final daily volume has traded at the confirmation
+minute, so the full-day volume condition is a future-information selector. The
+current frozen I12 model is therefore research-shadow only. The production path is
+a new PIT-clean corpus built from as-of-entry candidate snapshots, not another
+attempt to promote this corpus.
 
 Rules that matter:
 
@@ -285,6 +337,27 @@ dangerous. Current intent:
 Metric names and exact fail-closed behavior are active work. Check
 `engine/tests/test_stage1_ml_ranker.py` and `engine/alpha/jobs/train_model.py`
 before interpreting a model registry JSON blob.
+
+### I12 Frozen Model Status
+
+Current frozen I12 research-shadow model:
+
+```text
+model_id: stage1_i12_403a5ae359cd_accecdda
+manifest_version: stage1_i12_research_shadow_v2
+manifest_sha256: 6032ff99ce5b8d12c24f6b4b7967e170cf07d710c6b695e7e5b0fcecd46ed0e4
+feature_schema_hash: 403a5ae359cddc5a4927db8bf874addb209b17fc5d82415f134357adef748ee1
+status: shadow
+promotability: non-promotable, deferred_pit_model
+```
+
+This model is useful for read-only Stage-0 logging and as a teacher/upper-bound
+reference. It must not be promoted to production trading because all training rows
+come from the deferred-PIT I12 corpus. Older I12 model rows are rejected in
+`i12_rebuild_20260615_codex.ml_model_registry`.
+
+The next production-grade model must be trained from a PIT-clean candidate corpus
+whose feature JSON proves every field was knowable at the decision timestamp.
 
 ### What The ML Layer Is Not
 
@@ -354,7 +427,7 @@ Providers have roles. Convenience is not authority.
 | Benzinga | Catalyst/news/earnings/ratings/offering context. |
 | SEC EDGAR | Official Form 4 authority and filing acceptance timestamps; also PIT-safe form-type catalyst tagging (offering/424B, NT late filings) from per-issuer submissions. |
 | Nasdaq | Listing, halt, and archive authority paths. |
-| Alpaca | Paper trading integration. Live broker execution is not the current promoted path. |
+| Alpaca | Paper account, market-data probe, SIP quote feed, Stage-0 read-only fill-test logging, and later paper execution. Live broker execution is not the current promoted path. |
 
 Provider failures are observable states. Jobs should preserve whether data was
 missing, provider-failed, parse-failed, validation-failed, or excluded by policy.
@@ -439,6 +512,23 @@ uv run python -m alpha.jobs.run_market_path_pre_signal_context --schema scratch_
 # Stage-1 training
 uv run python -m alpha.jobs.run_train_model --manifest path/to/manifest.json --pattern-id M4
 
+# I12 Stage-0 read-only fill-test probe
+uv run python -m alpha.jobs.run_i12_live_fill_test --alpaca-probe-symbol AAPL --feed sip
+
+# I12 Stage-0 read-only once run with the research-shadow model
+uv run python -m alpha.jobs.run_i12_live_fill_test \
+  --schema scratch_i12_stage0_YYYYMMDD \
+  --create-tables \
+  --model-registry-schema i12_rebuild_20260615_codex \
+  --context-artifact artifacts/stage0/i12_context_YYYY-MM-DD.json \
+  --trading-date YYYY-MM-DD \
+  --model-id stage1_i12_403a5ae359cd_accecdda \
+  --feed sip \
+  --top-k 10 \
+  --intended-order-usd 250 \
+  --max-spread-bps 200 \
+  --once
+
 # Paper execution
 uv run python -m alpha.jobs.run_paper_execution --dry-run
 ```
@@ -517,7 +607,8 @@ on a tiny fold.
 3. A clean corpus matters more than a promising edge estimate.
 4. Pattern code and corpus code must agree on clocks.
 5. Full-day fields in intraday corpora are research-only unless proven
-   entry-knowable.
+   entry-knowable. I12 full-day volume is not entry-knowable and cannot be a live
+   detector gate.
 6. A provider profile saying "common stock" is not enough for training
    eligibility when series listings, funds, units, notes, or preferreds are in
    play.
@@ -530,6 +621,8 @@ on a tiny fold.
 This repo is infrastructure in motion. Important non-final areas include:
 
 - broker live execution promotion
+- Stage-0 read-only I12 Gate-0 pass over multiple trading days
+- PIT-clean I12 as-of-entry rebuild and replacement model
 - full allocator/optimizer promotion
 - final I11/I12 corpus promotion decisions
 - broader Stage-1 pattern manifests beyond the active pattern set

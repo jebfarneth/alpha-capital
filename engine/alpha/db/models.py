@@ -2492,6 +2492,230 @@ class I12FillLog(Base):
 
 
 # ---------------------------------------------------------------------------
+# i12 PIT-clean research rebuild tables (scratch/research schema)
+# ---------------------------------------------------------------------------
+class I12PitCandidate(Base):
+    """PIT-clean historical I12 candidate attempt at a fixed decision time."""
+
+    __tablename__ = "i12_pit_candidates"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="ux_i12_pit_candidates_content_hash"),
+        Index(
+            "ix_i12_pit_candidates_attempt_active",
+            "candidate_attempt_hash",
+            "is_active",
+        ),
+        Index(
+            "ux_i12_pit_candidates_active_attempt",
+            "candidate_attempt_hash",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+            postgresql_where=text("is_active"),
+        ),
+        Index(
+            "ix_i12_pit_candidates_ticker_decision",
+            "ticker",
+            "decision_ts",
+        ),
+        Index(
+            "ix_i12_pit_candidates_status",
+            "decision_date",
+            "candidate_status",
+            "coverage_status",
+        ),
+    )
+
+    i12_pit_candidate_id = Column(String, primary_key=True, default=_uuid)
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    decision_date = Column(Date, nullable=False)
+    decision_ts = Column(DateTime(timezone=True), nullable=False)
+    decision_time_label = Column(String, nullable=False)
+    feature_asof_ts = Column(DateTime(timezone=True), nullable=True)
+    candidate_status = Column(String, nullable=False)
+    coverage_status = Column(String, nullable=False)
+    fail_reason = Column(String, nullable=True)
+    feature_json = Column(Text, nullable=False)
+    gate_values_json = Column(Text, nullable=False)
+    leakage_guard_json = Column(Text, nullable=False)
+    source_bars_json = Column(Text, nullable=False)
+    label_json = Column(Text, nullable=True)
+    error_json = Column(Text, nullable=True)
+    candidate_attempt_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
+    superseded_by_candidate_id = Column(String, nullable=True)
+    input_hash = Column(String, nullable=False)
+    candidate_identity_hash = Column(String, nullable=False)
+    label_hash = Column(String, nullable=False)
+    content_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    quote_replays = relationship(
+        "I12PitQuoteReplay",
+        back_populates="candidate",
+        cascade="all, delete-orphan",
+    )
+    cost_replays = relationship(
+        "I12PitCostReplay",
+        back_populates="candidate",
+        cascade="all, delete-orphan",
+    )
+
+
+class I12PitQuoteReplay(Base):
+    """Scoped historical SIP quote evidence for one PIT-clean candidate window."""
+
+    __tablename__ = "i12_pit_quote_replays"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="ux_i12_pit_quote_replays_content_hash"),
+        Index(
+            "ix_i12_pit_quote_replays_attempt_active",
+            "quote_replay_attempt_hash",
+            "is_active",
+        ),
+        Index(
+            "ux_i12_pit_quote_replays_active_attempt",
+            "quote_replay_attempt_hash",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+            postgresql_where=text("is_active"),
+        ),
+        Index(
+            "ix_i12_pit_quote_replays_candidate_role",
+            "i12_pit_candidate_id",
+            "quote_role",
+        ),
+        Index(
+            "ix_i12_pit_quote_replays_status",
+            "quote_role",
+            "coverage_status",
+        ),
+    )
+
+    i12_pit_quote_replay_id = Column(String, primary_key=True, default=_uuid)
+    i12_pit_candidate_id = Column(
+        String, ForeignKey("i12_pit_candidates.i12_pit_candidate_id"), nullable=False
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    decision_date = Column(Date, nullable=False)
+    decision_ts = Column(DateTime(timezone=True), nullable=False)
+    quote_role = Column(String, nullable=False)
+    target_ts = Column(DateTime(timezone=True), nullable=False)
+    window_start_ts = Column(DateTime(timezone=True), nullable=False)
+    window_end_ts = Column(DateTime(timezone=True), nullable=False)
+    quote_ts = Column(DateTime(timezone=True), nullable=True)
+    quote_age_seconds = Column(Float, nullable=True)
+    bid = Column(Float, nullable=True)
+    ask = Column(Float, nullable=True)
+    bid_size = Column(Float, nullable=True)
+    ask_size = Column(Float, nullable=True)
+    spread_bps = Column(Float, nullable=True)
+    top_of_book_notional = Column(Float, nullable=True)
+    bid_notional = Column(Float, nullable=True)
+    ask_notional = Column(Float, nullable=True)
+    executable_notional = Column(Float, nullable=True)
+    executable_side = Column(String, nullable=True)
+    feed = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    quote_size_basis = Column(String, nullable=False)
+    coverage_status = Column(String, nullable=False)
+    raw_json = Column(Text, nullable=True)
+    error_json = Column(Text, nullable=True)
+    quote_replay_attempt_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
+    superseded_by_quote_replay_id = Column(String, nullable=True)
+    content_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    candidate = relationship("I12PitCandidate", back_populates="quote_replays")
+
+
+class I12PitCostReplay(Base):
+    """Quote-realistic return replay for a PIT-clean candidate and exit role."""
+
+    __tablename__ = "i12_pit_cost_replays"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="ux_i12_pit_cost_replays_content_hash"),
+        Index(
+            "ix_i12_pit_cost_replays_attempt_active",
+            "cost_replay_attempt_hash",
+            "is_active",
+        ),
+        Index(
+            "ux_i12_pit_cost_replays_active_attempt",
+            "cost_replay_attempt_hash",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+            postgresql_where=text("is_active"),
+        ),
+        Index(
+            "ix_i12_pit_cost_replays_candidate_exit",
+            "i12_pit_candidate_id",
+            "exit_role",
+        ),
+        Index(
+            "ix_i12_pit_cost_replays_status",
+            "exit_role",
+            "tradeability_status",
+            "skipped_reason",
+        ),
+    )
+
+    i12_pit_cost_replay_id = Column(String, primary_key=True, default=_uuid)
+    i12_pit_candidate_id = Column(
+        String, ForeignKey("i12_pit_candidates.i12_pit_candidate_id"), nullable=False
+    )
+    job_run_id = Column(
+        String, ForeignKey("evidence_job_runs.job_run_id"), nullable=True
+    )
+    ticker = Column(String, nullable=False)
+    decision_date = Column(Date, nullable=False)
+    decision_ts = Column(DateTime(timezone=True), nullable=False)
+    exit_role = Column(String, nullable=False)
+    entry_quote_replay_id = Column(
+        String, ForeignKey("i12_pit_quote_replays.i12_pit_quote_replay_id"), nullable=True
+    )
+    exit_quote_replay_id = Column(
+        String, ForeignKey("i12_pit_quote_replays.i12_pit_quote_replay_id"), nullable=True
+    )
+    tradeability_status = Column(String, nullable=False)
+    skipped_reason = Column(String, nullable=False)
+    intended_order_usd = Column(Float, nullable=False)
+    max_spread_bps = Column(Float, nullable=False)
+    slippage_bps = Column(Float, nullable=False)
+    entry_ask = Column(Float, nullable=True)
+    exit_bid = Column(Float, nullable=True)
+    gross_return = Column(Float, nullable=True)
+    quote_cost_return = Column(Float, nullable=True)
+    slippage_return = Column(Float, nullable=True)
+    modeled_return = Column(Float, nullable=False)
+    cost_replay_attempt_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
+    superseded_by_cost_replay_id = Column(String, nullable=True)
+    content_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    candidate = relationship("I12PitCandidate", back_populates="cost_replays")
+
+
+# ---------------------------------------------------------------------------
 # intraday_event_details
 # ---------------------------------------------------------------------------
 class IntradayEventDetail(Base):

@@ -2046,6 +2046,108 @@ class TestAlpacaAdapter:
         assert resp.data.bid_size == 0.0
         assert resp.data.ask_size == 0.0
 
+    def test_get_historical_quotes_uses_sip_window_and_paginates(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.side_effect = [
+            _mock_response(
+                200,
+                {
+                    "quotes": [
+                        {
+                            "bp": 10.0,
+                            "ap": 10.05,
+                            "bs": 10,
+                            "as": 0,
+                            "t": "2026-06-16T13:39:58Z",
+                            "c": ["R"],
+                        }
+                    ],
+                    "next_page_token": "next-page",
+                },
+            ),
+            _mock_response(
+                200,
+                {
+                    "quotes": [
+                        {
+                            "bp": 10.01,
+                            "ap": 10.06,
+                            "bs": 20,
+                            "as": 25,
+                            "t": "2026-06-16T13:40:00Z",
+                        }
+                    ]
+                },
+            ),
+        ]
+        adapter = self._adapter(session)
+        start = datetime(2026, 6, 16, 13, 38, tzinfo=timezone.utc)
+        end = datetime(2026, 6, 16, 13, 40, 5, tzinfo=timezone.utc)
+
+        resp = adapter.get_historical_quotes(
+            "acme",
+            start=start,
+            end=end,
+            feed="sip",
+            limit=2,
+            max_pages=2,
+        )
+
+        assert resp.ok
+        assert [quote.symbol for quote in resp.data] == ["ACME", "ACME"]
+        assert resp.data[0].ask_size == 0.0
+        assert resp.data[1].ask_size == 25.0
+        assert session.request.call_count == 2
+        first_call = session.request.call_args_list[0]
+        assert first_call.args[1] == "https://data.alpaca.markets/v2/stocks/ACME/quotes"
+        assert first_call.kwargs["params"] == {
+            "start": "2026-06-16T13:38:00Z",
+            "end": "2026-06-16T13:40:05Z",
+            "feed": "sip",
+            "limit": 2,
+        }
+        second_params = session.request.call_args_list[1].kwargs["params"]
+        assert second_params["page_token"] == "next-page"
+        assert second_params["feed"] == "sip"
+
+    def test_get_historical_quotes_fails_closed_when_page_window_truncated(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        session.request.return_value = _mock_response(
+            200,
+            {
+                "quotes": [
+                    {
+                        "bp": 10.0,
+                        "ap": 10.05,
+                        "bs": 10,
+                        "as": 25,
+                        "t": "2026-06-16T13:39:58Z",
+                    }
+                ],
+                "next_page_token": "still-more",
+            },
+        )
+        adapter = self._adapter(session)
+        start = datetime(2026, 6, 16, 13, 38, tzinfo=timezone.utc)
+        end = datetime(2026, 6, 16, 13, 40, 5, tzinfo=timezone.utc)
+
+        resp = adapter.get_historical_quotes(
+            "acme",
+            start=start,
+            end=end,
+            feed="sip",
+            limit=1,
+            max_pages=1,
+        )
+
+        assert not resp.ok
+        assert resp.data is None
+        assert resp.error is not None
+        assert resp.error.error_type == "historical_quote_window_truncated"
+        assert session.request.call_count == 1
+
     def test_get_stock_snapshots_parses_intraday_snapshot(self):
         session = MagicMock(spec=requests.Session)
         session.headers = {}
