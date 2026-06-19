@@ -367,6 +367,7 @@ class PolygonAdapter:
                 timeout=POLYGON_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -386,6 +387,7 @@ class PolygonAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(

@@ -12,13 +12,16 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import tempfile
+import threading
+import time as time_module
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -223,6 +226,8 @@ class I12PitRebuildJob(BaseJob):
         fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
         max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
         max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+        max_no_progress_seconds: float | None = None,
+        no_progress_exit_callback: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
@@ -230,6 +235,8 @@ class I12PitRebuildJob(BaseJob):
             raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
         if max_consecutive_fetch_timeouts < 1:
             raise ValueError("max_consecutive_fetch_timeouts must be >= 1")
+        if max_no_progress_seconds is not None and max_no_progress_seconds <= 0:
+            raise ValueError("max_no_progress_seconds must be > 0 when provided")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -255,6 +262,19 @@ class I12PitRebuildJob(BaseJob):
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
             max_consecutive_timeouts=max_consecutive_fetch_timeouts,
         )
+        self._max_no_progress_seconds = (
+            float(max_no_progress_seconds)
+            if max_no_progress_seconds is not None
+            else None
+        )
+        self._no_progress_exit_callback = no_progress_exit_callback
+        self._progress_state_lock = threading.Lock()
+        self._last_progress_monotonic = time_module.monotonic()
+        self._last_progress_wall_clock_utc = datetime.now(timezone.utc)
+        self._last_progress_event = "init"
+        self._last_progress_payload: dict[str, Any] = {}
+        self._no_progress_stop = threading.Event()
+        self._no_progress_thread: threading.Thread | None = None
         self.partial_metrics: dict[str, Any] = {}
         if (
             output_schema
@@ -275,199 +295,203 @@ class I12PitRebuildJob(BaseJob):
 
     def run(self, ctx: JobContext) -> JobResult:
         self._progress("start", {"job_run_id": ctx.job_run_id})
-        trading_dates = [
-            self._start_date + timedelta(days=offset)
-            for offset in range((self._end_date - self._start_date).days + 1)
-            if is_us_equity_session(self._start_date + timedelta(days=offset))
-        ]
-        counters: Counter[str] = Counter()
-        hur_rows_loaded = 0
-        for trading_date in trading_dates:
-            try:
-                hur_rows = self._load_hur_rows(trading_date)
-            except Exception:
-                if self._session.in_transaction():
-                    self._session.rollback()
-                raise
-            else:
-                if self._session.in_transaction():
-                    self._session.rollback()
-            hur_rows_loaded += len(hur_rows)
-            self._progress(
-                "date_start",
-                self._heartbeat_payload(
-                    counters=counters,
-                    trading_date=trading_date,
-                    hur_rows_for_date=len(hur_rows),
-                    hur_rows_processed_for_date=0,
-                    cumulative_hur_rows_loaded=hur_rows_loaded,
-                    job_run_id=ctx.job_run_id,
-                ),
-            )
-            if not hur_rows:
-                counters["zero_hur_dates"] += 1
-            for hur_index, hur_row in enumerate(hur_rows, start=1):
-                ticker = hur_row.ticker
-                daily_resp = self._fetch_fmp_daily_with_deadline(
-                    ticker,
-                    trading_date,
-                    job_run_id=ctx.job_run_id,
-                )
-                if not daily_resp.ok:
-                    daily_error = _provider_error_payload(daily_resp)
-                    daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
-                    for label in self._decision_times:
-                        decision_ts = _decision_timestamp(trading_date, label)
-                        result = _candidate_error(
-                            ticker=ticker,
-                            trading_date=trading_date,
-                            decision_ts=decision_ts,
-                            decision_time_label=label,
-                            coverage_status="daily_fetch_error",
-                            fail_reason="daily_fetch_error",
-                            daily_source_hash=daily_source_hash,
-                            minute_source_hash=None,
-                            daily_error=daily_error,
-                            minute_error=None,
-                            source_hur_identity_hash=hur_row.source_hur_identity_hash,
-                            source_hur=hur_row.source_hur_payload,
-                            path_mode=self._minute_path_mode,
-                        )
-                        self._persist_candidate(result, ctx.job_run_id)
-                        self._session.commit()
-                        counters[f"candidate_{result.candidate_status}"] += 1
-                        counters[f"coverage_{result.coverage_status}"] += 1
-                    self._maybe_emit_ticker_progress(
+        self._start_no_progress_monitor(ctx.job_run_id)
+        try:
+            trading_dates = [
+                self._start_date + timedelta(days=offset)
+                for offset in range((self._end_date - self._start_date).days + 1)
+                if is_us_equity_session(self._start_date + timedelta(days=offset))
+            ]
+            counters: Counter[str] = Counter()
+            hur_rows_loaded = 0
+            for trading_date in trading_dates:
+                try:
+                    hur_rows = self._load_hur_rows(trading_date)
+                except Exception:
+                    if self._session.in_transaction():
+                        self._session.rollback()
+                    raise
+                else:
+                    if self._session.in_transaction():
+                        self._session.rollback()
+                hur_rows_loaded += len(hur_rows)
+                self._progress(
+                    "date_start",
+                    self._heartbeat_payload(
                         counters=counters,
                         trading_date=trading_date,
                         hur_rows_for_date=len(hur_rows),
-                        hur_rows_processed_for_date=hur_index,
+                        hur_rows_processed_for_date=0,
                         cumulative_hur_rows_loaded=hur_rows_loaded,
-                        current_ticker=ticker,
                         job_run_id=ctx.job_run_id,
-                    )
-                    continue
-                minute_resp = self._fetch_polygon_minutes_with_deadline(
-                    ticker,
-                    trading_date,
-                    job_run_id=ctx.job_run_id,
+                    ),
                 )
-                daily_bars = _clean_daily_bars(ticker, daily_resp.data or [], _CleanCounters())
-                if not minute_resp.ok:
-                    minute_error = _provider_error_payload(minute_resp)
-                    daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
-                    minute_source_hash = getattr(minute_resp.lineage, "raw_payload_hash", None)
-                    for label in self._decision_times:
-                        decision_ts = _decision_timestamp(trading_date, label)
-                        result = _candidate_error(
-                            ticker=ticker,
-                            trading_date=trading_date,
-                            decision_ts=decision_ts,
-                            decision_time_label=label,
-                            coverage_status="minute_fetch_error",
-                            fail_reason="minute_fetch_error",
-                            daily_source_hash=daily_source_hash,
-                            minute_source_hash=minute_source_hash,
-                            daily_error=None,
-                            minute_error=minute_error,
-                            source_hur_identity_hash=hur_row.source_hur_identity_hash,
-                            source_hur=hur_row.source_hur_payload,
-                            path_mode=self._minute_path_mode,
-                        )
-                        self._persist_candidate(result, ctx.job_run_id)
-                        self._session.commit()
-                        counters[f"candidate_{result.candidate_status}"] += 1
-                        counters[f"coverage_{result.coverage_status}"] += 1
-                    self._maybe_emit_ticker_progress(
-                        counters=counters,
-                        trading_date=trading_date,
-                        hur_rows_for_date=len(hur_rows),
-                        hur_rows_processed_for_date=hur_index,
-                        cumulative_hur_rows_loaded=hur_rows_loaded,
-                        current_ticker=ticker,
+                if not hur_rows:
+                    counters["zero_hur_dates"] += 1
+                for hur_index, hur_row in enumerate(hur_rows, start=1):
+                    ticker = hur_row.ticker
+                    daily_resp = self._fetch_fmp_daily_with_deadline(
+                        ticker,
+                        trading_date,
                         job_run_id=ctx.job_run_id,
                     )
-                    continue
-                raw_minutes = minute_resp.data or []
-                minute_bars = _clean_minute_bars(trading_date, raw_minutes)
-                for label in self._decision_times:
-                    decision_ts = _decision_timestamp(trading_date, label)
-                    result = build_i12_pit_candidate(
-                        ticker=ticker,
-                        trading_date=trading_date,
-                        decision_ts=decision_ts,
-                        decision_time_label=label,
-                        daily_bars=daily_bars,
-                        minute_bars=minute_bars,
-                        daily_source_hash=getattr(daily_resp.lineage, "raw_payload_hash", None),
-                        minute_source_hash=(
-                            getattr(minute_resp.lineage, "raw_payload_hash", None)
-                            if minute_resp.ok
-                            else None
-                        ),
-                        minute_error=None if minute_resp.ok else _provider_error_payload(minute_resp),
-                        source_hur_identity_hash=hur_row.source_hur_identity_hash,
-                        source_hur=hur_row.source_hur_payload,
-                        path_mode=self._minute_path_mode,
-                    )
-                    candidate = self._persist_candidate(result, ctx.job_run_id)
-                    candidate_id = candidate.i12_pit_candidate_id
-                    self._session.commit()
-                    counters[f"candidate_{result.candidate_status}"] += 1
-                    counters[f"coverage_{result.coverage_status}"] += 1
-                    if (
-                        self._quote_replay
-                        and self._alpaca is not None
-                        and result.candidate_status == "passed"
-                    ):
-                        quotes = self._replay_quotes(candidate_id, ctx.job_run_id)
-                        candidate_for_costs = self._session.get(
-                            I12PitCandidate,
-                            candidate_id,
-                        )
-                        if candidate_for_costs is None:
-                            raise RuntimeError(
-                                f"I12 PIT candidate disappeared before cost replay: "
-                                f"{candidate_id}"
+                    if not daily_resp.ok:
+                        daily_error = _provider_error_payload(daily_resp)
+                        daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
+                        for label in self._decision_times:
+                            decision_ts = _decision_timestamp(trading_date, label)
+                            result = _candidate_error(
+                                ticker=ticker,
+                                trading_date=trading_date,
+                                decision_ts=decision_ts,
+                                decision_time_label=label,
+                                coverage_status="daily_fetch_error",
+                                fail_reason="daily_fetch_error",
+                                daily_source_hash=daily_source_hash,
+                                minute_source_hash=None,
+                                daily_error=daily_error,
+                                minute_error=None,
+                                source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                                source_hur=hur_row.source_hur_payload,
+                                path_mode=self._minute_path_mode,
                             )
-                        self._persist_costs(candidate_for_costs, quotes, ctx.job_run_id)
+                            self._persist_candidate(result, ctx.job_run_id)
+                            self._session.commit()
+                            counters[f"candidate_{result.candidate_status}"] += 1
+                            counters[f"coverage_{result.coverage_status}"] += 1
+                        self._maybe_emit_ticker_progress(
+                            counters=counters,
+                            trading_date=trading_date,
+                            hur_rows_for_date=len(hur_rows),
+                            hur_rows_processed_for_date=hur_index,
+                            cumulative_hur_rows_loaded=hur_rows_loaded,
+                            current_ticker=ticker,
+                            job_run_id=ctx.job_run_id,
+                        )
+                        continue
+                    minute_resp = self._fetch_polygon_minutes_with_deadline(
+                        ticker,
+                        trading_date,
+                        job_run_id=ctx.job_run_id,
+                    )
+                    daily_bars = _clean_daily_bars(ticker, daily_resp.data or [], _CleanCounters())
+                    if not minute_resp.ok:
+                        minute_error = _provider_error_payload(minute_resp)
+                        daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
+                        minute_source_hash = getattr(minute_resp.lineage, "raw_payload_hash", None)
+                        for label in self._decision_times:
+                            decision_ts = _decision_timestamp(trading_date, label)
+                            result = _candidate_error(
+                                ticker=ticker,
+                                trading_date=trading_date,
+                                decision_ts=decision_ts,
+                                decision_time_label=label,
+                                coverage_status="minute_fetch_error",
+                                fail_reason="minute_fetch_error",
+                                daily_source_hash=daily_source_hash,
+                                minute_source_hash=minute_source_hash,
+                                daily_error=None,
+                                minute_error=minute_error,
+                                source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                                source_hur=hur_row.source_hur_payload,
+                                path_mode=self._minute_path_mode,
+                            )
+                            self._persist_candidate(result, ctx.job_run_id)
+                            self._session.commit()
+                            counters[f"candidate_{result.candidate_status}"] += 1
+                            counters[f"coverage_{result.coverage_status}"] += 1
+                        self._maybe_emit_ticker_progress(
+                            counters=counters,
+                            trading_date=trading_date,
+                            hur_rows_for_date=len(hur_rows),
+                            hur_rows_processed_for_date=hur_index,
+                            cumulative_hur_rows_loaded=hur_rows_loaded,
+                            current_ticker=ticker,
+                            job_run_id=ctx.job_run_id,
+                        )
+                        continue
+                    raw_minutes = minute_resp.data or []
+                    minute_bars = _clean_minute_bars(trading_date, raw_minutes)
+                    for label in self._decision_times:
+                        decision_ts = _decision_timestamp(trading_date, label)
+                        result = build_i12_pit_candidate(
+                            ticker=ticker,
+                            trading_date=trading_date,
+                            decision_ts=decision_ts,
+                            decision_time_label=label,
+                            daily_bars=daily_bars,
+                            minute_bars=minute_bars,
+                            daily_source_hash=getattr(daily_resp.lineage, "raw_payload_hash", None),
+                            minute_source_hash=(
+                                getattr(minute_resp.lineage, "raw_payload_hash", None)
+                                if minute_resp.ok
+                                else None
+                            ),
+                            minute_error=None if minute_resp.ok else _provider_error_payload(minute_resp),
+                            source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                            source_hur=hur_row.source_hur_payload,
+                            path_mode=self._minute_path_mode,
+                        )
+                        candidate = self._persist_candidate(result, ctx.job_run_id)
+                        candidate_id = candidate.i12_pit_candidate_id
                         self._session.commit()
-                        counters["quote_replayed_candidates"] += 1
-                self._maybe_emit_ticker_progress(
+                        counters[f"candidate_{result.candidate_status}"] += 1
+                        counters[f"coverage_{result.coverage_status}"] += 1
+                        if (
+                            self._quote_replay
+                            and self._alpaca is not None
+                            and result.candidate_status == "passed"
+                        ):
+                            quotes = self._replay_quotes(candidate_id, ctx.job_run_id)
+                            candidate_for_costs = self._session.get(
+                                I12PitCandidate,
+                                candidate_id,
+                            )
+                            if candidate_for_costs is None:
+                                raise RuntimeError(
+                                    f"I12 PIT candidate disappeared before cost replay: "
+                                    f"{candidate_id}"
+                                )
+                            self._persist_costs(candidate_for_costs, quotes, ctx.job_run_id)
+                            self._session.commit()
+                            counters["quote_replayed_candidates"] += 1
+                    self._maybe_emit_ticker_progress(
+                        counters=counters,
+                        trading_date=trading_date,
+                        hur_rows_for_date=len(hur_rows),
+                        hur_rows_processed_for_date=hur_index,
+                        cumulative_hur_rows_loaded=hur_rows_loaded,
+                        current_ticker=ticker,
+                        job_run_id=ctx.job_run_id,
+                    )
+                self._session.commit()
+                self._update_partial_metrics(
                     counters=counters,
+                    hur_rows_loaded=hur_rows_loaded,
+                    event="date_finish",
                     trading_date=trading_date,
-                    hur_rows_for_date=len(hur_rows),
-                    hur_rows_processed_for_date=hur_index,
-                    cumulative_hur_rows_loaded=hur_rows_loaded,
-                    current_ticker=ticker,
                     job_run_id=ctx.job_run_id,
                 )
-            self._session.commit()
-            self._update_partial_metrics(
-                counters=counters,
+            report = i12_pit_rebuild_report(
+                self._session,
+                source_hur_schema=self._source_hur_schema,
                 hur_rows_loaded=hur_rows_loaded,
-                event="date_finish",
-                trading_date=trading_date,
-                job_run_id=ctx.job_run_id,
+                decision_time_count=len(self._decision_times),
+                decision_time_labels=self._decision_times,
+                start_date=self._start_date,
+                end_date=self._end_date,
+                path_mode=self._minute_path_mode,
             )
-        report = i12_pit_rebuild_report(
-            self._session,
-            source_hur_schema=self._source_hur_schema,
-            hur_rows_loaded=hur_rows_loaded,
-            decision_time_count=len(self._decision_times),
-            decision_time_labels=self._decision_times,
-            start_date=self._start_date,
-            end_date=self._end_date,
-            path_mode=self._minute_path_mode,
-        )
-        metrics = {
-            "counters": dict(counters),
-            "fetch_watchdog": self._fetch_watchdog.snapshot(),
-            **report,
-        }
-        self.partial_metrics = metrics
-        self._progress("finish", metrics)
-        return JobResult(status="finished", metrics=metrics)
+            metrics = {
+                "counters": dict(counters),
+                "fetch_watchdog": self._fetch_watchdog.snapshot(),
+                **report,
+            }
+            self.partial_metrics = metrics
+            self._progress("finish", metrics)
+            return JobResult(status="finished", metrics=metrics)
+        finally:
+            self._stop_no_progress_monitor()
 
     def _fetch_fmp_daily_with_deadline(
         self,
@@ -1567,7 +1591,83 @@ class I12PitRebuildJob(BaseJob):
         if callable(reset_session):
             reset_session()
 
+    def _start_no_progress_monitor(self, job_run_id: str | None) -> None:
+        if self._max_no_progress_seconds is None:
+            return
+        if self._no_progress_thread is not None:
+            return
+        self._no_progress_stop.clear()
+        self._no_progress_thread = threading.Thread(
+            target=self._no_progress_monitor_loop,
+            args=(job_run_id,),
+            name="i12-pit-no-progress-monitor",
+            daemon=True,
+        )
+        self._no_progress_thread.start()
+
+    def _stop_no_progress_monitor(self) -> None:
+        thread = self._no_progress_thread
+        if thread is None:
+            return
+        self._no_progress_stop.set()
+        thread.join(timeout=1.0)
+        self._no_progress_thread = None
+
+    def _no_progress_monitor_loop(self, job_run_id: str | None) -> None:
+        assert self._max_no_progress_seconds is not None
+        sleep_seconds = min(5.0, max(0.1, self._max_no_progress_seconds / 4.0))
+        while not self._no_progress_stop.wait(sleep_seconds):
+            payload = self._no_progress_timeout_payload(job_run_id)
+            if payload is None:
+                continue
+            try:
+                self._progress("no_progress_timeout", payload)
+            except Exception as exc:  # noqa: BLE001 - monitor must still terminate
+                print(
+                    "ERROR: failed to write no-progress artifact: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            callback = self._no_progress_exit_callback
+            if callback is not None:
+                callback(payload)
+            return
+
+    def _no_progress_timeout_payload(
+        self,
+        job_run_id: str | None,
+    ) -> dict[str, Any] | None:
+        if self._max_no_progress_seconds is None:
+            return None
+        now_monotonic = time_module.monotonic()
+        with self._progress_state_lock:
+            age_seconds = now_monotonic - self._last_progress_monotonic
+            if age_seconds < self._max_no_progress_seconds:
+                return None
+            return {
+                "job_run_id": job_run_id,
+                "minute_path_mode": self._minute_path_mode,
+                "decision_time_labels": list(self._decision_times),
+                "max_no_progress_seconds": self._max_no_progress_seconds,
+                "no_progress_age_seconds": age_seconds,
+                "last_progress_event": self._last_progress_event,
+                "last_progress_wall_clock_utc": (
+                    self._last_progress_wall_clock_utc.isoformat()
+                ),
+                "last_progress_payload": dict(self._last_progress_payload),
+                "fetch_watchdog": self._fetch_watchdog.snapshot(),
+            }
+
+    def _mark_progress(self, event: str, payload: Mapping[str, Any]) -> None:
+        with self._progress_state_lock:
+            self._last_progress_monotonic = time_module.monotonic()
+            self._last_progress_wall_clock_utc = datetime.now(timezone.utc)
+            self._last_progress_event = event
+            self._last_progress_payload = dict(payload)
+
     def _progress(self, event: str, payload: Mapping[str, Any]) -> None:
+        self._mark_progress(event, payload)
         if self._progress_artifact is None:
             return
         record = {

@@ -6,6 +6,7 @@ SCHEMA="${SCHEMA:-scratch_i12_pit_m1_0940_strict_20260618}"
 MINUTE_PATH_MODE="strict_contiguous"
 DECISION_TIME="09:40"
 SOURCE_HUR_SCHEMA="${SOURCE_HUR_SCHEMA:-public}"
+MAX_NO_PROGRESS_MINUTES="${MAX_NO_PROGRESS_MINUTES:-20}"
 REPLACE_STALE="${REPLACE_STALE:-0}"
 REPLACE_RUNNING="${REPLACE_RUNNING:-0}"
 ONLY_SHARD="${ONLY_SHARD:-}"
@@ -30,6 +31,23 @@ replaced_running_windows=0
 
 quote_cmd() {
   printf "%q " "$@"
+}
+
+regex_escape() {
+  printf "%s" "$1" | sed 's/[][(){}.^$*+?|\\]/\\&/g'
+}
+
+command_has_arg_value() {
+  local command="$1"
+  local flag
+  local value
+  local pattern
+  local normalized_command
+  normalized_command="${command//\\ / }"
+  flag="$(regex_escape "$2")"
+  value="$(regex_escape "$3")"
+  pattern="(^|[[:space:]])${flag}([[:space:]]+|=)${value}($|[[:space:]])"
+  [[ "${normalized_command}" =~ ${pattern} ]]
 }
 
 selector_enabled() {
@@ -139,6 +157,7 @@ window_running_expected() {
     [[ "${pane_start}" == *"--decision-time"* && "${pane_start}" == *"${DECISION_TIME}"* ]] || continue
     [[ "${pane_start}" == *"--minute-path-mode"* && "${pane_start}" == *"${MINUTE_PATH_MODE}"* ]] || continue
     [[ "${pane_start}" == *"--progress-artifact"* && "${pane_start}" == *"${progress_artifact}"* ]] || continue
+    command_has_arg_value "${pane_start}" "--max-no-progress-minutes" "${MAX_NO_PROGRESS_MINUTES}" || continue
     return 0
   done < <(tmux list-panes -t "${SESSION}:${window}" -F "#{pane_dead}\t#{pane_current_command}\t#{pane_start_command}" 2>/dev/null || true)
   return 1
@@ -212,6 +231,7 @@ for shard in "${SHARDS[@]}"; do
     --intended-order-usd 250
     --max-spread-bps 200
     --max-quote-age-seconds 60
+    --max-no-progress-minutes "${MAX_NO_PROGRESS_MINUTES}"
     --progress-artifact "${progress_artifact}"
   )
   cmd="$(worker_shell_command "${run_cmd[@]}")"
@@ -226,6 +246,7 @@ tmux list-windows -t "${SESSION}"
 echo
 echo "summary:"
 echo "matched_shards=${matched_shards} launched_windows=${launched_windows} skipped_running_windows=${skipped_running_windows} replaced_stale_windows=${replaced_stale_windows} replaced_running_windows=${replaced_running_windows}"
+echo "MAX_NO_PROGRESS_MINUTES=${MAX_NO_PROGRESS_MINUTES}"
 echo
 echo "process check:"
 echo "tmux list-panes -a -t ${SESSION} -F '#S:#W #{pane_pid} #{pane_current_command}'"

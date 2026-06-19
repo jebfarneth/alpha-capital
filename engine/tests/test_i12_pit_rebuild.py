@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
+import sys
 import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
@@ -2084,6 +2087,9 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "REPLACE_RUNNING" in text_value
         assert "ONLY_SHARD" in text_value
         assert "ONLY_WINDOW" in text_value
+        assert "MAX_NO_PROGRESS_MINUTES=\"${MAX_NO_PROGRESS_MINUTES:-20}\"" in text_value
+        assert "--max-no-progress-minutes" in text_value
+        assert '"${MAX_NO_PROGRESS_MINUTES}"' in text_value
         assert "validate_replacement_scope" in text_value
         assert "validate_selector_matches" in text_value
         assert "selector matched zero shards" in text_value
@@ -2096,6 +2102,11 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "shard_selected" in text_value
         assert "REPLACE_RUNNING=1 requires exactly one" in text_value
         assert "window_running_expected" in text_value
+        assert "command_has_arg_value" in text_value
+        assert "regex_escape" in text_value
+        assert 'normalized_command="${command//\\\\ / }"' in text_value
+        assert 'command_has_arg_value "${pane_start}" "--max-no-progress-minutes" "${MAX_NO_PROGRESS_MINUTES}"' in text_value
+        assert 'pane_start}" == *"--max-no-progress-minutes"*' not in text_value
         assert "window already running expected shard" in text_value
         assert "replacing running expected shard window" in text_value
         assert "REPLACE_RUNNING=1" in text_value
@@ -2106,6 +2117,52 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "pane_start_command" in text_value
         worker_loop = text_value.rsplit('for shard in "${SHARDS[@]}"; do', 1)[1]
         assert "--create-tables" not in worker_loop
+
+
+def test_i12_pit_shard_launcher_no_progress_match_is_exact():
+    def matches_pane_start(command: str, expected_value: str) -> bool:
+        normalized = command.replace("\\ ", " ")
+        pattern = re.compile(
+            rf"(^|\s)--max-no-progress-minutes(\s+|=){re.escape(expected_value)}($|\s)"
+        )
+        return bool(pattern.search(normalized))
+
+    assert matches_pane_start(
+        "python -m alpha.jobs.run_i12_pit_rebuild --max-no-progress-minutes 20 ",
+        "20",
+    )
+    assert matches_pane_start(
+        "python -m alpha.jobs.run_i12_pit_rebuild --max-no-progress-minutes=20 ",
+        "20",
+    )
+    assert matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20\ ",
+        "20",
+    )
+    assert matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes=20\ ",
+        "20",
+    )
+    assert not matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 30\ ",
+        "20",
+    )
+    assert not matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 120\ ",
+        "20",
+    )
+    assert not matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.0\ ",
+        "20",
+    )
+    assert not matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.5\ ",
+        "20",
+    )
+    assert matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.0\ ",
+        "20.0",
+    )
 
 
 def test_pit_required_column_preflight_covers_quote_and_cost_tables(monkeypatch):
@@ -2881,6 +2938,38 @@ def test_progress_write_replace_failure_preserves_previous_complete_artifact(
     assert not list(progress_path.parent.glob(f".{progress_path.name}.*.tmp"))
 
 
+def test_no_progress_timeout_payload_uses_last_progress_event(db_session):
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp([]),
+        polygon_adapter=FakePolygon([]),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        max_no_progress_seconds=30,
+    )
+
+    job._progress(
+        "provider_fetch_start",
+        {"job_run_id": "job-no-progress", "ticker": "WEDGE"},
+    )
+    with job._progress_state_lock:
+        job._last_progress_monotonic -= 31
+
+    payload = job._no_progress_timeout_payload("job-no-progress")
+
+    assert payload is not None
+    assert payload["job_run_id"] == "job-no-progress"
+    assert payload["max_no_progress_seconds"] == 30
+    assert payload["no_progress_age_seconds"] >= 30
+    assert payload["last_progress_event"] == "provider_fetch_start"
+    assert payload["last_progress_payload"]["ticker"] == "WEDGE"
+    assert payload["fetch_watchdog"]["circuit_open"] is False
+
+
 def test_i12_pit_run_emits_date_and_ticker_heartbeats(db_session):
     _add_hur(db_session, "HEART1", output_hash="hur-heart-1")
     _add_hur(db_session, "HEART2", output_hash="hur-heart-2")
@@ -3541,6 +3630,113 @@ def test_report_only_does_not_require_date_range(monkeypatch, capsys):
     assert captured["compare_path_modes"] is False
     assert captured["decision_time_labels"] == list(run_i12_pit_rebuild.DEFAULT_DECISION_TIMES)
     assert '"report": "ok"' in capsys.readouterr().out
+
+
+def test_runner_accepts_optional_no_progress_timeout():
+    args = run_i12_pit_rebuild._parse_args([
+        "--schema",
+        "scratch_i12",
+        "--start-date",
+        DAY.isoformat(),
+        "--end-date",
+        DAY.isoformat(),
+        "--max-no-progress-minutes",
+        "12.5",
+    ])
+
+    assert args.max_no_progress_minutes == 12.5
+
+
+def test_runner_defaults_no_progress_timeout_for_rebuilds():
+    args = run_i12_pit_rebuild._parse_args([
+        "--schema",
+        "scratch_i12",
+        "--start-date",
+        DAY.isoformat(),
+        "--end-date",
+        DAY.isoformat(),
+    ])
+
+    assert args.max_no_progress_minutes == 20.0
+
+
+def test_runner_rejects_negative_no_progress_timeout():
+    with pytest.raises(SystemExit):
+        run_i12_pit_rebuild._parse_args([
+            "--schema",
+            "scratch_i12",
+            "--start-date",
+            DAY.isoformat(),
+            "--end-date",
+            DAY.isoformat(),
+            "--max-no-progress-minutes",
+            "-1",
+        ])
+
+
+def test_runner_no_progress_exit_callback_exits_70(monkeypatch, capsys):
+    def fake_exit(code):
+        raise SystemExit(code)
+
+    monkeypatch.setattr(run_i12_pit_rebuild.os, "_exit", fake_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        run_i12_pit_rebuild._exit_on_no_progress({
+            "job_run_id": "job-wedged",
+            "last_progress_event": "provider_fetch_start",
+        })
+
+    assert exc.value.code == 70
+    err = capsys.readouterr().err
+    assert "no-progress watchdog fired" in err
+    assert "job-wedged" in err
+
+
+def test_runner_no_progress_exit_subprocess_writes_artifact_and_exits_70(tmp_path):
+    progress_path = tmp_path / "no_progress.json"
+    code = f"""
+from alpha.jobs.i12_pit_rebuild import I12PitRebuildJob
+from alpha.jobs.run_i12_pit_rebuild import _exit_on_no_progress
+
+class FakeSession:
+    pass
+
+job = I12PitRebuildJob(
+    session=FakeSession(),
+    fmp_adapter=object(),
+    polygon_adapter=object(),
+    alpaca_adapter=None,
+    start_date=None,
+    end_date=None,
+    decision_times=["09:40"],
+    minute_path_mode="strict_contiguous",
+    quote_replay=False,
+    progress_artifact={str(progress_path)!r},
+    max_no_progress_seconds=0.1,
+    no_progress_exit_callback=_exit_on_no_progress,
+)
+job._progress("provider_fetch_start", {{"job_run_id": "subprocess-no-progress"}})
+with job._progress_state_lock:
+    job._last_progress_monotonic -= 1
+payload = job._no_progress_timeout_payload("subprocess-no-progress")
+job._progress("no_progress_timeout", payload)
+_exit_on_no_progress(payload)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 70
+    assert "no-progress watchdog fired" in result.stderr
+    artifact = json.loads(progress_path.read_text())
+    assert artifact["event"] == "no_progress_timeout"
+    assert artifact["job_run_id"] == "subprocess-no-progress"
+    assert artifact["last_progress_event"] == "provider_fetch_start"
 
 
 def test_preflight_only_does_not_require_date_range_or_providers(monkeypatch, capsys):

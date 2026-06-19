@@ -9,6 +9,7 @@ import os
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any, Mapping
 
 from sqlalchemy import inspect
 
@@ -169,6 +170,14 @@ def main(argv: list[str] | None = None) -> int:
             fetch_deadline_seconds=args.fetch_deadline_seconds,
             max_outstanding_fetch_timeouts=args.max_outstanding_fetch_timeouts,
             max_consecutive_fetch_timeouts=args.max_consecutive_fetch_timeouts,
+            max_no_progress_seconds=(
+                args.max_no_progress_minutes * 60
+                if args.max_no_progress_minutes > 0
+                else None
+            ),
+            no_progress_exit_callback=(
+                _exit_on_no_progress if args.max_no_progress_minutes > 0 else None
+            ),
         )
         result = run_job(
             session,
@@ -192,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 "fetch_deadline_seconds": args.fetch_deadline_seconds,
                 "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
                 "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
+                "max_no_progress_minutes": args.max_no_progress_minutes,
             },
         )
         print(json.dumps(result.metrics or {}, indent=2, sort_keys=True, default=str))
@@ -253,6 +263,16 @@ def _write_json_artifact(path_value: str | None, payload: dict) -> None:
     path = Path(path_value)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
+def _exit_on_no_progress(payload: Mapping[str, Any]) -> None:
+    print(
+        "ERROR: I12 PIT rebuild no-progress watchdog fired: "
+        + json.dumps(payload, sort_keys=True, default=str),
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(70)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -329,6 +349,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
         help="Open the provider outage circuit after this many consecutive watchdog timeouts.",
     )
+    parser.add_argument(
+        "--max-no-progress-minutes",
+        type=float,
+        default=20.0,
+        help=(
+            "Exit nonzero if no progress artifact event occurs for this many "
+            "minutes during normal rebuild runs; 0 disables the shard-level "
+            "no-progress monitor. Report-only and preflight-only modes do not "
+            "start the monitor."
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         not args.report_only
@@ -357,6 +388,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--max-outstanding-fetch-timeouts must be >= 1")
     if args.max_consecutive_fetch_timeouts < 1:
         parser.error("--max-consecutive-fetch-timeouts must be >= 1")
+    if args.max_no_progress_minutes < 0:
+        parser.error("--max-no-progress-minutes must be >= 0")
     if (
         args.schema
         and args.source_hur_schema

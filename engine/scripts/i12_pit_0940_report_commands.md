@@ -16,6 +16,25 @@ The strict and sparse launchers run a single schema/table preflight in the
 control shell before fan-out. Shard workers then run without `--create-tables`,
 so a fresh parallel launch does not race on scratch table creation.
 
+Each worker also runs the PIT runner's no-progress watchdog:
+
+```bash
+MAX_NO_PROGRESS_MINUTES=20
+```
+
+The runner default is 20 minutes for normal rebuild runs, and these launchers
+also pass the value explicitly to every shard as `--max-no-progress-minutes`.
+A provider/socket wedge exits nonzero instead of polling forever. Override it
+only when you have a reason to tolerate longer provider stalls:
+
+```bash
+MAX_NO_PROGRESS_MINUTES=30 scripts/run_i12_pit_0940_strict_shards.sh
+```
+
+Existing tmux panes do not inherit new defaults or launcher matching rules. Kill
+or relaunch old panes after pulling this code if they were started before the
+no-progress monitor was added.
+
 Strict:
 
 ```bash
@@ -30,8 +49,10 @@ scripts/run_i12_pit_0940_sparse_shards.sh
 
 Both scripts reuse their tmux session if it already exists. They only skip an
 existing shard window when that pane is actively running the expected Python
-command for the same schema, date range, path mode, and progress artifact. A
-stale shell/dead/unexpected window is a hard error by default.
+command for the same schema, date range, path mode, progress artifact, and
+exact `--max-no-progress-minutes` value. Old panes launched without the monitor,
+or with a different monitor timeout, are treated as stale/unexpected. A stale
+shell/dead/unexpected window is a hard error by default.
 
 After manually confirming a stale or unexpected window is safe to replace:
 
@@ -55,6 +76,16 @@ provider replay worker, and the launcher refuses to run it unless exactly one
 `ONLY_SHARD` or `ONLY_WINDOW` selector is supplied. Do not use running
 replacement broadly after a power loss; inspect the pane and database state,
 then replace only the diagnosed shard.
+
+If an old monitor-less pane is present, the launcher will classify it as stale.
+Use this recovery flow:
+
+1. Check the pane output and progress artifact.
+2. Check Postgres for an idle-in-transaction or wedged provider signature.
+3. Replace stale monitor-less panes with `REPLACE_STALE=1`, or kill/relaunch
+   pre-monitor panes manually.
+4. Replace still-running expected-command panes only with
+   `REPLACE_RUNNING=1 ONLY_SHARD=<name>` after diagnosis.
 
 Selector typos fail closed before schema preflight. Valid examples:
 

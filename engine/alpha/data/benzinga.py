@@ -31,6 +31,7 @@ from alpha.data.contracts import (
 )
 
 PROVIDER = "Benzinga"
+BENZINGA_REQUEST_TIMEOUT = (10, 30)
 M_AND_A_ENDPOINT = "/api/v2.1/calendar/ma"
 EARNINGS_ENDPOINT = "/api/v2.1/calendar/earnings"
 GUIDANCE_ENDPOINT = "/api/v2.1/calendar/guidance"
@@ -339,6 +340,12 @@ class BenzingaAdapter:
         self._config = config
         self._session = session or requests.Session()
 
+    def reset_session(self) -> None:
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = requests.Session()
+
     def _request(
         self,
         endpoint: str,
@@ -377,9 +384,13 @@ class BenzingaAdapter:
 
         try:
             resp = self._session.get(
-                url, params=request_params, headers=headers, timeout=30
+                url,
+                params=request_params,
+                headers=headers,
+                timeout=BENZINGA_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -399,6 +410,7 @@ class BenzingaAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(

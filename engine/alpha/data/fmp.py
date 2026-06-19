@@ -291,6 +291,7 @@ class FmpAdapter:
                 timeout=FMP_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -310,6 +311,7 @@ class FmpAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(

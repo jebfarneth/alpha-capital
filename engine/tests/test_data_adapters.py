@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 
-from alpha.data.benzinga import BenzingaAdapter
+from alpha.data.benzinga import BENZINGA_REQUEST_TIMEOUT, BenzingaAdapter
 from alpha.data.config import (
     AlpacaConfig,
     BenzingaConfig,
@@ -33,8 +33,8 @@ from alpha.data.config import (
 )
 from alpha.data.contracts import stable_hash
 from alpha.data.fmp import FMP_REQUEST_TIMEOUT, FmpAdapter
-from alpha.data.alpaca import AlpacaAdapter
-from alpha.data.edgar import SecEdgarAdapter
+from alpha.data.alpaca import ALPACA_REQUEST_TIMEOUT, AlpacaAdapter
+from alpha.data.edgar import EDGAR_REQUEST_TIMEOUT, SecEdgarAdapter
 from alpha.data.polygon import POLYGON_REQUEST_TIMEOUT, PolygonAdapter, _normalized_cik
 from alpha.jobs.security_type import (
     ADR,
@@ -269,7 +269,7 @@ class TestSecEdgarAdapter:
                 "Accept-Encoding": "gzip, deflate",
                 "Accept": "application/json",
             },
-            timeout=30,
+            timeout=EDGAR_REQUEST_TIMEOUT,
         )
 
     def test_get_company_ticker_returns_none_for_unknown_ticker(self):
@@ -524,6 +524,7 @@ class TestSecEdgarAdapter:
         assert resp.error.error_type == "http"
         assert resp.error.message == "SEC EDGAR request failed: ConnectionError"
         assert "secret" not in resp.error.message
+        session.close.assert_called_once()
 
     def test_get_filings_maps_rate_limit_and_auth_errors(self):
         session = MagicMock(spec=requests.Session)
@@ -1863,6 +1864,7 @@ class TestFmpAdapter:
         assert not resp.ok
         assert resp.error.error_type == "timeout"
         assert resp.error.retryable is True
+        session.close.assert_called_once()
 
     def test_parse_error(self):
         session = MagicMock(spec=requests.Session)
@@ -2257,6 +2259,7 @@ class TestAlpacaAdapter:
 
         assert not resp.ok
         assert resp.error.error_type == "timeout"
+        session.close.assert_called_once()
 
     def test_request_converts_aware_asof_to_utc(self):
         session = MagicMock(spec=requests.Session)
@@ -4535,6 +4538,7 @@ class TestPolygonAdapter:
         assert not resp.ok
         assert resp.error.error_type == "timeout"
         assert resp.error.retryable is True
+        session.close.assert_called_once()
 
     def test_polygon_request_exception_does_not_leak_secret_or_url(self):
         session = MagicMock(spec=requests.Session)
@@ -4552,6 +4556,7 @@ class TestPolygonAdapter:
         assert "test-polygon-key" not in resp.error.message
         assert "apiKey" not in resp.error.message
         assert "https://api.polygon.io" not in resp.error.message
+        session.close.assert_called_once()
 
     def test_polygon_corporate_action_paginates_and_sanitizes_next_url(self):
         session = MagicMock(spec=requests.Session)
@@ -6267,7 +6272,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_get_wiims_uses_wiim_channel(self):
@@ -6355,6 +6360,7 @@ class TestBenzingaAdapter:
         assert not resp.ok
         assert resp.error.error_type == "timeout"
         assert resp.error.retryable is True
+        session.close.assert_called_once()
 
     def test_get_news_parse_error(self):
         session = MagicMock(spec=requests.Session)
@@ -6540,7 +6546,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_get_guidance_ok(self):
@@ -6773,7 +6779,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_get_insider_filings_ok_and_params(self):
@@ -6848,7 +6854,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_get_insider_transactions_ok_and_params(self):
@@ -6934,7 +6940,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_calendar_adapters_empty_payload_success(self):
@@ -7043,6 +7049,7 @@ class TestBenzingaAdapter:
         assert "test-benzinga-key" not in resp.error.message
         assert "token" not in resp.error.message
         assert "https://api.benzinga.com" not in resp.error.message
+        session.close.assert_called_once()
 
     @pytest.mark.parametrize(
         ("method_name", "endpoint"),
@@ -7287,7 +7294,7 @@ class TestBenzingaAdapter:
                 "token": "test-benzinga-key",
             },
             headers={"Accept": "application/json"},
-            timeout=30,
+            timeout=BENZINGA_REQUEST_TIMEOUT,
         )
 
     def test_get_mergers_acquisitions_date_window_and_ticker_list(self):

@@ -30,6 +30,7 @@ from alpha.data.contracts import (
 )
 
 PROVIDER = "Alpaca"
+ALPACA_REQUEST_TIMEOUT = (10, 30)
 
 
 # --- Response types ---
@@ -220,9 +221,14 @@ class AlpacaAdapter:
 
         try:
             resp = self._session.request(
-                method, url, params=params, json=json_body, timeout=15
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=ALPACA_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -242,6 +248,7 @@ class AlpacaAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(

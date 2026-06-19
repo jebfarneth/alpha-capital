@@ -34,6 +34,7 @@ from alpha.data.contracts import (
 
 PROVIDER = "SEC_EDGAR"
 SOURCE_AUTHORITY = "SEC_EDGAR"
+EDGAR_REQUEST_TIMEOUT = (10, 30)
 COMPANY_TICKERS_EXCHANGE_ENDPOINT = "/files/company_tickers_exchange.json"
 SUBMISSIONS_ENDPOINT_TEMPLATE = "/submissions/CIK{cik}.json"
 SURVIVORSHIP_EVENTS_ENDPOINT = "sec_edgar_survivorship_events"
@@ -128,6 +129,12 @@ class SecEdgarAdapter:
         self._company_tickers_lineage: Optional[LineageMeta] = None
         self._last_request_monotonic: Optional[float] = None
 
+    def reset_session(self) -> None:
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = requests.Session()
+
     def _request(
         self,
         endpoint: str,
@@ -172,9 +179,10 @@ class SecEdgarAdapter:
                 url,
                 params=params or {},
                 headers=self._headers,
-                timeout=30,
+                timeout=EDGAR_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -196,6 +204,7 @@ class SecEdgarAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -339,9 +348,10 @@ class SecEdgarAdapter:
                 url,
                 params={},
                 headers=self._headers,
-                timeout=30,
+                timeout=EDGAR_REQUEST_TIMEOUT,
             )
         except requests.exceptions.Timeout:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
@@ -363,6 +373,7 @@ class SecEdgarAdapter:
                 ),
             )
         except requests.exceptions.RequestException as exc:
+            self.reset_session()
             return AdapterResponse(
                 data=None,
                 lineage=LineageMeta(
