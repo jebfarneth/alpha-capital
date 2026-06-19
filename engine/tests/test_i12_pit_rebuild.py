@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import text
 
+import alpha.jobs.i12_pit_rebuild as i12_pit_rebuild
 import alpha.jobs.run_i12_pit_rebuild as run_i12_pit_rebuild
 from alpha.data.alpaca import AlpacaQuote
 from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
@@ -30,6 +33,7 @@ from alpha.jobs.i12_pit_rebuild import (
     quote_windows_for_candidate,
     replay_quote_window,
 )
+from alpha.jobs.contracts import JobContext
 from alpha.jobs.run_i12_pit_rebuild import main as run_i12_pit_rebuild_main
 from alpha.jobs.i12_live_fill_test import (
     FROZEN_I12_STAGE0_FEATURE_SCHEMA_HASH,
@@ -86,6 +90,36 @@ class FakeAlpaca:
             data=list(self.quotes_by_role.get(role, [])),
             lineage=_lineage("Alpaca", symbol),
         )
+
+
+class AssertingNoTransactionFmp(FakeFmp):
+    def __init__(self, bars, session):
+        super().__init__(bars)
+        self.session = session
+
+    def get_historical_price(self, ticker, **kwargs):
+        assert self.session.in_transaction() is False
+        return super().get_historical_price(ticker, **kwargs)
+
+
+class AssertingNoTransactionPolygon(FakePolygon):
+    def __init__(self, bars, session):
+        super().__init__(bars)
+        self.session = session
+
+    def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
+        assert self.session.in_transaction() is False
+        return super().get_minute_aggs(ticker, from_date, to_date, **kwargs)
+
+
+class AssertingNoTransactionAlpaca(FakeAlpaca):
+    def __init__(self, quotes_by_role, session):
+        super().__init__(quotes_by_role)
+        self.session = session
+
+    def get_historical_quotes(self, symbol, *, start, end, feed="sip"):
+        assert self.session.in_transaction() is False
+        return super().get_historical_quotes(symbol, start=start, end=end, feed=feed)
 
 
 class FakeAlpacaResponses:
@@ -747,6 +781,33 @@ def test_job_replays_only_passing_candidate_event_windows(db_session):
     assert {call[3] for call in alpaca.calls} == {"sip"}
     assert result.metrics["quote_replay_complete"] is True
     assert result.metrics["training_status"] == "eligible_for_retrain_evaluation"
+
+
+def test_i12_pit_job_does_not_call_providers_inside_open_db_transaction(db_session):
+    _add_hur(db_session, "TXPROV1", output_hash="hur-tx-provider-1")
+    _add_hur(db_session, "TXPROV2", output_hash="hur-tx-provider-2")
+    quotes = _complete_quotes()
+    alpaca = AssertingNoTransactionAlpaca(quotes, db_session)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=AssertingNoTransactionFmp(_fmp_bars(), db_session),
+        polygon_adapter=AssertingNoTransactionPolygon(_polygon_bars(), db_session),
+        alpaca_adapter=alpaca,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        intended_order_usd=250,
+        quote_replay=True,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    assert db_session.query(I12PitCandidate).count() == 2
+    assert db_session.query(I12PitQuoteReplay).count() == 6
+    assert db_session.query(I12PitCostReplay).count() == 4
+    assert len(alpaca.calls) == 6
 
 
 def test_clean_zero_pit_candidates_reports_explicit_zero_candidate_status(db_session):
@@ -1612,6 +1673,222 @@ def test_count_only_compare_report_cannot_be_final(db_session):
     assert report["training_status"] == "blocked_source_identity_denominator_unknown"
 
 
+def test_i12_pit_report_summarizer_extracts_exit_metrics(tmp_path):
+    summarizer = _load_report_summarizer()
+    report = {
+        "report_path_mode": "strict_contiguous",
+        "report_decision_time_labels": ["09:40"],
+        "conclusions_final": True,
+        "training_status": "eligible_for_retrain_evaluation",
+        "pit_candidate_count": 12,
+        "actual_candidate_row_count": 20,
+        "quote_replay_complete": True,
+        "cost_replay_complete": True,
+        "quote_coverage_rate": 1.0,
+        "expected_candidate_attempts": 20,
+        "missing_source_attempt_count": 0,
+        "extra_source_attempt_count": 0,
+        "source_identity_denominator_known": True,
+        "missing_source_attempt_identity_count": 0,
+        "extra_source_attempt_identity_count": 0,
+        "exit_metrics": {
+            "same_day_exit": {
+                "candidates": 12,
+                "tradeable_count": 9,
+                "tradeable_rate": 0.75,
+                "skipped_cash_count": 3,
+                "skipped_cash_by_reason": {"spread": 2, "size": 1},
+                "mean_modeled_return_skips_as_cash": 0.012,
+                "win_rate_skips_as_cash": 0.58,
+                "spread_bps": {"p50": 90, "p75": 120, "p90": 180},
+                "executable_notional": {"p50": 450, "p75": 700, "p90": 1000},
+            },
+            "next_open_exit": {
+                "candidates": 12,
+                "tradeable_count": 8,
+                "tradeable_rate": 0.6667,
+                "skipped_cash_count": 4,
+                "skipped_cash_by_reason": {"quote_missing": 4},
+                "mean_modeled_return_skips_as_cash": 0.004,
+                "win_rate_skips_as_cash": 0.5,
+                "spread_bps": {"p50": 100, "p75": 140, "p90": 220},
+                "executable_notional": {"p50": 400, "p75": 650, "p90": 900},
+            },
+        },
+        "path_mode_metrics": {
+            "strict_contiguous": {
+                "training_status": "eligible_for_retrain_evaluation",
+                "conclusions_final": True,
+                "candidate_count": 20,
+                "passed_candidate_count": 12,
+                "missing_source_attempt_count": 0,
+                "extra_source_attempt_count": 0,
+                "missing_source_attempt_identity_count": 0,
+                "extra_source_attempt_identity_count": 0,
+            }
+        },
+    }
+    path = tmp_path / "strict_report.json"
+    path.write_text(json.dumps(report))
+
+    summary = summarizer.summarize_report_paths([path], labels=["strict"])[0]
+    text = summarizer.render_text_table([summary])
+
+    assert summary["label"] == "strict"
+    assert summary["report_path_mode"] == "strict_contiguous"
+    assert summary["source_replay"]["expected_candidate_attempts"] == 20
+    assert summary["exits"]["same_day_exit"]["tradeable_count"] == 9
+    assert summary["exits"]["same_day_exit"]["spread_bps_p90"] == 180
+    assert summary["path_mode_metrics"]["strict_contiguous"]["candidate_count"] == 20
+    assert "strict" in text
+    assert "same_day_exit" in text
+    assert "Path Modes" in text
+
+
+def test_i12_pit_report_summarizer_handles_missing_file(tmp_path):
+    summarizer = _load_report_summarizer()
+    missing = tmp_path / "missing_report.json"
+
+    summary = summarizer.summarize_report_paths([missing], labels=["missing"])[0]
+    text = summarizer.render_text_table([summary])
+
+    assert summary["label"] == "missing"
+    assert summary["error"] == "missing_report_file"
+    assert "missing_report_file" in text
+
+
+def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    for script_name in (
+        "run_i12_pit_0940_strict_shards.sh",
+        "run_i12_pit_0940_sparse_shards.sh",
+    ):
+        text_value = (scripts_dir / script_name).read_text()
+        assert "--preflight-only" in text_value
+        assert "run_schema_preflight" in text_value
+        assert "REPLACE_STALE" in text_value
+        assert "REPLACE_RUNNING" in text_value
+        assert "ONLY_SHARD" in text_value
+        assert "ONLY_WINDOW" in text_value
+        assert "validate_replacement_scope" in text_value
+        assert "validate_selector_matches" in text_value
+        assert "selector matched zero shards" in text_value
+        assert "print_valid_selectors" in text_value
+        assert "matched_shards=" in text_value
+        assert "launched_windows=" in text_value
+        assert "skipped_running_windows=" in text_value
+        assert "replaced_stale_windows=" in text_value
+        assert "replaced_running_windows=" in text_value
+        assert "shard_selected" in text_value
+        assert "REPLACE_RUNNING=1 requires exactly one" in text_value
+        assert "window_running_expected" in text_value
+        assert "window already running expected shard" in text_value
+        assert "replacing running expected shard window" in text_value
+        assert "REPLACE_RUNNING=1" in text_value
+        assert "REPLACE_STALE=1" in text_value
+        assert "ERROR: .env is required" in text_value
+        assert "set -Eeuo pipefail" in text_value
+        assert "pane_current_command" in text_value
+        assert "pane_start_command" in text_value
+        worker_loop = text_value.rsplit('for shard in "${SHARDS[@]}"; do', 1)[1]
+        assert "--create-tables" not in worker_loop
+
+
+def test_pit_required_column_preflight_covers_quote_and_cost_tables(monkeypatch):
+    required = run_i12_pit_rebuild.I12_PIT_REBUILD_REQUIRED_COLUMNS
+    assert "quote_size_basis" in required["i12_pit_quote_replays"]
+    assert "cost_replay_attempt_hash" in required["i12_pit_cost_replays"]
+
+    class FakeSession:
+        def get_bind(self):
+            return object()
+
+    class FakeInspector:
+        def __init__(self, missing_by_table):
+            self.missing_by_table = missing_by_table
+
+        def get_columns(self, table_name, schema=None):
+            del schema
+            return [
+                {"name": column}
+                for column in required[table_name]
+                if column not in self.missing_by_table.get(table_name, set())
+            ]
+
+    def assert_missing(table_name, missing_column):
+        monkeypatch.setattr(
+            run_i12_pit_rebuild,
+            "inspect",
+            lambda bind: FakeInspector({table_name: {missing_column}}),
+        )
+        with pytest.raises(ValueError) as exc:
+            run_i12_pit_rebuild._assert_required_pit_columns(
+                FakeSession(),
+                "scratch_old",
+            )
+        assert table_name in str(exc.value)
+        assert missing_column in str(exc.value)
+        assert "fresh scratch schema or migrate it" in str(exc.value)
+
+    assert_missing("i12_pit_candidates", "candidate_attempt_hash")
+    assert_missing("i12_pit_quote_replays", "quote_size_basis")
+    assert_missing("i12_pit_cost_replays", "cost_replay_attempt_hash")
+
+
+def test_pit_required_index_preflight_catches_missing_active_attempt_indexes(monkeypatch):
+    required_columns = run_i12_pit_rebuild.I12_PIT_REBUILD_REQUIRED_COLUMNS
+    required_indexes = run_i12_pit_rebuild.I12_PIT_REBUILD_REQUIRED_INDEXES
+
+    class FakeSession:
+        def get_bind(self):
+            return object()
+
+    class FakeInspector:
+        def __init__(self, missing_by_table):
+            self.missing_by_table = missing_by_table
+
+        def get_columns(self, table_name, schema=None):
+            del schema
+            return [{"name": column} for column in required_columns[table_name]]
+
+        def get_indexes(self, table_name, schema=None):
+            del schema
+            return [
+                {"name": index}
+                for index in required_indexes[table_name]
+                if index not in self.missing_by_table.get(table_name, set())
+            ]
+
+    def assert_missing(table_name, missing_index):
+        monkeypatch.setattr(
+            run_i12_pit_rebuild,
+            "inspect",
+            lambda bind: FakeInspector({table_name: {missing_index}}),
+        )
+        with pytest.raises(ValueError) as exc:
+            run_i12_pit_rebuild._assert_required_pit_columns(
+                FakeSession(),
+                "scratch_old",
+            )
+        assert table_name in str(exc.value)
+        assert missing_index in str(exc.value)
+        assert "without index" in str(exc.value)
+        assert "fresh scratch schema or migrate it" in str(exc.value)
+
+    assert_missing(
+        "i12_pit_candidates",
+        "ux_i12_pit_candidates_active_attempt",
+    )
+    assert_missing(
+        "i12_pit_quote_replays",
+        "ux_i12_pit_quote_replays_active_attempt",
+    )
+    assert_missing(
+        "i12_pit_cost_replays",
+        "ux_i12_pit_cost_replays_active_attempt",
+    )
+
+
 def test_report_bad_hur_source_returns_structured_blocked_report(db_session):
     _persist_complete_candidate_replay(db_session, "BADHUR", path_mode="sparse_zero_fill")
     db_session.execute(text("ATTACH DATABASE ':memory:' AS missing_hur"))
@@ -2108,6 +2385,301 @@ def test_progress_metrics_expose_identity_exactness(db_session):
     assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
 
 
+def test_update_partial_metrics_closes_owned_read_transaction(db_session):
+    _add_hur(db_session, "TXNPROGRESS", output_hash="hur-txn-progress")
+    _persist_complete_candidate_replay(
+        db_session,
+        "TXNPROGRESS",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "TXNPROGRESS"),
+    )
+    db_session.commit()
+    assert db_session.in_transaction() is False
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+    )
+
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+    assert db_session.in_transaction() is False
+
+
+def test_i12_pit_run_rolls_back_hur_load_exception(db_session, monkeypatch):
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+    )
+
+    def fail_load_hur_rows(trading_date):
+        assert trading_date == DAY
+        db_session.execute(text("SELECT 1"))
+        assert db_session.in_transaction() is True
+        raise RuntimeError("hur read failed")
+
+    monkeypatch.setattr(job, "_load_hur_rows", fail_load_hur_rows)
+
+    with pytest.raises(RuntimeError, match="hur read failed"):
+        job.run(JobContext(
+            job_id="job-hur-fail",
+            job_run_id="run-hur-fail",
+            started_at=datetime.now(timezone.utc),
+        ))
+
+    assert db_session.in_transaction() is False
+
+
+def test_update_partial_metrics_error_rolls_back_and_writes_minimal_artifact(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    _add_hur(db_session, "ERRPROGRESS", output_hash="hur-err-progress")
+    _persist_complete_candidate_replay(
+        db_session,
+        "ERRPROGRESS",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "ERRPROGRESS"),
+    )
+    db_session.commit()
+    progress_path = tmp_path / "progress_error.json"
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+        progress_artifact=progress_path,
+    )
+
+    def fail_identity(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("progress identity failed")
+
+    monkeypatch.setattr(i12_pit_rebuild, "_source_attempt_identity_audit", fail_identity)
+
+    job._update_partial_metrics(
+        counters=Counter({"candidate_passed": 1}),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+        job_run_id="job-progress-error",
+    )
+
+    artifact = json.loads(progress_path.read_text())
+    assert artifact["event"] == "progress_error"
+    assert artifact["job_run_id"] == "job-progress-error"
+    assert artifact["last_trading_date"] == DAY.isoformat()
+    assert artifact["progress_error"]["error_type"] == "RuntimeError"
+    assert "progress identity failed" in artifact["progress_error"]["message"]
+    assert db_session.in_transaction() is False
+
+
+def _progress_only_job(db_session, progress_path):
+    return I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp([]),
+        polygon_adapter=FakePolygon([]),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        progress_artifact=progress_path,
+    )
+
+
+def test_progress_write_is_valid_json_and_creates_parent_directories(db_session, tmp_path):
+    progress_path = tmp_path / "nested" / "progress" / "i12_progress.json"
+    job = _progress_only_job(db_session, progress_path)
+
+    job._progress("date_start", {"ticker": "ATOM", "sequence": 1})
+
+    artifact = json.loads(progress_path.read_text())
+    assert artifact["event"] == "date_start"
+    assert artifact["ticker"] == "ATOM"
+    assert artifact["sequence"] == 1
+    assert artifact["wall_clock_utc"]
+
+
+def test_progress_write_repeated_updates_leave_last_complete_record(
+    db_session,
+    tmp_path,
+):
+    progress_path = tmp_path / "i12_progress.json"
+    job = _progress_only_job(db_session, progress_path)
+
+    job._progress("ticker_progress", {"sequence": 1})
+    job._progress("ticker_progress", {"sequence": 2})
+    job._progress("date_finish", {"sequence": 3})
+
+    artifact = json.loads(progress_path.read_text())
+    assert artifact["event"] == "date_finish"
+    assert artifact["sequence"] == 3
+
+
+def test_progress_write_replace_failure_preserves_previous_complete_artifact(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    progress_path = tmp_path / "i12_progress.json"
+    job = _progress_only_job(db_session, progress_path)
+    job._progress("date_start", {"sequence": 1})
+
+    def fail_replace(src, dst):
+        del src, dst
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(i12_pit_rebuild.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        job._progress("ticker_progress", {"sequence": 2})
+
+    artifact = json.loads(progress_path.read_text())
+    assert artifact["event"] == "date_start"
+    assert artifact["sequence"] == 1
+    assert not list(progress_path.parent.glob(f".{progress_path.name}.*.tmp"))
+
+
+def test_i12_pit_run_emits_date_and_ticker_heartbeats(db_session):
+    _add_hur(db_session, "HEART1", output_hash="hur-heart-1")
+    _add_hur(db_session, "HEART2", output_hash="hur-heart-2")
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        progress_interval_tickers=1,
+    )
+    events = []
+
+    def capture_progress(event, payload):
+        events.append((event, dict(payload)))
+
+    job._progress = capture_progress
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    event_names = [event for event, _payload in events]
+    assert event_names[0] == "start"
+    assert "date_start" in event_names
+    assert event_names.count("ticker_progress") == 2
+    assert "date_finish" in event_names
+    assert event_names[-1] == "finish"
+    date_start = next(payload for event, payload in events if event == "date_start")
+    assert date_start["hur_rows_for_date"] == 2
+    assert date_start["hur_rows_processed_for_date"] == 0
+    ticker_payloads = [payload for event, payload in events if event == "ticker_progress"]
+    assert [payload["hur_rows_processed_for_date"] for payload in ticker_payloads] == [1, 2]
+    assert ticker_payloads[-1]["cumulative_hur_rows_loaded"] == 2
+
+
+def test_i12_pit_daily_fetch_errors_emit_ticker_progress(db_session):
+    _add_hur(db_session, "DAILYERR1", output_hash="hur-daily-err-1")
+    _add_hur(db_session, "DAILYERR2", output_hash="hur-daily-err-2")
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({}, error_tickers={"DAILYERR1", "DAILYERR2"}),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        progress_interval_tickers=1,
+    )
+    events = []
+
+    def capture_progress(event, payload):
+        events.append((event, dict(payload)))
+
+    job._progress = capture_progress
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    ticker_payloads = [payload for event, payload in events if event == "ticker_progress"]
+    assert [payload["current_ticker"] for payload in ticker_payloads] == [
+        "DAILYERR1",
+        "DAILYERR2",
+    ]
+    assert [payload["hur_rows_processed_for_date"] for payload in ticker_payloads] == [1, 2]
+    assert all(payload["hur_rows_for_date"] == 2 for payload in ticker_payloads)
+    assert all(payload["job_run_id"] for payload in ticker_payloads)
+    assert ticker_payloads[-1]["counters"]["coverage_daily_fetch_error"] == 2
+    assert ticker_payloads[-1]["counters"]["candidate_failed"] == 2
+
+
+def test_i12_pit_minute_fetch_errors_emit_ticker_progress(db_session):
+    _add_hur(db_session, "MINERR1", output_hash="hur-minute-err-1")
+    _add_hur(db_session, "MINERR2", output_hash="hur-minute-err-2")
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygonByTicker({}, error_tickers={"MINERR1", "MINERR2"}),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        progress_interval_tickers=1,
+    )
+    events = []
+
+    def capture_progress(event, payload):
+        events.append((event, dict(payload)))
+
+    job._progress = capture_progress
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    ticker_payloads = [payload for event, payload in events if event == "ticker_progress"]
+    assert [payload["current_ticker"] for payload in ticker_payloads] == [
+        "MINERR1",
+        "MINERR2",
+    ]
+    assert [payload["hur_rows_processed_for_date"] for payload in ticker_payloads] == [1, 2]
+    assert all(payload["hur_rows_for_date"] == 2 for payload in ticker_payloads)
+    assert all(payload["job_run_id"] for payload in ticker_payloads)
+    assert ticker_payloads[-1]["counters"]["coverage_minute_fetch_error"] == 2
+    assert ticker_payloads[-1]["counters"]["candidate_failed"] == 2
+
+
 def test_progress_identity_scope_uses_processed_dates_not_full_window(db_session):
     next_day = next_us_equity_session(DAY + timedelta(days=1))
     _add_hur(db_session, "PROGRESSWINDOW", day=DAY, output_hash="hur-progress-window-1")
@@ -2517,6 +3089,40 @@ def test_report_only_does_not_require_date_range(monkeypatch, capsys):
     assert '"report": "ok"' in capsys.readouterr().out
 
 
+def test_preflight_only_does_not_require_date_range_or_providers(monkeypatch, capsys):
+    class FakeSession:
+        def close(self):
+            pass
+
+    session = FakeSession()
+    monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: session)
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", lambda *args, **kwargs: None)
+
+    class ExplodingFmpAdapter:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("provider constructed")
+
+    monkeypatch.setattr(run_i12_pit_rebuild, "FmpAdapter", ExplodingFmpAdapter)
+
+    code = run_i12_pit_rebuild.main([
+        "--schema",
+        "scratch_preflight",
+        "--create-tables",
+        "--preflight-only",
+        "--minute-path-mode",
+        "sparse_zero_fill",
+    ])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '"preflight": "ok"' in out
+    assert '"schema": "scratch_preflight"' in out
+    assert '"minute_path_mode": "sparse_zero_fill"' in out
+
+
 def test_report_only_passes_requested_decision_time_labels(monkeypatch):
     class FakeSession:
         def close(self):
@@ -2771,6 +3377,22 @@ def _add_hur(db_session, ticker, *, day=DAY, output_hash):
             output_hash=output_hash,
         )
     )
+
+
+def _load_report_summarizer():
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "summarize_i12_pit_report.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "summarize_i12_pit_report",
+        script_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _hur_identity_hash(db_session, ticker, *, day=DAY, source_schema="public"):

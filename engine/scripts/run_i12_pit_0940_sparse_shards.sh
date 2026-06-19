@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${SESSION:-i12pit_0940_sparse}"
+SCHEMA="${SCHEMA:-scratch_i12_pit_m1_0940_sparse_20260618}"
+MINUTE_PATH_MODE="sparse_zero_fill"
+DECISION_TIME="09:40"
+SOURCE_HUR_SCHEMA="${SOURCE_HUR_SCHEMA:-public}"
+REPLACE_STALE="${REPLACE_STALE:-0}"
+REPLACE_RUNNING="${REPLACE_RUNNING:-0}"
+ONLY_SHARD="${ONLY_SHARD:-}"
+ONLY_WINDOW="${ONLY_WINDOW:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+
+SHARDS=(
+  "may01_07:2026-05-01:2026-05-07:artifacts/stage0/i12_pit_0940_sparse_may01_07.json"
+  "may08_14:2026-05-08:2026-05-14:artifacts/stage0/i12_pit_0940_sparse_may08_14.json"
+  "may15_21:2026-05-15:2026-05-21:artifacts/stage0/i12_pit_0940_sparse_may15_21.json"
+  "may22_29:2026-05-22:2026-05-29:artifacts/stage0/i12_pit_0940_sparse_may22_29.json"
+  "jun01_05:2026-06-01:2026-06-05:artifacts/stage0/i12_pit_0940_sparse_jun01_05.json"
+)
+
+matched_shards=0
+launched_windows=0
+skipped_running_windows=0
+replaced_stale_windows=0
+replaced_running_windows=0
+
+quote_cmd() {
+  printf "%q " "$@"
+}
+
+selector_enabled() {
+  [[ -n "${ONLY_SHARD}" || -n "${ONLY_WINDOW}" ]]
+}
+
+print_valid_selectors() {
+  echo "Valid sparse shard selectors:" >&2
+  for shard in "${SHARDS[@]}"; do
+    IFS=":" read -r name _start_date _end_date _progress_artifact <<<"${shard}"
+    echo "  ONLY_SHARD=${name} or ONLY_WINDOW=sparse_${name}" >&2
+  done
+}
+
+validate_replacement_scope() {
+  local selector_count=0
+  [[ -n "${ONLY_SHARD}" ]] && selector_count=$((selector_count + 1))
+  [[ -n "${ONLY_WINDOW}" ]] && selector_count=$((selector_count + 1))
+  if [[ "${REPLACE_RUNNING}" == "1" && "${selector_count}" -ne 1 ]]; then
+    echo "ERROR: REPLACE_RUNNING=1 requires exactly one of ONLY_SHARD or ONLY_WINDOW." >&2
+    echo "Example: REPLACE_RUNNING=1 ONLY_SHARD=may15_21 $0" >&2
+    echo "Example: REPLACE_RUNNING=1 ONLY_WINDOW=sparse_may15_21 $0" >&2
+    exit 1
+  fi
+}
+
+validate_selector_matches() {
+  local matched=0
+  local name window shard
+  if ! selector_enabled; then
+    return 0
+  fi
+  for shard in "${SHARDS[@]}"; do
+    IFS=":" read -r name _start_date _end_date _progress_artifact <<<"${shard}"
+    window="sparse_${name}"
+    if shard_selected "${name}" "${window}"; then
+      matched=$((matched + 1))
+    fi
+  done
+  if [[ "${matched}" -eq 0 ]]; then
+    echo "ERROR: selector matched zero shards: ONLY_SHARD='${ONLY_SHARD}' ONLY_WINDOW='${ONLY_WINDOW}'" >&2
+    print_valid_selectors
+    exit 1
+  fi
+}
+
+shard_selected() {
+  local shard_name="$1"
+  local window="$2"
+  if [[ -n "${ONLY_SHARD}" && "${shard_name}" != "${ONLY_SHARD}" ]]; then
+    return 1
+  fi
+  if [[ -n "${ONLY_WINDOW}" && "${window}" != "${ONLY_WINDOW}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+require_env_file() {
+  if [[ ! -f "${ENGINE_DIR}/.env" ]]; then
+    echo "ERROR: ${ENGINE_DIR}/.env is required" >&2
+    exit 1
+  fi
+}
+
+run_schema_preflight() {
+  echo "preflighting scratch schema ${SCHEMA} for ${MINUTE_PATH_MODE}"
+  (
+    set -Eeuo pipefail
+    cd "${ENGINE_DIR}"
+    require_env_file
+    set -a
+    source .env
+    set +a
+    "${PYTHON_BIN}" -m alpha.jobs.run_i12_pit_rebuild \
+      --schema "${SCHEMA}" \
+      --create-tables \
+      --source-hur-schema "${SOURCE_HUR_SCHEMA}" \
+      --decision-time "${DECISION_TIME}" \
+      --minute-path-mode "${MINUTE_PATH_MODE}" \
+      --preflight-only
+  )
+}
+
+worker_shell_command() {
+  local -a run_cmd=("$@")
+  local inner
+  inner="set -Eeuo pipefail; cd $(printf "%q" "${ENGINE_DIR}"); "
+  inner+="if [[ ! -f .env ]]; then echo 'ERROR: .env is required' >&2; exit 1; fi; "
+  inner+="set -a; source .env; set +a; exec $(quote_cmd "${run_cmd[@]}")"
+  printf "exec bash -lc %q" "${inner}"
+}
+
+window_running_expected() {
+  local window="$1"
+  local start_date="$2"
+  local end_date="$3"
+  local progress_artifact="$4"
+  local pane_dead pane_command pane_start
+  while IFS=$'\t' read -r pane_dead pane_command pane_start; do
+    [[ "${pane_dead}" == "0" ]] || continue
+    [[ "${pane_command}" == *python* ]] || continue
+    [[ "${pane_start}" == *"alpha.jobs.run_i12_pit_rebuild"* ]] || continue
+    [[ "${pane_start}" == *"--schema"* && "${pane_start}" == *"${SCHEMA}"* ]] || continue
+    [[ "${pane_start}" == *"--start-date"* && "${pane_start}" == *"${start_date}"* ]] || continue
+    [[ "${pane_start}" == *"--end-date"* && "${pane_start}" == *"${end_date}"* ]] || continue
+    [[ "${pane_start}" == *"--decision-time"* && "${pane_start}" == *"${DECISION_TIME}"* ]] || continue
+    [[ "${pane_start}" == *"--minute-path-mode"* && "${pane_start}" == *"${MINUTE_PATH_MODE}"* ]] || continue
+    [[ "${pane_start}" == *"--progress-artifact"* && "${pane_start}" == *"${progress_artifact}"* ]] || continue
+    return 0
+  done < <(tmux list-panes -t "${SESSION}:${window}" -F "#{pane_dead}\t#{pane_current_command}\t#{pane_start_command}" 2>/dev/null || true)
+  return 1
+}
+
+handle_existing_window() {
+  local window="$1"
+  local start_date="$2"
+  local end_date="$3"
+  local progress_artifact="$4"
+  if ! tmux list-windows -t "${SESSION}" -F "#{window_name}" | grep -Fxq "${window}"; then
+    return 0
+  fi
+  if window_running_expected "${window}" "${start_date}" "${end_date}" "${progress_artifact}"; then
+    if [[ "${REPLACE_RUNNING}" == "1" ]]; then
+      echo "WARNING: replacing running expected shard window: ${SESSION}:${window}" >&2
+      echo "WARNING: verify pg_stat_activity/progress artifacts before using REPLACE_RUNNING=1." >&2
+      tmux kill-window -t "${SESSION}:${window}"
+      replaced_running_windows=$((replaced_running_windows + 1))
+      return 0
+    fi
+    echo "window already running expected shard: ${SESSION}:${window}"
+    echo "Set REPLACE_RUNNING=1 to kill/recreate an expected-command shard after diagnosing a hang." >&2
+    skipped_running_windows=$((skipped_running_windows + 1))
+    return 1
+  fi
+  if [[ "${REPLACE_STALE}" == "1" ]]; then
+    echo "replacing stale window: ${SESSION}:${window}"
+    tmux kill-window -t "${SESSION}:${window}"
+    replaced_stale_windows=$((replaced_stale_windows + 1))
+    return 0
+  fi
+  echo "ERROR: stale or unexpected tmux window exists: ${SESSION}:${window}" >&2
+  echo "Set REPLACE_STALE=1 to kill/recreate it after verifying it is safe." >&2
+  tmux list-panes -t "${SESSION}:${window}" -F "#{pane_index} dead=#{pane_dead} cmd=#{pane_current_command} start=#{pane_start_command}" >&2 || true
+  exit 1
+}
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "ERROR: tmux is required" >&2
+  exit 1
+fi
+
+validate_replacement_scope
+validate_selector_matches
+run_schema_preflight
+
+if ! tmux has-session -t "${SESSION}" 2>/dev/null; then
+  tmux new-session -d -s "${SESSION}" -n control -c "${ENGINE_DIR}"
+fi
+
+for shard in "${SHARDS[@]}"; do
+  IFS=":" read -r name start_date end_date progress_artifact <<<"${shard}"
+  window="sparse_${name}"
+  if ! shard_selected "${name}" "${window}"; then
+    continue
+  fi
+  matched_shards=$((matched_shards + 1))
+  if ! handle_existing_window "${window}" "${start_date}" "${end_date}" "${progress_artifact}"; then
+    continue
+  fi
+  run_cmd=(
+    "${PYTHON_BIN}" -m alpha.jobs.run_i12_pit_rebuild
+    --schema "${SCHEMA}"
+    --source-hur-schema "${SOURCE_HUR_SCHEMA}"
+    --start-date "${start_date}"
+    --end-date "${end_date}"
+    --decision-time "${DECISION_TIME}"
+    --minute-path-mode "${MINUTE_PATH_MODE}"
+    --feed sip
+    --intended-order-usd 250
+    --max-spread-bps 200
+    --max-quote-age-seconds 60
+    --progress-artifact "${progress_artifact}"
+  )
+  cmd="$(worker_shell_command "${run_cmd[@]}")"
+  tmux new-window -d -t "${SESSION}" -n "${window}" -c "${ENGINE_DIR}" "${cmd}"
+  launched_windows=$((launched_windows + 1))
+  echo "launched ${SESSION}:${window} ${start_date}..${end_date}"
+done
+
+echo
+echo "tmux windows:"
+tmux list-windows -t "${SESSION}"
+echo
+echo "summary:"
+echo "matched_shards=${matched_shards} launched_windows=${launched_windows} skipped_running_windows=${skipped_running_windows} replaced_stale_windows=${replaced_stale_windows} replaced_running_windows=${replaced_running_windows}"
+echo
+echo "process check:"
+echo "tmux list-panes -a -t ${SESSION} -F '#S:#W #{pane_pid} #{pane_current_command}'"
+echo "attach:"
+echo "tmux attach -t ${SESSION}"

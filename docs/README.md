@@ -45,13 +45,15 @@ promotability: non-promotable, deferred_pit_model
 The old I12 research corpus used a full-day volume selector. That is future
 information at the live decision minute, so the current model is a research
 upper bound and teacher, not a production trading model. The next production
-gate is a PIT-clean I12 rebuild using only as-of-entry intraday evidence, with
-same-day-close and next-session-open exits both evaluated.
+gate is a PIT-clean rolling I12 rebuild using only as-of-timestamp intraday
+evidence, with same-day-close and next-session-open exits both evaluated. A
+09:40 run is one diagnostic slice; the intended live architecture is a rolling
+top-K candidate tape across multiple decision times.
 
-If the simple PIT-clean live-visible set is weak, the follow-up is a diagnostic
-study of winners versus losers within that same live-visible set, then explicit
-early-curve features for the current GBRT. Do not jump directly to a neural net
-or study only old full-day-volume winners.
+If the simple PIT-clean live-visible tape is weak, the follow-up is a diagnostic
+study of winners versus losers within that same live-visible set, including later
+first-qualifying names, then explicit early-curve features for the current GBRT.
+Do not jump directly to a neural net or study only old full-day-volume winners.
 
 Do not use old 17-pattern/KOTH planning docs to steer current work, and do not
 promote any deferred-PIT I12 model as production-clean.

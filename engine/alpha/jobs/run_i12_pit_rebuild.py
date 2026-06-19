@@ -47,7 +47,38 @@ I12_PIT_REBUILD_REQUIRED_TABLES = (
 )
 
 I12_PIT_REBUILD_REQUIRED_COLUMNS = {
-    "i12_pit_candidates": ("path_mode",),
+    "i12_pit_candidates": (
+        "path_mode",
+        "candidate_attempt_hash",
+        "is_active",
+        "superseded_at",
+        "superseded_by_candidate_id",
+        "candidate_identity_hash",
+        "label_hash",
+    ),
+    "i12_pit_quote_replays": (
+        "quote_replay_attempt_hash",
+        "is_active",
+        "superseded_at",
+        "superseded_by_quote_replay_id",
+        "bid_notional",
+        "ask_notional",
+        "executable_notional",
+        "executable_side",
+        "quote_size_basis",
+    ),
+    "i12_pit_cost_replays": (
+        "cost_replay_attempt_hash",
+        "is_active",
+        "superseded_at",
+        "superseded_by_cost_replay_id",
+    ),
+}
+
+I12_PIT_REBUILD_REQUIRED_INDEXES = {
+    "i12_pit_candidates": ("ux_i12_pit_candidates_active_attempt",),
+    "i12_pit_quote_replays": ("ux_i12_pit_quote_replays_active_attempt",),
+    "i12_pit_cost_replays": ("ux_i12_pit_cost_replays_active_attempt",),
 }
 
 
@@ -80,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"ERROR: {exc}")
             return 1
+        if args.preflight_only:
+            print(json.dumps({
+                "preflight": "ok",
+                "schema": target_schema,
+                "minute_path_mode": args.minute_path_mode,
+            }, indent=2, sort_keys=True))
+            return 0
         if args.report_only:
             report = i12_pit_rebuild_report(
                 session,
@@ -177,6 +215,21 @@ def _assert_required_pit_columns(session, schema: str | None) -> None:
                 f"schema {schema} has old {table_name} table without {missing_text}; "
                 "create a fresh scratch schema or migrate it"
             )
+    for table_name, required_indexes in I12_PIT_REBUILD_REQUIRED_INDEXES.items():
+        try:
+            indexes = {
+                index["name"]
+                for index in inspector.get_indexes(table_name, schema=schema)
+            }
+        except Exception:
+            indexes = {index["name"] for index in inspector.get_indexes(table_name)}
+        missing = [index for index in required_indexes if index not in indexes]
+        if missing:
+            missing_text = ", ".join(missing)
+            raise ValueError(
+                f"schema {schema} has old {table_name} table without index "
+                f"{missing_text}; create a fresh scratch schema or migrate it"
+            )
 
 
 def _parse_date(value: str) -> date:
@@ -233,6 +286,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Deliberately delete/replace matching PIT artifacts instead of reusing them.",
     )
     parser.add_argument("--no-quote-replay", action="store_true")
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Create/verify scratch schema and PIT tables, then exit without providers.",
+    )
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument(
         "--compare-path-modes",
@@ -243,8 +301,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--report-artifact")
     parser.add_argument("--progress-artifact")
     args = parser.parse_args(argv)
-    if not args.report_only and (not args.start_date or not args.end_date):
-        parser.error("--start-date and --end-date are required unless --report-only is set")
+    if (
+        not args.report_only
+        and not args.preflight_only
+        and (not args.start_date or not args.end_date)
+    ):
+        parser.error(
+            "--start-date and --end-date are required unless --report-only "
+            "or --preflight-only is set"
+        )
     if bool(args.start_date) != bool(args.end_date):
         parser.error("--start-date and --end-date must be provided together")
     if args.start_date and args.end_date and _parse_date(args.start_date) > _parse_date(args.end_date):

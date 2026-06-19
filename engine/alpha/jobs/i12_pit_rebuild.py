@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -70,6 +72,7 @@ NEXT_OPEN_EXIT_OFFSET_MINUTES = 1
 MIN_PRIOR_DAILY_SESSIONS = 20
 REQUIRED_QUOTE_ROLES = ("entry", "same_day_exit", "next_open_exit")
 EXIT_ROLES = ("same_day_exit", "next_open_exit")
+DEFAULT_TICKER_PROGRESS_INTERVAL = 250
 STRICT_MINUTE_PATH_MODE = "strict_contiguous"
 SPARSE_ZERO_FILL_MINUTE_PATH_MODE = "sparse_zero_fill"
 MINUTE_PATH_MODES = (
@@ -205,6 +208,7 @@ class I12PitRebuildJob(BaseJob):
         output_schema: str | None = None,
         allow_source_hur_schema_matches_output: bool = False,
         progress_artifact: str | Path | None = None,
+        progress_interval_tickers: int = DEFAULT_TICKER_PROGRESS_INTERVAL,
     ) -> None:
         self._session = session
         self._fmp = fmp_adapter
@@ -225,6 +229,7 @@ class I12PitRebuildJob(BaseJob):
         self._source_hur_schema = _validate_source_schema_name(source_hur_schema)
         self._output_schema = output_schema
         self._progress_artifact = Path(progress_artifact) if progress_artifact else None
+        self._progress_interval_tickers = max(1, int(progress_interval_tickers))
         self.partial_metrics: dict[str, Any] = {}
         if (
             output_schema
@@ -253,11 +258,30 @@ class I12PitRebuildJob(BaseJob):
         counters: Counter[str] = Counter()
         hur_rows_loaded = 0
         for trading_date in trading_dates:
-            hur_rows = self._load_hur_rows(trading_date)
+            try:
+                hur_rows = self._load_hur_rows(trading_date)
+            except Exception:
+                if self._session.in_transaction():
+                    self._session.rollback()
+                raise
+            else:
+                if self._session.in_transaction():
+                    self._session.rollback()
             hur_rows_loaded += len(hur_rows)
+            self._progress(
+                "date_start",
+                self._heartbeat_payload(
+                    counters=counters,
+                    trading_date=trading_date,
+                    hur_rows_for_date=len(hur_rows),
+                    hur_rows_processed_for_date=0,
+                    cumulative_hur_rows_loaded=hur_rows_loaded,
+                    job_run_id=ctx.job_run_id,
+                ),
+            )
             if not hur_rows:
                 counters["zero_hur_dates"] += 1
-            for hur_row in hur_rows:
+            for hur_index, hur_row in enumerate(hur_rows, start=1):
                 ticker = hur_row.ticker
                 daily_resp = self._fmp.get_historical_price(
                     ticker,
@@ -286,8 +310,18 @@ class I12PitRebuildJob(BaseJob):
                             path_mode=self._minute_path_mode,
                         )
                         self._persist_candidate(result, ctx.job_run_id)
+                        self._session.commit()
                         counters[f"candidate_{result.candidate_status}"] += 1
                         counters[f"coverage_{result.coverage_status}"] += 1
+                    self._maybe_emit_ticker_progress(
+                        counters=counters,
+                        trading_date=trading_date,
+                        hur_rows_for_date=len(hur_rows),
+                        hur_rows_processed_for_date=hur_index,
+                        cumulative_hur_rows_loaded=hur_rows_loaded,
+                        current_ticker=ticker,
+                        job_run_id=ctx.job_run_id,
+                    )
                     continue
                 minute_resp = self._polygon.get_minute_aggs(
                     ticker,
@@ -318,8 +352,18 @@ class I12PitRebuildJob(BaseJob):
                             path_mode=self._minute_path_mode,
                         )
                         self._persist_candidate(result, ctx.job_run_id)
+                        self._session.commit()
                         counters[f"candidate_{result.candidate_status}"] += 1
                         counters[f"coverage_{result.coverage_status}"] += 1
+                    self._maybe_emit_ticker_progress(
+                        counters=counters,
+                        trading_date=trading_date,
+                        hur_rows_for_date=len(hur_rows),
+                        hur_rows_processed_for_date=hur_index,
+                        cumulative_hur_rows_loaded=hur_rows_loaded,
+                        current_ticker=ticker,
+                        job_run_id=ctx.job_run_id,
+                    )
                     continue
                 raw_minutes = minute_resp.data or []
                 minute_bars = _clean_minute_bars(trading_date, raw_minutes)
@@ -344,6 +388,8 @@ class I12PitRebuildJob(BaseJob):
                         path_mode=self._minute_path_mode,
                     )
                     candidate = self._persist_candidate(result, ctx.job_run_id)
+                    candidate_id = candidate.i12_pit_candidate_id
+                    self._session.commit()
                     counters[f"candidate_{result.candidate_status}"] += 1
                     counters[f"coverage_{result.coverage_status}"] += 1
                     if (
@@ -351,15 +397,35 @@ class I12PitRebuildJob(BaseJob):
                         and self._alpaca is not None
                         and result.candidate_status == "passed"
                     ):
-                        quotes = self._replay_quotes(candidate, ctx.job_run_id)
-                        self._persist_costs(candidate, quotes, ctx.job_run_id)
+                        quotes = self._replay_quotes(candidate_id, ctx.job_run_id)
+                        candidate_for_costs = self._session.get(
+                            I12PitCandidate,
+                            candidate_id,
+                        )
+                        if candidate_for_costs is None:
+                            raise RuntimeError(
+                                f"I12 PIT candidate disappeared before cost replay: "
+                                f"{candidate_id}"
+                            )
+                        self._persist_costs(candidate_for_costs, quotes, ctx.job_run_id)
+                        self._session.commit()
                         counters["quote_replayed_candidates"] += 1
+                self._maybe_emit_ticker_progress(
+                    counters=counters,
+                    trading_date=trading_date,
+                    hur_rows_for_date=len(hur_rows),
+                    hur_rows_processed_for_date=hur_index,
+                    cumulative_hur_rows_loaded=hur_rows_loaded,
+                    current_ticker=ticker,
+                    job_run_id=ctx.job_run_id,
+                )
             self._session.commit()
             self._update_partial_metrics(
                 counters=counters,
                 hur_rows_loaded=hur_rows_loaded,
                 event="date_finish",
                 trading_date=trading_date,
+                job_run_id=ctx.job_run_id,
             )
         report = i12_pit_rebuild_report(
             self._session,
@@ -530,18 +596,30 @@ class I12PitRebuildJob(BaseJob):
 
     def _replay_quotes(
         self,
-        candidate: I12PitCandidate,
+        candidate_id: str,
         job_run_id: str | None,
     ) -> dict[str, I12PitQuoteReplay]:
         assert self._alpaca is not None
-        rows: dict[str, I12PitQuoteReplay] = {}
-        for window in quote_windows_for_candidate(candidate):
-            attempt_hash = _quote_replay_attempt_hash(
-                candidate,
+        candidate = self._session.get(I12PitCandidate, candidate_id)
+        if candidate is None:
+            raise RuntimeError(f"I12 PIT candidate not found for quote replay: {candidate_id}")
+        windows_and_attempts = [
+            (
                 window,
-                feed=self._feed,
-                max_quote_age_seconds=self._max_quote_age_seconds,
+                _quote_replay_attempt_hash(
+                    candidate,
+                    window,
+                    feed=self._feed,
+                    max_quote_age_seconds=self._max_quote_age_seconds,
+                ),
             )
+            for window in quote_windows_for_candidate(candidate)
+        ]
+        ticker = candidate.ticker
+        if self._session.in_transaction():
+            self._session.rollback()
+        rows: dict[str, I12PitQuoteReplay] = {}
+        for window, attempt_hash in windows_and_attempts:
             active_quote = (
                 self._session.query(I12PitQuoteReplay)
                 .filter(
@@ -558,20 +636,28 @@ class I12PitRebuildJob(BaseJob):
                 active_quote.job_run_id = job_run_id
                 self._session.flush()
                 rows[window.quote_role] = active_quote
+                self._session.commit()
                 continue
+            if self._session.in_transaction():
+                self._session.rollback()
             resp = self._alpaca.get_historical_quotes(
-                candidate.ticker,
+                ticker,
                 start=window.window_start_ts,
                 end=window.window_end_ts,
                 feed=self._feed,
             )
             result = replay_quote_window(
-                ticker=candidate.ticker,
+                ticker=ticker,
                 window=window,
                 response=resp,
                 feed=self._feed,
                 max_quote_age_seconds=self._max_quote_age_seconds,
             )
+            candidate = self._session.get(I12PitCandidate, candidate_id)
+            if candidate is None:
+                raise RuntimeError(
+                    f"I12 PIT candidate disappeared before quote persist: {candidate_id}"
+                )
             row = self._persist_quote(
                 candidate,
                 result,
@@ -579,6 +665,7 @@ class I12PitRebuildJob(BaseJob):
                 attempt_hash=attempt_hash,
             )
             rows[result.quote_role] = row
+            self._session.commit()
         return rows
 
     def _persist_quote(
@@ -847,6 +934,43 @@ class I12PitRebuildJob(BaseJob):
         hur_rows_loaded: int,
         event: str,
         trading_date: date | None = None,
+        job_run_id: str | None = None,
+    ) -> None:
+        started_with_transaction = self._session.in_transaction()
+        try:
+            self._update_partial_metrics_inner(
+                counters=counters,
+                hur_rows_loaded=hur_rows_loaded,
+                event=event,
+                trading_date=trading_date,
+                job_run_id=job_run_id,
+            )
+        except Exception as exc:
+            if self._session.in_transaction():
+                self._session.rollback()
+            self.partial_metrics = {
+                "last_event": event,
+                "last_trading_date": trading_date.isoformat() if trading_date else None,
+                "job_run_id": job_run_id,
+                "progress_error": {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+                "counters": dict(counters),
+            }
+            self._progress("progress_error", self.partial_metrics)
+            return
+        if not started_with_transaction and self._session.in_transaction():
+            self._session.rollback()
+
+    def _update_partial_metrics_inner(
+        self,
+        *,
+        counters: Counter[str],
+        hur_rows_loaded: int,
+        event: str,
+        trading_date: date | None = None,
+        job_run_id: str | None = None,
     ) -> None:
         progress_start_date = self._start_date
         progress_end_date = trading_date if trading_date is not None else self._end_date
@@ -1017,8 +1141,65 @@ class I12PitRebuildJob(BaseJob):
             "counters": dict(counters),
             "last_event": event,
             "last_trading_date": trading_date.isoformat() if trading_date else None,
+            "job_run_id": job_run_id,
         }
         self._progress(event, self.partial_metrics)
+
+    def _maybe_emit_ticker_progress(
+        self,
+        *,
+        counters: Counter[str],
+        trading_date: date,
+        hur_rows_for_date: int,
+        hur_rows_processed_for_date: int,
+        cumulative_hur_rows_loaded: int,
+        current_ticker: str,
+        job_run_id: str | None,
+    ) -> None:
+        if (
+            hur_rows_processed_for_date % self._progress_interval_tickers != 0
+            and hur_rows_processed_for_date != hur_rows_for_date
+        ):
+            return
+        self._progress(
+            "ticker_progress",
+            self._heartbeat_payload(
+                counters=counters,
+                trading_date=trading_date,
+                hur_rows_for_date=hur_rows_for_date,
+                hur_rows_processed_for_date=hur_rows_processed_for_date,
+                cumulative_hur_rows_loaded=cumulative_hur_rows_loaded,
+                current_ticker=current_ticker,
+                job_run_id=job_run_id,
+            ),
+        )
+
+    def _heartbeat_payload(
+        self,
+        *,
+        counters: Counter[str],
+        trading_date: date,
+        hur_rows_for_date: int,
+        hur_rows_processed_for_date: int,
+        cumulative_hur_rows_loaded: int,
+        job_run_id: str | None,
+        current_ticker: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "job_run_id": job_run_id,
+            "trading_date": trading_date.isoformat(),
+            "minute_path_mode": self._minute_path_mode,
+            "decision_time_labels": list(self._decision_times),
+            "hur_rows_for_date": hur_rows_for_date,
+            "hur_rows_processed_for_date": hur_rows_processed_for_date,
+            "cumulative_hur_rows_loaded": cumulative_hur_rows_loaded,
+            "current_ticker": current_ticker,
+            "candidate_passed": counters.get("candidate_passed", 0),
+            "candidate_failed": counters.get("candidate_failed", 0),
+            "daily_fetch_error_count": counters.get("coverage_daily_fetch_error", 0),
+            "minute_fetch_error_count": counters.get("coverage_minute_fetch_error", 0),
+            "counters": dict(counters),
+        }
 
     def _progress(self, event: str, payload: Mapping[str, Any]) -> None:
         if self._progress_artifact is None:
@@ -1029,9 +1210,55 @@ class I12PitRebuildJob(BaseJob):
             **dict(payload),
         }
         self._progress_artifact.parent.mkdir(parents=True, exist_ok=True)
-        self._progress_artifact.write_text(
-            json.dumps(record, indent=2, sort_keys=True, default=str)
+        _atomic_write_text(
+            self._progress_artifact,
+            json.dumps(record, indent=2, sort_keys=True, default=str),
         )
+
+
+def _atomic_write_text(path: Path, text_value: str) -> None:
+    temp_path: Path | None = None
+    fd: int | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            text=True,
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(text_value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        _fsync_parent_directory(path.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _fsync_parent_directory(directory: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        dir_fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def build_i12_pit_candidate(

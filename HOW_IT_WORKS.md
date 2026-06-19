@@ -9,20 +9,27 @@ at the live decision minute.*
 
 ## What it does, every day
 
-1. **Find candidates** — watch stocks that are far below their 52-week high and
-   showing early intraday stress/volume/quote behavior. The live detector must
-   use only data available at that minute. Full-day volume is forbidden.
-2. **Rank** — a machine-learning model scores those candidates best to worst.
-3. **Pick** — take the **top ~10**, then drop any too hard to trade (spread too
-   wide or top-of-book too thin) → a realistic day may hold about **6-8** names.
-4. **Buy** — right after the setup confirms, split the $2,000 roughly evenly,
-   about **$250 each**.
+1. **Find candidates through the day** — watch stocks that are far below their
+   52-week high and showing intraday stress/volume/quote behavior. The live
+   detector must use only data available at that timestamp. Full-day volume is
+   forbidden.
+2. **Rank as they appear** — a machine-learning model scores candidates at each
+   decision time, not only at 09:40.
+3. **Maintain a rolling top ~10** — keep the best intended names seen so far,
+   then drop any too hard to trade (spread too wide or top-of-book too thin) -> a
+   realistic day may hold about **6-8** names.
+4. **Buy when the setup confirms** — right after a name qualifies and survives
+   the rolling top-K/liquidity rules, split the $2,000 roughly evenly, about
+   **$250 each**.
 5. **Exit test** — research says next-session open has been better than same-day
    close, but the PIT-clean rebuild should evaluate both. Do not hard-code the
    overnight exit until the clean corpus proves it.
 
-That's the whole thing. At $2k there is **no borrowing** and no real hedge yet —
-the one engine is the account until a second, genuinely different sleeve is built.
+That's the whole thing. A 09:40 run is only one slice of this. The final live
+translation is a rolling candidate tape: some names may qualify early, some may
+not reveal the volume/price signature until later in the day. At $2k there is
+**no borrowing** and no real hedge yet — the one engine is the account until a
+second, genuinely different sleeve is built.
 
 > **Current status:** the read-only live machine is built. It can watch, score,
 > rank, pull SIP quotes, and log intended trades. It does **not** place orders.
@@ -68,9 +75,10 @@ the one engine is the account until a second, genuinely different sleeve is buil
 - The current I12 model freeze is mechanically loadable but not production-clean:
   `stage1_i12_403a5ae359cd_accecdda` is `shadow` and non-promotable with
   `deferred_pit_model`.
-- The next serious model is a PIT-clean rebuild. It should generate candidate
-  rows at fixed early intraday decision times, train only on as-of-entry
-  features, and compare same-day close versus next-session open.
+- The next serious model is a PIT-clean rolling rebuild. It should generate
+  candidate rows at multiple intraday decision times, train only on
+  as-of-timestamp features, maintain a rolling top-K, and compare same-day close
+  versus next-session open.
 - These stocks are **thin** (small, low-volume). This works at small size; it cannot scale to
   big money.
 - We run **unlevered** (no borrowing) — these stocks can't be margined at $2k anyway.
@@ -85,13 +93,15 @@ live-visible candidates contain an early signature that separates future winners
 from future losers.
 
 Do the simple rebuild first. If it underperforms, study the names the live
-screen would actually have seen at 9:35/9:40/9:45/10:00:
+screen would actually have seen at each decision time, starting with
+9:35/9:40/9:45/10:00 and extending later if the old winners reveal volume later:
 
 - volume curve and acceleration
 - early price path and stabilization
 - spread and top-of-book behavior
 - catalyst/hazard tags
 - same-day exit versus next-open exit
+- first qualifying timestamp and whether later qualifiers contain the lost edge
 
 The important rule: compare winners versus losers **inside the live candidate
 set**. Do not study only old full-day-volume winners. If a useful early shape

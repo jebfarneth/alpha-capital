@@ -1,5 +1,5 @@
 # Present Task List
-_Last updated: 2026-06-17_
+_Last updated: 2026-06-19_
 
 This is the current working order. Older A1/A2/A3/I11-at-open build prompts are
 superseded unless explicitly revived.
@@ -9,8 +9,9 @@ superseded unless explicitly revived.
 I12 is still the lead research strategy. The live read-only fill-test machine is
 built, and Alpaca SIP quotes work. The current frozen model is mechanically
 loadable, but explicitly non-promotable because the I12 corpus is deferred-PIT.
-The real blocker is a PIT-clean as-of-entry I12 rebuild, not another attempt to
-promote the old full-day-volume corpus.
+The real blocker is a PIT-clean rolling I12 rebuild, not another attempt to
+promote the old full-day-volume corpus or force the full edge into one 09:40
+decision.
 
 ## Current Truth
 
@@ -25,8 +26,8 @@ promote the old full-day-volume corpus.
 - It is loadable by Stage-0 preflight, but non-promotable with
   `deferred_pit_model`.
 - The next useful engineering output is artifact-SHA/training-params preflight
-  hardening. The next useful strategy output is a PIT-clean I12 corpus and
-  replacement model.
+  hardening. The next useful strategy output is a PIT-clean rolling I12 candidate
+  tape and replacement model.
 
 ## Track A - Finish Current Model-Release Hardening
 
@@ -64,8 +65,10 @@ This is the load-bearing work before any real promotion.
 
 1. Finish operational integrity first: source attempts, quote replays, and cost
    replays must all be resumable/idempotent in the same scratch schema.
-2. Generate historical candidate rows at fixed early intraday decision times
-   such as 9:35, 9:40, 9:45, and 10:00.
+2. Generate historical candidate rows at multiple intraday decision times. Start
+   with 9:35, 9:40, 9:45, and 10:00, but do not treat 09:40 as the whole
+   strategy. Add later checkpoints if the old full-day winners often reveal
+   volume after the first half hour.
 3. Use only fields knowable at that timestamp:
    prior closed bars, opening gap, early cumulative volume, projected volume
    pace, early price action, live-style spread/size proxies, and PIT-safe
@@ -84,15 +87,24 @@ This is the load-bearing work before any real promotion.
    - spread/depth coverage
    - skip rate as cash
    - cost sensitivity
-8. Retrain only if the PIT-clean corpus preserves meaningful lift and survives
+8. Evaluate rolling top-K, not only one-shot top-K:
+   - first time each ticker qualifies
+   - one intended trade per ticker/day
+   - rolling best K names seen so far
+   - empty slots can be filled by later qualifiers
+   - replacement of existing intended names requires an explicit higher bar
+   - skips for spread/size/halt count as cash unless a rule explicitly allows
+     moving to the next candidate
+9. Retrain only if the PIT-clean corpus preserves meaningful lift and survives
    real spread/liquidity costs.
 
 If the simple PIT-clean live-visible set is weak, do not declare I12 dead and
 do not jump straight to a neural net. Run the diagnostic ladder:
 
 1. **Signature study:** within the live-visible candidate set, compare eventual
-   winners versus losers at each decision time. Do not study only old full-day
-   winners; that recreates deferred-PIT selection bias.
+   winners versus losers at each decision time. Include names that first qualify
+   later in the day. Do not study only old full-day winners; that recreates
+   deferred-PIT selection bias.
 2. **Engineered early-curve features:** add explicit curve features to the
    existing GBRT first:
    - cumulative volume at 9:30/9:35/9:40/9:45/10:00
@@ -106,6 +118,39 @@ do not jump straight to a neural net. Run the diagnostic ladder:
 
 The discriminant must separate winners from losers among names a live detector
 would actually surface. Describing old winners is not enough.
+
+### Volume-Realization Model Branch
+
+Build this only after the strict versus sparse PIT-clean candidate reports are
+available. Keep it separate from the return/risk ranker.
+
+Objective: predict whether a live-visible candidate will realize full-day
+volume ratio >= 5x.
+
+Inputs must be knowable at the evaluated timestamp only:
+
+- early cumulative volume
+- projected volume pace
+- volume ramp slope and acceleration
+- early return/path shape
+- spread/depth and quote freshness
+- PIT-safe catalyst/hazard tags
+- prior closed-bar technical context
+
+Benchmark against the simple projected-volume threshold:
+
+- recall
+- precision
+- false-positive rate
+- calibration
+- return edge conditional on high predicted volume probability
+
+Keep the architecture staged:
+
+1. early live-visible universe
+2. volume-realization probability
+3. rolling top-K return/risk ranker
+4. liquidity filter and skips-as-cash accounting
 
 ## Track C - Run Stage-0 Read-Only Instrumentation
 

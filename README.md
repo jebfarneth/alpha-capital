@@ -81,19 +81,23 @@ framing in planning docs is superseded.
   logging. It is deliberately non-promotable because the corpus selected fires with
   a full-day volume condition. Full-day volume is unknowable at the entry minute, so
   the current model is a research-shadow/teacher artifact, not a production model.
-- **The next real gate is a PIT-clean I12 rebuild.** Reconstruct historical
-  candidate rows at live decision times (9:35/9:40/9:45/10:00), using only
-  as-of-entry features: prior closed-bar drawdown, opening gap, early cumulative
-  volume, intraday-volume pace, projected volume, early return, liquidity/spread,
-  and PIT-safe catalyst/hazard flags. Label both exits — same-day near-close and
-  next-session open — then retrain and re-evaluate top-K books with real SIP spread
-  costs.
+- **The next real gate is a PIT-clean rolling I12 rebuild.** Reconstruct a
+  timestamped candidate tape at live decision times (starting with 9:35/9:40/
+  9:45/10:00, then later intraday checkpoints if the early slices miss too much
+  edge), using only as-of-timestamp features: prior closed-bar drawdown, opening
+  gap, cumulative volume so far, intraday-volume pace, projected volume, early
+  return/path, liquidity/spread, and PIT-safe catalyst/hazard flags. The live
+  translation is not "pick once at 09:40"; it is a rolling top-K queue where
+  names can first qualify at different times through the day. Label both exits —
+  same-day near-close and next-session open — then retrain and re-evaluate
+  rolling top-K books with real SIP spread costs.
 - **Complexity must be earned.** First test the simple PIT-clean live-visible
-  candidate set, including false positives and skips-as-cash. If it is weak,
-  study early-volume/price/quote signatures only inside that live-visible set:
-  eventual winners versus eventual losers. Then feed engineered early-curve
-  features into the existing GBRT before considering any raw-tape neural net.
-  A neural net is a last rung, not the next step.
+  candidate tape, including false positives and skips-as-cash. If it is weak,
+  study volume-realization and early-volume/price/quote signatures only inside
+  that live-visible set: eventual winners versus eventual losers at each decision
+  timestamp. Then feed engineered early-curve features into the existing GBRT
+  before considering any raw-tape neural net. A neural net is a last rung, not
+  the next step.
 - **The book is one pattern today, and its drawdown is idiosyncratic small-cap
   clustering, not market beta.** An index hedge does almost nothing; a liquidity filter
   and a light defensive trend overlay trim the tail, but the structural fix is
@@ -238,7 +242,7 @@ was fetched.
 | I1 | Gap-and-go intraday/day-0 continuation. | Spec variants have been researched; do not assume production readiness. |
 | I8 | Opening range breakout. | Detector exists; production viability depends on intraday data and execution assumptions. |
 | I11 | Intraday 52-week-high breakout, day-0 twin of M4. | Durable corpus builder exists. Minute-bar work showed real but smaller edge than daily proxies; overnight exit research matters. |
-| I12 | Capitulation volume bounce research family: deeply damaged stocks, small opening gap, abnormal early volume/liquidity context, short hold. | **Lead research engine, not yet live.** Stage-1 ML ranker validated OOS on the deferred-PIT research corpus (~2x top-decile lift). Stage-0 read-only fill-test is built. Current frozen model is research-shadow only and non-promotable; next step is a PIT-clean as-of-entry rebuild. |
+| I12 | Capitulation volume bounce research family: deeply damaged stocks, small opening gap, abnormal intraday volume/liquidity context, short hold. | **Lead research engine, not yet live.** Stage-1 ML ranker validated OOS on the deferred-PIT research corpus (~2x top-decile lift). Stage-0 read-only fill-test is built. Current frozen model is research-shadow only and non-promotable; next step is a PIT-clean rolling candidate tape and rolling top-K rebuild. |
 
 Pattern status is intentionally conservative. "Code exists" does not mean
 "tradable".
@@ -278,8 +282,9 @@ screen used a full-day volume floor for tractability. Independent rechecks showe
 that only a small fraction of final daily volume has traded at the confirmation
 minute, so the full-day volume condition is a future-information selector. The
 current frozen I12 model is therefore research-shadow only. The production path is
-a new PIT-clean corpus built from as-of-entry candidate snapshots, not another
-attempt to promote this corpus.
+a new PIT-clean corpus built from as-of-timestamp candidate snapshots and a
+rolling top-K selector, not another attempt to promote this corpus. A 09:40 run
+is one diagnostic slice; it is not the final live architecture.
 
 Rules that matter:
 
@@ -608,7 +613,8 @@ on a tiny fold.
 4. Pattern code and corpus code must agree on clocks.
 5. Full-day fields in intraday corpora are research-only unless proven
    entry-knowable. I12 full-day volume is not entry-knowable and cannot be a live
-   detector gate.
+   detector gate. The live detector must let names qualify over a rolling
+   intraday tape rather than forcing the whole edge into one early timestamp.
 6. A provider profile saying "common stock" is not enough for training
    eligibility when series listings, funds, units, notes, or preferreds are in
    play.
@@ -622,7 +628,7 @@ This repo is infrastructure in motion. Important non-final areas include:
 
 - broker live execution promotion
 - Stage-0 read-only I12 Gate-0 pass over multiple trading days
-- PIT-clean I12 as-of-entry rebuild and replacement model
+- PIT-clean I12 rolling candidate-tape rebuild and replacement model
 - full allocator/optimizer promotion
 - final I11/I12 corpus promotion decisions
 - broader Stage-1 pattern manifests beyond the active pattern set

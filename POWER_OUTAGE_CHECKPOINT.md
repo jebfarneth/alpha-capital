@@ -352,8 +352,13 @@ Gate 0 is about tradeability, not profitability:
 
 - I12 remains the lead research sleeve, but the old detector is not production-clean.
 - Full-day volume cannot be a live detector gate. The next real gate is a
-  PIT-clean as-of-entry rebuild using early intraday features.
-- The target is not "more I12 names"; it is a K around 20 across independent sleeves.
+  PIT-clean rolling candidate-tape rebuild using as-of-timestamp intraday
+  features.
+- The I12 target is a rolling top-K sleeve, not a single 09:40 decision. Names
+  can qualify at different timestamps through the day, with one intended trade
+  per ticker/day and skips counted as cash.
+- The broader portfolio target is not "more I12 names"; it is a K around 20
+  across independent sleeves.
 - I12 research suggests the return sleeve; uncorrelated sleeves are for
   drawdown/tail control.
 - No leverage until the tail is controlled.
@@ -369,17 +374,22 @@ Gate 0 is about tradeability, not profitability:
    survived. If using it, remember it was started before the latest local
    hardening.
 4. Prefer a fresh scratch schema for final evidence.
-5. Run strict 09:40 for `2026-05-01` through `2026-06-05`.
+5. Run strict 09:40 for `2026-05-01` through `2026-06-05` as one timestamp
+   slice, not as the full live strategy.
 6. Run sparse-zero-fill 09:40 over the same dates.
 7. Compare strict versus sparse reports. Sparse exists to test whether thin names
    with no minute trades were being excluded unfairly.
-8. Evaluate the simple PIT-clean detector first: all candidates, false
+8. Extend the same PIT-clean replay to multiple decision times and evaluate a
+   rolling top-K tape: first qualifying timestamp, no duplicate ticker/day buys,
+   later qualifiers filling empty slots, and explicit replacement rules if any.
+9. Evaluate the simple PIT-clean detector first: all candidates, false
    positives included, skips-as-cash, same-day exit, next-open exit, real
    spread/depth costs.
-9. Retrain/register a production-clean replacement model only if PIT-clean
+10. Retrain/register a production-clean replacement model only if PIT-clean
    metrics hold.
-10. If simple PIT-clean metrics are weak, run the early-signature diagnostic:
-   winners versus losers within the live-visible candidate set, then engineered
-   early-curve features in the existing GBRT. Consider a raw-tape neural net only
-   if that auditable baseline leaves clear out-of-time signal on the table.
-11. Then run Stage-0 promotion and write the paper-execution Stage-1 prompt.
+11. If simple PIT-clean metrics are weak, run the early-signature diagnostic:
+    winners versus losers within the live-visible candidate tape, including
+    names that first qualify later in the day, then engineered early-curve
+    features in the existing GBRT. Consider a raw-tape neural net only if that
+    auditable baseline leaves clear out-of-time signal on the table.
+12. Then run Stage-0 promotion and write the paper-execution Stage-1 prompt.
