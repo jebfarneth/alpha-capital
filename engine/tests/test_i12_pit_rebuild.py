@@ -67,18 +67,20 @@ def _decision_ts_for_label(label: str) -> datetime:
 class FakeFmp:
     def __init__(self, bars):
         self.bars = bars
+        self.calls = []
 
     def get_historical_price(self, ticker, **kwargs):
-        del kwargs
+        self.calls.append((ticker, dict(kwargs)))
         return AdapterResponse(data=list(self.bars), lineage=_lineage("FMP", ticker))
 
 
 class FakePolygon:
     def __init__(self, bars):
         self.bars = bars
+        self.calls = []
 
     def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
-        del from_date, to_date, kwargs
+        self.calls.append((ticker, from_date, to_date, dict(kwargs)))
         return AdapterResponse(data=list(self.bars), lineage=_lineage("Polygon", ticker))
 
 
@@ -200,9 +202,10 @@ class FakeFmpByTicker:
     def __init__(self, bars_by_ticker, error_tickers=None):
         self.bars_by_ticker = bars_by_ticker
         self.error_tickers = {ticker.upper() for ticker in (error_tickers or set())}
+        self.calls = []
 
     def get_historical_price(self, ticker, **kwargs):
-        del kwargs
+        self.calls.append((ticker, dict(kwargs)))
         normalized = ticker.upper()
         if normalized in self.error_tickers:
             return _provider_error_response("FMP", normalized, "daily_fetch_failed")
@@ -216,9 +219,10 @@ class FakePolygonByTicker:
     def __init__(self, bars_by_ticker, error_tickers=None):
         self.bars_by_ticker = bars_by_ticker
         self.error_tickers = {ticker.upper() for ticker in (error_tickers or set())}
+        self.calls = []
 
     def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
-        del from_date, to_date, kwargs
+        self.calls.append((ticker, from_date, to_date, dict(kwargs)))
         normalized = ticker.upper()
         if normalized in self.error_tickers:
             return _provider_error_response("Polygon", normalized, "minute_fetch_failed")
@@ -972,6 +976,107 @@ def test_clean_zero_pit_candidates_reports_explicit_zero_candidate_status(db_ses
     assert result.metrics["training_status"] == "blocked_zero_pit_candidates"
     assert result.metrics["ml_ranking_status"] == "blocked_zero_pit_candidates"
     assert result.metrics["conclusions_final"] is False
+
+
+def test_daily_prefilter_skip_avoids_minute_fetch_and_counts_source_attempt(db_session):
+    _add_hur(db_session, "NODRAW", output_hash="hur-no-drawdown")
+    polygon = FakePolygonByTicker({"NODRAW": _polygon_bars()})
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"NODRAW": _fmp_bars_no_drawdown()}),
+        polygon_adapter=polygon,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert polygon.calls == []
+    row = db_session.query(I12PitCandidate).one()
+    assert row.candidate_status == "failed"
+    assert row.coverage_status == "daily_prefilter_skip"
+    assert row.fail_reason == "drawdown"
+    assert result.metrics["expected_candidate_attempts"] == 1
+    assert result.metrics["actual_candidate_row_count"] == 1
+    assert result.metrics["missing_source_attempt_count"] == 0
+    assert result.metrics["extra_source_attempt_count"] == 0
+    assert result.metrics["missing_source_attempt_identity_count"] == 0
+    assert result.metrics["extra_source_attempt_identity_count"] == 0
+    assert result.metrics["source_replay_complete"] is True
+    assert result.metrics["candidate_coverage_status_counts"] == {
+        "daily_prefilter_skip": 1,
+    }
+
+
+def test_daily_cache_reuses_fmp_and_preserves_passed_candidate_identity(db_session):
+    day2 = next_us_equity_session(DAY + timedelta(days=1))
+    _add_hur(db_session, "CACHE", day=DAY, output_hash="hur-cache-day1")
+    _add_hur(db_session, "CACHE", day=day2, output_hash="hur-cache-day2")
+    fmp = FakeFmpByTicker({"CACHE": _fmp_bars()})
+    polygon = FakePolygonByTicker({"CACHE": _polygon_bars()})
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=day2,
+        decision_times=["09:40"],
+        quote_replay=False,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert len(fmp.calls) == 1
+    assert len(polygon.calls) == 1
+    assert result.metrics["expected_candidate_attempts"] == 2
+    assert result.metrics["actual_candidate_row_count"] == 2
+    assert result.metrics["missing_source_attempt_count"] == 0
+    assert result.metrics["missing_source_attempt_identity_count"] == 0
+    passed = (
+        db_session.query(I12PitCandidate)
+        .filter(
+            I12PitCandidate.ticker == "CACHE",
+            I12PitCandidate.decision_date == DAY,
+        )
+        .one()
+    )
+    stored_source_bars = json.loads(passed.source_bars_json)
+    daily_bars = i12_pit_rebuild._daily_bars_for_trading_date(
+        "CACHE",
+        DAY,
+        _fmp_bars(),
+    )
+    expected = build_i12_pit_candidate(
+        ticker="CACHE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=daily_bars,
+        minute_bars=_minute_bars(),
+        daily_source_hash=stored_source_bars["daily_source_hash"],
+        minute_source_hash=stored_source_bars["minute_source_hash"],
+        source_hur_identity_hash=stored_source_bars["source_hur_identity_hash"],
+        source_hur=stored_source_bars["source_hur"],
+        path_mode="strict_contiguous",
+    )
+    assert passed.candidate_status == "passed"
+    assert passed.content_hash == expected.content_hash
+    assert json.loads(passed.feature_json) == expected.feature_json
+    skipped = (
+        db_session.query(I12PitCandidate)
+        .filter(
+            I12PitCandidate.ticker == "CACHE",
+            I12PitCandidate.decision_date == day2,
+        )
+        .one()
+    )
+    assert skipped.coverage_status == "daily_prefilter_skip"
 
 
 def test_daily_fetch_error_attempts_are_persisted_and_block_finality(db_session):
@@ -3297,17 +3402,17 @@ def test_active_candidate_attempt_uniqueness_is_enforced(db_session):
 
 def test_interrupted_rerun_preserves_committed_dates_without_duplicates(db_session):
     next_day = next_us_equity_session(DAY + timedelta(days=1))
-    _add_hur(db_session, "RESUME", day=DAY, output_hash="hur-resume-1")
-    _add_hur(db_session, "RESUME", day=next_day, output_hash="hur-resume-2")
+    _add_hur(db_session, "RESUME1", day=DAY, output_hash="hur-resume-1")
+    _add_hur(db_session, "RESUME2", day=next_day, output_hash="hur-resume-2")
 
     class FailsOnSecondFetch(FakeFmp):
         def __init__(self):
             super().__init__(_fmp_bars())
-            self.calls = 0
+            self.call_count = 0
 
         def get_historical_price(self, ticker, **kwargs):
-            self.calls += 1
-            if self.calls > 1:
+            self.call_count += 1
+            if self.call_count > 1:
                 raise RuntimeError("interrupted")
             return super().get_historical_price(ticker, **kwargs)
 
@@ -4010,6 +4115,27 @@ def _fmp_bars(day_volume=100_000, next_open=4.4):
         )
     )
     return bars
+
+
+def _fmp_bars_no_drawdown():
+    bars = _fmp_bars()
+    out = []
+    for bar in bars:
+        if bar.date < DAY.isoformat():
+            out.append(
+                FmpBar(
+                    date=bar.date,
+                    open=4.0,
+                    high=4.1,
+                    low=3.9,
+                    close=4.0,
+                    volume=bar.volume,
+                    split_adjusted_close=4.0,
+                )
+            )
+        else:
+            out.append(bar)
+    return out
 
 
 def _add_hur(db_session, ticker, *, day=DAY, output_hash):

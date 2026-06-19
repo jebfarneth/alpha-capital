@@ -337,6 +337,9 @@ def _integrity_summary(report: Mapping[str, Any], loaded: LoadedReport) -> dict[
         "quote_ok_count": report.get("quote_ok_count"),
         "quote_non_ok_count": report.get("quote_non_ok_count"),
         "quote_ok_rate": report.get("quote_ok_rate"),
+        "candidate_coverage_status_counts": (
+            report.get("candidate_coverage_status_counts") or {}
+        ),
         "quote_coverage_status_counts": report.get("quote_coverage_status_counts") or {},
     }
 

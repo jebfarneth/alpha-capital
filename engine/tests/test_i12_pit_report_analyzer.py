@@ -33,7 +33,9 @@ def _load_analyzer():
 
 def test_i12_pit_analyzer_accepts_final_report(tmp_path):
     analyzer = _load_analyzer()
-    path = _write_report(tmp_path, _report_payload(conclusions_final=True))
+    payload = _report_payload(conclusions_final=True)
+    payload["candidate_coverage_status_counts"] = {"daily_prefilter_skip": 2, "ok": 8}
+    path = _write_report(tmp_path, payload)
 
     analysis = analyzer.analyze_report_paths([path], labels=["one-month"], require_final=True)
 
@@ -41,6 +43,10 @@ def test_i12_pit_analyzer_accepts_final_report(tmp_path):
     report = analysis["reports"][0]
     assert report["integrity"]["conclusions_final"] is True
     assert report["integrity"]["source_replay_complete"] is True
+    assert report["integrity"]["candidate_coverage_status_counts"] == {
+        "daily_prefilter_skip": 2,
+        "ok": 8,
+    }
     assert report["exit_comparison"]["same_day_exit"]["tradeable_count"] == 8
     assert "report_non_final" not in report["warnings"]
 

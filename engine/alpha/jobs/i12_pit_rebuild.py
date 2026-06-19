@@ -262,6 +262,7 @@ class I12PitRebuildJob(BaseJob):
             max_outstanding_timeouts=max_outstanding_fetch_timeouts,
             max_consecutive_timeouts=max_consecutive_fetch_timeouts,
         )
+        self._daily_response_cache: dict[str, AdapterResponse[Any]] = {}
         self._max_no_progress_seconds = (
             float(max_no_progress_seconds)
             if max_no_progress_seconds is not None
@@ -369,15 +370,49 @@ class I12PitRebuildJob(BaseJob):
                             job_run_id=ctx.job_run_id,
                         )
                         continue
+                    daily_bars = _daily_bars_for_trading_date(
+                        ticker,
+                        trading_date,
+                        daily_resp.data or [],
+                    )
+                    daily_source_hash = _daily_slice_source_hash(
+                        ticker,
+                        trading_date,
+                        daily_bars,
+                    )
+                    prefilter_results = _daily_prefilter_results(
+                        ticker=ticker,
+                        trading_date=trading_date,
+                        decision_time_labels=self._decision_times,
+                        daily_bars=daily_bars,
+                        daily_source_hash=daily_source_hash,
+                        source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                        source_hur=hur_row.source_hur_payload,
+                        path_mode=self._minute_path_mode,
+                    )
+                    if prefilter_results is not None:
+                        for result in prefilter_results:
+                            self._persist_candidate(result, ctx.job_run_id)
+                            self._session.commit()
+                            counters[f"candidate_{result.candidate_status}"] += 1
+                            counters[f"coverage_{result.coverage_status}"] += 1
+                        self._maybe_emit_ticker_progress(
+                            counters=counters,
+                            trading_date=trading_date,
+                            hur_rows_for_date=len(hur_rows),
+                            hur_rows_processed_for_date=hur_index,
+                            cumulative_hur_rows_loaded=hur_rows_loaded,
+                            current_ticker=ticker,
+                            job_run_id=ctx.job_run_id,
+                        )
+                        continue
                     minute_resp = self._fetch_polygon_minutes_with_deadline(
                         ticker,
                         trading_date,
                         job_run_id=ctx.job_run_id,
                     )
-                    daily_bars = _clean_daily_bars(ticker, daily_resp.data or [], _CleanCounters())
                     if not minute_resp.ok:
                         minute_error = _provider_error_payload(minute_resp)
-                        daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
                         minute_source_hash = getattr(minute_resp.lineage, "raw_payload_hash", None)
                         for label in self._decision_times:
                             decision_ts = _decision_timestamp(trading_date, label)
@@ -421,7 +456,7 @@ class I12PitRebuildJob(BaseJob):
                             decision_time_label=label,
                             daily_bars=daily_bars,
                             minute_bars=minute_bars,
-                            daily_source_hash=getattr(daily_resp.lineage, "raw_payload_hash", None),
+                            daily_source_hash=daily_source_hash,
                             minute_source_hash=(
                                 getattr(minute_resp.lineage, "raw_payload_hash", None)
                                 if minute_resp.ok
@@ -500,8 +535,12 @@ class I12PitRebuildJob(BaseJob):
         *,
         job_run_id: str | None,
     ) -> AdapterResponse[Any]:
-        from_date = trading_date - timedelta(days=460)
-        to_date = next_us_equity_session(trading_date + timedelta(days=2))
+        cache_key = ticker.upper()
+        cached = self._daily_response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        from_date = self._start_date - timedelta(days=460)
+        to_date = next_us_equity_session(self._end_date + timedelta(days=2))
         stage = "fmp_daily_fetch"
         self._progress_provider_fetch_start(
             stage=stage,
@@ -521,7 +560,7 @@ class I12PitRebuildJob(BaseJob):
             )
 
         try:
-            return call_with_daemon_deadline(
+            response = call_with_daemon_deadline(
                 _fetch,
                 timeout_seconds=self._fetch_deadline_seconds,
                 thread_name="i12-pit-fmp-daily-fetch",
@@ -534,6 +573,9 @@ class I12PitRebuildJob(BaseJob):
                     "deadline_seconds": self._fetch_deadline_seconds,
                 },
             )
+            if response.ok:
+                self._daily_response_cache[cache_key] = response
+            return response
         except ProviderOutageCircuitBreaker as exc:
             self._progress("provider_outage_circuit_breaker", exc.payload)
             if not _breaker_opened_by_current_watchdog_timeout(exc):
@@ -1762,6 +1804,99 @@ def _iter_chunks(values: Sequence[str], size: int) -> list[list[str]]:
     return [
         list(values[index : index + size])
         for index in range(0, len(values), size)
+    ]
+
+
+def _daily_bars_for_trading_date(
+    ticker: str,
+    trading_date: date,
+    raw_bars: Sequence[FmpBar],
+) -> list[_DailyBar]:
+    from_date = trading_date - timedelta(days=460)
+    to_date = next_us_equity_session(trading_date + timedelta(days=2))
+    return [
+        bar
+        for bar in _clean_daily_bars(ticker, raw_bars, _CleanCounters())
+        if from_date <= bar.date <= to_date
+    ]
+
+
+def _daily_slice_source_hash(
+    ticker: str,
+    trading_date: date,
+    daily_bars: Sequence[_DailyBar],
+) -> str:
+    from_date = trading_date - timedelta(days=460)
+    to_date = next_us_equity_session(trading_date + timedelta(days=2))
+    return stable_hash({
+        "source": "fmp_daily_clean_slice_v1",
+        "ticker": ticker.upper(),
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "bars": [
+            {
+                "date": bar.date.isoformat(),
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+                "split_adjusted_close": bar.split_adjusted_close,
+            }
+            for bar in daily_bars
+        ],
+    })
+
+
+def _daily_prefilter_results(
+    *,
+    ticker: str,
+    trading_date: date,
+    decision_time_labels: Sequence[str],
+    daily_bars: Sequence[_DailyBar],
+    daily_source_hash: str | None,
+    source_hur_identity_hash: str | None,
+    source_hur: Mapping[str, Any] | None,
+    path_mode: str,
+) -> list[PitCandidateResult] | None:
+    try:
+        prior_ctx = _prior_context(ticker.upper(), trading_date, daily_bars)
+    except RuntimeError as exc:
+        return [
+            _candidate_error(
+                ticker=ticker,
+                trading_date=trading_date,
+                decision_ts=_decision_timestamp(trading_date, label),
+                decision_time_label=label,
+                coverage_status="daily_context_error",
+                fail_reason=str(exc),
+                daily_source_hash=daily_source_hash,
+                minute_source_hash=None,
+                prior_ctx=None,
+                source_hur_identity_hash=source_hur_identity_hash,
+                source_hur=source_hur,
+                path_mode=path_mode,
+            )
+            for label in decision_time_labels
+        ]
+    if prior_ctx["distance_from_max252"] <= -0.50:
+        return None
+    return [
+        _candidate_error(
+            ticker=ticker,
+            trading_date=trading_date,
+            decision_ts=_decision_timestamp(trading_date, label),
+            decision_time_label=label,
+            coverage_status="daily_prefilter_skip",
+            fail_reason="drawdown",
+            daily_source_hash=daily_source_hash,
+            minute_source_hash=None,
+            prior_ctx=prior_ctx,
+            source_hur_identity_hash=source_hur_identity_hash,
+            source_hur=source_hur,
+            path_mode=path_mode,
+        )
+        for label in decision_time_labels
     ]
 
 
