@@ -35,6 +35,7 @@ def test_i12_pit_analyzer_accepts_final_report(tmp_path):
     analyzer = _load_analyzer()
     payload = _report_payload(conclusions_final=True)
     payload["candidate_coverage_status_counts"] = {"daily_prefilter_skip": 2, "ok": 8}
+    payload["daily_source_hash_basis_counts"] = {"legacy_per_date_raw_payload": 10}
     path = _write_report(tmp_path, payload)
 
     analysis = analyzer.analyze_report_paths([path], labels=["one-month"], require_final=True)
@@ -46,6 +47,9 @@ def test_i12_pit_analyzer_accepts_final_report(tmp_path):
     assert report["integrity"]["candidate_coverage_status_counts"] == {
         "daily_prefilter_skip": 2,
         "ok": 8,
+    }
+    assert report["integrity"]["daily_source_hash_basis_counts"] == {
+        "legacy_per_date_raw_payload": 10,
     }
     assert report["exit_comparison"]["same_day_exit"]["tradeable_count"] == 8
     assert "report_non_final" not in report["warnings"]
@@ -71,6 +75,10 @@ def test_i12_pit_analyzer_emits_quality_warnings(tmp_path):
     analyzer = _load_analyzer()
     payload = _report_payload()
     payload["quote_non_ok_count"] = 2
+    payload["daily_source_hash_basis_counts"] = {"clean_slice_v1": 4, "unknown": 1}
+    payload["daily_source_hash_reuse_status_counts"] = {
+        "existing_active_attempt_reuse": 5,
+    }
     payload["exit_metrics"]["same_day_exit"]["tradeable_rate"] = 0.50
     payload["exit_metrics"]["same_day_exit"]["mean_modeled_return_skips_as_cash"] = 0.01
     payload["exit_metrics"]["same_day_exit"]["win_rate_skips_as_cash"] = 0.40
@@ -83,6 +91,23 @@ def test_i12_pit_analyzer_emits_quality_warnings(tmp_path):
     assert "same_day_positive_mean_but_win_rate_below_50pct" in warnings
     assert "next_open_materially_worse_than_same_day" in warnings
     assert "same_day_exit_tradeable_rate_below_threshold" in warnings
+    assert "daily_source_hash_clean_slice_v1_present" in warnings
+    assert "daily_source_hash_unknown_basis_present" in warnings
+
+
+def test_i12_pit_analyzer_does_not_warn_clean_slice_for_reused_legacy_rows(tmp_path):
+    analyzer = _load_analyzer()
+    payload = _report_payload()
+    payload["daily_source_hash_basis_counts"] = {"legacy_per_date_raw_payload": 4}
+    payload["daily_source_hash_reuse_status_counts"] = {
+        "existing_active_attempt_reuse": 4,
+    }
+    path = _write_report(tmp_path, payload)
+
+    warnings = analyzer.analyze_report_paths([path])["reports"][0]["warnings"]
+
+    assert "daily_source_hash_clean_slice_v1_present" not in warnings
+    assert "daily_source_hash_unknown_basis_present" not in warnings
 
 
 @pytest.mark.parametrize("schema", ["public", "canonical", "default", "analysis"])

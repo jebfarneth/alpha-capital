@@ -162,6 +162,36 @@ def render_text_analysis(analysis: Mapping[str, Any]) -> str:
             for report in reports
         ],
     ))
+    basis_rows = [
+        [
+            report.get("label"),
+            json.dumps(
+                _nested(report, "integrity", "daily_source_hash_basis_counts") or {},
+                sort_keys=True,
+            ),
+        ]
+        for report in reports
+        if _nested(report, "integrity", "daily_source_hash_basis_counts")
+    ]
+    if basis_rows:
+        lines.append("")
+        lines.append("Daily Source Hash Basis")
+        lines.append(_format_table(["label", "counts"], basis_rows))
+    reuse_rows = [
+        [
+            report.get("label"),
+            json.dumps(
+                _nested(report, "integrity", "daily_source_hash_reuse_status_counts") or {},
+                sort_keys=True,
+            ),
+        ]
+        for report in reports
+        if _nested(report, "integrity", "daily_source_hash_reuse_status_counts")
+    ]
+    if reuse_rows:
+        lines.append("")
+        lines.append("Daily Source Hash Reuse Status")
+        lines.append(_format_table(["label", "counts"], reuse_rows))
     lines.append("")
     lines.append("Exit Comparison")
     exit_rows = []
@@ -339,6 +369,12 @@ def _integrity_summary(report: Mapping[str, Any], loaded: LoadedReport) -> dict[
         "quote_ok_rate": report.get("quote_ok_rate"),
         "candidate_coverage_status_counts": (
             report.get("candidate_coverage_status_counts") or {}
+        ),
+        "daily_source_hash_basis_counts": (
+            report.get("daily_source_hash_basis_counts") or {}
+        ),
+        "daily_source_hash_reuse_status_counts": (
+            report.get("daily_source_hash_reuse_status_counts") or {}
         ),
         "quote_coverage_status_counts": report.get("quote_coverage_status_counts") or {},
     }
@@ -948,6 +984,11 @@ def _quality_warnings(
             warnings.append(f"{key}_false")
     if (integrity.get("quote_non_ok_count") or 0) > 0:
         warnings.append("quote_non_ok_rows_present")
+    daily_basis_counts = _mapping(integrity.get("daily_source_hash_basis_counts"))
+    if int(daily_basis_counts.get("clean_slice_v1") or 0) > 0:
+        warnings.append("daily_source_hash_clean_slice_v1_present")
+    if int(daily_basis_counts.get("unknown") or 0) > 0:
+        warnings.append("daily_source_hash_unknown_basis_present")
     same_day = _mapping(exits.get("same_day_exit"))
     next_open = _mapping(exits.get("next_open_exit"))
     same_day_mean = _float_or_none(same_day.get("mean_modeled_return_skips_as_cash"))

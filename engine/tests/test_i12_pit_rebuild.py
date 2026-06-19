@@ -215,6 +215,36 @@ class FakeFmpByTicker:
         )
 
 
+class RangeHashFmpByTicker(FakeFmpByTicker):
+    def get_historical_price(self, ticker, **kwargs):
+        resp = super().get_historical_price(ticker, **kwargs)
+        if not resp.ok:
+            return resp
+        normalized = ticker.upper()
+        dates = {
+            date.fromisoformat(bar.date)
+            for bar in (resp.data or [])
+            if isinstance(getattr(bar, "date", None), str)
+        }
+        return AdapterResponse(
+            data=resp.data,
+            lineage=_range_lineage(
+                "FMP",
+                normalized,
+                from_date=kwargs.get("from_date"),
+                to_date=kwargs.get("to_date"),
+                data_quality_flags={
+                    i12_pit_rebuild.LEGACY_DAILY_SOURCE_HASHES_FLAG: {
+                        _legacy_daily_source_hash_key(normalized, trading_date): (
+                            _legacy_daily_source_hash(normalized, trading_date)
+                        )
+                        for trading_date in dates
+                    }
+                },
+            ),
+        )
+
+
 class FakePolygonByTicker:
     def __init__(self, bars_by_ticker, error_tickers=None):
         self.bars_by_ticker = bars_by_ticker
@@ -1038,6 +1068,8 @@ def test_daily_cache_reuses_fmp_and_preserves_passed_candidate_identity(db_sessi
     assert result.metrics["actual_candidate_row_count"] == 2
     assert result.metrics["missing_source_attempt_count"] == 0
     assert result.metrics["missing_source_attempt_identity_count"] == 0
+    assert result.metrics["daily_source_hash_basis_counts"] == {"clean_slice_v1": 2}
+    assert result.metrics["daily_source_hash_reuse_status_counts"] == {"fresh": 2}
     passed = (
         db_session.query(I12PitCandidate)
         .filter(
@@ -1047,6 +1079,9 @@ def test_daily_cache_reuses_fmp_and_preserves_passed_candidate_identity(db_sessi
         .one()
     )
     stored_source_bars = json.loads(passed.source_bars_json)
+    assert stored_source_bars["daily_source_hash_basis"] == "clean_slice_v1"
+    assert stored_source_bars["daily_source_hash_reuse_status"] == "fresh"
+    assert stored_source_bars["daily_provider_fetch_hash"] == _lineage("FMP", "CACHE").raw_payload_hash
     daily_bars = i12_pit_rebuild._daily_bars_for_trading_date(
         "CACHE",
         DAY,
@@ -1077,6 +1112,438 @@ def test_daily_cache_reuses_fmp_and_preserves_passed_candidate_identity(db_sessi
         .one()
     )
     assert skipped.coverage_status == "daily_prefilter_skip"
+    assert json.loads(skipped.source_bars_json)["daily_source_hash_basis"] == "clean_slice_v1"
+
+
+def test_fresh_daily_cache_matches_legacy_per_date_passed_candidate_identity(db_session):
+    _add_hur(db_session, "FRESH", day=DAY, output_hash="hur-fresh")
+    _add_hur(db_session, "SKIP", day=DAY, output_hash="hur-skip")
+    fresh_hur = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == DAY,
+            HistoricalUniverseReconstruction.normalized_symbol == "FRESH",
+        )
+        .one()
+    )
+    fresh_source = _hur_source_row_from_model(fresh_hur, source_schema="public")
+    expected = build_i12_pit_candidate(
+        ticker="FRESH",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_minute_bars(),
+        daily_source_hash=_legacy_daily_source_hash("FRESH", DAY),
+        minute_source_hash=_lineage("Polygon", "FRESH").raw_payload_hash,
+        source_hur_identity_hash=fresh_source.source_hur_identity_hash,
+        source_hur=fresh_source.source_hur_payload,
+        path_mode="strict_contiguous",
+    )
+    assert expected.candidate_status == "passed"
+    fmp = RangeHashFmpByTicker({
+        "FRESH": _fmp_bars(),
+        "SKIP": _fmp_bars_no_drawdown(),
+    })
+    polygon = FakePolygonByTicker({
+        "FRESH": _polygon_bars(),
+        "SKIP": _polygon_bars(),
+    })
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert {call[0] for call in fmp.calls} == {"FRESH", "SKIP"}
+    assert [call[0] for call in polygon.calls] == ["FRESH"]
+    assert result.metrics["expected_candidate_attempts"] == 2
+    assert result.metrics["actual_candidate_row_count"] == 2
+    assert result.metrics["missing_source_attempt_count"] == 0
+    assert result.metrics["extra_source_attempt_count"] == 0
+    assert result.metrics["missing_source_attempt_identity_count"] == 0
+    assert result.metrics["extra_source_attempt_identity_count"] == 0
+    assert result.metrics["daily_source_hash_basis_counts"] == {
+        "legacy_per_date_raw_payload": 2,
+    }
+    assert result.metrics["daily_source_hash_reuse_status_counts"] == {"fresh": 2}
+    passed = (
+        db_session.query(I12PitCandidate)
+        .filter(
+            I12PitCandidate.ticker == "FRESH",
+            I12PitCandidate.candidate_status == "passed",
+        )
+        .one()
+    )
+    assert (
+        passed.ticker,
+        passed.decision_date,
+        passed.decision_time_label,
+    ) == ("FRESH", DAY, "09:40")
+    assert json.loads(passed.feature_json) == expected.feature_json
+    assert json.loads(passed.gate_values_json) == expected.gate_values
+    assert json.loads(passed.label_json) == expected.label_json
+    assert passed.candidate_identity_hash == expected.candidate_identity_hash
+    assert passed.content_hash == expected.content_hash
+    assert json.loads(passed.source_bars_json)["daily_source_hash"] == (
+        _legacy_daily_source_hash("FRESH", DAY)
+    )
+    assert json.loads(passed.source_bars_json)["daily_source_hash_basis"] == (
+        "legacy_per_date_raw_payload"
+    )
+    skipped = (
+        db_session.query(I12PitCandidate)
+        .filter(
+            I12PitCandidate.ticker == "SKIP",
+            I12PitCandidate.coverage_status == "daily_prefilter_skip",
+        )
+        .one()
+    )
+    assert skipped.is_active is True
+    assert json.loads(skipped.source_bars_json)["daily_source_hash_basis"] == (
+        "legacy_per_date_raw_payload"
+    )
+
+
+def test_daily_cache_rerun_preserves_legacy_candidate_and_child_evidence(db_session):
+    day2 = next_us_equity_session(DAY + timedelta(days=1))
+    _add_hur(db_session, "PARITY", day=DAY, output_hash="hur-parity")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == DAY,
+            HistoricalUniverseReconstruction.normalized_symbol == "PARITY",
+        )
+        .one()
+    )
+    hur_source = _hur_source_row_from_model(hur_row, source_schema="public")
+    legacy_daily_hash = _legacy_daily_source_hash("PARITY", DAY)
+    optimized_wide_hash = _range_lineage(
+        "FMP",
+        "PARITY",
+        from_date=DAY - timedelta(days=460),
+        to_date=next_us_equity_session(day2 + timedelta(days=2)),
+    ).raw_payload_hash
+    assert legacy_daily_hash != optimized_wide_hash
+
+    baseline_result = build_i12_pit_candidate(
+        ticker="PARITY",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_minute_bars(),
+        daily_source_hash=legacy_daily_hash,
+        daily_source_hash_basis="legacy_per_date_raw_payload",
+        minute_source_hash=_lineage("Polygon", "PARITY").raw_payload_hash,
+        source_hur_identity_hash=hur_source.source_hur_identity_hash,
+        source_hur=hur_source.source_hur_payload,
+        path_mode="strict_contiguous",
+    )
+    assert baseline_result.candidate_status == "passed"
+    seed_job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"PARITY": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"PARITY": _polygon_bars()}),
+        alpaca_adapter=FakeAlpaca(_complete_quotes()),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=True,
+    )
+    baseline_candidate = seed_job._persist_candidate(baseline_result, None)
+    baseline_candidate_id = baseline_candidate.i12_pit_candidate_id
+    db_session.commit()
+    quotes = seed_job._replay_quotes(baseline_candidate_id, None)
+    baseline_candidate = db_session.get(I12PitCandidate, baseline_candidate_id)
+    assert baseline_candidate is not None
+    seed_job._persist_costs(baseline_candidate, quotes, None)
+    db_session.commit()
+    baseline_feature_json = json.loads(baseline_candidate.feature_json)
+    baseline_gate_values = json.loads(baseline_candidate.gate_values_json)
+    baseline_label_json = json.loads(baseline_candidate.label_json)
+    baseline_quote_ids = {
+        row.i12_pit_quote_replay_id
+        for row in db_session.query(I12PitQuoteReplay)
+        .filter(
+            I12PitQuoteReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitQuoteReplay.is_active.is_(True),
+        )
+        .all()
+    }
+    baseline_cost_ids = {
+        row.i12_pit_cost_replay_id
+        for row in db_session.query(I12PitCostReplay)
+        .filter(
+            I12PitCostReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitCostReplay.is_active.is_(True),
+        )
+        .all()
+    }
+    assert len(baseline_quote_ids) == 3
+    assert len(baseline_cost_ids) == 2
+
+    fmp = RangeHashFmpByTicker({"PARITY": _fmp_bars()})
+    polygon = FakePolygonByTicker({"PARITY": _polygon_bars()})
+    optimized_job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=day2,
+        decision_times=["09:40"],
+        quote_replay=True,
+    )
+
+    result = run_job(db_session, optimized_job, params={"test": True})
+
+    assert result.ok
+    assert len(fmp.calls) == 1
+    assert len(polygon.calls) == 1
+    assert result.metrics["expected_candidate_attempts"] == 1
+    assert result.metrics["missing_source_attempt_identity_count"] == 0
+    assert result.metrics["extra_source_attempt_identity_count"] == 0
+    assert result.metrics["daily_source_hash_basis_counts"] == {
+        "legacy_per_date_raw_payload": 1,
+    }
+    assert result.metrics["daily_source_hash_reuse_status_counts"] == {
+        "existing_active_attempt_reuse": 1,
+    }
+    assert result.metrics["quote_replay_complete"] is True
+    assert result.metrics["cost_replay_complete"] is True
+    candidates = db_session.query(I12PitCandidate).filter(I12PitCandidate.ticker == "PARITY").all()
+    assert len(candidates) == 1
+    stored = candidates[0]
+    assert stored.i12_pit_candidate_id == baseline_candidate_id
+    assert stored.is_active is True
+    assert stored.content_hash == baseline_result.content_hash
+    assert stored.candidate_identity_hash == baseline_result.candidate_identity_hash
+    assert json.loads(stored.feature_json) == baseline_feature_json
+    assert json.loads(stored.gate_values_json) == baseline_gate_values
+    assert json.loads(stored.label_json) == baseline_label_json
+    stored_source_bars = json.loads(stored.source_bars_json)
+    assert stored_source_bars["daily_source_hash"] == legacy_daily_hash
+    assert stored_source_bars["daily_source_hash_basis"] == (
+        "legacy_per_date_raw_payload"
+    )
+    assert stored_source_bars["daily_source_hash_reuse_status"] == (
+        "existing_active_attempt_reuse"
+    )
+    assert {
+        row.i12_pit_quote_replay_id
+        for row in db_session.query(I12PitQuoteReplay)
+        .filter(
+            I12PitQuoteReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitQuoteReplay.is_active.is_(True),
+        )
+        .all()
+    } == baseline_quote_ids
+    assert {
+        row.i12_pit_cost_replay_id
+        for row in db_session.query(I12PitCostReplay)
+        .filter(
+            I12PitCostReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitCostReplay.is_active.is_(True),
+        )
+        .all()
+    } == baseline_cost_ids
+    assert db_session.query(I12PitQuoteReplay).filter(
+        I12PitQuoteReplay.is_active.is_(False)
+    ).count() == 0
+    assert db_session.query(I12PitCostReplay).filter(
+        I12PitCostReplay.is_active.is_(False)
+    ).count() == 0
+
+
+def test_daily_cache_rerun_preserves_clean_slice_basis_warning_and_child_evidence(db_session):
+    _add_hur(db_session, "SLICE", day=DAY, output_hash="hur-slice")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == DAY,
+            HistoricalUniverseReconstruction.normalized_symbol == "SLICE",
+        )
+        .one()
+    )
+    hur_source = _hur_source_row_from_model(hur_row, source_schema="public")
+    daily_bars = i12_pit_rebuild._daily_bars_for_trading_date(
+        "SLICE",
+        DAY,
+        _fmp_bars(),
+    )
+    clean_slice_hash = i12_pit_rebuild._daily_slice_source_hash("SLICE", DAY, daily_bars)
+    baseline_result = build_i12_pit_candidate(
+        ticker="SLICE",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=daily_bars,
+        minute_bars=_minute_bars(),
+        daily_source_hash=clean_slice_hash,
+        daily_source_hash_basis="clean_slice_v1",
+        daily_provider_fetch_hash=_lineage("FMP", "SLICE").raw_payload_hash,
+        minute_source_hash=_lineage("Polygon", "SLICE").raw_payload_hash,
+        source_hur_identity_hash=hur_source.source_hur_identity_hash,
+        source_hur=hur_source.source_hur_payload,
+        path_mode="strict_contiguous",
+    )
+    assert baseline_result.candidate_status == "passed"
+    seed_job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"SLICE": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"SLICE": _polygon_bars()}),
+        alpaca_adapter=FakeAlpaca(_complete_quotes()),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=True,
+    )
+    baseline_candidate = seed_job._persist_candidate(baseline_result, None)
+    baseline_candidate_id = baseline_candidate.i12_pit_candidate_id
+    db_session.commit()
+    quotes = seed_job._replay_quotes(baseline_candidate_id, None)
+    baseline_candidate = db_session.get(I12PitCandidate, baseline_candidate_id)
+    assert baseline_candidate is not None
+    seed_job._persist_costs(baseline_candidate, quotes, None)
+    db_session.commit()
+    baseline_quote_ids = {
+        row.i12_pit_quote_replay_id
+        for row in db_session.query(I12PitQuoteReplay)
+        .filter(
+            I12PitQuoteReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitQuoteReplay.is_active.is_(True),
+        )
+        .all()
+    }
+    baseline_cost_ids = {
+        row.i12_pit_cost_replay_id
+        for row in db_session.query(I12PitCostReplay)
+        .filter(
+            I12PitCostReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitCostReplay.is_active.is_(True),
+        )
+        .all()
+    }
+
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"SLICE": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"SLICE": _polygon_bars()}),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=True,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert result.metrics["missing_source_attempt_identity_count"] == 0
+    assert result.metrics["extra_source_attempt_identity_count"] == 0
+    assert result.metrics["daily_source_hash_basis_counts"] == {"clean_slice_v1": 1}
+    assert result.metrics["daily_source_hash_reuse_status_counts"] == {
+        "existing_active_attempt_reuse": 1,
+    }
+    stored = (
+        db_session.query(I12PitCandidate)
+        .filter(I12PitCandidate.ticker == "SLICE")
+        .one()
+    )
+    assert stored.i12_pit_candidate_id == baseline_candidate_id
+    assert stored.content_hash == baseline_result.content_hash
+    source_bars = json.loads(stored.source_bars_json)
+    assert source_bars["daily_source_hash_basis"] == "clean_slice_v1"
+    assert source_bars["daily_source_hash_reuse_status"] == (
+        "existing_active_attempt_reuse"
+    )
+    assert {
+        row.i12_pit_quote_replay_id
+        for row in db_session.query(I12PitQuoteReplay)
+        .filter(
+            I12PitQuoteReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitQuoteReplay.is_active.is_(True),
+        )
+        .all()
+    } == baseline_quote_ids
+    assert {
+        row.i12_pit_cost_replay_id
+        for row in db_session.query(I12PitCostReplay)
+        .filter(
+            I12PitCostReplay.i12_pit_candidate_id == baseline_candidate_id,
+            I12PitCostReplay.is_active.is_(True),
+        )
+        .all()
+    } == baseline_cost_ids
+    assert db_session.query(I12PitQuoteReplay).filter(
+        I12PitQuoteReplay.is_active.is_(False)
+    ).count() == 0
+    assert db_session.query(I12PitCostReplay).filter(
+        I12PitCostReplay.is_active.is_(False)
+    ).count() == 0
+
+
+def test_report_counts_missing_daily_source_hash_basis_as_unknown(db_session):
+    _add_hur(db_session, "OLDBASIS", day=DAY, output_hash="hur-old-basis")
+    hur_row = (
+        db_session.query(HistoricalUniverseReconstruction)
+        .filter(
+            HistoricalUniverseReconstruction.replay_date == DAY,
+            HistoricalUniverseReconstruction.normalized_symbol == "OLDBASIS",
+        )
+        .one()
+    )
+    hur_source = _hur_source_row_from_model(hur_row, source_schema="public")
+    result = build_i12_pit_candidate(
+        ticker="OLDBASIS",
+        trading_date=DAY,
+        decision_ts=DECISION_TS,
+        decision_time_label="09:40",
+        daily_bars=_daily_bars(),
+        minute_bars=_minute_bars(),
+        daily_source_hash="old-daily-hash",
+        minute_source_hash="old-minute-hash",
+        source_hur_identity_hash=hur_source.source_hur_identity_hash,
+        source_hur=hur_source.source_hur_payload,
+        path_mode="strict_contiguous",
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"OLDBASIS": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"OLDBASIS": _polygon_bars()}),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+    )
+    candidate = job._persist_candidate(result, None)
+    source_bars = json.loads(candidate.source_bars_json)
+    source_bars.pop("daily_source_hash_basis", None)
+    source_bars.pop("daily_source_hash_reuse_status", None)
+    candidate.source_bars_json = json.dumps(source_bars, sort_keys=True)
+    db_session.commit()
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="strict_contiguous",
+    )
+
+    assert report["daily_source_hash_basis_counts"] == {"unknown": 1}
+    assert report["daily_source_hash_reuse_status_counts"] == {"unknown": 1}
 
 
 def test_daily_fetch_error_attempts_are_persisted_and_block_finality(db_session):
@@ -2209,7 +2676,8 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "window_running_expected" in text_value
         assert "command_has_arg_value" in text_value
         assert "regex_escape" in text_value
-        assert 'normalized_command="${command//\\\\ / }"' in text_value
+        assert "normalize_tmux_pane_start_command" in text_value
+        assert "sed -E 's/\\\\+[[:space:]]+/ /g'" in text_value
         assert 'command_has_arg_value "${pane_start}" "--max-no-progress-minutes" "${MAX_NO_PROGRESS_MINUTES}"' in text_value
         assert 'pane_start}" == *"--max-no-progress-minutes"*' not in text_value
         assert "window already running expected shard" in text_value
@@ -2226,7 +2694,7 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
 
 def test_i12_pit_shard_launcher_no_progress_match_is_exact():
     def matches_pane_start(command: str, expected_value: str) -> bool:
-        normalized = command.replace("\\ ", " ")
+        normalized = re.sub(r"\\+\s+", " ", command)
         pattern = re.compile(
             rf"(^|\s)--max-no-progress-minutes(\s+|=){re.escape(expected_value)}($|\s)"
         )
@@ -2248,12 +2716,28 @@ def test_i12_pit_shard_launcher_no_progress_match_is_exact():
         r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes=20\ ",
         "20",
     )
+    launcher_shaped = (
+        r"exec\ bash\ -lc\ set\ -Eeuo\ pipefail\;\ exec\ .venv/bin/python"
+        r"\\ -m\\ alpha.jobs.run_i12_pit_rebuild"
+        r"\\ --schema\\ scratch_i12_pit_m1_0940_strict_20260618"
+        r"\\ --start-date\\ 2026-05-01"
+        r"\\ --end-date\\ 2026-05-07"
+        r"\\ --decision-time\\ 09:40"
+        r"\\ --minute-path-mode\\ strict_contiguous"
+        r"\\ --max-no-progress-minutes\\ 20"
+        r"\\ --progress-artifact\\ artifacts/stage0/i12_pit_0940_strict_may01_07.json"
+    )
+    assert matches_pane_start(launcher_shaped, "20")
     assert not matches_pane_start(
         r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 30\ ",
         "20",
     )
     assert not matches_pane_start(
         r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 120\ ",
+        "20",
+    )
+    assert not matches_pane_start(
+        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --start-date\ 2026-05-20\ ",
         "20",
     )
     assert not matches_pane_start(
@@ -4524,6 +5008,45 @@ def _lineage(provider, ticker):
         asof_timestamp=now,
         raw_payload_hash=stable_hash({"provider": provider, "ticker": ticker}),
     )
+
+
+def _range_lineage(
+    provider,
+    ticker,
+    *,
+    from_date=None,
+    to_date=None,
+    data_quality_flags=None,
+):
+    now = datetime(2026, 6, 16, tzinfo=timezone.utc)
+    return LineageMeta(
+        provider=provider,
+        endpoint="fixture",
+        request_timestamp=now,
+        asof_timestamp=now,
+        raw_payload_hash=stable_hash({
+            "provider": provider,
+            "ticker": ticker,
+            "from_date": from_date.isoformat() if from_date else None,
+            "to_date": to_date.isoformat() if to_date else None,
+        }),
+        data_quality_flags=data_quality_flags,
+    )
+
+
+def _legacy_daily_source_hash_key(ticker, trading_date):
+    from_date = trading_date - timedelta(days=460)
+    to_date = next_us_equity_session(trading_date + timedelta(days=2))
+    return f"{ticker.upper()}|{from_date.isoformat()}|{to_date.isoformat()}|adjusted=false"
+
+
+def _legacy_daily_source_hash(ticker, trading_date):
+    return _range_lineage(
+        "FMP",
+        ticker.upper(),
+        from_date=trading_date - timedelta(days=460),
+        to_date=next_us_equity_session(trading_date + timedelta(days=2)),
+    ).raw_payload_hash
 
 
 def _role_from_window(start, end):

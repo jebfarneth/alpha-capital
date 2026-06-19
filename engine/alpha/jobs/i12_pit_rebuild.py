@@ -87,6 +87,17 @@ EXIT_ROLES = ("same_day_exit", "next_open_exit")
 DEFAULT_TICKER_PROGRESS_INTERVAL = 250
 DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
 CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE = 10000
+LEGACY_DAILY_SOURCE_HASHES_FLAG = "i12_pit_legacy_per_date_daily_source_hashes"
+DAILY_SOURCE_HASH_BASIS_LEGACY = "legacy_per_date_raw_payload"
+DAILY_SOURCE_HASH_BASIS_CLEAN_SLICE = "clean_slice_v1"
+DAILY_SOURCE_HASH_BASIS_PROVIDER_ERROR = "provider_error"
+DAILY_SOURCE_HASH_REUSE_FRESH = "fresh"
+DAILY_SOURCE_HASH_REUSE_EXISTING_ACTIVE = "existing_active_attempt_reuse"
+SOURCE_BARS_NON_IDENTITY_KEYS = frozenset({
+    "daily_source_hash_basis",
+    "daily_provider_fetch_hash",
+    "daily_source_hash_reuse_status",
+})
 STRICT_MINUTE_PATH_MODE = "strict_contiguous"
 SPARSE_ZERO_FILL_MINUTE_PATH_MODE = "sparse_zero_fill"
 MINUTE_PATH_MODES = (
@@ -339,6 +350,8 @@ class I12PitRebuildJob(BaseJob):
                     if not daily_resp.ok:
                         daily_error = _provider_error_payload(daily_resp)
                         daily_source_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
+                        daily_source_hash_basis = DAILY_SOURCE_HASH_BASIS_PROVIDER_ERROR
+                        daily_provider_fetch_hash = daily_source_hash
                         for label in self._decision_times:
                             decision_ts = _decision_timestamp(trading_date, label)
                             result = _candidate_error(
@@ -349,6 +362,8 @@ class I12PitRebuildJob(BaseJob):
                                 coverage_status="daily_fetch_error",
                                 fail_reason="daily_fetch_error",
                                 daily_source_hash=daily_source_hash,
+                                daily_source_hash_basis=daily_source_hash_basis,
+                                daily_provider_fetch_hash=daily_provider_fetch_hash,
                                 minute_source_hash=None,
                                 daily_error=daily_error,
                                 minute_error=None,
@@ -375,9 +390,14 @@ class I12PitRebuildJob(BaseJob):
                         trading_date,
                         daily_resp.data or [],
                     )
-                    daily_source_hash = _daily_slice_source_hash(
+                    (
+                        daily_source_hash,
+                        daily_source_hash_basis,
+                        daily_provider_fetch_hash,
+                    ) = _daily_source_hash_for_trading_date(
                         ticker,
                         trading_date,
+                        daily_resp,
                         daily_bars,
                     )
                     prefilter_results = _daily_prefilter_results(
@@ -386,6 +406,8 @@ class I12PitRebuildJob(BaseJob):
                         decision_time_labels=self._decision_times,
                         daily_bars=daily_bars,
                         daily_source_hash=daily_source_hash,
+                        daily_source_hash_basis=daily_source_hash_basis,
+                        daily_provider_fetch_hash=daily_provider_fetch_hash,
                         source_hur_identity_hash=hur_row.source_hur_identity_hash,
                         source_hur=hur_row.source_hur_payload,
                         path_mode=self._minute_path_mode,
@@ -424,6 +446,8 @@ class I12PitRebuildJob(BaseJob):
                                 coverage_status="minute_fetch_error",
                                 fail_reason="minute_fetch_error",
                                 daily_source_hash=daily_source_hash,
+                                daily_source_hash_basis=daily_source_hash_basis,
+                                daily_provider_fetch_hash=daily_provider_fetch_hash,
                                 minute_source_hash=minute_source_hash,
                                 daily_error=None,
                                 minute_error=minute_error,
@@ -447,8 +471,31 @@ class I12PitRebuildJob(BaseJob):
                         continue
                     raw_minutes = minute_resp.data or []
                     minute_bars = _clean_minute_bars(trading_date, raw_minutes)
+                    minute_source_hash = (
+                        getattr(minute_resp.lineage, "raw_payload_hash", None)
+                        if minute_resp.ok
+                        else None
+                    )
                     for label in self._decision_times:
                         decision_ts = _decision_timestamp(trading_date, label)
+                        (
+                            result_daily_source_hash,
+                            result_minute_source_hash,
+                            result_daily_source_hash_basis,
+                            result_daily_provider_fetch_hash,
+                            result_daily_source_hash_reuse_status,
+                        ) = self._candidate_attempt_source_hashes(
+                            ticker=ticker,
+                            trading_date=trading_date,
+                            decision_ts=decision_ts,
+                            decision_time_label=label,
+                            source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                            path_mode=self._minute_path_mode,
+                            daily_source_hash=daily_source_hash,
+                            minute_source_hash=minute_source_hash,
+                            daily_source_hash_basis=daily_source_hash_basis,
+                            daily_provider_fetch_hash=daily_provider_fetch_hash,
+                        )
                         result = build_i12_pit_candidate(
                             ticker=ticker,
                             trading_date=trading_date,
@@ -456,12 +503,13 @@ class I12PitRebuildJob(BaseJob):
                             decision_time_label=label,
                             daily_bars=daily_bars,
                             minute_bars=minute_bars,
-                            daily_source_hash=daily_source_hash,
-                            minute_source_hash=(
-                                getattr(minute_resp.lineage, "raw_payload_hash", None)
-                                if minute_resp.ok
-                                else None
+                            daily_source_hash=result_daily_source_hash,
+                            daily_source_hash_basis=result_daily_source_hash_basis,
+                            daily_provider_fetch_hash=result_daily_provider_fetch_hash,
+                            daily_source_hash_reuse_status=(
+                                result_daily_source_hash_reuse_status
                             ),
+                            minute_source_hash=result_minute_source_hash,
                             minute_error=None if minute_resp.ok else _provider_error_payload(minute_resp),
                             source_hur_identity_hash=hur_row.source_hur_identity_hash,
                             source_hur=hur_row.source_hur_payload,
@@ -760,6 +808,9 @@ class I12PitRebuildJob(BaseJob):
             active_attempt = None
         elif active_attempt is not None and active_attempt.content_hash == result.content_hash:
             active_attempt.job_run_id = job_run_id
+            source_bars_json = _json_dumps(result.source_bars)
+            if active_attempt.source_bars_json != source_bars_json:
+                active_attempt.source_bars_json = source_bars_json
             if active_attempt.label_hash != result.label_hash:
                 active_attempt.label_json = _json_dumps(result.label_json)
                 active_attempt.label_hash = result.label_hash
@@ -785,6 +836,9 @@ class I12PitRebuildJob(BaseJob):
             existing_content.is_active = True
             existing_content.superseded_at = None
             existing_content.superseded_by_candidate_id = None
+            source_bars_json = _json_dumps(result.source_bars)
+            if existing_content.source_bars_json != source_bars_json:
+                existing_content.source_bars_json = source_bars_json
             if existing_content.label_hash != result.label_hash:
                 existing_content.label_json = _json_dumps(result.label_json)
                 existing_content.label_hash = result.label_hash
@@ -1701,6 +1755,60 @@ class I12PitRebuildJob(BaseJob):
                 "fetch_watchdog": self._fetch_watchdog.snapshot(),
             }
 
+    def _candidate_attempt_source_hashes(
+        self,
+        *,
+        ticker: str,
+        trading_date: date,
+        decision_ts: datetime,
+        decision_time_label: str,
+        source_hur_identity_hash: str | None,
+        path_mode: str,
+        daily_source_hash: str | None,
+        minute_source_hash: str | None,
+        daily_source_hash_basis: str,
+        daily_provider_fetch_hash: str | None,
+    ) -> tuple[str | None, str | None, str, str | None, str]:
+        # Daily caching can change the provider raw-payload hash basis from the
+        # old per-date request to a wider per-ticker request. Preserve hashes
+        # from an active natural attempt so unchanged reruns do not supersede
+        # candidates or detach quote/cost evidence.
+        attempt_hash = _candidate_attempt_hash(
+            ticker=ticker,
+            trading_date=trading_date,
+            decision_ts=decision_ts,
+            decision_time_label=decision_time_label,
+            source_hur_identity_hash=source_hur_identity_hash,
+            path_mode=path_mode,
+        )
+        existing = (
+            self._session.query(I12PitCandidate)
+            .filter(
+                I12PitCandidate.candidate_attempt_hash == attempt_hash,
+                I12PitCandidate.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+        if existing is None:
+            return (
+                daily_source_hash,
+                minute_source_hash,
+                daily_source_hash_basis,
+                daily_provider_fetch_hash,
+                DAILY_SOURCE_HASH_REUSE_FRESH,
+            )
+        source_bars = _json_loads(existing.source_bars_json)
+        existing_basis = source_bars.get("daily_source_hash_basis")
+        if not isinstance(existing_basis, str) or not existing_basis:
+            existing_basis = "unknown"
+        return (
+            source_bars.get("daily_source_hash") or daily_source_hash,
+            source_bars.get("minute_source_hash") or minute_source_hash,
+            existing_basis,
+            source_bars.get("daily_provider_fetch_hash") or daily_provider_fetch_hash,
+            DAILY_SOURCE_HASH_REUSE_EXISTING_ACTIVE,
+        )
+
     def _mark_progress(self, event: str, payload: Mapping[str, Any]) -> None:
         with self._progress_state_lock:
             self._last_progress_monotonic = time_module.monotonic()
@@ -1821,13 +1929,56 @@ def _daily_bars_for_trading_date(
     ]
 
 
+def _daily_source_window(trading_date: date) -> tuple[date, date]:
+    return (
+        trading_date - timedelta(days=460),
+        next_us_equity_session(trading_date + timedelta(days=2)),
+    )
+
+
+def _legacy_daily_source_hash_key(ticker: str, trading_date: date) -> str:
+    from_date, to_date = _daily_source_window(trading_date)
+    return f"{ticker.upper()}|{from_date.isoformat()}|{to_date.isoformat()}|adjusted=false"
+
+
+def _daily_source_hash_for_trading_date(
+    ticker: str,
+    trading_date: date,
+    daily_resp: AdapterResponse[Any],
+    daily_bars: Sequence[_DailyBar],
+) -> tuple[str | None, str, str | None]:
+    # Exact legacy raw-response parity is only available when the adapter
+    # lineage explicitly carries the old per-date hash. Otherwise use a
+    # deterministic clean-slice provenance hash instead of the wide fetch hash.
+    flags = getattr(daily_resp.lineage, "data_quality_flags", None) or {}
+    provider_fetch_hash = getattr(daily_resp.lineage, "raw_payload_hash", None)
+    if isinstance(flags, Mapping):
+        legacy_hashes = flags.get(LEGACY_DAILY_SOURCE_HASHES_FLAG)
+        if isinstance(legacy_hashes, Mapping):
+            for key in (
+                _legacy_daily_source_hash_key(ticker, trading_date),
+                trading_date.isoformat(),
+            ):
+                value = legacy_hashes.get(key)
+                if isinstance(value, str) and value:
+                    return (
+                        value,
+                        DAILY_SOURCE_HASH_BASIS_LEGACY,
+                        provider_fetch_hash,
+                    )
+    return (
+        _daily_slice_source_hash(ticker, trading_date, daily_bars),
+        DAILY_SOURCE_HASH_BASIS_CLEAN_SLICE,
+        provider_fetch_hash,
+    )
+
+
 def _daily_slice_source_hash(
     ticker: str,
     trading_date: date,
     daily_bars: Sequence[_DailyBar],
 ) -> str:
-    from_date = trading_date - timedelta(days=460)
-    to_date = next_us_equity_session(trading_date + timedelta(days=2))
+    from_date, to_date = _daily_source_window(trading_date)
     return stable_hash({
         "source": "fmp_daily_clean_slice_v1",
         "ticker": ticker.upper(),
@@ -1848,6 +1999,16 @@ def _daily_slice_source_hash(
     })
 
 
+def _source_bars_for_candidate_identity(
+    source_bars: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in source_bars.items()
+        if key not in SOURCE_BARS_NON_IDENTITY_KEYS
+    }
+
+
 def _daily_prefilter_results(
     *,
     ticker: str,
@@ -1855,6 +2016,8 @@ def _daily_prefilter_results(
     decision_time_labels: Sequence[str],
     daily_bars: Sequence[_DailyBar],
     daily_source_hash: str | None,
+    daily_source_hash_basis: str,
+    daily_provider_fetch_hash: str | None,
     source_hur_identity_hash: str | None,
     source_hur: Mapping[str, Any] | None,
     path_mode: str,
@@ -1871,6 +2034,8 @@ def _daily_prefilter_results(
                 coverage_status="daily_context_error",
                 fail_reason=str(exc),
                 daily_source_hash=daily_source_hash,
+                daily_source_hash_basis=daily_source_hash_basis,
+                daily_provider_fetch_hash=daily_provider_fetch_hash,
                 minute_source_hash=None,
                 prior_ctx=None,
                 source_hur_identity_hash=source_hur_identity_hash,
@@ -1890,6 +2055,8 @@ def _daily_prefilter_results(
             coverage_status="daily_prefilter_skip",
             fail_reason="drawdown",
             daily_source_hash=daily_source_hash,
+            daily_source_hash_basis=daily_source_hash_basis,
+            daily_provider_fetch_hash=daily_provider_fetch_hash,
             minute_source_hash=None,
             prior_ctx=prior_ctx,
             source_hur_identity_hash=source_hur_identity_hash,
@@ -1909,7 +2076,10 @@ def build_i12_pit_candidate(
     daily_bars: Sequence[_DailyBar],
     minute_bars: Sequence[_MinuteBar],
     daily_source_hash: str | None,
-    minute_source_hash: str | None,
+    daily_source_hash_basis: str = "unknown",
+    daily_provider_fetch_hash: str | None = None,
+    daily_source_hash_reuse_status: str = DAILY_SOURCE_HASH_REUSE_FRESH,
+    minute_source_hash: str | None = None,
     minute_error: dict[str, Any] | None = None,
     source_hur_identity_hash: str | None = None,
     source_hur: Mapping[str, Any] | None = None,
@@ -1928,6 +2098,9 @@ def build_i12_pit_candidate(
             coverage_status="daily_context_error",
             fail_reason=str(exc),
             daily_source_hash=daily_source_hash,
+            daily_source_hash_basis=daily_source_hash_basis,
+            daily_provider_fetch_hash=daily_provider_fetch_hash,
+            daily_source_hash_reuse_status=daily_source_hash_reuse_status,
             minute_source_hash=minute_source_hash,
             minute_error=minute_error,
             source_hur_identity_hash=source_hur_identity_hash,
@@ -1958,6 +2131,9 @@ def build_i12_pit_candidate(
             coverage_status="missing_minute_bars",
             fail_reason="missing_minute_bars_before_decision",
             daily_source_hash=daily_source_hash,
+            daily_source_hash_basis=daily_source_hash_basis,
+            daily_provider_fetch_hash=daily_provider_fetch_hash,
+            daily_source_hash_reuse_status=daily_source_hash_reuse_status,
             minute_source_hash=minute_source_hash,
             minute_error=minute_error,
             prior_ctx=prior_ctx,
@@ -1986,6 +2162,9 @@ def build_i12_pit_candidate(
             coverage_status="duplicate_minute_bars",
             fail_reason="duplicate_minute_bars_before_decision",
             daily_source_hash=daily_source_hash,
+            daily_source_hash_basis=daily_source_hash_basis,
+            daily_provider_fetch_hash=daily_provider_fetch_hash,
+            daily_source_hash_reuse_status=daily_source_hash_reuse_status,
             minute_source_hash=minute_source_hash,
             minute_error=minute_error,
             prior_ctx=prior_ctx,
@@ -2016,6 +2195,9 @@ def build_i12_pit_candidate(
             coverage_status=coverage_status,
             fail_reason=fail_reason,
             daily_source_hash=daily_source_hash,
+            daily_source_hash_basis=daily_source_hash_basis,
+            daily_provider_fetch_hash=daily_provider_fetch_hash,
+            daily_source_hash_reuse_status=daily_source_hash_reuse_status,
             minute_source_hash=minute_source_hash,
             minute_error=minute_error,
             prior_ctx=prior_ctx,
@@ -2035,6 +2217,9 @@ def build_i12_pit_candidate(
                 coverage_status=coverage_status,
                 fail_reason=fail_reason,
                 daily_source_hash=daily_source_hash,
+                daily_source_hash_basis=daily_source_hash_basis,
+                daily_provider_fetch_hash=daily_provider_fetch_hash,
+                daily_source_hash_reuse_status=daily_source_hash_reuse_status,
                 minute_source_hash=minute_source_hash,
                 minute_error=minute_error,
                 prior_ctx=prior_ctx,
@@ -2193,6 +2378,9 @@ def build_i12_pit_candidate(
     )
     source_bars = {
         "daily_source_hash": daily_source_hash,
+        "daily_source_hash_basis": daily_source_hash_basis,
+        "daily_provider_fetch_hash": daily_provider_fetch_hash,
+        "daily_source_hash_reuse_status": daily_source_hash_reuse_status,
         "minute_source_hash": minute_source_hash,
         "source_hur_identity_hash": source_hur_identity_hash,
         "source_hur": dict(source_hur or {}),
@@ -2216,7 +2404,7 @@ def build_i12_pit_candidate(
         "decision_ts": decision_ts.isoformat(),
         "daily_source_hash": daily_source_hash,
         "minute_source_hash": minute_source_hash,
-        "source_bars": source_bars,
+        "source_bars": _source_bars_for_candidate_identity(source_bars),
         "path_mode": path_mode,
         "reconstruction_method": REBUILD_METHOD,
     })
@@ -2805,6 +2993,10 @@ def i12_pit_rebuild_report(
         "pit_candidate_count": len(passed),
         "candidate_status_counts": dict(Counter(row.candidate_status for row in candidates)),
         "candidate_coverage_status_counts": dict(candidate_coverage_counts),
+        "daily_source_hash_basis_counts": _daily_source_hash_basis_counts(candidates),
+        "daily_source_hash_reuse_status_counts": (
+            _daily_source_hash_reuse_status_counts(candidates)
+        ),
         "candidate_counts_by_path_mode": dict(Counter(row.path_mode for row in candidates)),
         "coverage_status_by_path_mode": _coverage_status_by_path_mode(candidates),
         "passed_candidates_by_path_mode": dict(Counter(row.path_mode for row in passed)),
@@ -3080,6 +3272,28 @@ def _coverage_status_by_path_mode(
     for candidate in candidates:
         out[candidate.path_mode][candidate.coverage_status] += 1
     return {mode: dict(counter) for mode, counter in sorted(out.items())}
+
+
+def _daily_source_hash_basis_counts(
+    candidates: Sequence[I12PitCandidate],
+) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for candidate in candidates:
+        source_bars = _json_loads(candidate.source_bars_json)
+        basis = source_bars.get("daily_source_hash_basis")
+        counts[str(basis or "unknown")] += 1
+    return dict(counts)
+
+
+def _daily_source_hash_reuse_status_counts(
+    candidates: Sequence[I12PitCandidate],
+) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for candidate in candidates:
+        source_bars = _json_loads(candidate.source_bars_json)
+        reuse_status = source_bars.get("daily_source_hash_reuse_status")
+        counts[str(reuse_status or "unknown")] += 1
+    return dict(counts)
 
 
 def _passed_candidates_by_path_mode_decision_time(
@@ -3452,6 +3666,10 @@ def _path_mode_report_metrics(
             ),
             "candidate_status_counts": dict(Counter(row.candidate_status for row in mode_candidates)),
             "coverage_status_counts": dict(Counter(row.coverage_status for row in mode_candidates)),
+            "daily_source_hash_basis_counts": _daily_source_hash_basis_counts(mode_candidates),
+            "daily_source_hash_reuse_status_counts": (
+                _daily_source_hash_reuse_status_counts(mode_candidates)
+            ),
             "passed_candidate_count": len(mode_passed),
             "quote_replay_status": (
                 "not_applicable"
@@ -3610,7 +3828,10 @@ def _candidate_error(
     coverage_status: str,
     fail_reason: str,
     daily_source_hash: str | None,
-    minute_source_hash: str | None,
+    daily_source_hash_basis: str = "unknown",
+    daily_provider_fetch_hash: str | None = None,
+    daily_source_hash_reuse_status: str = DAILY_SOURCE_HASH_REUSE_FRESH,
+    minute_source_hash: str | None = None,
     daily_error: dict[str, Any] | None = None,
     minute_error: dict[str, Any] | None = None,
     prior_ctx: Mapping[str, Any] | None = None,
@@ -3706,6 +3927,9 @@ def _candidate_error(
     }
     source_bars = {
         "daily_source_hash": daily_source_hash,
+        "daily_source_hash_basis": daily_source_hash_basis,
+        "daily_provider_fetch_hash": daily_provider_fetch_hash,
+        "daily_source_hash_reuse_status": daily_source_hash_reuse_status,
         "minute_source_hash": minute_source_hash,
         "source_hur_identity_hash": source_hur_identity_hash,
         "source_hur": dict(source_hur or {}),
@@ -3728,7 +3952,7 @@ def _candidate_error(
         "decision_date": trading_date.isoformat(),
         "decision_ts": decision_ts.isoformat(),
         "coverage_status": coverage_status,
-        "source_bars": source_bars,
+        "source_bars": _source_bars_for_candidate_identity(source_bars),
         "path_mode": path_mode,
     })
     candidate_attempt_hash = _candidate_attempt_hash(

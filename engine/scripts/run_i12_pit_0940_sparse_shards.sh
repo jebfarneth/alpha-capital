@@ -37,13 +37,17 @@ regex_escape() {
   printf "%s" "$1" | sed 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
+normalize_tmux_pane_start_command() {
+  printf "%s" "$1" | sed -E 's/\\+[[:space:]]+/ /g'
+}
+
 command_has_arg_value() {
   local command="$1"
   local flag
   local value
   local pattern
   local normalized_command
-  normalized_command="${command//\\ / }"
+  normalized_command="$(normalize_tmux_pane_start_command "${command}")"
   flag="$(regex_escape "$2")"
   value="$(regex_escape "$3")"
   pattern="(^|[[:space:]])${flag}([[:space:]]+|=)${value}($|[[:space:]])"
