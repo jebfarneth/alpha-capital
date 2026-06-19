@@ -1896,6 +1896,20 @@ class TestAlpacaAdapter:
     def _adapter(self, mock_session):
         return AlpacaAdapter(_alpaca_config(), session=mock_session)
 
+    def test_reset_session_replaces_session_and_restores_auth_headers(self):
+        session = MagicMock(spec=requests.Session)
+        session.headers = {}
+        adapter = self._adapter(session)
+
+        adapter.reset_session()
+
+        session.close.assert_called_once()
+        assert adapter._session is not session
+        assert adapter._session.headers["APCA-API-KEY-ID"] == "test-alpaca-key"
+        assert adapter._session.headers["APCA-API-SECRET-KEY"] == (
+            "test-alpaca-secret"
+        )
+
     def test_get_account_ok(self):
         session = MagicMock(spec=requests.Session)
         session.headers = {}

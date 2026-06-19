@@ -106,7 +106,11 @@ def call_with_daemon_deadline(
     watchdog_state = state or WatchdogState(max_outstanding_timeouts=1_000_000)
     call_context = dict(context or {})
     if watchdog_state.circuit_open:
-        raise _circuit_breaker_error(watchdog_state, call_context)
+        raise _circuit_breaker_error(
+            watchdog_state,
+            call_context,
+            opened_by_current_call=False,
+        )
     results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
     call_lock = threading.Lock()
     call_state = {
@@ -141,7 +145,11 @@ def call_with_daemon_deadline(
         raise
     except BaseException as exc:  # noqa: BLE001 - convert start/join failure to breaker
         watchdog_state.record_thread_start_failure(exc)
-        raise _circuit_breaker_error(watchdog_state, call_context) from exc
+        raise _circuit_breaker_error(
+            watchdog_state,
+            call_context,
+            opened_by_current_call=True,
+        ) from exc
 
     if thread.is_alive():
         with call_lock:
@@ -153,7 +161,11 @@ def call_with_daemon_deadline(
                 timed_out = True
                 circuit_open = watchdog_state.record_timeout()
         if timed_out and circuit_open:
-            raise _circuit_breaker_error(watchdog_state, call_context)
+            raise _circuit_breaker_error(
+                watchdog_state,
+                call_context,
+                opened_by_current_call=True,
+            )
         if timed_out:
             raise FuturesTimeoutError()
 
@@ -167,10 +179,13 @@ def call_with_daemon_deadline(
 def _circuit_breaker_error(
     state: WatchdogState,
     context: dict[str, Any],
+    *,
+    opened_by_current_call: bool,
 ) -> ProviderOutageCircuitBreaker:
     payload = {
         **context,
         "error": "provider_outage_circuit_breaker",
+        "breaker_opened_by_current_call": opened_by_current_call,
         **state.snapshot(),
     }
     return ProviderOutageCircuitBreaker(payload)

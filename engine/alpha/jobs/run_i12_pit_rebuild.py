@@ -24,6 +24,7 @@ from alpha.db.engine import (
 )
 from alpha.jobs.i12_pit_rebuild import (
     DEFAULT_DECISION_TIMES,
+    DEFAULT_FETCH_DEADLINE_SECONDS,
     DEFAULT_INTENDED_ORDER_USD,
     DEFAULT_MAX_QUOTE_AGE_SECONDS,
     DEFAULT_MAX_SPREAD_BPS,
@@ -35,6 +36,10 @@ from alpha.jobs.i12_pit_rebuild import (
     i12_pit_rebuild_report,
 )
 from alpha.jobs.runner import run_job
+from alpha.jobs.watchdog import (
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+)
 from alpha.runtime_env import load_runtime_env
 
 
@@ -161,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
             output_schema=target_schema,
             allow_source_hur_schema_matches_output=args.allow_source_hur_schema_matches_output,
             progress_artifact=args.progress_artifact,
+            fetch_deadline_seconds=args.fetch_deadline_seconds,
+            max_outstanding_fetch_timeouts=args.max_outstanding_fetch_timeouts,
+            max_consecutive_fetch_timeouts=args.max_consecutive_fetch_timeouts,
         )
         result = run_job(
             session,
@@ -181,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
                 "slippage_bps": args.slippage_bps,
                 "replace_existing": args.replace_existing,
                 "progress_artifact": args.progress_artifact,
+                "fetch_deadline_seconds": args.fetch_deadline_seconds,
+                "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
+                "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
             },
         )
         print(json.dumps(result.metrics or {}, indent=2, sort_keys=True, default=str))
@@ -300,6 +311,24 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--job-run-id", help="Optional report-only filter.")
     parser.add_argument("--report-artifact")
     parser.add_argument("--progress-artifact")
+    parser.add_argument(
+        "--fetch-deadline-seconds",
+        type=float,
+        default=DEFAULT_FETCH_DEADLINE_SECONDS,
+        help="Hard wall-clock deadline for one provider fetch.",
+    )
+    parser.add_argument(
+        "--max-outstanding-fetch-timeouts",
+        type=int,
+        default=DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        help="Open the provider outage circuit after this many abandoned timed-out fetch workers.",
+    )
+    parser.add_argument(
+        "--max-consecutive-fetch-timeouts",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+        help="Open the provider outage circuit after this many consecutive watchdog timeouts.",
+    )
     args = parser.parse_args(argv)
     if (
         not args.report_only
@@ -322,6 +351,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--max-quote-age-seconds must be positive")
     if args.slippage_bps < 0:
         parser.error("--slippage-bps must be >= 0")
+    if args.fetch_deadline_seconds <= 0:
+        parser.error("--fetch-deadline-seconds must be > 0")
+    if args.max_outstanding_fetch_timeouts < 1:
+        parser.error("--max-outstanding-fetch-timeouts must be >= 1")
+    if args.max_consecutive_fetch_timeouts < 1:
+        parser.error("--max-consecutive-fetch-timeouts must be >= 1")
     if (
         args.schema
         and args.source_hur_schema

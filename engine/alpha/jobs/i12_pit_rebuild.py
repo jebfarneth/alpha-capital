@@ -13,6 +13,7 @@ import json
 import math
 import os
 import tempfile
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -23,7 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from alpha.data.alpaca import AlpacaAdapter, AlpacaQuote
-from alpha.data.contracts import AdapterResponse, stable_hash
+from alpha.data.contracts import AdapterResponse, LineageMeta, ProviderError, stable_hash
 from alpha.data.fmp import FmpBar
 from alpha.data.polygon import PolygonBar
 from alpha.db.models import (
@@ -48,6 +49,13 @@ from alpha.jobs.i12_live_fill_test import (
     HALT_CONDITIONS,
 )
 from alpha.jobs.paper_execution import EASTERN
+from alpha.jobs.watchdog import (
+    DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
+    DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+    ProviderOutageCircuitBreaker,
+    WatchdogState,
+    call_with_daemon_deadline,
+)
 from alpha.market_calendar import (
     is_us_equity_session,
     next_us_equity_session,
@@ -73,6 +81,8 @@ MIN_PRIOR_DAILY_SESSIONS = 20
 REQUIRED_QUOTE_ROLES = ("entry", "same_day_exit", "next_open_exit")
 EXIT_ROLES = ("same_day_exit", "next_open_exit")
 DEFAULT_TICKER_PROGRESS_INTERVAL = 250
+DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
+CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE = 10000
 STRICT_MINUTE_PATH_MODE = "strict_contiguous"
 SPARSE_ZERO_FILL_MINUTE_PATH_MODE = "sparse_zero_fill"
 MINUTE_PATH_MODES = (
@@ -209,7 +219,16 @@ class I12PitRebuildJob(BaseJob):
         allow_source_hur_schema_matches_output: bool = False,
         progress_artifact: str | Path | None = None,
         progress_interval_tickers: int = DEFAULT_TICKER_PROGRESS_INTERVAL,
+        fetch_deadline_seconds: float = DEFAULT_FETCH_DEADLINE_SECONDS,
+        max_outstanding_fetch_timeouts: int = DEFAULT_MAX_OUTSTANDING_FETCH_TIMEOUTS,
+        max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
     ) -> None:
+        if fetch_deadline_seconds <= 0:
+            raise ValueError("fetch_deadline_seconds must be > 0")
+        if max_outstanding_fetch_timeouts < 1:
+            raise ValueError("max_outstanding_fetch_timeouts must be >= 1")
+        if max_consecutive_fetch_timeouts < 1:
+            raise ValueError("max_consecutive_fetch_timeouts must be >= 1")
         self._session = session
         self._fmp = fmp_adapter
         self._polygon = polygon_adapter
@@ -230,6 +249,11 @@ class I12PitRebuildJob(BaseJob):
         self._output_schema = output_schema
         self._progress_artifact = Path(progress_artifact) if progress_artifact else None
         self._progress_interval_tickers = max(1, int(progress_interval_tickers))
+        self._fetch_deadline_seconds = float(fetch_deadline_seconds)
+        self._fetch_watchdog = WatchdogState(
+            max_outstanding_timeouts=max_outstanding_fetch_timeouts,
+            max_consecutive_timeouts=max_consecutive_fetch_timeouts,
+        )
         self.partial_metrics: dict[str, Any] = {}
         if (
             output_schema
@@ -283,11 +307,10 @@ class I12PitRebuildJob(BaseJob):
                 counters["zero_hur_dates"] += 1
             for hur_index, hur_row in enumerate(hur_rows, start=1):
                 ticker = hur_row.ticker
-                daily_resp = self._fmp.get_historical_price(
+                daily_resp = self._fetch_fmp_daily_with_deadline(
                     ticker,
-                    from_date=trading_date - timedelta(days=460),
-                    to_date=next_us_equity_session(trading_date + timedelta(days=2)),
-                    adjusted=False,
+                    trading_date,
+                    job_run_id=ctx.job_run_id,
                 )
                 if not daily_resp.ok:
                     daily_error = _provider_error_payload(daily_resp)
@@ -323,11 +346,10 @@ class I12PitRebuildJob(BaseJob):
                         job_run_id=ctx.job_run_id,
                     )
                     continue
-                minute_resp = self._polygon.get_minute_aggs(
+                minute_resp = self._fetch_polygon_minutes_with_deadline(
                     ticker,
-                    trading_date.isoformat(),
-                    trading_date.isoformat(),
-                    adjusted=True,
+                    trading_date,
+                    job_run_id=ctx.job_run_id,
                 )
                 daily_bars = _clean_daily_bars(ticker, daily_resp.data or [], _CleanCounters())
                 if not minute_resp.ok:
@@ -437,10 +459,182 @@ class I12PitRebuildJob(BaseJob):
             end_date=self._end_date,
             path_mode=self._minute_path_mode,
         )
-        metrics = {"counters": dict(counters), **report}
+        metrics = {
+            "counters": dict(counters),
+            "fetch_watchdog": self._fetch_watchdog.snapshot(),
+            **report,
+        }
         self.partial_metrics = metrics
         self._progress("finish", metrics)
         return JobResult(status="finished", metrics=metrics)
+
+    def _fetch_fmp_daily_with_deadline(
+        self,
+        ticker: str,
+        trading_date: date,
+        *,
+        job_run_id: str | None,
+    ) -> AdapterResponse[Any]:
+        from_date = trading_date - timedelta(days=460)
+        to_date = next_us_equity_session(trading_date + timedelta(days=2))
+        stage = "fmp_daily_fetch"
+        self._progress_provider_fetch_start(
+            stage=stage,
+            provider="FMP",
+            ticker=ticker,
+            trading_date=trading_date,
+            job_run_id=job_run_id,
+        )
+        self._rollback_before_provider_call()
+
+        def _fetch() -> AdapterResponse[Any]:
+            return self._fmp.get_historical_price(
+                ticker,
+                from_date=from_date,
+                to_date=to_date,
+                adjusted=False,
+            )
+
+        try:
+            return call_with_daemon_deadline(
+                _fetch,
+                timeout_seconds=self._fetch_deadline_seconds,
+                thread_name="i12-pit-fmp-daily-fetch",
+                state=self._fetch_watchdog,
+                context={
+                    "stage": stage,
+                    "provider": "FMP",
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                },
+            )
+        except ProviderOutageCircuitBreaker as exc:
+            self._progress("provider_outage_circuit_breaker", exc.payload)
+            if not _breaker_opened_by_current_watchdog_timeout(exc):
+                raise
+            self._reset_provider_session(self._fmp)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="FMP",
+                ticker=ticker,
+                trading_date=trading_date,
+                job_run_id=job_run_id,
+            )
+            return _provider_watchdog_timeout_response(
+                provider="FMP",
+                endpoint="historical_price_full",
+                ticker=ticker,
+                stage=stage,
+                trading_date=trading_date,
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+                extra={"provider_outage_circuit_breaker": exc.payload},
+            )
+        except FuturesTimeoutError:
+            self._reset_provider_session(self._fmp)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="FMP",
+                ticker=ticker,
+                trading_date=trading_date,
+                job_run_id=job_run_id,
+            )
+            return _provider_watchdog_timeout_response(
+                provider="FMP",
+                endpoint="historical_price_full",
+                ticker=ticker,
+                stage=stage,
+                trading_date=trading_date,
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+            )
+
+    def _fetch_polygon_minutes_with_deadline(
+        self,
+        ticker: str,
+        trading_date: date,
+        *,
+        job_run_id: str | None,
+    ) -> AdapterResponse[Any]:
+        stage = "polygon_minute_fetch"
+        self._progress_provider_fetch_start(
+            stage=stage,
+            provider="Polygon",
+            ticker=ticker,
+            trading_date=trading_date,
+            job_run_id=job_run_id,
+        )
+        self._rollback_before_provider_call()
+
+        def _fetch() -> AdapterResponse[Any]:
+            return self._polygon.get_minute_aggs(
+                ticker,
+                trading_date.isoformat(),
+                trading_date.isoformat(),
+                adjusted=True,
+            )
+
+        try:
+            return call_with_daemon_deadline(
+                _fetch,
+                timeout_seconds=self._fetch_deadline_seconds,
+                thread_name="i12-pit-polygon-minute-fetch",
+                state=self._fetch_watchdog,
+                context={
+                    "stage": stage,
+                    "provider": "Polygon",
+                    "ticker": ticker.upper(),
+                    "trading_date": trading_date.isoformat(),
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                },
+            )
+        except ProviderOutageCircuitBreaker as exc:
+            self._progress("provider_outage_circuit_breaker", exc.payload)
+            if not _breaker_opened_by_current_watchdog_timeout(exc):
+                raise
+            self._reset_provider_session(self._polygon)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="Polygon",
+                ticker=ticker,
+                trading_date=trading_date,
+                job_run_id=job_run_id,
+            )
+            return _provider_watchdog_timeout_response(
+                provider="Polygon",
+                endpoint=MINUTE_BAR_ENDPOINT.format(
+                    ticker=ticker.upper(),
+                    date=trading_date.isoformat(),
+                ),
+                ticker=ticker,
+                stage=stage,
+                trading_date=trading_date,
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+                extra={"provider_outage_circuit_breaker": exc.payload},
+            )
+        except FuturesTimeoutError:
+            self._reset_provider_session(self._polygon)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="Polygon",
+                ticker=ticker,
+                trading_date=trading_date,
+                job_run_id=job_run_id,
+            )
+            return _provider_watchdog_timeout_response(
+                provider="Polygon",
+                endpoint=MINUTE_BAR_ENDPOINT.format(
+                    ticker=ticker.upper(),
+                    date=trading_date.isoformat(),
+                ),
+                ticker=ticker,
+                stage=stage,
+                trading_date=trading_date,
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+            )
 
     def _load_hur_rows(self, trading_date: date) -> list[HurSourceRow]:
         if _should_schema_qualify_hur(self._session, self._source_hur_schema):
@@ -640,11 +834,13 @@ class I12PitRebuildJob(BaseJob):
                 continue
             if self._session.in_transaction():
                 self._session.rollback()
-            resp = self._alpaca.get_historical_quotes(
+            resp = self._fetch_alpaca_quotes_with_deadline(
                 ticker,
                 start=window.window_start_ts,
                 end=window.window_end_ts,
                 feed=self._feed,
+                quote_role=window.quote_role,
+                job_run_id=job_run_id,
             )
             result = replay_quote_window(
                 ticker=ticker,
@@ -667,6 +863,120 @@ class I12PitRebuildJob(BaseJob):
             rows[result.quote_role] = row
             self._session.commit()
         return rows
+
+    def _fetch_alpaca_quotes_with_deadline(
+        self,
+        ticker: str,
+        *,
+        start: datetime,
+        end: datetime,
+        feed: str,
+        quote_role: str,
+        job_run_id: str | None,
+    ) -> AdapterResponse[Any]:
+        assert self._alpaca is not None
+        stage = f"alpaca_quote_fetch:{quote_role}"
+        self._progress_provider_fetch_start(
+            stage=stage,
+            provider="Alpaca",
+            ticker=ticker,
+            trading_date=start.date(),
+            job_run_id=job_run_id,
+            extra={
+                "quote_role": quote_role,
+                "window_start_ts": start.isoformat(),
+                "window_end_ts": end.isoformat(),
+                "feed": feed,
+            },
+        )
+        self._rollback_before_provider_call()
+
+        def _fetch() -> AdapterResponse[Any]:
+            return self._alpaca.get_historical_quotes(
+                ticker,
+                start=start,
+                end=end,
+                feed=feed,
+            )
+
+        try:
+            return call_with_daemon_deadline(
+                _fetch,
+                timeout_seconds=self._fetch_deadline_seconds,
+                thread_name="i12-pit-alpaca-quote-fetch",
+                state=self._fetch_watchdog,
+                context={
+                    "stage": stage,
+                    "provider": "Alpaca",
+                    "ticker": ticker.upper(),
+                    "quote_role": quote_role,
+                    "deadline_seconds": self._fetch_deadline_seconds,
+                },
+            )
+        except ProviderOutageCircuitBreaker as exc:
+            self._progress("provider_outage_circuit_breaker", exc.payload)
+            if not _breaker_opened_by_current_watchdog_timeout(exc):
+                raise
+            self._reset_provider_session(self._alpaca)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="Alpaca",
+                ticker=ticker,
+                trading_date=start.date(),
+                job_run_id=job_run_id,
+                extra={
+                    "quote_role": quote_role,
+                    "window_start_ts": start.isoformat(),
+                    "window_end_ts": end.isoformat(),
+                    "feed": feed,
+                },
+            )
+            return _provider_watchdog_timeout_response(
+                provider="Alpaca",
+                endpoint="/v2/stocks/{symbol}/quotes",
+                ticker=ticker,
+                stage=stage,
+                trading_date=start.date(),
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+                extra={
+                    "quote_role": quote_role,
+                    "window_start_ts": start.isoformat(),
+                    "window_end_ts": end.isoformat(),
+                    "feed": feed,
+                    "provider_outage_circuit_breaker": exc.payload,
+                },
+            )
+        except FuturesTimeoutError:
+            self._reset_provider_session(self._alpaca)
+            self._progress_provider_fetch_timeout(
+                stage=stage,
+                provider="Alpaca",
+                ticker=ticker,
+                trading_date=start.date(),
+                job_run_id=job_run_id,
+                extra={
+                    "quote_role": quote_role,
+                    "window_start_ts": start.isoformat(),
+                    "window_end_ts": end.isoformat(),
+                    "feed": feed,
+                },
+            )
+            return _provider_watchdog_timeout_response(
+                provider="Alpaca",
+                endpoint="/v2/stocks/{symbol}/quotes",
+                ticker=ticker,
+                stage=stage,
+                trading_date=start.date(),
+                deadline_seconds=self._fetch_deadline_seconds,
+                watchdog_snapshot=self._fetch_watchdog.snapshot(),
+                extra={
+                    "quote_role": quote_role,
+                    "window_start_ts": start.isoformat(),
+                    "window_end_ts": end.isoformat(),
+                    "feed": feed,
+                },
+            )
 
     def _persist_quote(
         self,
@@ -1009,35 +1319,27 @@ class I12PitRebuildJob(BaseJob):
         historical_candidate_ids = [
             row.i12_pit_candidate_id for row in historical_candidates
         ]
-        quote_replay_row_count = (
-            self._session.query(I12PitQuoteReplay)
-            .filter(
-                I12PitQuoteReplay.is_active.is_(True),
-                I12PitQuoteReplay.i12_pit_candidate_id.in_(active_candidate_ids),
-            )
-            .count()
-            if active_candidate_ids else 0
+        quote_replay_row_count = _count_child_rows_for_candidate_ids(
+            self._session,
+            I12PitQuoteReplay,
+            active_candidate_ids,
+            active_only=True,
         )
-        historical_quote_replay_row_count = (
-            self._session.query(I12PitQuoteReplay)
-            .filter(I12PitQuoteReplay.i12_pit_candidate_id.in_(historical_candidate_ids))
-            .count()
-            if historical_candidate_ids else 0
+        historical_quote_replay_row_count = _count_child_rows_for_candidate_ids(
+            self._session,
+            I12PitQuoteReplay,
+            historical_candidate_ids,
         )
-        cost_replay_row_count = (
-            self._session.query(I12PitCostReplay)
-            .filter(
-                I12PitCostReplay.is_active.is_(True),
-                I12PitCostReplay.i12_pit_candidate_id.in_(active_candidate_ids),
-            )
-            .count()
-            if active_candidate_ids else 0
+        cost_replay_row_count = _count_child_rows_for_candidate_ids(
+            self._session,
+            I12PitCostReplay,
+            active_candidate_ids,
+            active_only=True,
         )
-        historical_cost_replay_row_count = (
-            self._session.query(I12PitCostReplay)
-            .filter(I12PitCostReplay.i12_pit_candidate_id.in_(historical_candidate_ids))
-            .count()
-            if historical_candidate_ids else 0
+        historical_cost_replay_row_count = _count_child_rows_for_candidate_ids(
+            self._session,
+            I12PitCostReplay,
+            historical_candidate_ids,
         )
         expected_candidate_attempts = hur_rows_loaded * len(self._decision_times)
         missing_source_attempt_count = max(expected_candidate_attempts - len(active_candidate_ids), 0)
@@ -1199,7 +1501,70 @@ class I12PitRebuildJob(BaseJob):
             "daily_fetch_error_count": counters.get("coverage_daily_fetch_error", 0),
             "minute_fetch_error_count": counters.get("coverage_minute_fetch_error", 0),
             "counters": dict(counters),
+            "fetch_watchdog": self._fetch_watchdog.snapshot(),
         }
+
+    def _rollback_before_provider_call(self) -> None:
+        if self._session.in_transaction():
+            self._session.rollback()
+
+    def _progress_provider_fetch_start(
+        self,
+        *,
+        stage: str,
+        provider: str,
+        ticker: str,
+        trading_date: date,
+        job_run_id: str | None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._progress(
+            "provider_fetch_start",
+            {
+                "job_run_id": job_run_id,
+                "stage": stage,
+                "provider": provider,
+                "ticker": ticker.upper(),
+                "trading_date": trading_date.isoformat(),
+                "deadline_seconds": self._fetch_deadline_seconds,
+                "minute_path_mode": self._minute_path_mode,
+                "decision_time_labels": list(self._decision_times),
+                "fetch_watchdog": self._fetch_watchdog.snapshot(),
+                **dict(extra or {}),
+            },
+        )
+
+    def _progress_provider_fetch_timeout(
+        self,
+        *,
+        stage: str,
+        provider: str,
+        ticker: str,
+        trading_date: date,
+        job_run_id: str | None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._progress(
+            "provider_fetch_timeout",
+            {
+                "job_run_id": job_run_id,
+                "stage": stage,
+                "provider": provider,
+                "ticker": ticker.upper(),
+                "trading_date": trading_date.isoformat(),
+                "deadline_seconds": self._fetch_deadline_seconds,
+                "minute_path_mode": self._minute_path_mode,
+                "decision_time_labels": list(self._decision_times),
+                "fetch_watchdog": self._fetch_watchdog.snapshot(),
+                **dict(extra or {}),
+            },
+        )
+
+    @staticmethod
+    def _reset_provider_session(adapter: Any) -> None:
+        reset_session = getattr(adapter, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
 
     def _progress(self, event: str, payload: Mapping[str, Any]) -> None:
         if self._progress_artifact is None:
@@ -1259,6 +1624,44 @@ def _fsync_parent_directory(directory: Path) -> None:
         pass
     finally:
         os.close(dir_fd)
+
+
+def _load_child_rows_for_candidate_ids(
+    session: Session,
+    model: Any,
+    candidate_ids: Sequence[str],
+) -> list[Any]:
+    rows: list[Any] = []
+    for chunk in _iter_chunks(candidate_ids, CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE):
+        rows.extend(
+            session.query(model)
+            .filter(model.i12_pit_candidate_id.in_(chunk))
+            .all()
+        )
+    return rows
+
+
+def _count_child_rows_for_candidate_ids(
+    session: Session,
+    model: Any,
+    candidate_ids: Sequence[str],
+    *,
+    active_only: bool = False,
+) -> int:
+    total = 0
+    for chunk in _iter_chunks(candidate_ids, CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE):
+        query = session.query(model).filter(model.i12_pit_candidate_id.in_(chunk))
+        if active_only:
+            query = query.filter(model.is_active.is_(True))
+        total += query.count()
+    return total
+
+
+def _iter_chunks(values: Sequence[str], size: int) -> list[list[str]]:
+    return [
+        list(values[index : index + size])
+        for index in range(0, len(values), size)
+    ]
 
 
 def build_i12_pit_candidate(
@@ -1850,30 +2253,25 @@ def i12_pit_rebuild_report(
     inactive_candidate_ids = {
         row.i12_pit_candidate_id for row in scoped_candidates if not row.is_active
     }
-    if scoped_candidate_ids:
-        all_quotes = (
-            session.query(I12PitQuoteReplay)
-            .filter(I12PitQuoteReplay.i12_pit_candidate_id.in_(scoped_candidate_ids))
-            .all()
-        )
-        all_costs = (
-            session.query(I12PitCostReplay)
-            .filter(I12PitCostReplay.i12_pit_candidate_id.in_(scoped_candidate_ids))
-            .all()
-        )
-        quotes = [
-            row for row in all_quotes
-            if row.is_active and row.i12_pit_candidate_id in candidate_ids
-        ]
-        costs = [
-            row for row in all_costs
-            if row.is_active and row.i12_pit_candidate_id in candidate_ids
-        ]
-    else:
-        all_quotes = []
-        quotes = []
-        all_costs = []
-        costs = []
+    all_quotes = _load_child_rows_for_candidate_ids(
+        session,
+        I12PitQuoteReplay,
+        scoped_candidate_ids,
+    )
+    all_costs = _load_child_rows_for_candidate_ids(
+        session,
+        I12PitCostReplay,
+        scoped_candidate_ids,
+    )
+    candidate_id_set = set(candidate_ids)
+    quotes = [
+        row for row in all_quotes
+        if row.is_active and row.i12_pit_candidate_id in candidate_id_set
+    ]
+    costs = [
+        row for row in all_costs
+        if row.is_active and row.i12_pit_candidate_id in candidate_id_set
+    ]
     active_quote_rows_with_inactive_candidate_count = sum(
         1
         for row in all_quotes
@@ -3330,7 +3728,7 @@ def _exit_skip_reason(
 def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None:
     if resp.error is None:
         return None
-    return {
+    payload = {
         "provider": resp.error.provider,
         "endpoint": resp.error.endpoint,
         "status_code": resp.error.status_code,
@@ -3338,6 +3736,68 @@ def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None
         "message": resp.error.message,
         "retryable": resp.error.retryable,
     }
+    flags = getattr(resp.lineage, "data_quality_flags", None)
+    if flags:
+        payload["data_quality_flags"] = dict(flags)
+    return payload
+
+
+def _breaker_opened_by_current_watchdog_timeout(
+    exc: ProviderOutageCircuitBreaker,
+) -> bool:
+    payload = exc.payload
+    reason = str(payload.get("circuit_reason") or "")
+    return (
+        payload.get("breaker_opened_by_current_call") is True
+        and reason.startswith("watchdog_timeout")
+    )
+
+
+def _provider_watchdog_timeout_response(
+    *,
+    provider: str,
+    endpoint: str,
+    ticker: str,
+    stage: str,
+    trading_date: date,
+    deadline_seconds: float,
+    watchdog_snapshot: Mapping[str, Any],
+    extra: Mapping[str, Any] | None = None,
+) -> AdapterResponse[Any]:
+    normalized = ticker.upper()
+    payload = {
+        "provider": provider,
+        "endpoint": endpoint,
+        "ticker": normalized,
+        "stage": stage,
+        "trading_date": trading_date.isoformat(),
+        "deadline_seconds": deadline_seconds,
+        "watchdog": dict(watchdog_snapshot),
+        **dict(extra or {}),
+    }
+    return AdapterResponse(
+        data=None,
+        lineage=LineageMeta(
+            provider=provider,
+            endpoint=endpoint,
+            request_timestamp=datetime.now(timezone.utc),
+            asof_timestamp=datetime.now(timezone.utc),
+            raw_payload_hash=stable_hash(payload),
+            source_authority=provider,
+            data_quality_flags=payload,
+        ),
+        error=ProviderError(
+            provider=provider,
+            endpoint=endpoint,
+            status_code=None,
+            error_type="watchdog_timeout",
+            message=(
+                f"{stage} exceeded hard wall-clock deadline "
+                f"of {deadline_seconds:g} seconds"
+            ),
+            retryable=True,
+        ),
+    )
 
 
 def _validate_minute_path_mode(value: str) -> str:

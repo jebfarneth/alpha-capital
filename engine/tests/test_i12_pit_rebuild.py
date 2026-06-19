@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -90,6 +91,53 @@ class FakeAlpaca:
             data=list(self.quotes_by_role.get(role, [])),
             lineage=_lineage("Alpaca", symbol),
         )
+
+
+class SleepyFmp(FakeFmp):
+    def __init__(self, bars, *, delay_seconds=0.05):
+        super().__init__(bars)
+        self.delay_seconds = delay_seconds
+        self.reset_calls = 0
+
+    def get_historical_price(self, ticker, **kwargs):
+        time_module.sleep(self.delay_seconds)
+        return super().get_historical_price(ticker, **kwargs)
+
+    def reset_session(self):
+        self.reset_calls += 1
+
+
+class SleepyPolygon(FakePolygon):
+    def __init__(self, bars, *, delay_seconds=0.05):
+        super().__init__(bars)
+        self.delay_seconds = delay_seconds
+        self.reset_calls = 0
+
+    def get_minute_aggs(self, ticker, from_date, to_date, **kwargs):
+        time_module.sleep(self.delay_seconds)
+        return super().get_minute_aggs(ticker, from_date, to_date, **kwargs)
+
+    def reset_session(self):
+        self.reset_calls += 1
+
+
+class SleepyAlpaca(FakeAlpaca):
+    def __init__(self, quotes_by_role, *, delay_seconds=0.05):
+        super().__init__(quotes_by_role)
+        self.delay_seconds = delay_seconds
+        self.reset_calls = 0
+
+    def get_historical_quotes(self, symbol, *, start, end, feed="sip"):
+        time_module.sleep(self.delay_seconds)
+        return super().get_historical_quotes(
+            symbol,
+            start=start,
+            end=end,
+            feed=feed,
+        )
+
+    def reset_session(self):
+        self.reset_calls += 1
 
 
 class AssertingNoTransactionFmp(FakeFmp):
@@ -783,6 +831,86 @@ def test_job_replays_only_passing_candidate_event_windows(db_session):
     assert result.metrics["training_status"] == "eligible_for_retrain_evaluation"
 
 
+def test_quote_fetch_watchdog_timeout_is_persisted_as_quote_error(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "QWATCH", output_hash="hur-quote-watchdog")
+
+    def timeout_quotes(func, *, thread_name, **kwargs):
+        if "alpaca-quote" in thread_name:
+            raise i12_pit_rebuild.FuturesTimeoutError()
+        return func()
+
+    monkeypatch.setattr(i12_pit_rebuild, "call_with_daemon_deadline", timeout_quotes)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=FakeAlpaca({}),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        intended_order_usd=250,
+        quote_replay=True,
+        fetch_deadline_seconds=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    quotes = db_session.query(I12PitQuoteReplay).all()
+    assert len(quotes) == 3
+    assert {row.coverage_status for row in quotes} == {"error"}
+    assert {
+        json.loads(row.error_json)["error_type"] for row in quotes
+    } == {"watchdog_timeout"}
+    assert db_session.query(I12PitCostReplay).count() == 2
+    assert result.metrics["quote_replay_complete"] is False
+    assert result.metrics["cost_replay_complete"] is True
+    assert result.metrics["training_status"] == "blocked_quote_replay_incomplete"
+    assert result.metrics["exit_metrics"]["same_day_exit"]["tradeable_count"] == 0
+
+
+def test_quote_fetch_breaker_opening_timeout_is_persisted_and_resets_alpaca(
+    db_session,
+):
+    _add_hur(db_session, "QBREAK", output_hash="hur-quote-breaker")
+    alpaca = SleepyAlpaca({}, delay_seconds=0.05)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=alpaca,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        intended_order_usd=250,
+        quote_replay=True,
+        fetch_deadline_seconds=0.001,
+        max_consecutive_fetch_timeouts=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert not result.ok
+    assert db_session.in_transaction() is False
+    assert alpaca.reset_calls == 1
+    quotes = db_session.query(I12PitQuoteReplay).all()
+    assert len(quotes) == 1
+    quote = quotes[0]
+    assert quote.quote_role == "entry"
+    assert quote.coverage_status == "error"
+    error = json.loads(quote.error_json)
+    assert error["error_type"] == "watchdog_timeout"
+    flags = error["data_quality_flags"]
+    breaker = flags["provider_outage_circuit_breaker"]
+    assert breaker["breaker_opened_by_current_call"] is True
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert db_session.query(I12PitCandidate).one().candidate_status == "passed"
+
+
 def test_i12_pit_job_does_not_call_providers_inside_open_db_transaction(db_session):
     _add_hur(db_session, "TXPROV1", output_hash="hur-tx-provider-1")
     _add_hur(db_session, "TXPROV2", output_hash="hur-tx-provider-2")
@@ -883,6 +1011,115 @@ def test_daily_fetch_error_attempts_are_persisted_and_block_finality(db_session)
     assert result.metrics["cost_replay_complete"] is True
     assert result.metrics["data_integrity_passed"] is False
     assert result.metrics["conclusions_final"] is False
+    assert result.metrics["training_status"] == "blocked_source_provider_errors"
+
+
+def test_daily_fetch_watchdog_timeout_is_persisted_as_provider_error(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "FMPWATCH", output_hash="hur-fmp-watchdog")
+
+    def timeout_daily(func, *, thread_name, **kwargs):
+        del func, kwargs
+        if "fmp-daily" in thread_name:
+            raise i12_pit_rebuild.FuturesTimeoutError()
+        raise AssertionError(f"unexpected provider fetch: {thread_name}")
+
+    monkeypatch.setattr(i12_pit_rebuild, "call_with_daemon_deadline", timeout_daily)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        fetch_deadline_seconds=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    row = db_session.query(I12PitCandidate).one()
+    assert row.coverage_status == "daily_fetch_error"
+    error = json.loads(row.error_json)["source_errors"]["daily_error"]
+    assert error["error_type"] == "watchdog_timeout"
+    assert "1 seconds" in error["message"]
+    assert result.metrics["daily_fetch_error_count"] == 1
+    assert result.metrics["training_status"] == "blocked_source_provider_errors"
+
+
+def test_daily_fetch_breaker_opening_timeout_is_persisted_as_provider_error(
+    db_session,
+):
+    _add_hur(db_session, "FMPBREAK", output_hash="hur-fmp-breaker")
+    fmp = SleepyFmp(_fmp_bars(), delay_seconds=0.05)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        fetch_deadline_seconds=0.001,
+        max_consecutive_fetch_timeouts=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    assert fmp.reset_calls == 1
+    row = db_session.query(I12PitCandidate).one()
+    assert row.coverage_status == "daily_fetch_error"
+    error = json.loads(row.error_json)["source_errors"]["daily_error"]
+    assert error["error_type"] == "watchdog_timeout"
+    flags = error["data_quality_flags"]
+    breaker = flags["provider_outage_circuit_breaker"]
+    assert breaker["breaker_opened_by_current_call"] is True
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert result.metrics["daily_fetch_error_count"] == 1
+    assert result.metrics["training_status"] == "blocked_source_provider_errors"
+
+
+def test_daily_fetch_outstanding_timeout_breaker_persists_provider_error(
+    db_session,
+):
+    _add_hur(db_session, "FMPOUT", output_hash="hur-fmp-outstanding-breaker")
+    fmp = SleepyFmp(_fmp_bars(), delay_seconds=0.05)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        fetch_deadline_seconds=0.001,
+        max_outstanding_fetch_timeouts=1,
+        max_consecutive_fetch_timeouts=10,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    assert fmp.reset_calls == 1
+    row = db_session.query(I12PitCandidate).one()
+    assert row.coverage_status == "daily_fetch_error"
+    error = json.loads(row.error_json)["source_errors"]["daily_error"]
+    assert error["error_type"] == "watchdog_timeout"
+    flags = error["data_quality_flags"]
+    breaker = flags["provider_outage_circuit_breaker"]
+    assert breaker["breaker_opened_by_current_call"] is True
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_outstanding_timeouts"
+    assert result.metrics["daily_fetch_error_count"] == 1
     assert result.metrics["training_status"] == "blocked_source_provider_errors"
 
 
@@ -1017,6 +1254,77 @@ def test_minute_fetch_error_is_distinct_from_legitimate_missing_bars(db_session)
     assert result.metrics["minute_fetch_error_count"] == 1
     assert result.metrics["data_integrity_passed"] is False
     assert result.metrics["conclusions_final"] is False
+    assert result.metrics["training_status"] == "blocked_source_provider_errors"
+
+
+def test_minute_fetch_watchdog_timeout_is_persisted_as_provider_error(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "MINWATCH", output_hash="hur-minute-watchdog")
+
+    def timeout_minute(func, *, thread_name, **kwargs):
+        if "polygon-minute" in thread_name:
+            raise i12_pit_rebuild.FuturesTimeoutError()
+        return func()
+
+    monkeypatch.setattr(i12_pit_rebuild, "call_with_daemon_deadline", timeout_minute)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_polygon_bars()),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        fetch_deadline_seconds=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    row = db_session.query(I12PitCandidate).one()
+    assert row.coverage_status == "minute_fetch_error"
+    error = json.loads(row.source_bars_json)["minute_error"]
+    assert error["error_type"] == "watchdog_timeout"
+    assert result.metrics["minute_fetch_error_count"] == 1
+    assert result.metrics["training_status"] == "blocked_source_provider_errors"
+
+
+def test_minute_fetch_breaker_opening_timeout_is_persisted_as_provider_error(
+    db_session,
+):
+    _add_hur(db_session, "MINBREAK", output_hash="hur-minute-breaker")
+    polygon = SleepyPolygon(_polygon_bars(), delay_seconds=0.05)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=polygon,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        fetch_deadline_seconds=0.001,
+        max_consecutive_fetch_timeouts=1,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert db_session.in_transaction() is False
+    assert polygon.reset_calls == 1
+    row = db_session.query(I12PitCandidate).one()
+    assert row.coverage_status == "minute_fetch_error"
+    error = json.loads(row.source_bars_json)["minute_error"]
+    assert error["error_type"] == "watchdog_timeout"
+    flags = error["data_quality_flags"]
+    breaker = flags["provider_outage_circuit_breaker"]
+    assert breaker["breaker_opened_by_current_call"] is True
+    assert breaker["circuit_reason"] == "watchdog_timeout:max_consecutive_timeouts"
+    assert result.metrics["minute_fetch_error_count"] == 1
     assert result.metrics["training_status"] == "blocked_source_provider_errors"
 
 
@@ -2742,6 +3050,36 @@ def test_progress_identity_scope_uses_processed_dates_not_full_window(db_session
     assert final_report["missing_source_attempt_identity_count"] == 1
     assert final_report["source_replay_complete"] is False
     assert final_report["conclusions_final"] is False
+
+
+def test_i12_pit_report_chunks_child_candidate_id_queries(db_session, monkeypatch):
+    tickers = ["CHUNK1", "CHUNK2", "CHUNK3"]
+    for ticker in tickers:
+        _add_hur(db_session, ticker, output_hash=f"hur-{ticker}")
+        _persist_complete_candidate_replay(
+            db_session,
+            ticker,
+            source_hur_identity_hash=_hur_identity_hash(db_session, ticker),
+        )
+    db_session.commit()
+    monkeypatch.setattr(i12_pit_rebuild, "CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE", 2)
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        path_mode="strict_contiguous",
+    )
+
+    assert report["expected_candidate_attempts"] == 3
+    assert report["pit_candidate_count"] == 3
+    assert report["quote_replay_row_count"] == 9
+    assert report["cost_replay_row_count"] == 6
+    assert report["quote_replay_complete"] is True
+    assert report["cost_replay_complete"] is True
+    assert report["conclusions_final"] is True
 
 
 def test_candidate_attempt_hash_includes_decision_time_label():

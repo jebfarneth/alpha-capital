@@ -166,12 +166,22 @@ class AlpacaAdapter:
     ):
         self._config = config
         self._session = session or requests.Session()
-        self._session.headers.update(
+        self._configure_session(self._session)
+
+    def _configure_session(self, session: requests.Session) -> None:
+        session.headers.update(
             {
-                "APCA-API-KEY-ID": config.api_key,
-                "APCA-API-SECRET-KEY": config.secret_key,
+                "APCA-API-KEY-ID": self._config.api_key,
+                "APCA-API-SECRET-KEY": self._config.secret_key,
             }
         )
+
+    def reset_session(self) -> None:
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = requests.Session()
+        self._configure_session(self._session)
 
     def _request(
         self,
