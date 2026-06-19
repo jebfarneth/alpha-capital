@@ -87,6 +87,7 @@ EXIT_ROLES = ("same_day_exit", "next_open_exit")
 DEFAULT_TICKER_PROGRESS_INTERVAL = 250
 DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
 CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE = 10000
+PROGRESS_METRICS_STATEMENT_TIMEOUT_MS = 15_000
 LEGACY_DAILY_SOURCE_HASHES_FLAG = "i12_pit_legacy_per_date_daily_source_hashes"
 DAILY_SOURCE_HASH_BASIS_LEGACY = "legacy_per_date_raw_payload"
 DAILY_SOURCE_HASH_BASIS_CLEAN_SLICE = "clean_slice_v1"
@@ -239,6 +240,7 @@ class I12PitRebuildJob(BaseJob):
         max_consecutive_fetch_timeouts: int = DEFAULT_MAX_CONSECUTIVE_FETCH_TIMEOUTS,
         max_no_progress_seconds: float | None = None,
         no_progress_exit_callback: Callable[[Mapping[str, Any]], None] | None = None,
+        progress_session_factory: Callable[[], Session] | None = None,
     ) -> None:
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
@@ -287,6 +289,7 @@ class I12PitRebuildJob(BaseJob):
         self._last_progress_payload: dict[str, Any] = {}
         self._no_progress_stop = threading.Event()
         self._no_progress_thread: threading.Thread | None = None
+        self._progress_session_factory = progress_session_factory
         self.partial_metrics: dict[str, Any] = {}
         if (
             output_schema
@@ -548,13 +551,34 @@ class I12PitRebuildJob(BaseJob):
                         job_run_id=ctx.job_run_id,
                     )
                 self._session.commit()
-                self._update_partial_metrics(
+                date_finish_payload = self._heartbeat_payload(
+                    counters=counters,
+                    trading_date=trading_date,
+                    hur_rows_for_date=len(hur_rows),
+                    hur_rows_processed_for_date=len(hur_rows),
+                    cumulative_hur_rows_loaded=hur_rows_loaded,
+                    job_run_id=ctx.job_run_id,
+                )
+                self._progress("date_loop_complete", date_finish_payload)
+                self._reset_provider_sessions_at_date_boundary()
+                self._progress("date_finish_metrics_start", date_finish_payload)
+                metrics_updated = self._update_partial_metrics(
                     counters=counters,
                     hur_rows_loaded=hur_rows_loaded,
                     event="date_finish",
                     trading_date=trading_date,
                     job_run_id=ctx.job_run_id,
                 )
+                if not metrics_updated:
+                    self._progress(
+                        "date_finish_minimal",
+                        {
+                            **date_finish_payload,
+                            "progress_metrics_session": "isolated",
+                            "progress_metrics_status": "failed",
+                            "progress_error": self.partial_metrics.get("progress_error"),
+                        },
+                    )
             report = i12_pit_rebuild_report(
                 self._session,
                 source_hur_schema=self._source_hur_schema,
@@ -1366,10 +1390,16 @@ class I12PitRebuildJob(BaseJob):
         event: str,
         trading_date: date | None = None,
         job_run_id: str | None = None,
-    ) -> None:
-        started_with_transaction = self._session.in_transaction()
+    ) -> bool:
+        progress_session: Session | None = None
         try:
+            if self._session.in_transaction():
+                self._session.commit()
+            if self._session.in_transaction():
+                raise RuntimeError("main job session still has an open transaction")
+            progress_session = self._open_progress_metrics_session()
             self._update_partial_metrics_inner(
+                progress_session=progress_session,
                 counters=counters,
                 hur_rows_loaded=hur_rows_loaded,
                 event=event,
@@ -1377,12 +1407,17 @@ class I12PitRebuildJob(BaseJob):
                 job_run_id=job_run_id,
             )
         except Exception as exc:
+            self._close_progress_metrics_session(progress_session)
+            progress_session = None
             if self._session.in_transaction():
                 self._session.rollback()
             self.partial_metrics = {
                 "last_event": event,
                 "last_trading_date": trading_date.isoformat() if trading_date else None,
                 "job_run_id": job_run_id,
+                "fetch_watchdog": self._fetch_watchdog.snapshot(),
+                "progress_metrics_session": "isolated",
+                "progress_metrics_status": "failed",
                 "progress_error": {
                     "error_type": type(exc).__name__,
                     "message": str(exc),
@@ -1390,28 +1425,37 @@ class I12PitRebuildJob(BaseJob):
                 "counters": dict(counters),
             }
             self._progress("progress_error", self.partial_metrics)
-            return
-        if not started_with_transaction and self._session.in_transaction():
-            self._session.rollback()
+            return False
+        else:
+            self._close_progress_metrics_session(progress_session)
+            progress_session = None
+            self._progress(event, self.partial_metrics)
+            return True
+        finally:
+            self._close_progress_metrics_session(progress_session)
+            if self._session.in_transaction():
+                self._session.rollback()
 
     def _update_partial_metrics_inner(
         self,
         *,
+        progress_session: Session,
         counters: Counter[str],
         hur_rows_loaded: int,
         event: str,
         trading_date: date | None = None,
         job_run_id: str | None = None,
     ) -> None:
+        self._set_local_progress_statement_timeout(progress_session)
         progress_start_date = self._start_date
         progress_end_date = trading_date if trading_date is not None else self._end_date
         if progress_end_date is not None and self._end_date is not None:
             progress_end_date = min(progress_end_date, self._end_date)
-        active_candidate_query = self._session.query(I12PitCandidate).filter(
+        active_candidate_query = progress_session.query(I12PitCandidate).filter(
             I12PitCandidate.is_active.is_(True),
             I12PitCandidate.path_mode == self._minute_path_mode,
         )
-        historical_candidate_query = self._session.query(I12PitCandidate).filter(
+        historical_candidate_query = progress_session.query(I12PitCandidate).filter(
             I12PitCandidate.path_mode == self._minute_path_mode,
         )
         if self._start_date is not None:
@@ -1434,62 +1478,47 @@ class I12PitRebuildJob(BaseJob):
         historical_candidate_query = historical_candidate_query.filter(
             I12PitCandidate.decision_time_label.in_(self._decision_times)
         )
-        active_candidates = active_candidate_query.all()
-        historical_candidates = historical_candidate_query.all()
-        active_candidate_ids = [row.i12_pit_candidate_id for row in active_candidates]
-        historical_candidate_ids = [
-            row.i12_pit_candidate_id for row in historical_candidates
-        ]
-        quote_replay_row_count = _count_child_rows_for_candidate_ids(
-            self._session,
+        active_candidate_count = active_candidate_query.count()
+        historical_candidate_count = historical_candidate_query.count()
+        active_candidate_ids = active_candidate_query.with_entities(
+            I12PitCandidate.i12_pit_candidate_id
+        ).subquery()
+        historical_candidate_ids = historical_candidate_query.with_entities(
+            I12PitCandidate.i12_pit_candidate_id
+        ).subquery()
+        quote_replay_row_count = _count_child_rows_for_candidate_subquery(
+            progress_session,
             I12PitQuoteReplay,
             active_candidate_ids,
             active_only=True,
         )
-        historical_quote_replay_row_count = _count_child_rows_for_candidate_ids(
-            self._session,
+        historical_quote_replay_row_count = _count_child_rows_for_candidate_subquery(
+            progress_session,
             I12PitQuoteReplay,
             historical_candidate_ids,
         )
-        cost_replay_row_count = _count_child_rows_for_candidate_ids(
-            self._session,
+        cost_replay_row_count = _count_child_rows_for_candidate_subquery(
+            progress_session,
             I12PitCostReplay,
             active_candidate_ids,
             active_only=True,
         )
-        historical_cost_replay_row_count = _count_child_rows_for_candidate_ids(
-            self._session,
+        historical_cost_replay_row_count = _count_child_rows_for_candidate_subquery(
+            progress_session,
             I12PitCostReplay,
             historical_candidate_ids,
         )
         expected_candidate_attempts = hur_rows_loaded * len(self._decision_times)
-        missing_source_attempt_count = max(expected_candidate_attempts - len(active_candidate_ids), 0)
-        extra_source_attempt_count = max(len(active_candidate_ids) - expected_candidate_attempts, 0)
+        missing_source_attempt_count = max(expected_candidate_attempts - active_candidate_count, 0)
+        extra_source_attempt_count = max(active_candidate_count - expected_candidate_attempts, 0)
         source_attempt_count_exact = (
             missing_source_attempt_count == 0 and extra_source_attempt_count == 0
-        )
-        identity_audit = _source_attempt_identity_audit(
-            self._session,
-            source_hur_schema=self._source_hur_schema,
-            start_date=progress_start_date,
-            end_date=progress_end_date,
-            decision_time_labels=self._decision_times,
-            path_modes=(self._minute_path_mode,),
-            candidates=active_candidates,
-        )
-        path_identity_audit = identity_audit["path_mode_identity_audits"].get(
-            self._minute_path_mode,
-            _empty_source_identity_audit(known=False),
-        )
-        source_attempt_identity_exact = (
-            bool(path_identity_audit.get("source_identity_denominator_known"))
-            and not path_identity_audit.get("source_identity_denominator_error")
-            and path_identity_audit.get("missing_source_attempt_identity_count") == 0
-            and path_identity_audit.get("extra_source_attempt_identity_count") == 0
         )
         self.partial_metrics = {
             "source_hur_schema": self._source_hur_schema,
             "hur_rows_loaded": hur_rows_loaded,
+            "progress_metrics_session": "isolated",
+            "progress_metrics_status": "ok",
             "progress_source_start_date": (
                 progress_start_date.isoformat() if progress_start_date else None
             ),
@@ -1504,27 +1533,20 @@ class I12PitRebuildJob(BaseJob):
             "decision_time_count": len(self._decision_times),
             "minute_path_mode": self._minute_path_mode,
             "expected_candidate_attempts": expected_candidate_attempts,
-            "candidate_row_count": len(active_candidate_ids),
-            "active_candidate_row_count_for_path_mode": len(active_candidate_ids),
+            "candidate_row_count": active_candidate_count,
+            "active_candidate_row_count_for_path_mode": active_candidate_count,
             "missing_source_attempt_count_for_path_mode": missing_source_attempt_count,
             "extra_source_attempt_count_for_path_mode": extra_source_attempt_count,
             "source_attempt_count_exact_for_path_mode": source_attempt_count_exact,
-            "source_identity_denominator_known_for_path_mode": path_identity_audit.get(
-                "source_identity_denominator_known",
-                False,
+            "source_identity_denominator_known_for_path_mode": False,
+            "source_identity_denominator_error_for_path_mode": (
+                "progress_identity_audit_skipped_final_report_only"
             ),
-            "source_identity_denominator_error_for_path_mode": path_identity_audit.get(
-                "source_identity_denominator_error",
-            ),
-            "missing_source_attempt_identity_count_for_path_mode": (
-                path_identity_audit.get("missing_source_attempt_identity_count")
-            ),
-            "extra_source_attempt_identity_count_for_path_mode": (
-                path_identity_audit.get("extra_source_attempt_identity_count")
-            ),
-            "source_attempt_identity_exact_for_path_mode": source_attempt_identity_exact,
-            "historical_candidate_row_count": len(historical_candidate_ids),
-            "historical_candidate_row_count_for_path_mode": len(historical_candidate_ids),
+            "missing_source_attempt_identity_count_for_path_mode": None,
+            "extra_source_attempt_identity_count_for_path_mode": None,
+            "source_attempt_identity_exact_for_path_mode": False,
+            "historical_candidate_row_count": historical_candidate_count,
+            "historical_candidate_row_count_for_path_mode": historical_candidate_count,
             "quote_replay_row_count": quote_replay_row_count,
             "quote_replay_row_count_for_path_mode": quote_replay_row_count,
             "historical_quote_replay_row_count": historical_quote_replay_row_count,
@@ -1537,26 +1559,26 @@ class I12PitRebuildJob(BaseJob):
             "historical_cost_replay_row_count_for_path_mode": (
                 historical_cost_replay_row_count
             ),
-            "schema_total_active_candidate_row_count": self._session.query(I12PitCandidate)
+            "schema_total_active_candidate_row_count": progress_session.query(I12PitCandidate)
             .filter(I12PitCandidate.is_active.is_(True))
             .count(),
-            "schema_total_historical_candidate_row_count": self._session.query(
+            "schema_total_historical_candidate_row_count": progress_session.query(
                 I12PitCandidate
             ).count(),
-            "schema_total_active_quote_replay_row_count": self._session.query(
+            "schema_total_active_quote_replay_row_count": progress_session.query(
                 I12PitQuoteReplay
             )
             .filter(I12PitQuoteReplay.is_active.is_(True))
             .count(),
-            "schema_total_historical_quote_replay_row_count": self._session.query(
+            "schema_total_historical_quote_replay_row_count": progress_session.query(
                 I12PitQuoteReplay
             ).count(),
-            "schema_total_active_cost_replay_row_count": self._session.query(
+            "schema_total_active_cost_replay_row_count": progress_session.query(
                 I12PitCostReplay
             )
             .filter(I12PitCostReplay.is_active.is_(True))
             .count(),
-            "schema_total_historical_cost_replay_row_count": self._session.query(
+            "schema_total_historical_cost_replay_row_count": progress_session.query(
                 I12PitCostReplay
             ).count(),
             "daily_fetch_error_count": counters.get("coverage_daily_fetch_error", 0),
@@ -1566,7 +1588,6 @@ class I12PitRebuildJob(BaseJob):
             "last_trading_date": trading_date.isoformat() if trading_date else None,
             "job_run_id": job_run_id,
         }
-        self._progress(event, self.partial_metrics)
 
     def _maybe_emit_ticker_progress(
         self,
@@ -1629,6 +1650,31 @@ class I12PitRebuildJob(BaseJob):
         if self._session.in_transaction():
             self._session.rollback()
 
+    def _open_progress_metrics_session(self) -> Session:
+        if self._progress_session_factory is not None:
+            return self._progress_session_factory()
+        return Session(bind=self._session.get_bind())
+
+    @staticmethod
+    def _close_progress_metrics_session(progress_session: Session | None) -> None:
+        if progress_session is None:
+            return
+        try:
+            if progress_session.in_transaction():
+                progress_session.rollback()
+        finally:
+            progress_session.close()
+
+    @staticmethod
+    def _set_local_progress_statement_timeout(progress_session: Session) -> None:
+        bind = progress_session.get_bind()
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+        if dialect_name != "postgresql":
+            return
+        progress_session.execute(
+            text(f"SET LOCAL statement_timeout = {PROGRESS_METRICS_STATEMENT_TIMEOUT_MS}")
+        )
+
     def _progress_provider_fetch_start(
         self,
         *,
@@ -1686,6 +1732,10 @@ class I12PitRebuildJob(BaseJob):
         reset_session = getattr(adapter, "reset_session", None)
         if callable(reset_session):
             reset_session()
+
+    def _reset_provider_sessions_at_date_boundary(self) -> None:
+        for adapter in (self._fmp, self._polygon, self._alpaca):
+            self._reset_provider_session(adapter)
 
     def _start_no_progress_monitor(self, job_run_id: str | None) -> None:
         if self._max_no_progress_seconds is None:
@@ -1906,6 +1956,22 @@ def _count_child_rows_for_candidate_ids(
             query = query.filter(model.is_active.is_(True))
         total += query.count()
     return total
+
+
+def _count_child_rows_for_candidate_subquery(
+    session: Session,
+    model: Any,
+    candidate_ids_subquery: Any,
+    *,
+    active_only: bool = False,
+) -> int:
+    query = session.query(model).join(
+        candidate_ids_subquery,
+        model.i12_pit_candidate_id == candidate_ids_subquery.c.i12_pit_candidate_id,
+    )
+    if active_only:
+        query = query.filter(model.is_active.is_(True))
+    return query.count()
 
 
 def _iter_chunks(values: Sequence[str], size: int) -> list[list[str]]:

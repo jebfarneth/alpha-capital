@@ -1653,7 +1653,7 @@ def test_daily_fetch_breaker_opening_timeout_is_persisted_as_provider_error(
 
     assert result.ok
     assert db_session.in_transaction() is False
-    assert fmp.reset_calls == 1
+    assert fmp.reset_calls >= 1
     row = db_session.query(I12PitCandidate).one()
     assert row.coverage_status == "daily_fetch_error"
     error = json.loads(row.error_json)["source_errors"]["daily_error"]
@@ -1689,7 +1689,7 @@ def test_daily_fetch_outstanding_timeout_breaker_persists_provider_error(
 
     assert result.ok
     assert db_session.in_transaction() is False
-    assert fmp.reset_calls == 1
+    assert fmp.reset_calls >= 1
     row = db_session.query(I12PitCandidate).one()
     assert row.coverage_status == "daily_fetch_error"
     error = json.loads(row.error_json)["source_errors"]["daily_error"]
@@ -1894,7 +1894,7 @@ def test_minute_fetch_breaker_opening_timeout_is_persisted_as_provider_error(
 
     assert result.ok
     assert db_session.in_transaction() is False
-    assert polygon.reset_calls == 1
+    assert polygon.reset_calls >= 1
     row = db_session.query(I12PitCandidate).one()
     assert row.coverage_status == "minute_fetch_error"
     error = json.loads(row.source_bars_json)["minute_error"]
@@ -3304,13 +3304,16 @@ def test_progress_metrics_expose_count_exactness(db_session):
     assert job.partial_metrics["missing_source_attempt_count_for_path_mode"] == 0
     assert job.partial_metrics["extra_source_attempt_count_for_path_mode"] == 1
     assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is False
-    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
-    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
-    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 2
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is False
+    assert job.partial_metrics["source_identity_denominator_error_for_path_mode"] == (
+        "progress_identity_audit_skipped_final_report_only"
+    )
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] is None
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] is None
     assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is False
 
 
-def test_progress_metrics_expose_identity_exactness(db_session):
+def test_progress_metrics_defer_identity_exactness_to_final_report(db_session):
     _add_hur(db_session, "PROGRESSID", output_hash="hur-progress-id")
     _persist_complete_candidate_replay(
         db_session,
@@ -3338,11 +3341,13 @@ def test_progress_metrics_expose_identity_exactness(db_session):
     )
 
     assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is True
-    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
-    assert job.partial_metrics["source_identity_denominator_error_for_path_mode"] is None
-    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
-    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 0
-    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is False
+    assert job.partial_metrics["source_identity_denominator_error_for_path_mode"] == (
+        "progress_identity_audit_skipped_final_report_only"
+    )
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] is None
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] is None
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is False
 
 
 def test_update_partial_metrics_closes_owned_read_transaction(db_session):
@@ -3374,7 +3379,96 @@ def test_update_partial_metrics_closes_owned_read_transaction(db_session):
         trading_date=DAY,
     )
 
-    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is False
+    assert db_session.in_transaction() is False
+
+
+def test_update_partial_metrics_uses_isolated_session_for_progress_reads(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "ISOLATEDREAD", output_hash="hur-isolated-read")
+    _persist_complete_candidate_replay(
+        db_session,
+        "ISOLATEDREAD",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "ISOLATEDREAD"),
+    )
+    db_session.commit()
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+
+    def fail_main_session_query(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("main job session used for progress query")
+
+    def fail_main_session_execute(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("main job session used for progress execute")
+
+    monkeypatch.setattr(db_session, "query", fail_main_session_query)
+    monkeypatch.setattr(db_session, "execute", fail_main_session_execute)
+
+    ok = job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+    )
+
+    assert ok is True
+    assert job.partial_metrics["progress_metrics_session"] == "isolated"
+    assert job.partial_metrics["progress_metrics_status"] == "ok"
+    assert db_session.in_transaction() is False
+
+
+def test_update_partial_metrics_writes_progress_after_transaction_closed(db_session):
+    _add_hur(db_session, "TXNWRITE", output_hash="hur-txn-write")
+    _persist_complete_candidate_replay(
+        db_session,
+        "TXNWRITE",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "TXNWRITE"),
+    )
+    db_session.commit()
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+    )
+    progress_events = []
+
+    def assert_no_transaction_progress(event, payload):
+        assert db_session.in_transaction() is False
+        progress_events.append((event, dict(payload)))
+
+    job._progress = assert_no_transaction_progress
+
+    ok = job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+    )
+
+    assert ok is True
+    assert [event for event, _payload in progress_events] == ["date_finish"]
     assert db_session.in_transaction() is False
 
 
@@ -3436,11 +3530,15 @@ def test_update_partial_metrics_error_rolls_back_and_writes_minimal_artifact(
         progress_artifact=progress_path,
     )
 
-    def fail_identity(*args, **kwargs):
+    def fail_progress_count(*args, **kwargs):
         del args, kwargs
-        raise RuntimeError("progress identity failed")
+        raise RuntimeError("progress metrics failed")
 
-    monkeypatch.setattr(i12_pit_rebuild, "_source_attempt_identity_audit", fail_identity)
+    monkeypatch.setattr(
+        i12_pit_rebuild,
+        "_count_child_rows_for_candidate_subquery",
+        fail_progress_count,
+    )
 
     job._update_partial_metrics(
         counters=Counter({"candidate_passed": 1}),
@@ -3455,7 +3553,142 @@ def test_update_partial_metrics_error_rolls_back_and_writes_minimal_artifact(
     assert artifact["job_run_id"] == "job-progress-error"
     assert artifact["last_trading_date"] == DAY.isoformat()
     assert artifact["progress_error"]["error_type"] == "RuntimeError"
-    assert "progress identity failed" in artifact["progress_error"]["message"]
+    assert "progress metrics failed" in artifact["progress_error"]["message"]
+    assert db_session.in_transaction() is False
+
+
+def test_update_partial_metrics_closes_isolated_session_on_success(db_session):
+    _add_hur(db_session, "ISOLATEDOK", output_hash="hur-isolated-ok")
+    _persist_complete_candidate_replay(
+        db_session,
+        "ISOLATEDOK",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "ISOLATEDOK"),
+    )
+    db_session.commit()
+    events = []
+
+    def progress_session_factory():
+        assert db_session.in_transaction() is False
+        progress_session = db_session.__class__(bind=db_session.get_bind())
+        original_rollback = progress_session.rollback
+        original_close = progress_session.close
+
+        def rollback():
+            events.append(("rollback", progress_session.in_transaction()))
+            return original_rollback()
+
+        def close():
+            events.append(("close", progress_session.in_transaction()))
+            return original_close()
+
+        progress_session.rollback = rollback
+        progress_session.close = close
+        return progress_session
+
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+        progress_session_factory=progress_session_factory,
+    )
+
+    ok = job._update_partial_metrics(
+        counters=Counter(),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+    )
+
+    assert ok is True
+    assert ("rollback", True) in events
+    assert events[-1][0] == "close"
+    assert db_session.in_transaction() is False
+
+
+def test_update_partial_metrics_writes_progress_error_after_transaction_closed(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "ERRTXNWRITE", output_hash="hur-err-txn-write")
+    _persist_complete_candidate_replay(
+        db_session,
+        "ERRTXNWRITE",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "ERRTXNWRITE"),
+    )
+    db_session.commit()
+    events = []
+
+    def progress_session_factory():
+        assert db_session.in_transaction() is False
+        progress_session = db_session.__class__(bind=db_session.get_bind())
+        original_rollback = progress_session.rollback
+        original_close = progress_session.close
+
+        def rollback():
+            events.append(("rollback", progress_session.in_transaction()))
+            return original_rollback()
+
+        def close():
+            events.append(("close", progress_session.in_transaction()))
+            return original_close()
+
+        progress_session.rollback = rollback
+        progress_session.close = close
+        return progress_session
+
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmp(_fmp_bars()),
+        polygon_adapter=FakePolygon(_sparse_polygon_bars()),
+        alpaca_adapter=FailingAlpaca(),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="sparse_zero_fill",
+        quote_replay=False,
+        progress_session_factory=progress_session_factory,
+    )
+
+    def fail_progress_count(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("progress metrics failed after transaction opened")
+
+    monkeypatch.setattr(
+        i12_pit_rebuild,
+        "_count_child_rows_for_candidate_subquery",
+        fail_progress_count,
+    )
+    progress_events = []
+
+    def assert_no_transaction_progress(event, payload):
+        assert db_session.in_transaction() is False
+        progress_events.append((event, dict(payload)))
+
+    job._progress = assert_no_transaction_progress
+
+    ok = job._update_partial_metrics(
+        counters=Counter({"candidate_passed": 1}),
+        hur_rows_loaded=1,
+        event="date_finish",
+        trading_date=DAY,
+        job_run_id="job-progress-error",
+    )
+
+    assert ok is False
+    assert [event for event, _payload in progress_events] == ["progress_error"]
+    assert progress_events[0][1]["progress_error"]["error_type"] == "RuntimeError"
+    assert progress_events[0][1]["progress_metrics_session"] == "isolated"
+    assert progress_events[0][1]["progress_metrics_status"] == "failed"
+    assert ("rollback", True) in events
+    assert events[-1][0] == "close"
     assert db_session.in_transaction() is False
 
 
@@ -3598,6 +3831,97 @@ def test_i12_pit_run_emits_date_and_ticker_heartbeats(db_session):
     assert ticker_payloads[-1]["cumulative_hur_rows_loaded"] == 2
 
 
+def test_i12_pit_run_continues_when_date_finish_metrics_fail(
+    db_session,
+    monkeypatch,
+):
+    next_day = next_us_equity_session(DAY + timedelta(days=1))
+    _add_hur(db_session, "METRICSERR1", day=DAY, output_hash="hur-metrics-err-1")
+    _add_hur(
+        db_session,
+        "METRICSERR2",
+        day=next_day,
+        output_hash="hur-metrics-err-2",
+    )
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({
+            "METRICSERR1": _fmp_bars(),
+            "METRICSERR2": _fmp_bars(),
+        }),
+        polygon_adapter=FakePolygonByTicker({
+            "METRICSERR1": _polygon_bars(),
+            "METRICSERR2": _polygon_bars(),
+        }),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=next_day,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+        progress_interval_tickers=1,
+    )
+    events = []
+
+    def capture_progress(event, payload):
+        events.append((event, dict(payload)))
+
+    job._progress = capture_progress
+    original_update = job._update_partial_metrics_inner
+
+    def fail_first_date_metrics(*args, **kwargs):
+        if kwargs.get("trading_date") == DAY:
+            raise TimeoutError("date finish metrics timed out")
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(job, "_update_partial_metrics_inner", fail_first_date_metrics)
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    event_names = [event for event, _payload in events]
+    assert event_names.count("date_loop_complete") == 2
+    assert event_names.count("date_finish_metrics_start") == 2
+    assert "progress_error" in event_names
+    assert "date_finish_minimal" in event_names
+    assert "date_finish" in event_names
+    assert event_names[-1] == "finish"
+    first_error = next(payload for event, payload in events if event == "progress_error")
+    assert first_error["last_trading_date"] == DAY.isoformat()
+    assert first_error["progress_error"]["error_type"] == "TimeoutError"
+    assert "date finish metrics timed out" in first_error["progress_error"]["message"]
+    minimal = next(payload for event, payload in events if event == "date_finish_minimal")
+    assert minimal["trading_date"] == DAY.isoformat()
+    assert minimal["progress_metrics_session"] == "isolated"
+    assert minimal["progress_metrics_status"] == "failed"
+    assert db_session.in_transaction() is False
+
+
+def test_i12_pit_run_resets_provider_sessions_at_date_boundary(db_session):
+    _add_hur(db_session, "RESETDAY", output_hash="hur-reset-day")
+    fmp = SleepyFmp(_fmp_bars(), delay_seconds=0.0)
+    polygon = SleepyPolygon(_polygon_bars(), delay_seconds=0.0)
+    alpaca = SleepyAlpaca(_complete_quotes(), delay_seconds=0.0)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=fmp,
+        polygon_adapter=polygon,
+        alpaca_adapter=alpaca,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=True,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert fmp.reset_calls == 1
+    assert polygon.reset_calls == 1
+    assert alpaca.reset_calls == 1
+
+
 def test_i12_pit_daily_fetch_errors_emit_ticker_progress(db_session):
     _add_hur(db_session, "DAILYERR1", output_hash="hur-daily-err-1")
     _add_hur(db_session, "DAILYERR2", output_hash="hur-daily-err-2")
@@ -3713,10 +4037,13 @@ def test_progress_identity_scope_uses_processed_dates_not_full_window(db_session
     assert job.partial_metrics["progress_source_scope"] == "processed_through_trading_date"
     assert job.partial_metrics["progress_source_end_date"] == DAY.isoformat()
     assert job.partial_metrics["source_attempt_count_exact_for_path_mode"] is True
-    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is True
-    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] == 0
-    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] == 0
-    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is True
+    assert job.partial_metrics["source_identity_denominator_known_for_path_mode"] is False
+    assert job.partial_metrics["source_identity_denominator_error_for_path_mode"] == (
+        "progress_identity_audit_skipped_final_report_only"
+    )
+    assert job.partial_metrics["missing_source_attempt_identity_count_for_path_mode"] is None
+    assert job.partial_metrics["extra_source_attempt_identity_count_for_path_mode"] is None
+    assert job.partial_metrics["source_attempt_identity_exact_for_path_mode"] is False
 
     final_report = i12_pit_rebuild_report(
         db_session,
