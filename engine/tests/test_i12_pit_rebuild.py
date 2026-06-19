@@ -867,9 +867,13 @@ def test_quote_fetch_watchdog_timeout_is_persisted_as_quote_error(
         json.loads(row.error_json)["error_type"] for row in quotes
     } == {"watchdog_timeout"}
     assert db_session.query(I12PitCostReplay).count() == 2
-    assert result.metrics["quote_replay_complete"] is False
+    assert result.metrics["quote_replay_complete"] is True
     assert result.metrics["cost_replay_complete"] is True
-    assert result.metrics["training_status"] == "blocked_quote_replay_incomplete"
+    assert result.metrics["quote_ok_count"] == 0
+    assert result.metrics["quote_non_ok_count"] == 3
+    assert result.metrics["quote_ok_rate"] == 0.0
+    assert result.metrics["quote_coverage_rate"] == 1.0
+    assert result.metrics["training_status"] == "eligible_for_retrain_evaluation"
     assert result.metrics["exit_metrics"]["same_day_exit"]["tradeable_count"] == 0
 
 
@@ -1477,8 +1481,10 @@ def test_quote_error_rerun_recovers_without_duplicate_active_roles(db_session):
         params={"test": True},
     )
     assert first.ok
-    assert first.metrics["quote_replay_complete"] is False
-    assert first.metrics["training_status"] == "blocked_quote_replay_incomplete"
+    assert first.metrics["quote_replay_complete"] is True
+    assert first.metrics["quote_non_ok_count"] == 1
+    assert first.metrics["quote_ok_rate"] == pytest.approx(2 / 3)
+    assert first.metrics["training_status"] == "eligible_for_retrain_evaluation"
 
     second = run_job(
         db_session,
@@ -3284,6 +3290,116 @@ def test_report_marks_incomplete_quote_replay_non_final(db_session):
     assert report["conclusions_final"] is False
     assert report["training_status"] == "blocked_quote_replay_incomplete"
     assert report["ml_ranking_status"] == "blocked_until_quote_replay_complete"
+
+
+def test_report_treats_non_ok_quote_rows_as_complete_durable_evidence(db_session):
+    _add_hur(db_session, "MISSQ", output_hash="hur-missing-quote-final")
+    candidate = _persist_candidate(
+        db_session,
+        "MISSQ",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "MISSQ"),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", status="ok")
+    same_day = _persist_quote(
+        db_session,
+        candidate,
+        role="same_day_exit",
+        status="missing",
+    )
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", status="ok")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=50,
+                max_spread_bps=200,
+                slippage_bps=0,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["quote_replay_complete"] is True
+    assert report["cost_replay_complete"] is True
+    assert report["data_integrity_passed"] is True
+    assert report["conclusions_final"] is True
+    assert report["training_status"] == "eligible_for_retrain_evaluation"
+    assert report["ml_ranking_status"] == "not_run_quote_layer_ready"
+    assert report["quote_ok_count"] == 2
+    assert report["quote_non_ok_count"] == 1
+    assert report["quote_ok_rate"] == pytest.approx(2 / 3)
+    assert report["quote_coverage_rate"] == 1.0
+    assert report["quote_coverage_by_role"]["same_day_exit"][
+        "coverage_status_counts"
+    ] == {"missing": 1}
+    assert report["exit_metrics"]["same_day_exit"]["skipped_cash_by_reason"] == {
+        "exit_quote_missing": 1,
+    }
+
+
+def test_report_blocks_unknown_quote_coverage_status_as_integrity_error(db_session):
+    _add_hur(db_session, "WEIRDQ", output_hash="hur-weird-quote")
+    candidate = _persist_candidate(
+        db_session,
+        "WEIRDQ",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "WEIRDQ"),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", status="ok")
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", status="ok")
+    next_open = _persist_quote(
+        db_session,
+        candidate,
+        role="next_open_exit",
+        status="weird",
+    )
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=50,
+                max_spread_bps=200,
+                slippage_bps=0,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["quote_replay_complete"] is False
+    assert report["unknown_quote_coverage_status_count"] == 1
+    assert report["quote_coverage_by_role"]["next_open_exit"]["unknown_status"] == 1
+    assert report["cost_replay_complete"] is True
+    assert report["data_integrity_passed"] is False
+    assert report["conclusions_final"] is False
+    assert report["training_status"] == "blocked_quote_replay_integrity"
+    assert report["ml_ranking_status"] == "blocked_quote_replay_integrity"
 
 
 def test_report_blocks_when_quotes_complete_but_cost_rows_missing(db_session):

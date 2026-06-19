@@ -79,6 +79,7 @@ SAME_DAY_EXIT_TIME = time(15, 55)
 NEXT_OPEN_EXIT_OFFSET_MINUTES = 1
 MIN_PRIOR_DAILY_SESSIONS = 20
 REQUIRED_QUOTE_ROLES = ("entry", "same_day_exit", "next_open_exit")
+QUOTE_REPLAY_DURABLE_COVERAGE_STATUSES = frozenset({"ok", "missing", "stale", "error"})
 EXIT_ROLES = ("same_day_exit", "next_open_exit")
 DEFAULT_TICKER_PROGRESS_INTERVAL = 250
 DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
@@ -2364,9 +2365,15 @@ def i12_pit_rebuild_report(
             ),
         }
     required_quote_rows = len(passed) * len(REQUIRED_QUOTE_ROLES)
-    ok_quote_rows = quote_audit["usable_quote_role_count"]
+    quote_ok_count = quote_status.get("ok", 0)
+    quote_non_ok_count = len(quotes) - quote_ok_count
     quote_coverage_rate = (
-        ok_quote_rows / required_quote_rows if required_quote_rows else None
+        quote_audit["durable_quote_role_count"] / required_quote_rows
+        if required_quote_rows else None
+    )
+    quote_ok_rate = (
+        quote_audit["usable_quote_role_count"] / required_quote_rows
+        if required_quote_rows else None
     )
     quote_complete = quote_audit["quote_replay_complete"]
     cost_complete = cost_audit["cost_replay_complete"]
@@ -2495,6 +2502,8 @@ def i12_pit_rebuild_report(
         training_status = "blocked_source_provider_errors"
     elif zero_pit_candidates:
         training_status = "blocked_zero_pit_candidates"
+    elif quote_audit["unknown_quote_coverage_status_count"] > 0:
+        training_status = "blocked_quote_replay_integrity"
     elif not quote_complete:
         training_status = "blocked_quote_replay_incomplete"
     elif not cost_complete:
@@ -2580,6 +2589,13 @@ def i12_pit_rebuild_report(
         "quote_coverage_status_counts": dict(quote_status),
         "quote_replay_status": quote_replay_status,
         "quote_coverage_rate": quote_coverage_rate,
+        "quote_ok_count": quote_ok_count,
+        "quote_non_ok_count": quote_non_ok_count,
+        "quote_ok_rate": quote_ok_rate,
+        "quote_usable_ok_count": quote_audit["usable_quote_role_count"],
+        "unknown_quote_coverage_status_count": (
+            quote_audit["unknown_quote_coverage_status_count"]
+        ),
         "quote_coverage_by_role": quote_audit["quote_coverage_by_role"],
         "missing_quote_role_count": quote_audit["missing_quote_role_count"],
         "duplicate_quote_role_count": quote_audit["duplicate_quote_role_count"],
@@ -2614,6 +2630,7 @@ def i12_pit_rebuild_report(
                 or training_status == "blocked_child_evidence_parent_inactive"
                 or training_status == "blocked_zero_pit_candidates"
                 or training_status == "blocked_path_mode_comparison_incomplete"
+                or training_status == "blocked_quote_replay_integrity"
                 else "blocked_until_quote_replay_complete"
             )
         ),
@@ -2633,9 +2650,11 @@ def _quote_completeness_audit(
     coverage_by_role: dict[str, dict[str, Any]] = {
         role: {
             "required": len(passed_candidates),
+            "present": 0,
             "usable_ok": 0,
             "missing": 0,
             "duplicate": 0,
+            "unknown_status": 0,
             "coverage_status_counts": {},
         }
         for role in REQUIRED_QUOTE_ROLES
@@ -2644,6 +2663,8 @@ def _quote_completeness_audit(
     duplicate_quote_role_count = 0
     complete_candidates = 0
     usable_quote_role_count = 0
+    durable_quote_role_count = 0
+    unknown_quote_coverage_status_count = 0
 
     for candidate in passed_candidates:
         candidate_complete = True
@@ -2662,15 +2683,28 @@ def _quote_completeness_audit(
             role_bucket["coverage_status_counts"] = dict(
                 Counter(role_bucket["coverage_status_counts"]) + status_counts
             )
+            unknown_status_count = sum(
+                count
+                for status, count in status_counts.items()
+                if status not in QUOTE_REPLAY_DURABLE_COVERAGE_STATUSES
+            )
+            if unknown_status_count:
+                role_bucket["unknown_status"] += unknown_status_count
+                unknown_quote_coverage_status_count += unknown_status_count
+                candidate_complete = False
             if len(rows) > 1:
                 duplicate_quote_role_count += len(rows) - 1
                 role_bucket["duplicate"] += len(rows) - 1
                 candidate_complete = False
-            if len(rows) == 1 and rows[0].coverage_status == "ok":
-                role_bucket["usable_ok"] += 1
-                usable_quote_role_count += 1
-            else:
-                candidate_complete = False
+            elif len(rows) == 1:
+                role_bucket["present"] += 1
+                if rows[0].coverage_status in QUOTE_REPLAY_DURABLE_COVERAGE_STATUSES:
+                    durable_quote_role_count += 1
+                    if rows[0].coverage_status == "ok":
+                        role_bucket["usable_ok"] += 1
+                        usable_quote_role_count += 1
+                else:
+                    candidate_complete = False
         if candidate_complete:
             complete_candidates += 1
 
@@ -2682,10 +2716,13 @@ def _quote_completeness_audit(
         "candidate_complete_quote_count": complete_candidates,
         "candidate_incomplete_quote_count": incomplete_candidates,
         "usable_quote_role_count": usable_quote_role_count,
+        "durable_quote_role_count": durable_quote_role_count,
+        "unknown_quote_coverage_status_count": unknown_quote_coverage_status_count,
         "quote_replay_complete": bool(passed_candidates)
         and complete_candidates == len(passed_candidates)
         and missing_quote_role_count == 0
-        and duplicate_quote_role_count == 0,
+        and duplicate_quote_role_count == 0
+        and unknown_quote_coverage_status_count == 0,
     }
 
 
@@ -3140,6 +3177,8 @@ def _path_mode_report_metrics(
             training_status = "blocked_source_provider_errors"
         elif not mode_passed:
             training_status = "blocked_zero_pit_candidates"
+        elif quote_audit["unknown_quote_coverage_status_count"] > 0:
+            training_status = "blocked_quote_replay_integrity"
         elif not quote_audit["quote_replay_complete"]:
             training_status = "blocked_quote_replay_incomplete"
         elif not cost_audit["cost_replay_complete"]:
@@ -3186,6 +3225,16 @@ def _path_mode_report_metrics(
                 )
             ),
             "quote_replay_complete": quote_audit["quote_replay_complete"],
+            "unknown_quote_coverage_status_count": (
+                quote_audit["unknown_quote_coverage_status_count"]
+            ),
+            "quote_ok_count": sum(
+                1 for row in mode_quotes if row.coverage_status == "ok"
+            ),
+            "quote_non_ok_count": sum(
+                1 for row in mode_quotes if row.coverage_status != "ok"
+            ),
+            "quote_usable_ok_count": quote_audit["usable_quote_role_count"],
             "cost_replay_status": (
                 "not_applicable"
                 if mode_not_run or not mode_passed else (
