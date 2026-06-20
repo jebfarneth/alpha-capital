@@ -599,6 +599,7 @@ class I12PitRebuildJob(BaseJob):
                 return JobResult(status="finished", metrics=metrics)
             report = i12_pit_rebuild_report(
                 self._session,
+                output_schema=self._output_schema,
                 source_hur_schema=self._source_hur_schema,
                 hur_rows_loaded=hur_rows_loaded,
                 decision_time_count=len(self._decision_times),
@@ -2759,6 +2760,7 @@ def evaluate_quote_cost_replay(
 def i12_pit_rebuild_report(
     session: Session,
     *,
+    output_schema: str | None = None,
     source_hur_schema: str | None = None,
     hur_rows_loaded: int | None = None,
     decision_time_count: int | None = None,
@@ -3084,7 +3086,12 @@ def i12_pit_rebuild_report(
     ):
         training_status = "blocked_path_mode_comparison_incomplete"
     return {
+        "schema": output_schema,
+        "output_schema": output_schema,
+        "start_date": start_date.isoformat() if start_date is not None else None,
+        "end_date": end_date.isoformat() if end_date is not None else None,
         "report_path_mode": report_path_mode,
+        "minute_path_mode": report_path_mode,
         "compare_path_modes": compare_path_modes,
         "comparison_path_modes": list(requested_path_modes) if compare_path_modes else [],
         "available_path_modes": available_path_modes,
@@ -3096,7 +3103,7 @@ def i12_pit_rebuild_report(
         ),
         "mixed_decision_times_present": mixed_decision_times_present,
         "comparison_conclusions_final": comparison_conclusions_final,
-        "source_hur_schema": source_hur_schema,
+        "source_hur_schema": source_hur_schema or "public",
         "hur_rows_loaded": hur_rows_loaded,
         "zero_hur_source_blocked": zero_hur_source_blocked,
         "decision_time_count": decision_time_count,

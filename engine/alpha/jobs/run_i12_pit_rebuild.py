@@ -127,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.report_only:
             report = i12_pit_rebuild_report(
                 session,
+                output_schema=target_schema,
                 source_hur_schema=args.source_hur_schema,
                 decision_time_count=len(args.decision_time or list(DEFAULT_DECISION_TIMES)),
                 decision_time_labels=args.decision_time or list(DEFAULT_DECISION_TIMES),
