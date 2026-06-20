@@ -7,6 +7,7 @@ MINUTE_PATH_MODE="strict_contiguous"
 DECISION_TIME="09:40"
 SOURCE_HUR_SCHEMA="${SOURCE_HUR_SCHEMA:-public}"
 MAX_NO_PROGRESS_MINUTES="${MAX_NO_PROGRESS_MINUTES:-20}"
+MAX_RESUMES="${MAX_RESUMES:-5}"
 REPLACE_STALE="${REPLACE_STALE:-0}"
 REPLACE_RUNNING="${REPLACE_RUNNING:-0}"
 ONLY_SHARD="${ONLY_SHARD:-}"
@@ -51,6 +52,17 @@ command_has_arg_value() {
   flag="$(regex_escape "$2")"
   value="$(regex_escape "$3")"
   pattern="(^|[[:space:]])${flag}([[:space:]]+|=)${value}($|[[:space:]])"
+  [[ "${normalized_command}" =~ ${pattern} ]]
+}
+
+command_has_arg() {
+  local command="$1"
+  local flag
+  local pattern
+  local normalized_command
+  normalized_command="$(normalize_tmux_pane_start_command "${command}")"
+  flag="$(regex_escape "$2")"
+  pattern="(^|[[:space:]])${flag}($|[[:space:]])"
   [[ "${normalized_command}" =~ ${pattern} ]]
 }
 
@@ -150,18 +162,21 @@ window_running_expected() {
   local start_date="$2"
   local end_date="$3"
   local progress_artifact="$4"
+  local artifact_base
   local pane_dead pane_command pane_start
+  artifact_base="${progress_artifact%.json}"
   while IFS=$'\t' read -r pane_dead pane_command pane_start; do
     [[ "${pane_dead}" == "0" ]] || continue
-    [[ "${pane_command}" == *python* ]] || continue
-    [[ "${pane_start}" == *"alpha.jobs.run_i12_pit_rebuild"* ]] || continue
-    [[ "${pane_start}" == *"--schema"* && "${pane_start}" == *"${SCHEMA}"* ]] || continue
-    [[ "${pane_start}" == *"--start-date"* && "${pane_start}" == *"${start_date}"* ]] || continue
-    [[ "${pane_start}" == *"--end-date"* && "${pane_start}" == *"${end_date}"* ]] || continue
-    [[ "${pane_start}" == *"--decision-time"* && "${pane_start}" == *"${DECISION_TIME}"* ]] || continue
-    [[ "${pane_start}" == *"--minute-path-mode"* && "${pane_start}" == *"${MINUTE_PATH_MODE}"* ]] || continue
-    [[ "${pane_start}" == *"--progress-artifact"* && "${pane_start}" == *"${progress_artifact}"* ]] || continue
+    [[ "${pane_start}" == *"run_i12_pit_shard_supervised.sh"* ]] || continue
+    command_has_arg_value "${pane_start}" "--schema" "${SCHEMA}" || continue
+    command_has_arg_value "${pane_start}" "--source-hur-schema" "${SOURCE_HUR_SCHEMA}" || continue
+    command_has_arg_value "${pane_start}" "--start-date" "${start_date}" || continue
+    command_has_arg_value "${pane_start}" "--end-date" "${end_date}" || continue
+    command_has_arg_value "${pane_start}" "--decision-time" "${DECISION_TIME}" || continue
+    command_has_arg_value "${pane_start}" "--minute-path-mode" "${MINUTE_PATH_MODE}" || continue
+    command_has_arg_value "${pane_start}" "--artifact-base" "${artifact_base}" || continue
     command_has_arg_value "${pane_start}" "--max-no-progress-minutes" "${MAX_NO_PROGRESS_MINUTES}" || continue
+    command_has_arg_value "${pane_start}" "--max-resumes" "${MAX_RESUMES}" || continue
     return 0
   done < <(tmux list-panes -t "${SESSION}:${window}" -F "#{pane_dead}\t#{pane_current_command}\t#{pane_start_command}" 2>/dev/null || true)
   return 1
@@ -224,7 +239,7 @@ for shard in "${SHARDS[@]}"; do
     continue
   fi
   run_cmd=(
-    "${PYTHON_BIN}" -m alpha.jobs.run_i12_pit_rebuild
+    "${SCRIPT_DIR}/run_i12_pit_shard_supervised.sh"
     --schema "${SCHEMA}"
     --source-hur-schema "${SOURCE_HUR_SCHEMA}"
     --start-date "${start_date}"
@@ -236,7 +251,9 @@ for shard in "${SHARDS[@]}"; do
     --max-spread-bps 200
     --max-quote-age-seconds 60
     --max-no-progress-minutes "${MAX_NO_PROGRESS_MINUTES}"
-    --progress-artifact "${progress_artifact}"
+    --max-resumes "${MAX_RESUMES}"
+    --artifact-base "${progress_artifact%.json}"
+    --python-bin "${PYTHON_BIN}"
   )
   cmd="$(worker_shell_command "${run_cmd[@]}")"
   tmux new-window -d -t "${SESSION}" -n "${window}" -c "${ENGINE_DIR}" "${cmd}"
@@ -251,6 +268,7 @@ echo
 echo "summary:"
 echo "matched_shards=${matched_shards} launched_windows=${launched_windows} skipped_running_windows=${skipped_running_windows} replaced_stale_windows=${replaced_stale_windows} replaced_running_windows=${replaced_running_windows}"
 echo "MAX_NO_PROGRESS_MINUTES=${MAX_NO_PROGRESS_MINUTES}"
+echo "MAX_RESUMES=${MAX_RESUMES}"
 echo
 echo "process check:"
 echo "tmux list-panes -a -t ${SESSION} -F '#S:#W #{pane_pid} #{pane_current_command}'"

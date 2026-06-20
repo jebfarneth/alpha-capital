@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -9,9 +10,10 @@ import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy import text
 
 import alpha.jobs.i12_pit_rebuild as i12_pit_rebuild
@@ -2660,8 +2662,13 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "ONLY_SHARD" in text_value
         assert "ONLY_WINDOW" in text_value
         assert "MAX_NO_PROGRESS_MINUTES=\"${MAX_NO_PROGRESS_MINUTES:-20}\"" in text_value
+        assert "MAX_RESUMES=\"${MAX_RESUMES:-5}\"" in text_value
         assert "--max-no-progress-minutes" in text_value
+        assert "run_i12_pit_shard_supervised.sh" in text_value
+        assert "--max-resumes" in text_value
+        assert "--artifact-base" in text_value
         assert '"${MAX_NO_PROGRESS_MINUTES}"' in text_value
+        assert '"${MAX_RESUMES}"' in text_value
         assert "validate_replacement_scope" in text_value
         assert "validate_selector_matches" in text_value
         assert "selector matched zero shards" in text_value
@@ -2674,11 +2681,14 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "shard_selected" in text_value
         assert "REPLACE_RUNNING=1 requires exactly one" in text_value
         assert "window_running_expected" in text_value
+        assert "command_has_arg()" in text_value
         assert "command_has_arg_value" in text_value
         assert "regex_escape" in text_value
         assert "normalize_tmux_pane_start_command" in text_value
         assert "sed -E 's/\\\\+[[:space:]]+/ /g'" in text_value
         assert 'command_has_arg_value "${pane_start}" "--max-no-progress-minutes" "${MAX_NO_PROGRESS_MINUTES}"' in text_value
+        assert 'command_has_arg_value "${pane_start}" "--max-resumes" "${MAX_RESUMES}"' in text_value
+        assert 'command_has_arg_value "${pane_start}" "--artifact-base" "${artifact_base}"' in text_value
         assert 'pane_start}" == *"--max-no-progress-minutes"*' not in text_value
         assert "window already running expected shard" in text_value
         assert "replacing running expected shard window" in text_value
@@ -2689,6 +2699,8 @@ def test_i12_pit_shard_launchers_preflight_once_and_harden_workers():
         assert "pane_current_command" in text_value
         assert "pane_start_command" in text_value
         worker_loop = text_value.rsplit('for shard in "${SHARDS[@]}"; do', 1)[1]
+        assert "run_i12_pit_shard_supervised.sh" in worker_loop
+        assert "-m alpha.jobs.run_i12_pit_rebuild" not in worker_loop
         assert "--create-tables" not in worker_loop
 
 
@@ -2701,57 +2713,312 @@ def test_i12_pit_shard_launcher_no_progress_match_is_exact():
         return bool(pattern.search(normalized))
 
     assert matches_pane_start(
-        "python -m alpha.jobs.run_i12_pit_rebuild --max-no-progress-minutes 20 ",
+        "scripts/run_i12_pit_shard_supervised.sh --max-no-progress-minutes 20 ",
         "20",
     )
     assert matches_pane_start(
-        "python -m alpha.jobs.run_i12_pit_rebuild --max-no-progress-minutes=20 ",
+        "scripts/run_i12_pit_shard_supervised.sh --max-no-progress-minutes=20 ",
         "20",
     )
     assert matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 20\ ",
         "20",
     )
     assert matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes=20\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes=20\ ",
         "20",
     )
     launcher_shaped = (
-        r"exec\ bash\ -lc\ set\ -Eeuo\ pipefail\;\ exec\ .venv/bin/python"
-        r"\\ -m\\ alpha.jobs.run_i12_pit_rebuild"
+        r"exec\ bash\ -lc\ set\ -Eeuo\ pipefail\;\ exec\ scripts/run_i12_pit_shard_supervised.sh"
         r"\\ --schema\\ scratch_i12_pit_m1_0940_strict_20260618"
         r"\\ --start-date\\ 2026-05-01"
         r"\\ --end-date\\ 2026-05-07"
         r"\\ --decision-time\\ 09:40"
         r"\\ --minute-path-mode\\ strict_contiguous"
         r"\\ --max-no-progress-minutes\\ 20"
-        r"\\ --progress-artifact\\ artifacts/stage0/i12_pit_0940_strict_may01_07.json"
+        r"\\ --artifact-base\\ artifacts/stage0/i12_pit_0940_strict_may01_07"
     )
     assert matches_pane_start(launcher_shaped, "20")
     assert not matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 30\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 30\ ",
         "20",
     )
     assert not matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 120\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 120\ ",
         "20",
     )
     assert not matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --start-date\ 2026-05-20\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --start-date\ 2026-05-20\ ",
         "20",
     )
     assert not matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.0\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 20.0\ ",
         "20",
     )
     assert not matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.5\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 20.5\ ",
         "20",
     )
     assert matches_pane_start(
-        r"python\ -m\ alpha.jobs.run_i12_pit_rebuild\ --max-no-progress-minutes\ 20.0\ ",
+        r"scripts/run_i12_pit_shard_supervised.sh\ --max-no-progress-minutes\ 20.0\ ",
         "20.0",
     )
+
+
+def test_i12_pit_shard_launcher_supervisor_match_is_required():
+    def has_flag(command: str, flag: str) -> bool:
+        normalized = re.sub(r"\\+\s+", " ", command)
+        pattern = re.compile(rf"(^|\s){re.escape(flag)}($|\s)")
+        return bool(pattern.search(normalized))
+
+    launcher_shaped = (
+        r"exec\ bash\ -lc\ set\ -Eeuo\ pipefail\;\ exec\ scripts/run_i12_pit_shard_supervised.sh"
+        r"\\ --schema\\ scratch_i12_pit_m1_0940_strict_20260618"
+        r"\\ --start-date\\ 2026-05-01"
+        r"\\ --end-date\\ 2026-05-07"
+        r"\\ --max-no-progress-minutes\\ 20"
+        r"\\ --artifact-base\\ artifacts/stage0/i12_pit_0940_strict_may01_07"
+    )
+    old_pane = (
+        r"exec\ bash\ -lc\ set\ -Eeuo\ pipefail\;\ exec\ .venv/bin/python"
+        r"\\ -m\\ alpha.jobs.run_i12_pit_rebuild"
+        r"\\ --schema\\ scratch_i12_pit_m1_0940_strict_20260618"
+        r"\\ --start-date\\ 2026-05-01"
+        r"\\ --end-date\\ 2026-05-07"
+        r"\\ --max-no-progress-minutes\\ 20"
+        r"\\ --progress-artifact\\ artifacts/stage0/i12_pit_0940_strict_may01_07.json"
+    )
+
+    assert "run_i12_pit_shard_supervised.sh" in re.sub(r"\\+\s+", " ", launcher_shaped)
+    assert "run_i12_pit_shard_supervised.sh" not in re.sub(r"\\+\s+", " ", old_pane)
+    assert has_flag(launcher_shaped, "--artifact-base")
+    assert not has_flag(old_pane, "--artifact-base")
+
+
+def _write_fake_supervised_python(tmp_path: Path, *, mode: str) -> Path:
+    fake_python = tmp_path / "fake_python.py"
+    fake_python.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if "--progress-artifact" not in args:
+    log_path = pathlib.Path(os.environ["CALL_LOG"])
+    with log_path.open("a") as handle:
+        handle.write(json.dumps({{"args": args, "db_check": True}}) + "\\n")
+    if os.environ.get("FAKE_DB_COMPLETED") == "1":
+        raise SystemExit(0)
+    raise SystemExit(1)
+artifact = pathlib.Path(args[args.index("--progress-artifact") + 1])
+start_date = args[args.index("--start-date") + 1]
+log_path = pathlib.Path(os.environ["CALL_LOG"])
+with log_path.open("a") as handle:
+    handle.write(json.dumps({{"args": args, "start_date": start_date}}) + "\\n")
+call_number = sum(1 for _ in log_path.open())
+mode = {mode!r}
+if mode == "finish_first":
+    artifact.write_text(json.dumps({{"event": "finish", "start_date": start_date}}))
+    raise SystemExit(0)
+if mode == "timeout_then_finish" and call_number == 1:
+    artifact.write_text(json.dumps({{
+        "event": "no_progress_timeout",
+        "last_progress_event": "date_finish",
+        "last_progress_payload": {{"last_trading_date": "2024-05-09"}},
+    }}))
+    raise SystemExit(70)
+if mode == "provider_progress_then_finish" and call_number == 1:
+    artifact.write_text(json.dumps({{
+        "event": "no_progress_timeout",
+        "last_progress_event": "provider_fetch_start",
+        "last_progress_payload": {{"trading_date": "2024-05-10"}},
+    }}))
+    raise SystemExit(70)
+if mode == "no_completed_then_finish" and call_number == 1:
+    artifact.write_text(json.dumps({{"event": "no_progress_timeout"}}))
+    raise SystemExit(70)
+if mode == "always_timeout":
+    artifact.write_text(json.dumps({{
+        "event": "no_progress_timeout",
+        "last_progress_event": "date_finish",
+        "last_progress_payload": {{"last_trading_date": "2024-05-09"}},
+    }}))
+    raise SystemExit(70)
+if mode == "generic_failure_with_artifact":
+    artifact.write_text(json.dumps({{"event": "progress_error"}}))
+    raise SystemExit(42)
+if mode == "generic_failure_missing_artifact":
+    raise SystemExit(43)
+artifact.write_text(json.dumps({{"event": "finish", "start_date": start_date}}))
+raise SystemExit(0)
+"""
+    )
+    fake_python.chmod(0o755)
+    return fake_python
+
+
+def _run_supervised_wrapper(
+    tmp_path: Path,
+    fake_python: Path,
+    *,
+    max_resumes: int = 2,
+    database_url: str | None = None,
+    fake_db_completed: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_i12_pit_shard_supervised.sh"
+    env = os.environ.copy()
+    env["CALL_LOG"] = str(tmp_path / "calls.jsonl")
+    if database_url is None:
+        env.pop("DATABASE_URL", None)
+    else:
+        env["DATABASE_URL"] = database_url
+    if fake_db_completed:
+        env["FAKE_DB_COMPLETED"] = "1"
+    return subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--schema",
+            "scratch_i12_pit_test",
+            "--source-hur-schema",
+            "public",
+            "--start-date",
+            "2024-05-01",
+            "--end-date",
+            "2024-05-31",
+            "--decision-time",
+            "09:40",
+            "--minute-path-mode",
+            "strict_contiguous",
+            "--artifact-base",
+            str(tmp_path / "progress"),
+            "--max-resumes",
+            str(max_resumes),
+            "--python-bin",
+            str(fake_python),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _supervised_wrapper_calls(tmp_path: Path) -> list[dict[str, Any]]:
+    log_path = tmp_path / "calls.jsonl"
+    return [json.loads(line) for line in log_path.read_text().splitlines()]
+
+
+def test_i12_pit_supervised_wrapper_resumes_from_last_completed_date(tmp_path):
+    fake_python = _write_fake_supervised_python(tmp_path, mode="timeout_then_finish")
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01", "2024-05-10"]
+    for call in calls:
+        assert "--skip-final-report" in call["args"]
+        assert "--max-no-progress-minutes" in call["args"]
+    assert (tmp_path / "progress_attempt1.json").exists()
+    assert json.loads((tmp_path / "progress_attempt2.json").read_text())["event"] == "finish"
+
+
+def test_i12_pit_supervised_wrapper_ignores_provider_fetch_trading_date(tmp_path):
+    fake_python = _write_fake_supervised_python(
+        tmp_path,
+        mode="provider_progress_then_finish",
+    )
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01", "2024-05-01"]
+
+
+def test_i12_pit_supervised_wrapper_retries_same_start_without_completed_date(tmp_path):
+    fake_python = _write_fake_supervised_python(tmp_path, mode="no_completed_then_finish")
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01", "2024-05-01"]
+
+
+def test_i12_pit_supervised_wrapper_does_not_use_partial_db_completion(tmp_path):
+    fake_python = _write_fake_supervised_python(tmp_path, mode="no_completed_then_finish")
+
+    result = _run_supervised_wrapper(
+        tmp_path,
+        fake_python,
+        database_url="postgresql+psycopg://user:pass@example.invalid/db",
+        fake_db_completed=True,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call.get("db_check", False) for call in calls] == [False, False]
+    assert [call["start_date"] for call in calls] == ["2024-05-01", "2024-05-01"]
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_i12_pit_shard_supervised.sh"
+    ).read_text()
+    assert "db_end_date_completed" not in script
+    assert "max(decision_date)" not in script
+
+
+def test_i12_pit_supervised_wrapper_does_not_retry_generic_nonzero_artifact(tmp_path):
+    fake_python = _write_fake_supervised_python(
+        tmp_path,
+        mode="generic_failure_with_artifact",
+    )
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 42
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01"]
+    assert "non-recoverable" in result.stderr
+
+
+def test_i12_pit_supervised_wrapper_does_not_retry_generic_missing_artifact(tmp_path):
+    fake_python = _write_fake_supervised_python(
+        tmp_path,
+        mode="generic_failure_missing_artifact",
+    )
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 43
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01"]
+    assert "non-recoverable" in result.stderr
+
+
+def test_i12_pit_supervised_wrapper_stops_on_finish(tmp_path):
+    fake_python = _write_fake_supervised_python(tmp_path, mode="finish_first")
+
+    result = _run_supervised_wrapper(tmp_path, fake_python)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01"]
+
+
+def test_i12_pit_supervised_wrapper_caps_resumes(tmp_path):
+    fake_python = _write_fake_supervised_python(tmp_path, mode="always_timeout")
+
+    result = _run_supervised_wrapper(tmp_path, fake_python, max_resumes=1)
+
+    assert result.returncode != 0
+    calls = _supervised_wrapper_calls(tmp_path)
+    assert [call["start_date"] for call in calls] == ["2024-05-01", "2024-05-10"]
 
 
 def test_pit_required_column_preflight_covers_quote_and_cost_tables(monkeypatch):
@@ -4515,6 +4782,159 @@ def test_current_deferred_pit_model_remains_non_promotable(db_session):
     assert "deferred_pit_model" in contract.non_promotable_reasons
 
 
+def test_i12_pit_worker_shard_skips_heavy_final_report(
+    db_session,
+    monkeypatch,
+):
+    _add_hur(db_session, "WORKERSHARD", output_hash="hur-worker-shard")
+
+    def fail_report(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("worker shard should not run final report")
+
+    monkeypatch.setattr(i12_pit_rebuild, "i12_pit_rebuild_report", fail_report)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"WORKERSHARD": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"WORKERSHARD": _polygon_bars()}),
+        alpaca_adapter=FakeAlpaca(_complete_quotes()),
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=True,
+        skip_final_report=True,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert result.status == "finished"
+    assert result.metrics["final_report_skipped"] is True
+    assert result.metrics["training_status"] == "worker_shard_complete_pending_report"
+    assert result.metrics["shard_status"] == "worker_shard_complete_pending_report"
+    assert result.metrics["last_completed_trading_date"] == DAY.isoformat()
+    assert result.metrics["final_partial_metrics"]["progress_metrics_status"] == "ok"
+    candidate = (
+        db_session.query(I12PitCandidate)
+        .filter(I12PitCandidate.ticker == "WORKERSHARD")
+        .one()
+    )
+    assert candidate.candidate_status == "passed"
+    assert db_session.query(I12PitQuoteReplay).filter(
+        I12PitQuoteReplay.i12_pit_candidate_id == candidate.i12_pit_candidate_id,
+        I12PitQuoteReplay.is_active.is_(True),
+    ).count() == 3
+    assert db_session.query(I12PitCostReplay).filter(
+        I12PitCostReplay.i12_pit_candidate_id == candidate.i12_pit_candidate_id,
+        I12PitCostReplay.is_active.is_(True),
+    ).count() == 2
+
+
+def test_i12_pit_normal_mode_still_runs_final_report(db_session, monkeypatch):
+    _add_hur(db_session, "NORMALREPORT", output_hash="hur-normal-report")
+    called = {"report": False}
+
+    def fake_report(*args, **kwargs):
+        del args, kwargs
+        called["report"] = True
+        return {
+            "conclusions_final": True,
+            "training_status": "eligible_for_retrain_evaluation",
+        }
+
+    monkeypatch.setattr(i12_pit_rebuild, "i12_pit_rebuild_report", fake_report)
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=FakeFmpByTicker({"NORMALREPORT": _fmp_bars()}),
+        polygon_adapter=FakePolygonByTicker({"NORMALREPORT": _polygon_bars()}),
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        minute_path_mode="strict_contiguous",
+        quote_replay=False,
+    )
+
+    result = run_job(db_session, job, params={"test": True})
+
+    assert result.ok
+    assert called["report"] is True
+    assert result.metrics["conclusions_final"] is True
+    assert result.metrics["training_status"] == "eligible_for_retrain_evaluation"
+    assert "final_report_skipped" not in result.metrics
+
+
+def test_i12_pit_hur_load_retries_operational_error(db_session, monkeypatch):
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=None,
+        polygon_adapter=None,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        skip_final_report=True,
+    )
+    calls = {"count": 0}
+    progress_events = []
+
+    def flaky_load(trading_date):
+        assert trading_date == DAY
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OperationalError("SELECT hur", {}, RuntimeError("wedged pooler"))
+        return []
+
+    monkeypatch.setattr(job, "_load_hur_rows", flaky_load)
+    monkeypatch.setattr(i12_pit_rebuild.time_module, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        job,
+        "_progress",
+        lambda event, payload: progress_events.append((event, payload)),
+    )
+
+    rows = job._load_hur_rows_with_retry(DAY, job_run_id="hur-retry")
+
+    assert rows == []
+    assert calls["count"] == 2
+    assert progress_events[0][0] == "hur_load_retry"
+    assert progress_events[0][1]["job_run_id"] == "hur-retry"
+    assert progress_events[0][1]["attempt"] == 1
+    assert db_session.in_transaction() is False
+
+
+def test_i12_pit_hur_load_retry_propagates_after_cap(db_session, monkeypatch):
+    job = I12PitRebuildJob(
+        session=db_session,
+        fmp_adapter=None,
+        polygon_adapter=None,
+        alpaca_adapter=None,
+        start_date=DAY,
+        end_date=DAY,
+        decision_times=["09:40"],
+        quote_replay=False,
+        skip_final_report=True,
+    )
+    calls = {"count": 0}
+
+    def always_fail(trading_date):
+        assert trading_date == DAY
+        calls["count"] += 1
+        raise OperationalError("SELECT hur", {}, RuntimeError("wedged pooler"))
+
+    monkeypatch.setattr(job, "_load_hur_rows", always_fail)
+    monkeypatch.setattr(i12_pit_rebuild.time_module, "sleep", lambda seconds: None)
+    monkeypatch.setattr(job, "_progress", lambda event, payload: None)
+
+    with pytest.raises(OperationalError):
+        job._load_hur_rows_with_retry(DAY, job_run_id="hur-fail")
+
+    assert calls["count"] == i12_pit_rebuild.HUR_LOAD_OPERATIONAL_ERROR_RETRIES + 1
+    assert db_session.in_transaction() is False
+
+
 def test_report_only_does_not_require_date_range(monkeypatch, capsys):
     class FakeSession:
         def close(self):
@@ -4546,6 +4966,51 @@ def test_report_only_does_not_require_date_range(monkeypatch, capsys):
     assert captured["compare_path_modes"] is False
     assert captured["decision_time_labels"] == list(run_i12_pit_rebuild.DEFAULT_DECISION_TIMES)
     assert '"report": "ok"' in capsys.readouterr().out
+
+
+def test_runner_wires_skip_final_report(monkeypatch):
+    class FakeSession:
+        def close(self):
+            pass
+
+    class FakeJob:
+        def __init__(self, **kwargs):
+            captured["job_kwargs"] = kwargs
+
+    class FakeResult:
+        ok = True
+        metrics = {"ok": True}
+
+    captured = {}
+    monkeypatch.setattr(run_i12_pit_rebuild, "load_runtime_env", lambda: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "prepare_writable_schema_target", lambda **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild, "open_writable_session", lambda *, schema: FakeSession())
+    monkeypatch.setattr(run_i12_pit_rebuild, "_assert_required_pit_columns", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_i12_pit_rebuild.FmpConfig, "from_env", lambda: object())
+    monkeypatch.setattr(run_i12_pit_rebuild.PolygonConfig, "from_env", lambda: object())
+    monkeypatch.setattr(run_i12_pit_rebuild, "FmpAdapter", lambda config: object())
+    monkeypatch.setattr(run_i12_pit_rebuild, "PolygonAdapter", lambda config: object())
+    monkeypatch.setattr(run_i12_pit_rebuild, "I12PitRebuildJob", FakeJob)
+    monkeypatch.setattr(
+        run_i12_pit_rebuild,
+        "run_job",
+        lambda session, job, params: captured.update({"params": params}) or FakeResult(),
+    )
+
+    code = run_i12_pit_rebuild.main([
+        "--schema",
+        "scratch_worker",
+        "--start-date",
+        DAY.isoformat(),
+        "--end-date",
+        DAY.isoformat(),
+        "--no-quote-replay",
+        "--skip-final-report",
+    ])
+
+    assert code == 0
+    assert captured["job_kwargs"]["skip_final_report"] is True
+    assert captured["params"]["skip_final_report"] is True
 
 
 def test_runner_accepts_optional_no_progress_timeout():

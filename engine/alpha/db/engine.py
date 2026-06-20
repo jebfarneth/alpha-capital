@@ -20,6 +20,7 @@ DEFAULT_POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_POSTGRES_KEEPALIVES_IDLE_SECONDS = 30
 DEFAULT_POSTGRES_KEEPALIVES_INTERVAL_SECONDS = 10
 DEFAULT_POSTGRES_KEEPALIVES_COUNT = 5
+DEFAULT_POSTGRES_TCP_USER_TIMEOUT_MS = 30_000
 DEFAULT_POSTGRES_STATEMENT_TIMEOUT_MS = 300_000
 DEFAULT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 300_000
 
@@ -96,6 +97,12 @@ def _postgres_connect_args(
             os.environ.get(
                 "ALPHA_DB_KEEPALIVES_COUNT",
                 str(DEFAULT_POSTGRES_KEEPALIVES_COUNT),
+            )
+        ),
+        "tcp_user_timeout": int(
+            os.environ.get(
+                "ALPHA_DB_TCP_USER_TIMEOUT_MS",
+                str(DEFAULT_POSTGRES_TCP_USER_TIMEOUT_MS),
             )
         ),
         "options": _postgres_timeout_options(

@@ -178,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             no_progress_exit_callback=(
                 _exit_on_no_progress if args.max_no_progress_minutes > 0 else None
             ),
+            skip_final_report=args.skip_final_report,
         )
         result = run_job(
             session,
@@ -202,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_outstanding_fetch_timeouts": args.max_outstanding_fetch_timeouts,
                 "max_consecutive_fetch_timeouts": args.max_consecutive_fetch_timeouts,
                 "max_no_progress_minutes": args.max_no_progress_minutes,
+                "skip_final_report": args.skip_final_report,
             },
         )
         print(json.dumps(result.metrics or {}, indent=2, sort_keys=True, default=str))
@@ -358,6 +360,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "minutes during normal rebuild runs; 0 disables the shard-level "
             "no-progress monitor. Report-only and preflight-only modes do not "
             "start the monitor."
+        ),
+    )
+    parser.add_argument(
+        "--skip-final-report",
+        action="store_true",
+        help=(
+            "Worker-shard mode: persist rows and write a lightweight finish "
+            "artifact without running the heavy strict final report. Use "
+            "--report-only afterward for conclusions_final/training_status."
         ),
     )
     args = parser.parse_args(argv)

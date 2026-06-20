@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from alpha.data.alpaca import AlpacaAdapter, AlpacaQuote
@@ -88,6 +89,8 @@ DEFAULT_TICKER_PROGRESS_INTERVAL = 250
 DEFAULT_FETCH_DEADLINE_SECONDS = 120.0
 CHILD_CANDIDATE_ID_QUERY_CHUNK_SIZE = 10000
 PROGRESS_METRICS_STATEMENT_TIMEOUT_MS = 15_000
+HUR_LOAD_OPERATIONAL_ERROR_RETRIES = 2
+HUR_LOAD_RETRY_BACKOFF_SECONDS = 1.0
 LEGACY_DAILY_SOURCE_HASHES_FLAG = "i12_pit_legacy_per_date_daily_source_hashes"
 DAILY_SOURCE_HASH_BASIS_LEGACY = "legacy_per_date_raw_payload"
 DAILY_SOURCE_HASH_BASIS_CLEAN_SLICE = "clean_slice_v1"
@@ -241,6 +244,7 @@ class I12PitRebuildJob(BaseJob):
         max_no_progress_seconds: float | None = None,
         no_progress_exit_callback: Callable[[Mapping[str, Any]], None] | None = None,
         progress_session_factory: Callable[[], Session] | None = None,
+        skip_final_report: bool = False,
     ) -> None:
         if fetch_deadline_seconds <= 0:
             raise ValueError("fetch_deadline_seconds must be > 0")
@@ -283,6 +287,7 @@ class I12PitRebuildJob(BaseJob):
         )
         self._no_progress_exit_callback = no_progress_exit_callback
         self._progress_state_lock = threading.Lock()
+        self._skip_final_report = bool(skip_final_report)
         self._last_progress_monotonic = time_module.monotonic()
         self._last_progress_wall_clock_utc = datetime.now(timezone.utc)
         self._last_progress_event = "init"
@@ -321,7 +326,10 @@ class I12PitRebuildJob(BaseJob):
             hur_rows_loaded = 0
             for trading_date in trading_dates:
                 try:
-                    hur_rows = self._load_hur_rows(trading_date)
+                    hur_rows = self._load_hur_rows_with_retry(
+                        trading_date,
+                        job_run_id=ctx.job_run_id,
+                    )
                 except Exception:
                     if self._session.in_transaction():
                         self._session.rollback()
@@ -579,6 +587,16 @@ class I12PitRebuildJob(BaseJob):
                             "progress_error": self.partial_metrics.get("progress_error"),
                         },
                     )
+            if self._skip_final_report:
+                metrics = self._worker_shard_finish_metrics(
+                    counters=counters,
+                    hur_rows_loaded=hur_rows_loaded,
+                    trading_dates=trading_dates,
+                    job_run_id=ctx.job_run_id,
+                )
+                self.partial_metrics = metrics
+                self._progress("finish", metrics)
+                return JobResult(status="finished", metrics=metrics)
             report = i12_pit_rebuild_report(
                 self._session,
                 source_hur_schema=self._source_hur_schema,
@@ -599,6 +617,66 @@ class I12PitRebuildJob(BaseJob):
             return JobResult(status="finished", metrics=metrics)
         finally:
             self._stop_no_progress_monitor()
+
+    def _worker_shard_finish_metrics(
+        self,
+        *,
+        counters: Counter[str],
+        hur_rows_loaded: int,
+        trading_dates: Sequence[date],
+        job_run_id: str | None,
+    ) -> dict[str, Any]:
+        final_partial_metrics = dict(self.partial_metrics or {})
+        last_completed_trading_date = trading_dates[-1] if trading_dates else None
+        return {
+            "job_run_id": job_run_id,
+            "source_hur_schema": self._source_hur_schema,
+            "start_date": self._start_date.isoformat(),
+            "end_date": self._end_date.isoformat(),
+            "decision_time_labels": list(self._decision_times),
+            "decision_time_count": len(self._decision_times),
+            "minute_path_mode": self._minute_path_mode,
+            "hur_rows_loaded": hur_rows_loaded,
+            "last_completed_trading_date": (
+                last_completed_trading_date.isoformat()
+                if last_completed_trading_date else None
+            ),
+            "counters": dict(counters),
+            "fetch_watchdog": self._fetch_watchdog.snapshot(),
+            "final_report_skipped": True,
+            "training_status": "worker_shard_complete_pending_report",
+            "shard_status": "worker_shard_complete_pending_report",
+            "final_partial_metrics": final_partial_metrics,
+        }
+
+    def _load_hur_rows_with_retry(
+        self,
+        trading_date: date,
+        *,
+        job_run_id: str | None,
+    ) -> list[HurSourceRow]:
+        max_attempts = HUR_LOAD_OPERATIONAL_ERROR_RETRIES + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._load_hur_rows(trading_date)
+            except OperationalError as exc:
+                if self._session.in_transaction():
+                    self._session.rollback()
+                if attempt >= max_attempts:
+                    raise
+                self._progress(
+                    "hur_load_retry",
+                    {
+                        "job_run_id": job_run_id,
+                        "trading_date": trading_date.isoformat(),
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                time_module.sleep(HUR_LOAD_RETRY_BACKOFF_SECONDS)
+        raise RuntimeError("unreachable HUR load retry state")
 
     def _fetch_fmp_daily_with_deadline(
         self,

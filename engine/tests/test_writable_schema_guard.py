@@ -34,6 +34,16 @@ from alpha.jobs import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_alpha_db_schema_env_after_test():
+    original = os.environ.get("ALPHA_DB_SCHEMA")
+    yield
+    if original is None:
+        os.environ.pop("ALPHA_DB_SCHEMA", None)
+    else:
+        os.environ["ALPHA_DB_SCHEMA"] = original
+
+
 class _FakeEngine:
     def __init__(self):
         self.disposed = False
@@ -359,6 +369,7 @@ def test_intraday_corpus_runners_preflight_before_open_writable_session(
     )
 
     rc = module.main(argv)
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
     captured = capsys.readouterr()
 
     assert rc == 1
@@ -550,6 +561,7 @@ def test_prepare_writable_schema_target_create_tables_verifies_complete_schema(
         (engines[1], "scratch_ready", tuple(db_engine.Base.metadata.tables.keys()))
     ]
     assert create_engine_calls[0][1]["connect_args"]["connect_timeout"] == 10
+    assert create_engine_calls[0][1]["connect_args"]["tcp_user_timeout"] == 30000
     assert create_engine_calls[0][1]["connect_args"]["options"] == (
         "-cstatement_timeout=300000 "
         "-cidle_in_transaction_session_timeout=300000"
@@ -572,7 +584,25 @@ def test_migration_connect_args_drop_statement_timeouts():
 
     assert kwargs["connect_args"]["connect_timeout"] == 10
     assert kwargs["connect_args"]["keepalives"] == 1
+    assert kwargs["connect_args"]["tcp_user_timeout"] == 30000
     assert kwargs["connect_args"]["options"] == "-csearch_path=scratch_migrations"
+
+
+def test_postgres_connect_args_tcp_user_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("ALPHA_DB_TCP_USER_TIMEOUT_MS", "0")
+
+    kwargs = schema_connect_args(
+        "postgresql+psycopg://user:pass@example.com/db",
+        "scratch_tcp_timeout",
+    )
+
+    assert kwargs["connect_args"]["tcp_user_timeout"] == 0
+
+
+def test_sqlite_connect_args_do_not_include_tcp_user_timeout(monkeypatch):
+    monkeypatch.setenv("ALPHA_DB_TCP_USER_TIMEOUT_MS", "0")
+
+    assert schema_connect_args("sqlite:///alpha.db") == {}
 
 
 def test_prepare_writable_schema_target_create_tables_uses_required_subset(
@@ -773,6 +803,7 @@ def test_market_path_schema_preflight_does_not_require_m3_tables(monkeypatch, ca
         "--through-date",
         "2026-06-05",
     ])
+    monkeypatch.delenv("ALPHA_DB_SCHEMA", raising=False)
     out = capsys.readouterr().out
 
     assert rc == 1

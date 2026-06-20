@@ -20,6 +20,7 @@ Each worker also runs the PIT runner's no-progress watchdog:
 
 ```bash
 MAX_NO_PROGRESS_MINUTES=20
+MAX_RESUMES=5
 ```
 
 The runner default is 20 minutes for normal rebuild runs, and these launchers
@@ -31,9 +32,30 @@ only when you have a reason to tolerate longer provider stalls:
 MAX_NO_PROGRESS_MINUTES=30 scripts/run_i12_pit_0940_strict_shards.sh
 ```
 
+Workers are launched through `scripts/run_i12_pit_shard_supervised.sh`. If the
+runner records `no_progress_timeout`, or exits with the explicit no-progress
+code before writing a complete artifact, the wrapper reads the attempt progress
+artifact and restarts the shard from the day after the last completed trading
+date, up to `MAX_RESUMES`. Generic nonzero worker failures are not retried.
+Attempt artifacts are written as `<artifact_base>_attemptN.json`. The wrapper
+only advances from artifact fields that explicitly mean a date completed;
+provider-fetch and ticker-progress timestamps are not treated as completed
+dates.
+
+Postgres connections also set `tcp_user_timeout` by default so a pooler socket
+wedged mid-write fails quickly instead of waiting for the kernel's long TCP
+retransmit window:
+
+```bash
+ALPHA_DB_TCP_USER_TIMEOUT_MS=30000
+```
+
+Set `ALPHA_DB_TCP_USER_TIMEOUT_MS=0` only when you intentionally want the
+system/libpq default.
+
 Existing tmux panes do not inherit new defaults or launcher matching rules. Kill
 or relaunch old panes after pulling this code if they were started before the
-no-progress monitor was added.
+no-progress monitor, supervised wrapper, or TCP timeout was added.
 
 Strict:
 
@@ -48,11 +70,25 @@ scripts/run_i12_pit_0940_sparse_shards.sh
 ```
 
 Both scripts reuse their tmux session if it already exists. They only skip an
-existing shard window when that pane is actively running the expected Python
-command for the same schema, date range, path mode, progress artifact, and
-exact `--max-no-progress-minutes` value. Old panes launched without the monitor,
-or with a different monitor timeout, are treated as stale/unexpected. A stale
-shell/dead/unexpected window is a hard error by default.
+existing shard window when that pane is actively running the expected supervised
+wrapper command for the same schema, date range, path mode, artifact base,
+resume cap, and exact `--max-no-progress-minutes` value. Old direct Python
+panes are treated as stale/unexpected. A stale shell/dead/unexpected window is a
+hard error by default.
+
+Worker shard finish artifacts are not final research verdicts. They skip the
+heavy strict report and finish with:
+
+```json
+{
+  "final_report_skipped": true,
+  "training_status": "worker_shard_complete_pending_report"
+}
+```
+
+Use `--report-only` after all shard ranges are complete. The report-only output
+is the source of `conclusions_final`, `data_integrity_passed`, and the final
+`training_status`.
 
 After manually confirming a stale or unexpected window is safe to replace:
 
@@ -169,6 +205,7 @@ one-day range after the schema already exists. Example for 2026-05-08:
   --intended-order-usd 250 \
   --max-spread-bps 200 \
   --max-quote-age-seconds 60 \
+  --skip-final-report \
   --progress-artifact artifacts/stage0/i12_pit_0940_strict_resume_2026-05-08.json
 ```
 
@@ -192,6 +229,7 @@ for range in 2026-05-08:2026-05-14 2026-05-15:2026-05-21 2026-06-01:2026-06-05; 
     --intended-order-usd 250 \
     --max-spread-bps 200 \
     --max-quote-age-seconds 60 \
+    --skip-final-report \
     --progress-artifact "artifacts/stage0/i12_pit_0940_strict_resume_${safe_start}_${safe_end}.json"
 done
 ```

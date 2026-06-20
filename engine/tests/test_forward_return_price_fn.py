@@ -4548,6 +4548,7 @@ def test_postgres_schema_connect_args_sets_scratch_search_path():
             "keepalives_idle": 30,
             "keepalives_interval": 10,
             "keepalives_count": 5,
+            "tcp_user_timeout": 30000,
             "options": (
                 "-csearch_path=scratch_codex_m4_pricefn_audit_test "
                 "-cstatement_timeout=300000 "
