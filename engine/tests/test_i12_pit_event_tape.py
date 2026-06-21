@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 LEFT_SCHEMA = "scratch_i12_tape_left"
 RIGHT_SCHEMA = "scratch_i12_tape_right"
+THIRD_SCHEMA = "scratch_i12_tape_third"
 DAY = "2026-05-01"
 
 
@@ -443,6 +444,55 @@ def _build(db_session, **kwargs):
     )
 
 
+def _seed_three_snapshot_fixture(db_session) -> None:
+    for schema in (LEFT_SCHEMA, RIGHT_SCHEMA, THIRD_SCHEMA):
+        _create_schema_tables(db_session, schema)
+
+    rows = (
+        (LEFT_SCHEMA, "09:35", "aaa-0935", "AAA", "passed", None),
+        (RIGHT_SCHEMA, "09:40", "aaa-0940", "AAA", "passed", None),
+        (THIRD_SCHEMA, "09:45", "aaa-0945", "AAA", "passed", None),
+        (LEFT_SCHEMA, "09:35", "bbb-0935", "BBB", "passed", None),
+        (RIGHT_SCHEMA, "09:40", "bbb-0940", "BBB", "failed", "projected_volume_ratio"),
+        (THIRD_SCHEMA, "09:45", "bbb-0945", "BBB", "passed", None),
+        (LEFT_SCHEMA, "09:35", "ccc-0935", "CCC", "failed", "drawdown"),
+        (RIGHT_SCHEMA, "09:40", "ccc-0940", "CCC", "failed", "drawdown"),
+        (THIRD_SCHEMA, "09:45", "ccc-0945", "CCC", "passed", None),
+        (LEFT_SCHEMA, "09:35", "ddd-0935", "DDD", "failed", "drawdown"),
+        (RIGHT_SCHEMA, "09:40", "ddd-0940", "DDD", "failed", "drawdown"),
+        (THIRD_SCHEMA, "09:45", "ddd-0945", "DDD", "failed", "drawdown"),
+    )
+    for schema, decision_time, candidate_id, ticker, status, fail_reason in rows:
+        _insert_candidate(
+            db_session,
+            schema,
+            candidate_id,
+            ticker,
+            decision_time=decision_time,
+            status=status,
+            fail_reason=fail_reason,
+        )
+        if status == "passed":
+            _insert_complete_evidence(db_session, schema, candidate_id, ret=0.01)
+    db_session.flush()
+
+
+def _build_three(db_session, **kwargs):
+    tape = _load_tape()
+    return tape.build_event_tape(
+        snapshots=[
+            tape.SnapshotSpec("09:35", LEFT_SCHEMA),
+            tape.SnapshotSpec("09:40", RIGHT_SCHEMA),
+            tape.SnapshotSpec("09:45", THIRD_SCHEMA),
+        ],
+        start_date=DAY,
+        end_date=DAY,
+        minute_path_mode="strict_contiguous",
+        db_session=db_session,
+        **kwargs,
+    )
+
+
 def _final_report(schema: str, label: str) -> dict:
     return {
         "conclusions_final": True,
@@ -506,6 +556,48 @@ def test_event_tape_rejects_duplicate_snapshot_labels_before_db_work():
                 tape.SnapshotSpec("09:35", "scratch_i12_tape_a"),
                 tape.SnapshotSpec("09:35", "scratch_i12_tape_b"),
             ],
+            start_date=DAY,
+            end_date=DAY,
+            minute_path_mode="strict_contiguous",
+        )
+
+
+def test_event_tape_accepts_chronological_snapshot_order_before_db_work():
+    tape = _load_tape()
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        tape.build_event_tape(
+            snapshots=[
+                tape.SnapshotSpec("09:35", "scratch_i12_tape_a"),
+                tape.SnapshotSpec("09:40", "scratch_i12_tape_b"),
+                tape.SnapshotSpec("09:45", "scratch_i12_tape_c"),
+            ],
+            start_date=DAY,
+            end_date=DAY,
+            minute_path_mode="strict_contiguous",
+        )
+
+
+def test_event_tape_rejects_non_chronological_snapshot_order_before_db_work():
+    tape = _load_tape()
+    with pytest.raises(ValueError, match="chronological order.*09:45, 09:35, 09:40"):
+        tape.build_event_tape(
+            snapshots=[
+                tape.SnapshotSpec("09:45", "scratch_i12_tape_c"),
+                tape.SnapshotSpec("09:35", "scratch_i12_tape_a"),
+                tape.SnapshotSpec("09:40", "scratch_i12_tape_b"),
+            ],
+            start_date=DAY,
+            end_date=DAY,
+            minute_path_mode="strict_contiguous",
+        )
+
+
+@pytest.mark.parametrize("bad_label", ["24:00", "29:59"])
+def test_event_tape_rejects_invalid_decision_time_label(bad_label):
+    tape = _load_tape()
+    with pytest.raises(ValueError, match="decision time must be HH:MM"):
+        tape.build_event_tape(
+            snapshots=[tape.SnapshotSpec(bad_label, "scratch_i12_tape_bad")],
             start_date=DAY,
             end_date=DAY,
             minute_path_mode="strict_contiguous",
@@ -680,6 +772,105 @@ def test_event_tape_membership_fields(db_session):
     assert rows[("AAA", "09:35")]["survived_to_later_snapshot"] is True
     assert rows[("BBB", "09:35")]["dropped_by_later_snapshot"] is True
     assert rows[("CCC", "09:40")]["first_passed_decision_time"] == "09:40"
+
+
+def test_event_tape_three_snapshot_exact_fire_patterns_and_buckets(db_session):
+    _seed_three_snapshot_fixture(db_session)
+    result = _build_three(db_session)
+    summary = result["summary"]
+    rows = {(row["ticker"], row["decision_time_label"]): row for row in result["events"]}
+
+    assert summary["row_count"] == 6
+    assert "passed_multiple_snapshots" not in summary["bucket_counts"]
+    assert summary["bucket_counts"] == {
+        "only_0945": 1,
+        "pattern_0935_0940_0945": 1,
+        "pattern_0935_0945": 1,
+    }
+    assert summary["fire_pattern_counts"] == {
+        "09:35->09:40->09:45": 1,
+        "09:35->09:45": 1,
+        "09:45": 1,
+    }
+    assert summary["source_pattern_counts"] == {"09:35->09:40->09:45": 3}
+
+    assert rows[("AAA", "09:35")]["bucket"] == "pattern_0935_0940_0945"
+    assert rows[("AAA", "09:35")]["fire_pattern"] == "09:35->09:40->09:45"
+    assert rows[("AAA", "09:35")]["fire_pattern_key"] == "p_0935_0940_0945"
+    assert rows[("AAA", "09:35")]["source_pattern_key"] == "s_0935_0940_0945"
+    assert rows[("AAA", "09:35")]["survived_to_next_snapshot"] is True
+    assert rows[("AAA", "09:40")]["survived_to_next_snapshot"] is True
+
+    assert rows[("BBB", "09:35")]["bucket"] == "pattern_0935_0945"
+    assert rows[("BBB", "09:35")]["fire_pattern"] == "09:35->09:45"
+    assert rows[("BBB", "09:35")]["dropped_at_next_snapshot"] is True
+    assert rows[("BBB", "09:35")]["next_snapshot_label"] == "09:40"
+    assert rows[("BBB", "09:35")]["next_snapshot_candidate_status"] == "failed"
+    assert rows[("BBB", "09:35")]["reentered_after_drop"] is True
+    assert rows[("BBB", "09:45")]["reentered_after_drop"] is True
+
+    assert rows[("CCC", "09:45")]["bucket"] == "only_0945"
+    assert rows[("CCC", "09:45")]["source_pattern"] == "09:35->09:40->09:45"
+    assert rows[("CCC", "09:45")]["fire_pattern"] == "09:45"
+
+
+def test_event_tape_three_snapshot_generic_summary(db_session):
+    _seed_three_snapshot_fixture(db_session)
+    summary = _build_three(db_session)["summary"]["multi_snapshot_summary"]
+
+    assert summary["transition_matrix_scope"] == "emitted_ever_fired_ticker_date_identities"
+    assert summary["transition_identity_count"] == 3
+    assert summary["fire_pattern_counts"] == {
+        "09:35->09:40->09:45": 1,
+        "09:35->09:45": 1,
+        "09:45": 1,
+    }
+    assert summary["return_by_fire_pattern_decision_time"][
+        "same_day_volume_participation"
+    ]["09:35->09:40->09:45"]["09:35"]["count"] == 1
+    assert summary["return_by_fire_pattern_decision_time"][
+        "same_day_volume_participation"
+    ]["09:35->09:45"]["09:45"]["count"] == 1
+    assert summary["liquidity_by_fire_pattern_decision_time"][
+        "entry_spread_bps"
+    ]["09:35->09:40->09:45"]["09:40"]["count"] == 1
+    assert summary["adjacent_transition_matrix"]["09:35->09:40"] == {
+        "pass_to_pass": 1,
+        "pass_to_fail": 1,
+        "fail_to_pass": 0,
+        "fail_to_fail": 1,
+        "present_to_missing": 0,
+        "missing_to_present": 0,
+        "missing_to_missing": 0,
+    }
+    assert summary["adjacent_transition_matrix"]["09:40->09:45"] == {
+        "pass_to_pass": 1,
+        "pass_to_fail": 0,
+        "fail_to_pass": 2,
+        "fail_to_fail": 0,
+        "present_to_missing": 0,
+        "missing_to_present": 0,
+        "missing_to_missing": 0,
+    }
+    assert summary["adjacent_timing_deltas"]["09:35->09:40"]["pair_count"] == 1
+    assert summary["adjacent_timing_deltas"]["09:40->09:45"]["pair_count"] == 1
+
+
+def test_event_tape_three_snapshot_all_source_failed_all_bucket(db_session):
+    _seed_three_snapshot_fixture(db_session)
+    result = _build_three(db_session, scope="all-source-attempts")
+    rows = {(row["ticker"], row["decision_time_label"]): row for row in result["events"]}
+
+    assert result["summary"]["bucket_counts"]["failed_all"] == 1
+    assert result["summary"]["fire_pattern_counts"]["none"] == 1
+    assert (
+        result["summary"]["multi_snapshot_summary"]["transition_matrix_scope"]
+        == "source_attempt_ticker_date_identities"
+    )
+    assert result["summary"]["multi_snapshot_summary"]["transition_identity_count"] == 4
+    assert rows[("DDD", "09:35")]["bucket"] == "failed_all"
+    assert rows[("DDD", "09:35")]["fire_pattern"] == "none"
+    assert rows[("DDD", "09:35")]["source_pattern"] == "09:35->09:40->09:45"
 
 
 def test_event_tape_passed_scope_uses_real_source_presence_for_earlier_failed_row(db_session):

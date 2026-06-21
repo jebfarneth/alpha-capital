@@ -260,6 +260,15 @@ def _validate_snapshot_set(snapshots: Sequence[SnapshotSpec]) -> None:
     duplicate_labels = sorted(label for label, count in Counter(labels).items() if count > 1)
     if duplicate_labels:
         raise ValueError(f"duplicate snapshot decision-time labels are ambiguous: {', '.join(duplicate_labels)}")
+    label_minutes = [_decision_time_minutes(label) for label in labels]
+    if any(
+        current >= following
+        for current, following in zip(label_minutes, label_minutes[1:])
+    ):
+        raise ValueError(
+            "snapshots must be passed in chronological order with strictly "
+            f"increasing decision-time labels; received order: {', '.join(labels)}"
+        )
     schemas = [snapshot.schema for snapshot in snapshots]
     duplicate_schemas = sorted(schema for schema, count in Counter(schemas).items() if count > 1)
     if duplicate_schemas:
@@ -270,6 +279,11 @@ def _validate_snapshot_set(snapshots: Sequence[SnapshotSpec]) -> None:
     )
     if duplicate_specs:
         raise ValueError(f"duplicate snapshot specs are ambiguous: {', '.join(duplicate_specs)}")
+
+
+def _decision_time_minutes(label: str) -> int:
+    hour, minute = str(label).split(":", 1)
+    return int(hour) * 60 + int(minute)
 
 
 def _preflight_event_row_guard(
@@ -1077,8 +1091,21 @@ def _annotate_membership(rows: list[dict[str, Any]], snapshot_labels: Sequence[s
         first_fire = passed[0] if passed else None
         last_fire = passed[-1] if passed else None
         bucket = _bucket_for_membership(snapshot_labels, present, passed)
+        fire_pattern = _pattern_label(passed)
+        source_pattern = _pattern_label(present)
+        fire_pattern_key = _pattern_key(passed, prefix="p")
+        source_pattern_key = _pattern_key(present, prefix="s")
+        reentered = _reentered_after_drop(snapshot_labels, source_status)
         for row in group_rows:
             label = str(row["decision_time_label"])
+            label_index = order.get(label)
+            next_label = (
+                snapshot_labels[label_index + 1]
+                if label_index is not None and label_index + 1 < len(snapshot_labels)
+                else None
+            )
+            next_source_present = bool(source_presence.get(next_label)) if next_label else None
+            next_candidate_status = source_status.get(next_label) if next_label else None
             later_present = any(order.get(item, 999) > order.get(label, 999) for item in present)
             later_passed = any(order.get(item, 999) > order.get(label, 999) for item in passed)
             later_snapshot_exists = any(order.get(item, 999) > order.get(label, 999) for item in snapshot_labels)
@@ -1095,12 +1122,28 @@ def _annotate_membership(rows: list[dict[str, Any]], snapshot_labels: Sequence[s
                     "last_fire_decision_time": last_fire,
                     "present_decision_times": present,
                     "passed_decision_times": passed,
+                    "fire_pattern": fire_pattern,
+                    "fire_pattern_key": fire_pattern_key,
+                    "source_pattern": source_pattern,
+                    "source_pattern_key": source_pattern_key,
                     "bucket": bucket,
                     "bucket_tags": [bucket],
                     "present_count": len(present),
                     "passed_count": len(passed),
                     "first_passed_decision_time": first_fire,
                     "last_passed_decision_time": last_fire,
+                    "next_snapshot_label": next_label,
+                    "next_snapshot_source_present": next_source_present,
+                    "next_snapshot_candidate_status": next_candidate_status,
+                    "survived_to_next_snapshot": bool(
+                        row.get("is_passed") and next_candidate_status == "passed"
+                    ),
+                    "dropped_at_next_snapshot": bool(
+                        row.get("is_passed")
+                        and next_label is not None
+                        and next_candidate_status != "passed"
+                    ),
+                    "reentered_after_drop": reentered,
                     "survived_to_later_snapshot": bool(row.get("is_passed") and later_passed),
                     "dropped_by_later_snapshot": bool(row.get("is_passed") and dropped_basis and not later_passed),
                 }
@@ -1128,10 +1171,43 @@ def _bucket_for_membership(
             return "failed_both"
         return "nonpassed_seen"
     if len(passed) > 1:
-        return "passed_multiple_snapshots"
+        return f"pattern_{'_'.join(_label_tag(label) for label in passed)}"
     if len(passed) == 1:
-        return f"only_{passed[0].replace(':', '')}"
-    return "nonpassed_seen"
+        return f"only_{_label_tag(passed[0])}"
+    if present:
+        return "failed_all"
+    return "missing_all"
+
+
+def _pattern_label(labels: Sequence[str]) -> str:
+    return "->".join(labels) if labels else "none"
+
+
+def _pattern_key(labels: Sequence[str], *, prefix: str) -> str:
+    if not labels:
+        return f"{prefix}_none"
+    return f"{prefix}_{'_'.join(_label_tag(label) for label in labels)}"
+
+
+def _label_tag(label: str) -> str:
+    return str(label).replace(":", "")
+
+
+def _reentered_after_drop(
+    snapshot_labels: Sequence[str],
+    source_status: Mapping[str, Any],
+) -> bool:
+    seen_pass = False
+    seen_gap_after_pass = False
+    for label in snapshot_labels:
+        passed = source_status.get(label) == "passed"
+        if passed and seen_gap_after_pass:
+            return True
+        if passed:
+            seen_pass = True
+        elif seen_pass:
+            seen_gap_after_pass = True
+    return False
 
 
 def _summary(
@@ -1152,9 +1228,16 @@ def _summary(
         str(row["decision_time_label"]) for row in rows if row.get("is_passed")
     )
     bucket_by_key: dict[tuple[Any, Any, Any], str] = {}
+    fire_pattern_by_key: dict[tuple[Any, Any, Any], str] = {}
+    source_pattern_by_key: dict[tuple[Any, Any, Any], str] = {}
     for row in rows:
-        bucket_by_key[(row.get("ticker"), row.get("decision_date"), row.get("path_mode"))] = str(row.get("bucket"))
+        key = (row.get("ticker"), row.get("decision_date"), row.get("path_mode"))
+        bucket_by_key[key] = str(row.get("bucket"))
+        fire_pattern_by_key[key] = str(row.get("fire_pattern") or "none")
+        source_pattern_by_key[key] = str(row.get("source_pattern") or "none")
     bucket_counts = Counter(bucket_by_key.values())
+    fire_pattern_counts = Counter(fire_pattern_by_key.values())
+    source_pattern_counts = Counter(source_pattern_by_key.values())
     predictor_blocked = sum(1 for row in rows if row.get("predictor_status") != "ok")
     predictor_missing_counts = {
         field: sum(1 for row in rows if _mapping(row.get("predictors")).get(field) is None)
@@ -1197,6 +1280,8 @@ def _summary(
         "unique_ticker_date_count": len(ticker_dates),
         "passed_count_by_decision_time": dict(passed_by_time),
         "bucket_counts": dict(bucket_counts),
+        "fire_pattern_counts": dict(sorted(fire_pattern_counts.items())),
+        "source_pattern_counts": dict(sorted(source_pattern_counts.items())),
         "missing_quote_role_count": missing_quote_count,
         "missing_cost_role_count": missing_cost_count,
         "predictor_blocked_count": predictor_blocked,
@@ -1219,6 +1304,13 @@ def _summary(
             else "diagnostic_not_training_ready"
         ),
     }
+    summary["multi_snapshot_summary"] = _multi_snapshot_summary(
+        rows,
+        snapshot_labels=[snapshot.label for snapshot in snapshots],
+        fire_pattern_counts=fire_pattern_counts,
+        source_pattern_counts=source_pattern_counts,
+        scope=scope,
+    )
     if len(snapshots) == 2:
         left, right = snapshots
         shared_key = f"shared_{left.label.replace(':', '')}_{right.label.replace(':', '')}"
@@ -1269,6 +1361,63 @@ def _summary(
     return summary
 
 
+def _multi_snapshot_summary(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    snapshot_labels: Sequence[str],
+    fire_pattern_counts: Counter[str],
+    source_pattern_counts: Counter[str],
+    scope: str,
+) -> dict[str, Any]:
+    identity_count = len(_rows_by_identity(rows))
+    return {
+        "fire_pattern_counts": dict(sorted(fire_pattern_counts.items())),
+        "source_pattern_counts": dict(sorted(source_pattern_counts.items())),
+        "transition_matrix_scope": (
+            "emitted_ever_fired_ticker_date_identities"
+            if scope == "passed"
+            else "source_attempt_ticker_date_identities"
+        ),
+        "transition_identity_count": identity_count,
+        "return_by_fire_pattern_decision_time": {
+            "same_day_volume_participation": _metric_summary_by_fire_pattern_decision_time(
+                rows, "same_day_modeled_return_volume_participation"
+            ),
+            "next_open_volume_participation": _metric_summary_by_fire_pattern_decision_time(
+                rows, "next_open_modeled_return_volume_participation"
+            ),
+            "diagnostic_displayed_size_same_day": _metric_summary_by_fire_pattern_decision_time(
+                rows, "same_day_modeled_return_displayed_size"
+            ),
+            "diagnostic_displayed_size_next_open": _metric_summary_by_fire_pattern_decision_time(
+                rows, "next_open_modeled_return_displayed_size"
+            ),
+        },
+        "liquidity_by_fire_pattern_decision_time": {
+            "entry_spread_bps": _metric_summary_by_fire_pattern_decision_time(
+                rows, "entry_spread_bps"
+            ),
+            "entry_executable_notional": _metric_summary_by_fire_pattern_decision_time(
+                rows, "entry_executable_notional"
+            ),
+            "entry_window_dollar_volume": _metric_summary_by_fire_pattern_decision_time(
+                rows, "entry_window_dollar_volume"
+            ),
+            "intended_order_participation_rate": _metric_summary_by_fire_pattern_decision_time(
+                rows, "intended_order_participation_rate"
+            ),
+        },
+        "adjacent_transition_matrix": _adjacent_transition_matrix(
+            rows,
+            snapshot_labels=snapshot_labels,
+        ),
+        "adjacent_timing_deltas": _adjacent_timing_deltas(
+            rows,
+            snapshot_labels=snapshot_labels,
+        ),
+    }
+
+
 def _metric_summary_by_bucket_decision_time(rows: Sequence[Mapping[str, Any]], field: str) -> dict[str, Any]:
     values: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
@@ -1294,9 +1443,7 @@ def _metric_summary_by_fire_pattern_decision_time(rows: Sequence[Mapping[str, An
         value = _float_or_none(row.get(field))
         if value is None:
             continue
-        pattern = "->".join(str(item) for item in row.get("passed_decision_times") or [])
-        if not pattern:
-            pattern = "nonpassed"
+        pattern = str(row.get("fire_pattern") or "none")
         values[pattern][str(row.get("decision_time_label"))].append(value)
     return {
         pattern: {
@@ -1305,6 +1452,111 @@ def _metric_summary_by_fire_pattern_decision_time(rows: Sequence[Mapping[str, An
         }
         for pattern, decision_values in sorted(values.items())
     }
+
+
+def _adjacent_transition_matrix(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    snapshot_labels: Sequence[str],
+) -> dict[str, dict[str, int]]:
+    grouped = _rows_by_identity(rows)
+    matrix: dict[str, Counter[str]] = {
+        f"{left}->{right}": Counter()
+        for left, right in zip(snapshot_labels, snapshot_labels[1:])
+    }
+    for group_rows in grouped.values():
+        representative = group_rows[0]
+        presence = _mapping(representative.get("source_presence_by_decision_time"))
+        statuses = _mapping(representative.get("source_candidate_status_by_decision_time"))
+        for left, right in zip(snapshot_labels, snapshot_labels[1:]):
+            key = f"{left}->{right}"
+            left_present = bool(presence.get(left))
+            right_present = bool(presence.get(right))
+            if left_present and not right_present:
+                matrix[key]["present_to_missing"] += 1
+                continue
+            if not left_present and right_present:
+                matrix[key]["missing_to_present"] += 1
+                continue
+            if not left_present and not right_present:
+                matrix[key]["missing_to_missing"] += 1
+                continue
+            left_passed = statuses.get(left) == "passed"
+            right_passed = statuses.get(right) == "passed"
+            if left_passed and right_passed:
+                matrix[key]["pass_to_pass"] += 1
+            elif left_passed and not right_passed:
+                matrix[key]["pass_to_fail"] += 1
+            elif not left_passed and right_passed:
+                matrix[key]["fail_to_pass"] += 1
+            else:
+                matrix[key]["fail_to_fail"] += 1
+    return {
+        key: {
+            count_key: counts.get(count_key, 0)
+            for count_key in (
+                "pass_to_pass",
+                "pass_to_fail",
+                "fail_to_pass",
+                "fail_to_fail",
+                "present_to_missing",
+                "missing_to_present",
+                "missing_to_missing",
+            )
+        }
+        for key, counts in matrix.items()
+    }
+
+
+def _adjacent_timing_deltas(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    snapshot_labels: Sequence[str],
+) -> dict[str, Any]:
+    fields = (
+        "entry_spread_bps",
+        "entry_executable_notional",
+        "entry_window_dollar_volume",
+        "intended_order_participation_rate",
+        "same_day_modeled_return_volume_participation",
+        "next_open_modeled_return_volume_participation",
+    )
+    grouped = _rows_by_identity(rows)
+    output: dict[str, Any] = {}
+    for left_label, right_label in zip(snapshot_labels, snapshot_labels[1:]):
+        pair_key = f"{left_label}->{right_label}"
+        deltas: dict[str, list[float]] = {field: [] for field in fields}
+        pair_count = 0
+        for group_rows in grouped.values():
+            by_label = {
+                str(row.get("decision_time_label")): row
+                for row in group_rows
+                if row.get("is_passed")
+            }
+            left = by_label.get(left_label)
+            right = by_label.get(right_label)
+            if left is None or right is None:
+                continue
+            pair_count += 1
+            for field in fields:
+                left_value = _float_or_none(left.get(field))
+                right_value = _float_or_none(right.get(field))
+                if left_value is not None and right_value is not None:
+                    deltas[field].append(right_value - left_value)
+        output[pair_key] = {
+            "pair_count": pair_count,
+            **{field: _numeric_summary(values) for field, values in deltas.items()},
+        }
+    return output
+
+
+def _rows_by_identity(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[tuple[Any, Any, Any], list[Mapping[str, Any]]]:
+    grouped: dict[tuple[Any, Any, Any], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row.get("ticker"), row.get("decision_date"), row.get("path_mode"))].append(row)
+    return grouped
 
 
 def _volume_tradeability_status_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:

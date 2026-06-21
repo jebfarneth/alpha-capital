@@ -1317,7 +1317,7 @@ def _validate_scratch_schema(value: str, *, side: str = "schema") -> str:
 
 
 def _validate_decision_time(value: str) -> str:
-    if not re.fullmatch(r"[0-2][0-9]:[0-5][0-9]", str(value or "")):
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value or "")):
         raise ValueError(f"decision time must be HH:MM, got {value!r}")
     return str(value)
 
