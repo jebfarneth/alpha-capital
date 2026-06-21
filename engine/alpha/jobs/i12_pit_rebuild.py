@@ -23,7 +23,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -79,6 +79,12 @@ DEFAULT_QUOTE_WINDOW_AFTER_SECONDS = 5.0
 DEFAULT_MAX_SPREAD_BPS = 200.0
 DEFAULT_INTENDED_ORDER_USD = 250.0
 DEFAULT_SLIPPAGE_BPS = 0.0
+DEFAULT_VOLUME_PARTICIPATION_THRESHOLD = 0.05
+VOLUME_PARTICIPATION_THRESHOLDS = (0.01, 0.025, 0.05, 0.10)
+VOLUME_TRADEABILITY_OK_STATUS = "tradeable_volume"
+VOLUME_TRADEABILITY_SKIP_STATUS = "skipped_cash"
+VOLUME_WINDOW_BASIS_PRE_DECISION = "pre_decision_completed_minutes"
+VOLUME_PRICE_BASIS_LAST_PRE_DECISION = "last_predecision_price_proxy"
 SAME_DAY_EXIT_TIME = time(15, 55)
 NEXT_OPEN_EXIT_OFFSET_MINUTES = 1
 MIN_PRIOR_DAILY_SESSIONS = 20
@@ -154,6 +160,22 @@ class HurSourceRow:
     trading_date: date
     source_hur_identity_hash: str
     source_hur_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ReportCandidateAggregates:
+    active_count: int
+    active_decision_time_labels: list[str]
+    candidate_status_counts: dict[str, int]
+    candidate_coverage_status_counts: dict[str, int]
+    candidate_counts_by_path_mode: dict[str, int]
+    coverage_status_by_path_mode: dict[str, dict[str, int]]
+    candidate_status_counts_by_path_mode: dict[str, dict[str, int]]
+    daily_source_hash_basis_counts: dict[str, int]
+    daily_source_hash_reuse_status_counts: dict[str, int]
+    daily_source_hash_basis_counts_by_path_mode: dict[str, dict[str, int]]
+    daily_source_hash_reuse_status_counts_by_path_mode: dict[str, dict[str, int]]
+    decision_time_bucket_counts: dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -2796,11 +2818,15 @@ def i12_pit_rebuild_report(
     if job_run_id is not None:
         candidate_query = candidate_query.filter(I12PitCandidate.job_run_id == job_run_id)
         base_candidate_query = base_candidate_query.filter(I12PitCandidate.job_run_id == job_run_id)
-    unfiltered_scoped_candidates = base_candidate_query.all()
-    available_path_modes = sorted({row.path_mode for row in unfiltered_scoped_candidates})
+    unfiltered_base_candidate_query = base_candidate_query
+    available_path_modes = _distinct_candidate_values(
+        unfiltered_base_candidate_query,
+        I12PitCandidate.path_mode,
+    )
     mixed_path_modes_present = len(available_path_modes) > 1
-    available_decision_time_labels = sorted(
-        {row.decision_time_label for row in unfiltered_scoped_candidates}
+    available_decision_time_labels = _distinct_candidate_values(
+        unfiltered_base_candidate_query,
+        I12PitCandidate.decision_time_label,
     )
     mixed_decision_times_present = len(available_decision_time_labels) > 1
     if report_path_mode is not None:
@@ -2815,49 +2841,96 @@ def i12_pit_rebuild_report(
         base_candidate_query = base_candidate_query.filter(
             I12PitCandidate.decision_time_label.in_(report_decision_time_labels)
         )
-    candidates = candidate_query.all()
-    scoped_candidates = base_candidate_query.all()
-    available_decision_time_labels_for_report_scope = sorted(
-        {row.decision_time_label for row in scoped_candidates}
+    available_decision_time_labels_for_report_scope = _distinct_candidate_values(
+        base_candidate_query,
+        I12PitCandidate.decision_time_label,
     )
-    historical_candidate_row_count = len(scoped_candidates)
-    candidate_ids = [row.i12_pit_candidate_id for row in candidates]
-    scoped_candidate_ids = [row.i12_pit_candidate_id for row in scoped_candidates]
-    inactive_candidate_ids = {
-        row.i12_pit_candidate_id for row in scoped_candidates if not row.is_active
-    }
-    all_quotes = _load_child_rows_for_candidate_ids(
+    historical_candidate_row_count = base_candidate_query.count()
+    candidate_aggregates = _report_candidate_aggregates(candidate_query)
+    active_candidate_count = candidate_aggregates.active_count
+    scoped_candidate_ids_subquery = base_candidate_query.with_entities(
+        I12PitCandidate.i12_pit_candidate_id
+    ).subquery()
+    inactive_scoped_candidate_ids_subquery = (
+        base_candidate_query.filter(I12PitCandidate.is_active.is_(False))
+        .with_entities(I12PitCandidate.i12_pit_candidate_id)
+        .subquery()
+    )
+    active_nonpassed_scoped_candidate_ids_subquery = (
+        candidate_query.filter(I12PitCandidate.candidate_status != "passed")
+        .with_entities(I12PitCandidate.i12_pit_candidate_id)
+        .subquery()
+    )
+    passed_query = candidate_query.filter(I12PitCandidate.candidate_status == "passed")
+    passed = passed_query.all()
+    passed_candidate_ids = [row.i12_pit_candidate_id for row in passed]
+    loaded_quotes = _load_child_rows_for_candidate_ids(
         session,
         I12PitQuoteReplay,
-        scoped_candidate_ids,
+        passed_candidate_ids,
     )
-    all_costs = _load_child_rows_for_candidate_ids(
+    loaded_costs = _load_child_rows_for_candidate_ids(
         session,
         I12PitCostReplay,
-        scoped_candidate_ids,
+        passed_candidate_ids,
     )
-    candidate_id_set = set(candidate_ids)
     quotes = [
-        row for row in all_quotes
-        if row.is_active and row.i12_pit_candidate_id in candidate_id_set
+        row for row in loaded_quotes
+        if row.is_active
     ]
     costs = [
-        row for row in all_costs
-        if row.is_active and row.i12_pit_candidate_id in candidate_id_set
+        row for row in loaded_costs
+        if row.is_active
     ]
-    active_quote_rows_with_inactive_candidate_count = sum(
-        1
-        for row in all_quotes
-        if row.is_active and row.i12_pit_candidate_id in inactive_candidate_ids
+    historical_quote_replay_row_count = _count_child_rows_for_candidate_subquery(
+        session,
+        I12PitQuoteReplay,
+        scoped_candidate_ids_subquery,
     )
-    active_cost_rows_with_inactive_candidate_count = sum(
-        1
-        for row in all_costs
-        if row.is_active and row.i12_pit_candidate_id in inactive_candidate_ids
+    historical_cost_replay_row_count = _count_child_rows_for_candidate_subquery(
+        session,
+        I12PitCostReplay,
+        scoped_candidate_ids_subquery,
+    )
+    active_quote_rows_with_inactive_candidate_count = (
+        _count_child_rows_for_candidate_subquery(
+            session,
+            I12PitQuoteReplay,
+            inactive_scoped_candidate_ids_subquery,
+            active_only=True,
+        )
+    )
+    active_cost_rows_with_inactive_candidate_count = (
+        _count_child_rows_for_candidate_subquery(
+            session,
+            I12PitCostReplay,
+            inactive_scoped_candidate_ids_subquery,
+            active_only=True,
+        )
+    )
+    active_quote_rows_with_nonpassed_candidate_count = (
+        _count_child_rows_for_candidate_subquery(
+            session,
+            I12PitQuoteReplay,
+            active_nonpassed_scoped_candidate_ids_subquery,
+            active_only=True,
+        )
+    )
+    active_cost_rows_with_nonpassed_candidate_count = (
+        _count_child_rows_for_candidate_subquery(
+            session,
+            I12PitCostReplay,
+            active_nonpassed_scoped_candidate_ids_subquery,
+            active_only=True,
+        )
     )
     child_evidence_parent_inactive = (
         active_quote_rows_with_inactive_candidate_count > 0
         or active_cost_rows_with_inactive_candidate_count > 0
+    )
+    child_evidence_parent_nonpassed = (
+        active_quote_rows_with_nonpassed_candidate_count > 0
+        or active_cost_rows_with_nonpassed_candidate_count > 0
     )
     source_identity_denominator_error: str | None = None
     if hur_rows_loaded is None and start_date is not None and end_date is not None:
@@ -2874,11 +2947,12 @@ def i12_pit_rebuild_report(
         decision_time_count = len(report_decision_time_labels)
     elif decision_time_count is None:
         decision_time_count = (
-            len({row.decision_time_label for row in candidates})
-            if candidates else None
+            len(candidate_aggregates.active_decision_time_labels)
+            if active_candidate_count else None
         )
-    passed = [row for row in candidates if row.candidate_status == "passed"]
-    candidate_coverage_counts = Counter(row.coverage_status for row in candidates)
+    candidate_coverage_counts = Counter(
+        candidate_aggregates.candidate_coverage_status_counts
+    )
     quote_status = Counter(row.coverage_status for row in quotes)
     skip_reasons = Counter(row.skipped_reason for row in costs)
     quote_audit = _quote_completeness_audit(passed, quotes)
@@ -2936,6 +3010,40 @@ def i12_pit_rebuild_report(
                 row.slippage_return for row in tradeable
             ),
         }
+    predecision_volume_tradeability = _volume_tradeability_report(
+        passed_candidates=passed,
+        quotes=quotes,
+        costs=costs,
+        default_threshold=DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+        evidence_getter=_predecision_volume_evidence,
+        window_prefix="predecision_window",
+        evidence_metadata={
+            "entry_volume_window_basis": VOLUME_WINDOW_BASIS_PRE_DECISION,
+            "entry_volume_window_price_basis_preference": [
+                "entry_quote_mid",
+                VOLUME_PRICE_BASIS_LAST_PRE_DECISION,
+            ],
+            "entry_volume_window_description": (
+                "completed start-stamped minute bars strictly before decision_ts; "
+                "for 09:40 this is 09:30 through 09:39 ET, not the 09:40 bar"
+            ),
+        },
+    )
+    execution_window_volume_tradeability = _volume_tradeability_report(
+        passed_candidates=passed,
+        quotes=quotes,
+        costs=costs,
+        default_threshold=DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+        evidence_getter=_execution_window_volume_evidence,
+        window_prefix="execution_window",
+        evidence_metadata={
+            "execution_window_basis": "persisted_execution_window_minute_bars",
+            "execution_window_description": (
+                "actual execution-window minute volume beginning at decision_ts; "
+                "absent unless a scratch/cache backfill persisted this evidence"
+            ),
+        },
+    )
     required_quote_rows = len(passed) * len(REQUIRED_QUOTE_ROLES)
     quote_ok_count = quote_status.get("ok", 0)
     quote_non_ok_count = len(quotes) - quote_ok_count
@@ -2973,7 +3081,7 @@ def i12_pit_rebuild_report(
         end_date=end_date,
         decision_time_labels=report_decision_time_labels,
         path_modes=requested_path_modes,
-        candidates=candidates,
+        candidate_query=candidate_query,
     )
     if source_identity_denominator_error is not None:
         identity_audit = _source_identity_error_audit(
@@ -2981,12 +3089,12 @@ def i12_pit_rebuild_report(
             requested_path_modes,
         )
     missing_source_attempt_count = (
-        max(expected_candidate_attempts - len(candidates), 0)
+        max(expected_candidate_attempts - active_candidate_count, 0)
         if expected_candidate_attempts is not None
         else None
     )
     extra_source_attempt_count = (
-        max(len(candidates) - expected_candidate_attempts, 0)
+        max(active_candidate_count - expected_candidate_attempts, 0)
         if expected_candidate_attempts is not None
         else None
     )
@@ -3005,7 +3113,8 @@ def i12_pit_rebuild_report(
         and source_provider_error_count == 0
     )
     path_mode_metrics = _path_mode_report_metrics(
-        candidates,
+        candidate_aggregates,
+        passed,
         quotes,
         costs,
         requested_path_modes=requested_path_modes,
@@ -3014,10 +3123,11 @@ def i12_pit_rebuild_report(
         source_denominator_known=source_denominator_known,
         zero_hur_source_blocked=hur_rows_loaded == 0 if hur_rows_loaded is not None else False,
         child_evidence_parent_inactive=child_evidence_parent_inactive,
+        child_evidence_parent_nonpassed=child_evidence_parent_nonpassed,
         compare_path_modes=compare_path_modes,
     )
     strict_partial_rows_that_would_pass_sparse_zero_fill = (
-        _strict_partial_rows_that_would_pass_sparse_zero_fill(candidates)
+        _strict_partial_rows_that_would_pass_sparse_zero_fill(candidate_query)
     )
     comparison_conclusions_final = (
         all(
@@ -3043,15 +3153,18 @@ def i12_pit_rebuild_report(
         and quote_complete
         and cost_complete
         and not child_evidence_parent_inactive
+        and not child_evidence_parent_nonpassed
         and not zero_hur_source_blocked
         and (comparison_conclusions_final is not False)
     )
-    if identity_denominator_error:
+    if child_evidence_parent_inactive:
+        training_status = "blocked_child_evidence_parent_inactive"
+    elif child_evidence_parent_nonpassed:
+        training_status = "blocked_child_evidence_parent_nonpassed"
+    elif identity_denominator_error:
         training_status = "blocked_source_identity_denominator_error"
     elif not source_denominator_known:
         training_status = "blocked_source_denominator_unknown"
-    elif child_evidence_parent_inactive:
-        training_status = "blocked_child_evidence_parent_inactive"
     elif zero_hur_source_blocked:
         training_status = "blocked_zero_hur_source"
     elif source_denominator_known and not identity_audit["source_identity_denominator_known"]:
@@ -3111,9 +3224,9 @@ def i12_pit_rebuild_report(
         "zero_hur_source_blocked": zero_hur_source_blocked,
         "decision_time_count": decision_time_count,
         "expected_candidate_attempts": expected_candidate_attempts,
-        "candidate_row_count": len(candidates),
-        "actual_candidate_row_count": len(candidates),
-        "active_candidate_row_count": len(candidates),
+        "candidate_row_count": active_candidate_count,
+        "actual_candidate_row_count": active_candidate_count,
+        "active_candidate_row_count": active_candidate_count,
         "historical_candidate_row_count": historical_candidate_row_count,
         "missing_source_attempt_count": missing_source_attempt_count,
         "extra_source_attempt_count": extra_source_attempt_count,
@@ -3145,14 +3258,16 @@ def i12_pit_rebuild_report(
         "source_denominator_known": source_denominator_known,
         "source_replay_complete": source_attempts_complete,
         "pit_candidate_count": len(passed),
-        "candidate_status_counts": dict(Counter(row.candidate_status for row in candidates)),
+        "candidate_status_counts": candidate_aggregates.candidate_status_counts,
         "candidate_coverage_status_counts": dict(candidate_coverage_counts),
-        "daily_source_hash_basis_counts": _daily_source_hash_basis_counts(candidates),
-        "daily_source_hash_reuse_status_counts": (
-            _daily_source_hash_reuse_status_counts(candidates)
+        "daily_source_hash_basis_counts": (
+            candidate_aggregates.daily_source_hash_basis_counts
         ),
-        "candidate_counts_by_path_mode": dict(Counter(row.path_mode for row in candidates)),
-        "coverage_status_by_path_mode": _coverage_status_by_path_mode(candidates),
+        "daily_source_hash_reuse_status_counts": (
+            candidate_aggregates.daily_source_hash_reuse_status_counts
+        ),
+        "candidate_counts_by_path_mode": candidate_aggregates.candidate_counts_by_path_mode,
+        "coverage_status_by_path_mode": candidate_aggregates.coverage_status_by_path_mode,
         "passed_candidates_by_path_mode": dict(Counter(row.path_mode for row in passed)),
         "passed_candidates_by_path_mode_decision_time": (
             _passed_candidates_by_path_mode_decision_time(passed)
@@ -3160,12 +3275,15 @@ def i12_pit_rebuild_report(
         "strict_partial_rows_that_would_pass_sparse_zero_fill": (
             strict_partial_rows_that_would_pass_sparse_zero_fill
         ),
-        "sparse_imputation_distributions": _sparse_imputation_distributions(candidates),
+        "sparse_imputation_distributions": _sparse_imputation_distributions(candidate_query),
         "path_mode_metrics": path_mode_metrics,
         "quote_replay_row_count": len(quotes),
-        "historical_quote_replay_row_count": len(all_quotes),
+        "historical_quote_replay_row_count": historical_quote_replay_row_count,
         "active_quote_rows_with_inactive_candidate_count": (
             active_quote_rows_with_inactive_candidate_count
+        ),
+        "active_quote_rows_with_nonpassed_candidate_count": (
+            active_quote_rows_with_nonpassed_candidate_count
         ),
         "quote_coverage_status_counts": dict(quote_status),
         "quote_replay_status": quote_replay_status,
@@ -3183,9 +3301,12 @@ def i12_pit_rebuild_report(
         "candidate_complete_quote_count": quote_audit["candidate_complete_quote_count"],
         "candidate_incomplete_quote_count": quote_audit["candidate_incomplete_quote_count"],
         "cost_replay_row_count": len(costs),
-        "historical_cost_replay_row_count": len(all_costs),
+        "historical_cost_replay_row_count": historical_cost_replay_row_count,
         "active_cost_rows_with_inactive_candidate_count": (
             active_cost_rows_with_inactive_candidate_count
+        ),
+        "active_cost_rows_with_nonpassed_candidate_count": (
+            active_cost_rows_with_nonpassed_candidate_count
         ),
         "cost_replay_status": cost_replay_status,
         "cost_replay_complete": cost_complete,
@@ -3196,7 +3317,78 @@ def i12_pit_rebuild_report(
         "cost_coverage_by_exit_role": cost_audit["cost_coverage_by_exit_role"],
         "skip_reason_counts": dict(skip_reasons),
         "exit_metrics": by_exit,
-        "decision_time_buckets": _decision_time_buckets(candidates, costs),
+        "candidate_semantics": {
+            "candidate_status_passed": (
+                "detector gate passed using PIT-safe decision-time features; "
+                "tradeability is evaluated separately in the execution/cost layer"
+            ),
+            "displayed_tradeability_metrics": (
+                "strict displayed top-of-book size model from persisted cost rows"
+            ),
+            "volume_tradeability_metrics": (
+                "backward-compatible alias for pre-decision volume-participation "
+                "metrics using persisted completed pre-decision minute volume"
+            ),
+            "predecision_volume_tradeability_metrics": (
+                "diagnostic volume-participation model using persisted completed "
+                "pre-decision minute volume and entry/exit quote costs"
+            ),
+            "execution_window_volume_tradeability_metrics": (
+                "optional diagnostic volume-participation model using persisted "
+                "actual execution-window minute volume when available"
+            ),
+        },
+        "displayed_tradeability_metrics": by_exit,
+        "displayed_size_tradeability_status_counts": dict(
+            Counter(row.tradeability_status for row in costs)
+        ),
+        "predecision_volume_tradeability_metrics": predecision_volume_tradeability["metrics"],
+        "predecision_volume_tradeability_sensitivity": (
+            predecision_volume_tradeability["sensitivity"]
+        ),
+        "predecision_volume_tradeability_status_counts": (
+            predecision_volume_tradeability["status_counts"]
+        ),
+        "predecision_volume_tradeability_skip_reason_counts": (
+            predecision_volume_tradeability["skip_reason_counts"]
+        ),
+        "predecision_volume_tradeability_rate": (
+            predecision_volume_tradeability["tradeability_rate"]
+        ),
+        "predecision_volume_tradeability_evidence": predecision_volume_tradeability[
+            "evidence"
+        ],
+        "execution_window_volume_tradeability_metrics": (
+            execution_window_volume_tradeability["metrics"]
+        ),
+        "execution_window_volume_tradeability_sensitivity": (
+            execution_window_volume_tradeability["sensitivity"]
+        ),
+        "execution_window_volume_tradeability_status_counts": (
+            execution_window_volume_tradeability["status_counts"]
+        ),
+        "execution_window_volume_tradeability_skip_reason_counts": (
+            execution_window_volume_tradeability["skip_reason_counts"]
+        ),
+        "execution_window_volume_tradeability_rate": (
+            execution_window_volume_tradeability["tradeability_rate"]
+        ),
+        "execution_window_volume_tradeability_evidence": (
+            execution_window_volume_tradeability["evidence"]
+        ),
+        "volume_tradeability_metrics": predecision_volume_tradeability["metrics"],
+        "volume_tradeability_sensitivity": predecision_volume_tradeability["sensitivity"],
+        "volume_tradeability_status_counts": predecision_volume_tradeability["status_counts"],
+        "volume_tradeability_skip_reason_counts": (
+            predecision_volume_tradeability["skip_reason_counts"]
+        ),
+        "volume_tradeability_rate": predecision_volume_tradeability["tradeability_rate"],
+        "volume_tradeability_evidence": predecision_volume_tradeability["evidence"],
+        "decision_time_buckets": _decision_time_buckets(
+            candidate_aggregates.decision_time_bucket_counts,
+            passed,
+            costs,
+        ),
         "data_integrity_passed": data_integrity_passed,
         "quote_replay_complete": quote_complete,
         "training_status": training_status,
@@ -3209,6 +3401,7 @@ def i12_pit_rebuild_report(
                 if training_status.startswith("blocked_source")
                 or training_status == "blocked_zero_hur_source"
                 or training_status == "blocked_child_evidence_parent_inactive"
+                or training_status == "blocked_child_evidence_parent_nonpassed"
                 or training_status == "blocked_zero_pit_candidates"
                 or training_status == "blocked_path_mode_comparison_incomplete"
                 or training_status == "blocked_quote_replay_integrity"
@@ -3374,27 +3567,202 @@ def _cost_completeness_audit(
     }
 
 
+def _distinct_candidate_values(candidate_query: Any, column: Any) -> list[str]:
+    return [
+        row[0]
+        for row in candidate_query.with_entities(column)
+        .distinct()
+        .order_by(column)
+        .all()
+        if row[0] is not None
+    ]
+
+
+def _candidate_group_counts(candidate_query: Any, column: Any) -> dict[str, int]:
+    return {
+        value: int(count or 0)
+        for value, count in candidate_query.with_entities(
+            column,
+            func.count(I12PitCandidate.i12_pit_candidate_id),
+        )
+        .group_by(column)
+        .all()
+    }
+
+
+def _candidate_nested_group_counts(
+    candidate_query: Any,
+    outer_column: Any,
+    inner_column: Any,
+) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = defaultdict(dict)
+    rows = (
+        candidate_query.with_entities(
+            outer_column,
+            inner_column,
+            func.count(I12PitCandidate.i12_pit_candidate_id),
+        )
+        .group_by(outer_column, inner_column)
+        .all()
+    )
+    for outer, inner, count in rows:
+        out[outer][inner] = int(count or 0)
+    return {key: dict(value) for key, value in sorted(out.items())}
+
+
+def _candidate_decision_time_bucket_counts(
+    candidate_query: Any,
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    rows = (
+        candidate_query.with_entities(
+            I12PitCandidate.decision_time_label,
+            I12PitCandidate.candidate_status,
+            I12PitCandidate.coverage_status,
+            func.count(I12PitCandidate.i12_pit_candidate_id),
+        )
+        .group_by(
+            I12PitCandidate.decision_time_label,
+            I12PitCandidate.candidate_status,
+            I12PitCandidate.coverage_status,
+        )
+        .all()
+    )
+    for label, candidate_status, coverage_status, count in rows:
+        bucket = buckets.setdefault(
+            label,
+            {
+                "candidate_count": 0,
+                "passed_count": 0,
+                "candidate_status_counts": Counter(),
+                "coverage_status_counts": Counter(),
+            },
+        )
+        row_count = int(count or 0)
+        bucket["candidate_count"] += row_count
+        if candidate_status == "passed":
+            bucket["passed_count"] += row_count
+        bucket["candidate_status_counts"][candidate_status] += row_count
+        bucket["coverage_status_counts"][coverage_status] += row_count
+    return {
+        label: {
+            "candidate_count": bucket["candidate_count"],
+            "passed_count": bucket["passed_count"],
+            "candidate_status_counts": dict(bucket["candidate_status_counts"]),
+            "coverage_status_counts": dict(bucket["coverage_status_counts"]),
+        }
+        for label, bucket in sorted(buckets.items())
+    }
+
+
+def _daily_source_hash_counts_from_query(
+    candidate_query: Any,
+) -> tuple[
+    dict[str, int],
+    dict[str, int],
+    dict[str, dict[str, int]],
+    dict[str, dict[str, int]],
+]:
+    basis_counts: Counter[str] = Counter()
+    reuse_counts: Counter[str] = Counter()
+    basis_by_mode: dict[str, Counter[str]] = defaultdict(Counter)
+    reuse_by_mode: dict[str, Counter[str]] = defaultdict(Counter)
+    rows = candidate_query.with_entities(
+        I12PitCandidate.path_mode,
+        I12PitCandidate.source_bars_json,
+    ).yield_per(1000)
+    for path_mode, source_bars_json in rows:
+        source_bars = _json_loads(source_bars_json)
+        basis = str(source_bars.get("daily_source_hash_basis") or "unknown")
+        reuse_status = str(
+            source_bars.get("daily_source_hash_reuse_status") or "unknown"
+        )
+        basis_counts[basis] += 1
+        reuse_counts[reuse_status] += 1
+        basis_by_mode[path_mode][basis] += 1
+        reuse_by_mode[path_mode][reuse_status] += 1
+    return (
+        dict(basis_counts),
+        dict(reuse_counts),
+        {mode: dict(counter) for mode, counter in sorted(basis_by_mode.items())},
+        {mode: dict(counter) for mode, counter in sorted(reuse_by_mode.items())},
+    )
+
+
+def _report_candidate_aggregates(candidate_query: Any) -> _ReportCandidateAggregates:
+    (
+        daily_source_hash_basis_counts,
+        daily_source_hash_reuse_status_counts,
+        daily_source_hash_basis_counts_by_path_mode,
+        daily_source_hash_reuse_status_counts_by_path_mode,
+    ) = _daily_source_hash_counts_from_query(candidate_query)
+    return _ReportCandidateAggregates(
+        active_count=candidate_query.count(),
+        active_decision_time_labels=_distinct_candidate_values(
+            candidate_query,
+            I12PitCandidate.decision_time_label,
+        ),
+        candidate_status_counts=_candidate_group_counts(
+            candidate_query,
+            I12PitCandidate.candidate_status,
+        ),
+        candidate_coverage_status_counts=_candidate_group_counts(
+            candidate_query,
+            I12PitCandidate.coverage_status,
+        ),
+        candidate_counts_by_path_mode=_candidate_group_counts(
+            candidate_query,
+            I12PitCandidate.path_mode,
+        ),
+        coverage_status_by_path_mode=_candidate_nested_group_counts(
+            candidate_query,
+            I12PitCandidate.path_mode,
+            I12PitCandidate.coverage_status,
+        ),
+        candidate_status_counts_by_path_mode=_candidate_nested_group_counts(
+            candidate_query,
+            I12PitCandidate.path_mode,
+            I12PitCandidate.candidate_status,
+        ),
+        daily_source_hash_basis_counts=daily_source_hash_basis_counts,
+        daily_source_hash_reuse_status_counts=daily_source_hash_reuse_status_counts,
+        daily_source_hash_basis_counts_by_path_mode=(
+            daily_source_hash_basis_counts_by_path_mode
+        ),
+        daily_source_hash_reuse_status_counts_by_path_mode=(
+            daily_source_hash_reuse_status_counts_by_path_mode
+        ),
+        decision_time_bucket_counts=_candidate_decision_time_bucket_counts(
+            candidate_query
+        ),
+    )
+
+
 def _decision_time_buckets(
-    candidates: Sequence[I12PitCandidate],
+    candidate_bucket_counts: Mapping[str, Mapping[str, Any]],
+    passed: Sequence[I12PitCandidate],
     costs: Sequence[I12PitCostReplay],
 ) -> dict[str, Any]:
     costs_by_candidate: dict[str, list[I12PitCostReplay]] = defaultdict(list)
     for row in costs:
         costs_by_candidate[row.i12_pit_candidate_id].append(row)
+    passed_by_label: dict[str, list[I12PitCandidate]] = defaultdict(list)
+    for row in passed:
+        passed_by_label[row.decision_time_label].append(row)
     buckets: dict[str, Any] = {}
-    for label in sorted({row.decision_time_label for row in candidates}):
-        rows = [row for row in candidates if row.decision_time_label == label]
-        passed = [row for row in rows if row.candidate_status == "passed"]
+    for label in sorted(candidate_bucket_counts):
+        counts = candidate_bucket_counts[label]
+        label_passed = passed_by_label.get(label, [])
         bucket: dict[str, Any] = {
-            "candidate_count": len(rows),
-            "passed_count": len(passed),
-            "candidate_status_counts": dict(Counter(row.candidate_status for row in rows)),
-            "coverage_status_counts": dict(Counter(row.coverage_status for row in rows)),
+            "candidate_count": int(counts.get("candidate_count") or 0),
+            "passed_count": int(counts.get("passed_count") or 0),
+            "candidate_status_counts": dict(counts.get("candidate_status_counts") or {}),
+            "coverage_status_counts": dict(counts.get("coverage_status_counts") or {}),
         }
         for exit_role in EXIT_ROLES:
             role_costs = [
                 cost
-                for candidate in passed
+                for candidate in label_passed
                 for cost in costs_by_candidate.get(candidate.i12_pit_candidate_id, [])
                 if cost.exit_role == exit_role
             ]
@@ -3406,7 +3774,7 @@ def _decision_time_buckets(
                 "cost_row_count": len(role_costs),
                 "tradeable_count": len(tradeable),
                 "tradeable_rate": (
-                    len(tradeable) / len(passed) if passed else None
+                    len(tradeable) / len(label_passed) if label_passed else None
                 ),
                 "skipped_cash_by_reason": dict(
                     Counter(cost.skipped_reason for cost in role_costs)
@@ -3467,7 +3835,7 @@ def _source_attempt_identity_audit(
     end_date: date | None,
     decision_time_labels: Sequence[str] | None,
     path_modes: Sequence[str],
-    candidates: Sequence[I12PitCandidate],
+    candidate_query: Any,
 ) -> dict[str, Any]:
     known = (
         bool(source_hur_schema)
@@ -3498,12 +3866,18 @@ def _source_attempt_identity_audit(
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         return _source_identity_error_audit(error, path_modes)
-    actual_by_mode: dict[str, set[str]] = {
-        mode: {
-            row.candidate_attempt_hash for row in candidates if row.path_mode == mode
-        }
-        for mode in path_modes
-    }
+    actual_by_mode: dict[str, set[str]] = {mode: set() for mode in path_modes}
+    actual_rows = (
+        candidate_query.filter(I12PitCandidate.path_mode.in_(path_modes))
+        .with_entities(
+            I12PitCandidate.path_mode,
+            I12PitCandidate.candidate_attempt_hash,
+        )
+        .yield_per(1000)
+    )
+    for path_mode, candidate_attempt_hash in actual_rows:
+        if path_mode in actual_by_mode and candidate_attempt_hash is not None:
+            actual_by_mode[path_mode].add(candidate_attempt_hash)
     path_mode_identity_audits = {
         mode: _source_identity_set_diff(expected_by_mode[mode], actual_by_mode[mode])
         for mode in path_modes
@@ -3640,31 +4014,78 @@ def _load_hur_source_rows_for_report(
 
 
 def _strict_partial_rows_that_would_pass_sparse_zero_fill(
-    candidates: Sequence[I12PitCandidate],
+    candidate_query: Any,
 ) -> int:
+    sparse_pass_rows = (
+        candidate_query.filter(
+            I12PitCandidate.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE,
+            I12PitCandidate.candidate_status == "passed",
+        )
+        .with_entities(
+            I12PitCandidate.ticker,
+            I12PitCandidate.decision_date,
+            I12PitCandidate.decision_time_label,
+            I12PitCandidate.source_bars_json,
+        )
+        .yield_per(1000)
+    )
     sparse_pass_keys = {
-        _candidate_attempt_comparison_key(row)
-        for row in candidates
-        if row.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE
-        and row.candidate_status == "passed"
+        _candidate_attempt_comparison_key_from_values(
+            ticker,
+            decision_date,
+            decision_time_label,
+            source_bars_json,
+        )
+        for ticker, decision_date, decision_time_label, source_bars_json in sparse_pass_rows
     }
+    strict_partial_rows = (
+        candidate_query.filter(
+            I12PitCandidate.path_mode == STRICT_MINUTE_PATH_MODE,
+            I12PitCandidate.coverage_status == "partial_minute_path",
+        )
+        .with_entities(
+            I12PitCandidate.ticker,
+            I12PitCandidate.decision_date,
+            I12PitCandidate.decision_time_label,
+            I12PitCandidate.source_bars_json,
+        )
+        .yield_per(1000)
+    )
     return sum(
         1
-        for row in candidates
-        if row.path_mode == STRICT_MINUTE_PATH_MODE
-        and row.coverage_status == "partial_minute_path"
-        and _candidate_attempt_comparison_key(row) in sparse_pass_keys
+        for ticker, decision_date, decision_time_label, source_bars_json in strict_partial_rows
+        if _candidate_attempt_comparison_key_from_values(
+            ticker,
+            decision_date,
+            decision_time_label,
+            source_bars_json,
+        )
+        in sparse_pass_keys
     )
 
 
 def _candidate_attempt_comparison_key(
     row: I12PitCandidate,
 ) -> tuple[str, date, str, str | None]:
-    return (
+    return _candidate_attempt_comparison_key_from_values(
         row.ticker,
         row.decision_date,
         row.decision_time_label,
-        _candidate_source_hur_identity_hash(row),
+        row.source_bars_json,
+    )
+
+
+def _candidate_attempt_comparison_key_from_values(
+    ticker: str,
+    decision_date: date,
+    decision_time_label: str,
+    source_bars_json: str | None,
+) -> tuple[str, date, str, str | None]:
+    return (
+        ticker,
+        decision_date,
+        decision_time_label,
+        _json_loads(source_bars_json).get("source_hur_identity_hash"),
     )
 
 
@@ -3673,38 +4094,46 @@ def _candidate_source_hur_identity_hash(row: I12PitCandidate) -> str | None:
 
 
 def _sparse_imputation_distributions(
-    candidates: Sequence[I12PitCandidate],
+    candidate_query: Any,
 ) -> dict[str, Any]:
-    sparse = [
-        row for row in candidates
-        if row.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE
+    sparse_values = [
+        _candidate_path_diagnostic_values(source_bars_json, feature_json)
+        for source_bars_json, feature_json in candidate_query.filter(
+            I12PitCandidate.path_mode == SPARSE_ZERO_FILL_MINUTE_PATH_MODE,
+        )
+        .with_entities(
+            I12PitCandidate.source_bars_json,
+            I12PitCandidate.feature_json,
+        )
+        .yield_per(1000)
     ]
     return {
-        "candidate_count": len(sparse),
+        "candidate_count": len(sparse_values),
         "missing_minute_count": _numeric_summary(
-            _candidate_path_diagnostic_value(row, "missing_minute_count_before_decision")
-            for row in sparse
+            values.get("missing_minute_count_before_decision")
+            for values in sparse_values
         ),
         "path_coverage_ratio": _numeric_summary(
-            _candidate_path_diagnostic_value(row, "path_coverage_ratio") for row in sparse
+            values.get("path_coverage_ratio") for values in sparse_values
         ),
         "last_observed_age_seconds": _numeric_summary(
-            _candidate_path_diagnostic_value(row, "last_observed_before_decision_age_seconds")
-            for row in sparse
+            values.get("last_observed_before_decision_age_seconds")
+            for values in sparse_values
         ),
         "observed_cumulative_volume": _numeric_summary(
-            _candidate_path_diagnostic_value(row, "observed_cumulative_volume_before_decision")
-            for row in sparse
+            values.get("observed_cumulative_volume_before_decision")
+            for values in sparse_values
         ),
         "projected_volume_ratio": _numeric_summary(
-            _candidate_path_diagnostic_value(row, "zero_fill_projected_volume_ratio")
-            for row in sparse
+            values.get("zero_fill_projected_volume_ratio")
+            for values in sparse_values
         ),
     }
 
 
 def _path_mode_report_metrics(
-    candidates: Sequence[I12PitCandidate],
+    candidate_aggregates: _ReportCandidateAggregates,
+    passed: Sequence[I12PitCandidate],
     quotes: Sequence[I12PitQuoteReplay],
     costs: Sequence[I12PitCostReplay],
     *,
@@ -3714,37 +4143,43 @@ def _path_mode_report_metrics(
     source_denominator_known: bool,
     zero_hur_source_blocked: bool,
     child_evidence_parent_inactive: bool,
+    child_evidence_parent_nonpassed: bool,
     compare_path_modes: bool,
 ) -> dict[str, Any]:
     modes = list(requested_path_modes)
     metrics: dict[str, Any] = {}
     for mode in modes:
-        mode_candidates = [row for row in candidates if row.path_mode == mode]
-        mode_passed = [row for row in mode_candidates if row.candidate_status == "passed"]
-        mode_candidate_ids = {row.i12_pit_candidate_id for row in mode_candidates}
+        mode_candidate_count = candidate_aggregates.candidate_counts_by_path_mode.get(
+            mode,
+            0,
+        )
+        mode_passed = [row for row in passed if row.path_mode == mode]
+        mode_candidate_ids = {row.i12_pit_candidate_id for row in mode_passed}
         mode_quotes = [row for row in quotes if row.i12_pit_candidate_id in mode_candidate_ids]
         mode_costs = [row for row in costs if row.i12_pit_candidate_id in mode_candidate_ids]
         quote_audit = _quote_completeness_audit(mode_passed, mode_quotes)
         cost_audit = _cost_completeness_audit(mode_passed, mode_costs)
         mode_not_run = (
             compare_path_modes
-            and not mode_candidates
+            and not mode_candidate_count
             and not source_denominator_known
         )
         mode_missing_attempts = (
-            max(expected_candidate_attempts - len(mode_candidates), 0)
+            max(expected_candidate_attempts - mode_candidate_count, 0)
             if expected_candidate_attempts is not None
             else None
         )
         mode_extra_attempts = (
-            max(len(mode_candidates) - expected_candidate_attempts, 0)
+            max(mode_candidate_count - expected_candidate_attempts, 0)
             if expected_candidate_attempts is not None
             else None
         )
-        provider_errors = sum(
-            1
-            for row in mode_candidates
-            if row.coverage_status in {"daily_fetch_error", "minute_fetch_error"}
+        coverage_counts = candidate_aggregates.coverage_status_by_path_mode.get(
+            mode,
+            {},
+        )
+        provider_errors = int(coverage_counts.get("daily_fetch_error") or 0) + int(
+            coverage_counts.get("minute_fetch_error") or 0
         )
         identity_audit = dict(identity_audits_by_mode.get(mode, {}))
         identity_error = identity_audit.get("source_identity_denominator_error")
@@ -3757,12 +4192,14 @@ def _path_mode_report_metrics(
         )
         if mode_not_run:
             training_status = "not_run"
+        elif child_evidence_parent_inactive:
+            training_status = "blocked_child_evidence_parent_inactive"
+        elif child_evidence_parent_nonpassed:
+            training_status = "blocked_child_evidence_parent_nonpassed"
         elif identity_error:
             training_status = "blocked_source_identity_denominator_error"
         elif not source_denominator_known:
             training_status = "blocked_source_denominator_unknown"
-        elif child_evidence_parent_inactive:
-            training_status = "blocked_child_evidence_parent_inactive"
         elif zero_hur_source_blocked:
             training_status = "blocked_zero_hur_source"
         elif source_denominator_known and not identity_audit.get(
@@ -3789,7 +4226,7 @@ def _path_mode_report_metrics(
         else:
             training_status = "eligible_for_retrain_evaluation"
         metrics[mode] = {
-            "candidate_count": len(mode_candidates),
+            "candidate_count": mode_candidate_count,
             "expected_candidate_attempts": expected_candidate_attempts,
             "missing_source_attempt_count": mode_missing_attempts,
             "extra_source_attempt_count": mode_extra_attempts,
@@ -3818,11 +4255,21 @@ def _path_mode_report_metrics(
                 "extra_source_attempt_identities_sample",
                 [],
             ),
-            "candidate_status_counts": dict(Counter(row.candidate_status for row in mode_candidates)),
-            "coverage_status_counts": dict(Counter(row.coverage_status for row in mode_candidates)),
-            "daily_source_hash_basis_counts": _daily_source_hash_basis_counts(mode_candidates),
+            "candidate_status_counts": (
+                candidate_aggregates.candidate_status_counts_by_path_mode.get(mode, {})
+            ),
+            "coverage_status_counts": coverage_counts,
+            "daily_source_hash_basis_counts": (
+                candidate_aggregates.daily_source_hash_basis_counts_by_path_mode.get(
+                    mode,
+                    {},
+                )
+            ),
             "daily_source_hash_reuse_status_counts": (
-                _daily_source_hash_reuse_status_counts(mode_candidates)
+                candidate_aggregates.daily_source_hash_reuse_status_counts_by_path_mode.get(
+                    mode,
+                    {},
+                )
             ),
             "passed_candidate_count": len(mode_passed),
             "quote_replay_status": (
@@ -3912,11 +4359,43 @@ def _candidate_path_diagnostic_value(
     candidate: I12PitCandidate,
     key: str,
 ) -> float | None:
-    source_bars = _json_loads(candidate.source_bars_json)
+    return _candidate_path_diagnostic_values(
+        candidate.source_bars_json,
+        candidate.feature_json,
+    ).get(key)
+
+
+def _candidate_path_diagnostic_values(
+    source_bars_json: str | None,
+    feature_json: str | None,
+) -> dict[str, float | None]:
+    keys = (
+        "missing_minute_count_before_decision",
+        "path_coverage_ratio",
+        "last_observed_before_decision_age_seconds",
+        "observed_cumulative_volume_before_decision",
+        "zero_fill_projected_volume_ratio",
+    )
+    return {
+        key: _candidate_path_diagnostic_value_from_payloads(
+            source_bars_json,
+            feature_json,
+            key,
+        )
+        for key in keys
+    }
+
+
+def _candidate_path_diagnostic_value_from_payloads(
+    source_bars_json: str | None,
+    feature_json: str | None,
+    key: str,
+) -> float | None:
+    source_bars = _json_loads(source_bars_json)
     path_diagnostics = source_bars.get("path_diagnostics") or {}
     value = path_diagnostics.get(key)
     if value is None:
-        value = _json_loads(candidate.feature_json).get(key)
+        value = _json_loads(feature_json).get(key)
     if isinstance(value, bool):
         return None
     try:
@@ -4385,6 +4864,605 @@ def _exit_skip_reason(
     if notional is None or notional < intended_order_usd:
         return "size"
     return "none"
+
+
+def _volume_tradeability_report(
+    *,
+    passed_candidates: Sequence[I12PitCandidate],
+    quotes: Sequence[I12PitQuoteReplay],
+    costs: Sequence[I12PitCostReplay],
+    default_threshold: float,
+    evidence_getter: Callable[[I12PitCandidate | None, I12PitQuoteReplay | None], dict[str, Any]],
+    window_prefix: str,
+    evidence_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate_by_id = {
+        row.i12_pit_candidate_id: row for row in passed_candidates
+    }
+    quotes_by_id = {row.i12_pit_quote_replay_id: row for row in quotes}
+    quotes_by_candidate_role: dict[tuple[str, str], list[I12PitQuoteReplay]] = defaultdict(list)
+    for quote in quotes:
+        quotes_by_candidate_role[
+            (quote.i12_pit_candidate_id, quote.quote_role)
+        ].append(quote)
+
+    metrics = {
+        role: _volume_tradeability_metrics_for_role(
+            role,
+            passed_candidates,
+            [row for row in costs if row.exit_role == role],
+            candidate_by_id,
+            quotes_by_id,
+            quotes_by_candidate_role,
+            default_threshold,
+            evidence_getter,
+            window_prefix,
+        )
+        for role in EXIT_ROLES
+    }
+    sensitivity = {
+        _volume_threshold_label(threshold): {
+            role: _volume_tradeability_metrics_for_role(
+                role,
+                passed_candidates,
+                [row for row in costs if row.exit_role == role],
+                candidate_by_id,
+                quotes_by_id,
+                quotes_by_candidate_role,
+                threshold,
+                evidence_getter,
+                window_prefix,
+            )
+            for role in EXIT_ROLES
+        }
+        for threshold in VOLUME_PARTICIPATION_THRESHOLDS
+    }
+    status_counts: Counter[str] = Counter()
+    skip_counts: Counter[str] = Counter()
+    tradeable = 0
+    total = 0
+    evidence_missing = 0
+    basis_counts: Counter[str] = Counter()
+    denominator_basis_counts: Counter[str] = Counter()
+    price_basis_counts: Counter[str] = Counter()
+    for role_metrics in metrics.values():
+        status_counts.update(role_metrics["volume_tradeability_status_counts"])
+        skip_counts.update(role_metrics["volume_tradeability_skip_reason_counts"])
+        tradeable += int(role_metrics["tradeable_volume_count"])
+        total += int(role_metrics["row_count"])
+        evidence_missing += int(role_metrics["volume_evidence_missing_count"])
+        basis_counts.update(role_metrics[f"{window_prefix}_basis_counts"])
+        denominator_basis_counts.update(
+            role_metrics[f"{window_prefix}_denominator_basis_counts"]
+        )
+        price_basis_counts.update(role_metrics[f"{window_prefix}_price_basis_counts"])
+    return {
+        "metrics": metrics,
+        "sensitivity": sensitivity,
+        "status_counts": dict(status_counts),
+        "skip_reason_counts": dict(skip_counts),
+        "tradeability_rate": tradeable / total if total else None,
+        "evidence": {
+            **dict(evidence_metadata),
+            "default_participation_threshold": default_threshold,
+            "volume_evidence_missing_count": evidence_missing,
+            f"{window_prefix}_basis_counts": dict(basis_counts),
+            f"{window_prefix}_denominator_basis_counts": dict(denominator_basis_counts),
+            f"{window_prefix}_price_basis_counts": dict(price_basis_counts),
+        },
+    }
+
+
+def _volume_tradeability_metrics_for_role(
+    exit_role: str,
+    passed_candidates: Sequence[I12PitCandidate],
+    rows: Sequence[I12PitCostReplay],
+    candidate_by_id: Mapping[str, I12PitCandidate],
+    quotes_by_id: Mapping[str, I12PitQuoteReplay],
+    quotes_by_candidate_role: Mapping[tuple[str, str], Sequence[I12PitQuoteReplay]],
+    threshold: float,
+    evidence_getter: Callable[[I12PitCandidate | None, I12PitQuoteReplay | None], dict[str, Any]],
+    window_prefix: str,
+) -> dict[str, Any]:
+    modeled_returns: list[float] = []
+    tradeable_returns: list[float] = []
+    participation_rates: list[float] = []
+    share_volumes: list[float] = []
+    share_participation_rates: list[float] = []
+    dollar_volumes: list[float] = []
+    status_counts: Counter[str] = Counter()
+    skip_counts: Counter[str] = Counter()
+    basis_counts: Counter[str] = Counter()
+    denominator_basis_counts: Counter[str] = Counter()
+    price_basis_counts: Counter[str] = Counter()
+    evidence_missing = 0
+    tradeable = 0
+
+    for cost in rows:
+        candidate = candidate_by_id.get(cost.i12_pit_candidate_id)
+        entry_quote = _quote_for_cost_role(
+            cost,
+            "entry",
+            quotes_by_id,
+            quotes_by_candidate_role,
+        )
+        exit_quote = _quote_for_cost_role(
+            cost,
+            exit_role,
+            quotes_by_id,
+            quotes_by_candidate_role,
+        )
+        result = _volume_tradeability_for_cost(
+            candidate=candidate,
+            entry_quote=entry_quote,
+            exit_quote=exit_quote,
+            cost=cost,
+            threshold=threshold,
+            evidence_getter=evidence_getter,
+        )
+        status_counts[result["volume_tradeability_status"]] += 1
+        if result["volume_tradeability_status"] == VOLUME_TRADEABILITY_OK_STATUS:
+            tradeable += 1
+            if result["modeled_return"] is not None:
+                tradeable_returns.append(float(result["modeled_return"]))
+        else:
+            skip_counts[str(result["volume_skipped_reason"])] += 1
+        modeled_returns.append(float(result["modeled_return"] or 0.0))
+        if result["entry_window_dollar_volume"] is not None:
+            dollar_volumes.append(float(result["entry_window_dollar_volume"]))
+        if result["intended_order_participation_rate"] is not None:
+            participation_rates.append(float(result["intended_order_participation_rate"]))
+        if result["entry_window_share_volume"] is not None:
+            share_volumes.append(float(result["entry_window_share_volume"]))
+        if result["intended_order_share_participation_rate"] is not None:
+            share_participation_rates.append(
+                float(result["intended_order_share_participation_rate"])
+            )
+        if result["volume_evidence_available"] is not True:
+            evidence_missing += 1
+        basis_counts[str(result["window_basis"] or "unknown")] += 1
+        denominator_basis_counts[str(result["denominator_basis"] or "unknown")] += 1
+        price_basis_counts[str(result["window_price_basis"] or "unknown")] += 1
+
+    dollar_summary = _numeric_summary(dollar_volumes)
+    participation_summary = _numeric_summary(participation_rates)
+    share_summary = _numeric_summary(share_volumes)
+    share_participation_summary = _numeric_summary(share_participation_rates)
+
+    return {
+        "candidates": len(passed_candidates),
+        "row_count": len(rows),
+        "participation_threshold": threshold,
+        "tradeable_volume_count": tradeable,
+        "volume_tradeability_rate": tradeable / len(passed_candidates)
+        if passed_candidates else None,
+        "skipped_cash_count": len(rows) - tradeable,
+        "volume_tradeability_status_counts": dict(status_counts),
+        "volume_tradeability_skip_reason_counts": dict(skip_counts),
+        "mean_modeled_return_volume_skips_as_cash": (
+            sum(modeled_returns) / len(modeled_returns) if modeled_returns else None
+        ),
+        "win_rate_volume_skips_as_cash": (
+            sum(1 for value in modeled_returns if value > 0.0) / len(modeled_returns)
+            if modeled_returns else None
+        ),
+        "mean_modeled_return_volume_tradeable": _mean(tradeable_returns),
+        "entry_window_dollar_volume": dollar_summary,
+        "intended_order_participation_rate": participation_summary,
+        "entry_window_share_volume": share_summary,
+        "intended_order_share_participation_rate": share_participation_summary,
+        f"{window_prefix}_dollar_volume": dollar_summary,
+        f"{window_prefix}_share_volume": share_summary,
+        f"{window_prefix}_share_participation_rate": share_participation_summary,
+        "volume_evidence_missing_count": evidence_missing,
+        f"{window_prefix}_basis_counts": dict(basis_counts),
+        f"{window_prefix}_denominator_basis_counts": dict(denominator_basis_counts),
+        f"{window_prefix}_price_basis_counts": dict(price_basis_counts),
+        f"{window_prefix}_basis": next(iter(basis_counts), None),
+        f"{window_prefix}_denominator_basis": next(
+            iter(denominator_basis_counts), None
+        ),
+        f"{window_prefix}_price_basis": next(iter(price_basis_counts), None),
+        "entry_volume_window_basis": next(iter(basis_counts), None),
+    }
+
+
+def _quote_for_cost_role(
+    cost: I12PitCostReplay,
+    role: str,
+    quotes_by_id: Mapping[str, I12PitQuoteReplay],
+    quotes_by_candidate_role: Mapping[tuple[str, str], Sequence[I12PitQuoteReplay]],
+) -> I12PitQuoteReplay | None:
+    quote_id = (
+        cost.entry_quote_replay_id if role == "entry" else cost.exit_quote_replay_id
+    )
+    if quote_id:
+        quote = quotes_by_id.get(quote_id)
+        if quote is not None:
+            return quote
+    candidates = list(quotes_by_candidate_role.get((cost.i12_pit_candidate_id, role), ()))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _volume_tradeability_for_cost(
+    *,
+    candidate: I12PitCandidate | None,
+    entry_quote: I12PitQuoteReplay | None,
+    exit_quote: I12PitQuoteReplay | None,
+    cost: I12PitCostReplay,
+    threshold: float,
+    evidence_getter: Callable[[I12PitCandidate | None, I12PitQuoteReplay | None], dict[str, Any]],
+) -> dict[str, Any]:
+    evidence = evidence_getter(candidate, entry_quote)
+    entry_reason = _quote_quality_skip_reason(
+        entry_quote,
+        missing_reason="entry_quote_missing",
+        stale_reason="entry_quote_stale",
+        error_reason="halt_or_bad_quote",
+        max_spread_bps=cost.max_spread_bps,
+    )
+    participation_rate = None
+    share_participation_rate = None
+    observed_share_volume = evidence["entry_window_share_volume_denominator"]
+    if entry_quote is not None and entry_quote.ask and entry_quote.ask > 0:
+        if evidence["entry_window_dollar_volume"]:
+            participation_rate = (
+                cost.intended_order_usd / evidence["entry_window_dollar_volume"]
+            )
+        if observed_share_volume:
+            intended_shares = cost.intended_order_usd / entry_quote.ask
+            share_participation_rate = intended_shares / observed_share_volume
+    if entry_reason == "none":
+        if evidence["volume_evidence_available"] is not True:
+            skipped_reason = "volume_missing"
+        elif participation_rate is None:
+            skipped_reason = "volume_missing"
+        elif participation_rate > threshold:
+            skipped_reason = "volume_too_thin"
+        else:
+            skipped_reason = _quote_quality_skip_reason(
+                exit_quote,
+                missing_reason=f"{cost.exit_role}_quote_missing",
+                stale_reason=f"{cost.exit_role}_quote_stale",
+                error_reason="halt_or_bad_quote",
+                max_spread_bps=cost.max_spread_bps,
+            )
+    else:
+        skipped_reason = entry_reason
+
+    quote_cost_return = None
+    slippage_return = None
+    modeled_return = 0.0
+    status = VOLUME_TRADEABILITY_SKIP_STATUS
+    if skipped_reason == "none" and entry_quote is not None and exit_quote is not None:
+        assert entry_quote.ask is not None and exit_quote.bid is not None
+        quote_cost_return = exit_quote.bid / entry_quote.ask - 1.0
+        slip = cost.slippage_bps / 10000.0
+        slip_entry = entry_quote.ask * (1.0 + slip)
+        slip_exit = exit_quote.bid * (1.0 - slip)
+        slippage_return = slip_exit / slip_entry - 1.0
+        modeled_return = slippage_return
+        status = VOLUME_TRADEABILITY_OK_STATUS
+
+    return {
+        "volume_tradeability_status": status,
+        "volume_skipped_reason": skipped_reason,
+        "entry_window_share_volume": observed_share_volume,
+        "intended_order_share_participation_rate": share_participation_rate,
+        "entry_window_dollar_volume": evidence["entry_window_dollar_volume"],
+        "intended_order_usd": cost.intended_order_usd,
+        "intended_order_participation_rate": participation_rate,
+        "quote_cost_return": quote_cost_return,
+        "slippage_return": slippage_return,
+        "modeled_return": modeled_return,
+        "volume_evidence_available": evidence["volume_evidence_available"],
+        "window_basis": evidence["window_basis"],
+        "window_price_basis": evidence.get("window_price_basis"),
+        "denominator_basis": evidence.get("denominator_basis"),
+    }
+
+
+def _predecision_volume_evidence(
+    candidate: I12PitCandidate | None,
+    entry_quote: I12PitQuoteReplay | None,
+) -> dict[str, Any]:
+    if candidate is None:
+        return _missing_entry_volume_evidence()
+    features = _json_loads(candidate.feature_json)
+    source_bars = _json_loads(candidate.source_bars_json)
+    observed_volume = _finite_float(features.get("observed_cumulative_volume_before_decision"))
+    early_volume = _finite_float(features.get("early_cumulative_volume"))
+    if observed_volume is not None:
+        share_volume = observed_volume
+        denominator_basis = "observed_cumulative_volume_before_decision"
+    elif early_volume is not None:
+        share_volume = early_volume
+        denominator_basis = "early_cumulative_volume_fallback"
+    else:
+        share_volume = None
+        denominator_basis = "missing"
+    if share_volume is not None and share_volume > 0:
+        unsafe_reason = _predecision_volume_timestamp_violation(
+            candidate,
+            features=features,
+            source_bars=source_bars,
+        )
+        if unsafe_reason is not None:
+            return _missing_entry_volume_evidence(
+                window_basis="unsafe_predecision_timestamp",
+                denominator_basis=unsafe_reason,
+            )
+    prior_close = _finite_float(features.get("prior_close"))
+    gap = _finite_float(features.get("gap"))
+    early_return = _finite_float(features.get("early_return"))
+    price = None
+    price_basis = "missing"
+    if (
+        entry_quote is not None
+        and entry_quote.bid is not None
+        and entry_quote.ask is not None
+        and entry_quote.bid > 0
+        and entry_quote.ask > 0
+        and entry_quote.ask >= entry_quote.bid
+    ):
+        price = (entry_quote.bid + entry_quote.ask) / 2.0
+        price_basis = "entry_quote_mid"
+    if (
+        price is None
+        and prior_close is not None
+        and prior_close > 0
+        and gap is not None
+        and early_return is not None
+    ):
+        day_open = prior_close * (1.0 + gap)
+        price = day_open * (1.0 + early_return)
+        price_basis = VOLUME_PRICE_BASIS_LAST_PRE_DECISION
+    dollar_volume = (
+        share_volume * price
+        if share_volume is not None
+        and share_volume > 0
+        and price is not None
+        and price > 0
+        else None
+    )
+    return {
+        "volume_evidence_available": dollar_volume is not None,
+        "entry_window_dollar_volume": dollar_volume,
+        "entry_window_share_volume_denominator": (
+            share_volume if share_volume is not None and share_volume > 0 else None
+        ),
+        "window_basis": VOLUME_WINDOW_BASIS_PRE_DECISION,
+        "window_price_basis": price_basis,
+        "denominator_basis": denominator_basis,
+        "source_minute_bars_max_start_ts": (
+            source_bars.get("source_minute_bars_max_start_ts")
+        ),
+        "completed_through_ts": (
+            features.get("completed_through_ts") or source_bars.get("completed_through_ts")
+        ),
+    }
+
+
+def _missing_entry_volume_evidence(
+    *,
+    window_basis: str = "missing",
+    denominator_basis: str = "missing",
+) -> dict[str, Any]:
+    return {
+        "volume_evidence_available": False,
+        "entry_window_dollar_volume": None,
+        "entry_window_share_volume_denominator": None,
+        "window_basis": window_basis,
+        "window_price_basis": None,
+        "denominator_basis": denominator_basis,
+        "source_minute_bars_max_start_ts": None,
+        "completed_through_ts": None,
+    }
+
+
+def _predecision_volume_timestamp_violation(
+    candidate: I12PitCandidate,
+    *,
+    features: Mapping[str, Any],
+    source_bars: Mapping[str, Any],
+) -> str | None:
+    decision_ts = _coerce_persisted_utc(candidate.decision_ts)
+    source_max_ts, source_max_error = _select_predecision_timestamp_proof(
+        features,
+        source_bars,
+        "source_minute_bars_max_start_ts",
+    )
+    if source_max_error is not None:
+        return source_max_error
+    if source_max_ts is not None and source_max_ts >= decision_ts:
+        return "source_minute_bars_max_start_ts_at_or_after_decision_ts"
+    completed_through_ts, completed_error = _select_predecision_timestamp_proof(
+        features,
+        source_bars,
+        "completed_through_ts",
+    )
+    if completed_error is not None:
+        return completed_error
+    if completed_through_ts is not None and completed_through_ts > decision_ts:
+        return "completed_through_ts_after_decision_ts"
+    return None
+
+
+def _select_predecision_timestamp_proof(
+    features: Mapping[str, Any],
+    source_bars: Mapping[str, Any],
+    key: str,
+) -> tuple[datetime | None, str | None]:
+    saw_value = False
+    for mapping in (features, source_bars):
+        value = mapping.get(key)
+        if _timestamp_value_missing(value):
+            continue
+        saw_value = True
+        parsed = _parse_timestamp_candidate(value)
+        if parsed is not None:
+            return parsed, None
+    if not saw_value:
+        return None, "missing_predecision_timestamp_proof"
+    return None, "malformed_predecision_timestamp_proof"
+
+
+def _timestamp_value_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _parse_timestamp_candidate(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _coerce_persisted_utc(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return _coerce_persisted_utc(parsed)
+
+
+def _execution_window_volume_evidence(
+    candidate: I12PitCandidate | None,
+    entry_quote: I12PitQuoteReplay | None,
+) -> dict[str, Any]:
+    del entry_quote
+    if candidate is None:
+        return _missing_execution_window_volume_evidence()
+    features = _json_loads(candidate.feature_json)
+    source_bars = _json_loads(candidate.source_bars_json)
+    payload = _first_mapping(
+        source_bars.get("execution_window_volume_evidence"),
+        source_bars.get("execution_window_volume"),
+        features.get("execution_window_volume_evidence"),
+        features.get("execution_window_volume"),
+    )
+    if not payload:
+        return _missing_execution_window_volume_evidence()
+
+    dollar_volume = _finite_float(
+        payload.get("execution_window_dollar_volume"),
+        payload.get("dollar_volume"),
+    )
+    share_volume = _finite_float(
+        payload.get("execution_window_share_volume"),
+        payload.get("share_volume"),
+        payload.get("volume"),
+    )
+    if dollar_volume is None:
+        price = _finite_float(
+            payload.get("execution_window_vwap"),
+            payload.get("vwap"),
+            payload.get("close"),
+        )
+        if (
+            share_volume is not None
+            and share_volume > 0
+            and price is not None
+            and price > 0
+        ):
+            dollar_volume = share_volume * price
+    if share_volume is None and dollar_volume is not None:
+        price = _finite_float(
+            payload.get("execution_window_vwap"),
+            payload.get("vwap"),
+            payload.get("close"),
+        )
+        if price is not None and price > 0:
+            share_volume = dollar_volume / price
+
+    return {
+        "volume_evidence_available": (
+            dollar_volume is not None and dollar_volume > 0
+        ),
+        "entry_window_dollar_volume": (
+            dollar_volume if dollar_volume is not None and dollar_volume > 0 else None
+        ),
+        "entry_window_share_volume_denominator": (
+            share_volume if share_volume is not None and share_volume > 0 else None
+        ),
+        "window_basis": str(
+            payload.get("execution_window_basis")
+            or payload.get("basis")
+            or "persisted_execution_window_minute_bars"
+        ),
+        "window_price_basis": payload.get("price_basis") or payload.get("vwap_basis"),
+        "denominator_basis": str(
+            payload.get("denominator_basis")
+            or "persisted_execution_window_volume"
+        ),
+        "execution_window_start_ts": payload.get("execution_window_start_ts"),
+        "execution_window_end_ts": payload.get("execution_window_end_ts"),
+        "execution_window_minutes": payload.get("execution_window_minutes"),
+    }
+
+
+def _missing_execution_window_volume_evidence() -> dict[str, Any]:
+    return {
+        "volume_evidence_available": False,
+        "entry_window_dollar_volume": None,
+        "entry_window_share_volume_denominator": None,
+        "window_basis": "missing_execution_window_volume",
+        "window_price_basis": None,
+        "denominator_basis": "missing",
+        "execution_window_start_ts": None,
+        "execution_window_end_ts": None,
+        "execution_window_minutes": None,
+    }
+
+
+def _first_mapping(*values: Any) -> Mapping[str, Any] | None:
+    for value in values:
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _quote_quality_skip_reason(
+    quote: I12PitQuoteReplay | None,
+    *,
+    missing_reason: str,
+    stale_reason: str,
+    error_reason: str,
+    max_spread_bps: float,
+) -> str:
+    if quote is None:
+        return missing_reason
+    if quote.coverage_status == "missing":
+        return missing_reason
+    if quote.coverage_status == "stale":
+        return stale_reason
+    if quote.coverage_status != "ok":
+        return error_reason
+    raw = _json_loads(quote.raw_json)
+    conditions = raw.get("c") or raw.get("conditions") or []
+    if any(str(item).upper() in HALT_CONDITIONS for item in conditions):
+        return "halt_or_bad_quote"
+    if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0:
+        return "halt_or_bad_quote"
+    if quote.ask < quote.bid:
+        return "halt_or_bad_quote"
+    if quote.spread_bps is None or quote.spread_bps > max_spread_bps:
+        return "spread"
+    return "none"
+
+
+def _finite_float(*values: Any) -> float | None:
+    for value in values:
+        try:
+            if value is None:
+                continue
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _volume_threshold_label(threshold: float) -> str:
+    pct = threshold * 100.0
+    text = f"{pct:g}".replace(".", "_")
+    return f"{text}pct"
 
 
 def _provider_error_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None:

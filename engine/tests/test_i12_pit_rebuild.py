@@ -2248,7 +2248,136 @@ def test_failed_candidate_supersession_inactivates_old_child_evidence(db_session
     assert second.metrics["active_cost_rows_with_inactive_candidate_count"] == 0
 
 
-def test_active_child_rows_with_inactive_candidate_fail_report(db_session):
+def test_report_child_loaders_receive_passed_candidate_ids_only(db_session, monkeypatch):
+    passed = _persist_complete_candidate_replay(db_session, "PASSLOAD")
+    _persist_candidate(
+        db_session,
+        "FAILLOAD",
+        candidate_status="failed",
+        coverage_status="daily_fetch_error",
+    )
+    calls = []
+    original = i12_pit_rebuild._load_child_rows_for_candidate_ids
+
+    def tracking_loader(session, model, candidate_ids):
+        calls.append((model, list(candidate_ids)))
+        return original(session, model, candidate_ids)
+
+    monkeypatch.setattr(
+        i12_pit_rebuild,
+        "_load_child_rows_for_candidate_ids",
+        tracking_loader,
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        hur_rows_loaded=0,
+        decision_time_count=1,
+    )
+
+    assert calls == [
+        (I12PitQuoteReplay, [passed.i12_pit_candidate_id]),
+        (I12PitCostReplay, [passed.i12_pit_candidate_id]),
+    ]
+    assert report["active_candidate_row_count"] == 2
+    assert report["pit_candidate_count"] == 1
+    assert report["quote_replay_row_count"] == 3
+    assert report["cost_replay_row_count"] == 2
+
+
+def test_active_child_rows_with_nonpassed_candidate_block_report(
+    db_session,
+    monkeypatch,
+):
+    passed = _persist_complete_candidate_replay(db_session, "PASSCHILD")
+    failed = _persist_candidate(
+        db_session,
+        "FAILCHILD",
+        candidate_status="failed",
+        coverage_status="ok",
+    )
+    failed_entry = _persist_quote(db_session, failed, role="entry", status="ok")
+    failed_same_day = _persist_quote(
+        db_session,
+        failed,
+        role="same_day_exit",
+        status="ok",
+    )
+    failed_next_open = _persist_quote(
+        db_session,
+        failed,
+        role="next_open_exit",
+        status="ok",
+    )
+    _persist_cost(
+        db_session,
+        failed,
+        "same_day_exit",
+        evaluate_quote_cost_replay(
+            entry_quote=failed_entry,
+            exit_quote=failed_same_day,
+            exit_role="same_day_exit",
+            intended_order_usd=50,
+            max_spread_bps=200,
+        ),
+    )
+    _persist_cost(
+        db_session,
+        failed,
+        "next_open_exit",
+        evaluate_quote_cost_replay(
+            entry_quote=failed_entry,
+            exit_quote=failed_next_open,
+            exit_role="next_open_exit",
+            intended_order_usd=50,
+            max_spread_bps=200,
+        ),
+    )
+    calls = []
+    original = i12_pit_rebuild._load_child_rows_for_candidate_ids
+
+    def tracking_loader(session, model, candidate_ids):
+        calls.append((model, list(candidate_ids)))
+        return original(session, model, candidate_ids)
+
+    monkeypatch.setattr(
+        i12_pit_rebuild,
+        "_load_child_rows_for_candidate_ids",
+        tracking_loader,
+    )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        compare_path_modes=True,
+    )
+
+    assert calls == [
+        (I12PitQuoteReplay, [passed.i12_pit_candidate_id]),
+        (I12PitCostReplay, [passed.i12_pit_candidate_id]),
+    ]
+    assert report["quote_replay_row_count"] == 3
+    assert report["cost_replay_row_count"] == 2
+    assert report["historical_quote_replay_row_count"] == 6
+    assert report["historical_cost_replay_row_count"] == 4
+    assert report["active_quote_rows_with_nonpassed_candidate_count"] == 3
+    assert report["active_cost_rows_with_nonpassed_candidate_count"] == 2
+    assert report["active_quote_rows_with_inactive_candidate_count"] == 0
+    assert report["active_cost_rows_with_inactive_candidate_count"] == 0
+    assert report["source_denominator_known"] is False
+    assert report["training_status"] == "blocked_child_evidence_parent_nonpassed"
+    assert report["data_integrity_passed"] is False
+    assert report["conclusions_final"] is False
+    assert report["comparison_conclusions_final"] is False
+    assert report["path_mode_metrics"]["strict_contiguous"]["training_status"] == (
+        "blocked_child_evidence_parent_nonpassed"
+    )
+    assert all(
+        metrics["training_status"] != "eligible_for_retrain_evaluation"
+        for metrics in report["path_mode_metrics"].values()
+    )
+
+
+def test_active_child_rows_with_inactive_candidate_fail_report(db_session, monkeypatch):
     candidate = _persist_candidate(db_session, "ORPHAN")
     entry = _persist_quote(db_session, candidate, role="entry", status="ok")
     same_day = _persist_quote(db_session, candidate, role="same_day_exit", status="ok")
@@ -2280,6 +2409,18 @@ def test_active_child_rows_with_inactive_candidate_fail_report(db_session):
     candidate.is_active = False
     candidate.superseded_at = datetime.now(timezone.utc)
     db_session.flush()
+    calls = []
+    original = i12_pit_rebuild._load_child_rows_for_candidate_ids
+
+    def tracking_loader(session, model, candidate_ids):
+        calls.append((model, list(candidate_ids)))
+        return original(session, model, candidate_ids)
+
+    monkeypatch.setattr(
+        i12_pit_rebuild,
+        "_load_child_rows_for_candidate_ids",
+        tracking_loader,
+    )
 
     report = i12_pit_rebuild_report(
         db_session,
@@ -2287,6 +2428,7 @@ def test_active_child_rows_with_inactive_candidate_fail_report(db_session):
         decision_time_count=1,
     )
 
+    assert calls == [(I12PitQuoteReplay, []), (I12PitCostReplay, [])]
     assert report["active_quote_rows_with_inactive_candidate_count"] == 3
     assert report["active_cost_rows_with_inactive_candidate_count"] == 2
     assert report["training_status"] == "blocked_child_evidence_parent_inactive"
@@ -3465,6 +3607,83 @@ def test_compare_path_modes_respects_decision_time_labels(db_session):
     assert report["conclusions_final"] is True
 
 
+def test_report_sql_aggregates_match_legacy_full_hydration(db_session):
+    for ticker in ("AGGSTRICT", "AGGSPARSE", "AGGFAIL", "AGGPART", "AGGOLD"):
+        _add_hur(db_session, ticker, output_hash=f"hur-{ticker.lower()}")
+    _persist_complete_candidate_replay(
+        db_session,
+        "AGGSTRICT",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "AGGSTRICT"),
+        decision_time_label="09:40",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "AGGSPARSE",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "AGGSPARSE"),
+        decision_time_label="09:40",
+    )
+    _persist_candidate(
+        db_session,
+        "AGGFAIL",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "AGGFAIL"),
+        decision_time_label="09:40",
+        candidate_status="failed",
+        coverage_status="daily_fetch_error",
+    )
+    part_hash = _hur_identity_hash(db_session, "AGGPART")
+    _persist_candidate(
+        db_session,
+        "AGGPART",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=part_hash,
+        decision_time_label="09:40",
+        candidate_status="failed",
+        coverage_status="partial_minute_path",
+    )
+    _persist_complete_candidate_replay(
+        db_session,
+        "AGGPART",
+        path_mode="sparse_zero_fill",
+        source_hur_identity_hash=part_hash,
+        decision_time_label="09:40",
+    )
+    old = _persist_complete_candidate_replay(
+        db_session,
+        "AGGOLD",
+        path_mode="strict_contiguous",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "AGGOLD"),
+        decision_time_label="09:35",
+    )
+    old.is_active = False
+    db_session.flush()
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+        compare_path_modes=True,
+    )
+    legacy = _legacy_report_aggregate_snapshot(
+        db_session,
+        decision_time_labels=["09:40"],
+    )
+
+    for key, expected in legacy.items():
+        if key == "path_mode_metrics":
+            continue
+        assert report[key] == expected
+    for mode in ("strict_contiguous", "sparse_zero_fill"):
+        mode_report = report["path_mode_metrics"][mode]
+        mode_legacy = legacy["path_mode_metrics"][mode]
+        for key, expected in mode_legacy.items():
+            assert mode_report[key] == expected
+
+
 def test_progress_metrics_are_scoped_to_path_mode(db_session):
     _persist_complete_candidate_replay(db_session, "STRICTPROGRESS", path_mode="strict_contiguous")
     _persist_complete_candidate_replay(db_session, "SPARSEPROGRESS", path_mode="sparse_zero_fill")
@@ -4623,6 +4842,827 @@ def test_report_treats_non_ok_quote_rows_as_complete_durable_evidence(db_session
     }
 
 
+def test_report_adds_predecision_volume_tradeability_when_displayed_size_is_tiny(db_session):
+    _add_hur(db_session, "VOLSIZE", output_hash="hur-volume-size")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLSIZE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLSIZE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    entry = _persist_quote(
+        db_session,
+        candidate,
+        role="entry",
+        bid=10.00,
+        ask=10.05,
+        bid_size=1,
+        ask_size=1,
+    )
+    same_day = _persist_quote(
+        db_session,
+        candidate,
+        role="same_day_exit",
+        bid=10.50,
+        ask=10.55,
+        bid_size=1,
+        ask_size=1,
+    )
+    next_open = _persist_quote(
+        db_session,
+        candidate,
+        role="next_open_exit",
+        bid=10.20,
+        ask=10.25,
+        bid_size=1,
+        ask_size=1,
+    )
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+                slippage_bps=0,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["exit_metrics"]["same_day_exit"]["skipped_cash_by_reason"] == {
+        "size": 1,
+    }
+    volume = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert volume["tradeable_volume_count"] == 1
+    assert volume["volume_tradeability_rate"] == 1.0
+    assert volume["mean_modeled_return_volume_skips_as_cash"] == pytest.approx(
+        10.50 / 10.05 - 1.0
+    )
+    assert volume["entry_window_dollar_volume"]["p50"] == pytest.approx(
+        10_000 * ((10.00 + 10.05) / 2.0)
+    )
+    assert volume["entry_window_share_volume"]["p50"] == 10_000
+    assert volume["intended_order_participation_rate"]["p50"] == pytest.approx(
+        250 / (10_000 * ((10.00 + 10.05) / 2.0))
+    )
+    assert volume["intended_order_share_participation_rate"]["p50"] == pytest.approx(
+        (250 / 10.05) / 10_000
+    )
+    assert (
+        report["predecision_volume_tradeability_evidence"]["entry_volume_window_basis"]
+        == "pre_decision_completed_minutes"
+    )
+    assert report["predecision_volume_tradeability_evidence"][
+        "predecision_window_denominator_basis_counts"
+    ] == {"observed_cumulative_volume_before_decision": 2}
+    assert report["predecision_volume_tradeability_evidence"][
+        "predecision_window_price_basis_counts"
+    ] == {"entry_quote_mid": 2}
+    assert report["volume_tradeability_metrics"] == report[
+        "predecision_volume_tradeability_metrics"
+    ]
+    assert report["displayed_size_tradeability_status_counts"] == {"skipped_cash": 2}
+    assert report["execution_window_volume_tradeability_metrics"]["same_day_exit"][
+        "volume_tradeability_skip_reason_counts"
+    ] == {"volume_missing": 1}
+
+
+def test_report_predecision_volume_requires_timestamp_proof_when_volume_exists(db_session):
+    _add_hur(db_session, "VOLNOPROOF", output_hash="hur-volume-no-proof")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLNOPROOF",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLNOPROOF"),
+        feature_json={
+            "prior_close": 10.0,
+            "gap": 0.0,
+            "early_return": 0.0,
+            "observed_cumulative_volume_before_decision": 10_000,
+        },
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 0
+    assert metrics["volume_tradeability_skip_reason_counts"] == {"volume_missing": 1}
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "missing_predecision_timestamp_proof": 1,
+    }
+    assert metrics["predecision_window_basis_counts"] == {
+        "unsafe_predecision_timestamp": 1,
+    }
+
+
+def test_report_predecision_volume_uses_valid_source_timestamp_when_feature_malformed(db_session):
+    _add_hur(db_session, "VOLSRCOK", output_hash="hur-volume-source-ok")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLSRCOK",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLSRCOK"),
+        feature_json=_volume_feature_payload(
+            early_cumulative_volume=10_000,
+            source_minute_bars_max_start_ts="not-a-timestamp",
+        ),
+    )
+    _set_source_bar_timestamp_proof(
+        candidate,
+        source_max_ts=(DECISION_TS - timedelta(minutes=1)).isoformat(),
+        completed_through_ts=DECISION_TS.isoformat(),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 1
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "observed_cumulative_volume_before_decision": 1,
+    }
+
+
+def test_report_predecision_volume_fails_closed_when_timestamp_proof_malformed(db_session):
+    _add_hur(db_session, "VOLBADTIME", output_hash="hur-volume-bad-time")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLBADTIME",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLBADTIME"),
+        feature_json=_volume_feature_payload(
+            early_cumulative_volume=10_000,
+            source_minute_bars_max_start_ts="not-a-timestamp",
+        ),
+    )
+    _set_source_bar_timestamp_proof(
+        candidate,
+        source_max_ts="also-not-a-timestamp",
+        completed_through_ts=DECISION_TS.isoformat(),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 0
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "malformed_predecision_timestamp_proof": 1,
+    }
+
+
+def test_report_predecision_volume_tradeability_keeps_wide_spread_skipped(db_session):
+    _add_hur(db_session, "VOLWIDE", output_hash="hur-volume-wide")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLWIDE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLWIDE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    entry = _persist_quote(
+        db_session,
+        candidate,
+        role="entry",
+        bid=9.00,
+        ask=10.05,
+        bid_size=1_000,
+        ask_size=1_000,
+    )
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["predecision_volume_tradeability_metrics"]["same_day_exit"][
+        "tradeable_volume_count"
+    ] == 0
+    assert report["predecision_volume_tradeability_metrics"]["same_day_exit"][
+        "volume_tradeability_skip_reason_counts"
+    ] == {"spread": 1}
+
+
+def test_report_predecision_volume_price_basis_falls_back_without_entry_mid(db_session):
+    _add_hur(db_session, "VOLPRICE", output_hash="hur-volume-price")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLPRICE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLPRICE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    entry = _persist_quote(
+        db_session,
+        candidate,
+        role="entry",
+        bid=0.0,
+        ask=10.05,
+        bid_size=1_000,
+        ask_size=1_000,
+    )
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["predecision_window_price_basis_counts"] == {
+        "last_predecision_price_proxy": 1,
+    }
+    assert metrics["entry_window_dollar_volume"]["p50"] == 100_000
+    assert metrics["volume_tradeability_skip_reason_counts"] == {
+        "halt_or_bad_quote": 1,
+    }
+
+
+def test_report_predecision_volume_tradeability_records_early_volume_fallback(db_session):
+    _add_hur(db_session, "VOLFALL", output_hash="hur-volume-fallback")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLFALL",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLFALL"),
+        feature_json={
+            "prior_close": 10.0,
+            "gap": 0.0,
+            "early_return": 0.0,
+            "early_cumulative_volume": 10_000,
+        },
+    )
+    _set_source_bar_timestamp_proof(
+        candidate,
+        source_max_ts=(DECISION_TS - timedelta(minutes=1)).isoformat(),
+        completed_through_ts=DECISION_TS.isoformat(),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=1_000, ask_size=1_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=1_000, ask_size=1_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=1_000, ask_size=1_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 1
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "early_cumulative_volume_fallback": 1,
+    }
+
+
+def test_report_predecision_volume_tradeability_keeps_stale_quote_skipped(db_session):
+    _add_hur(db_session, "VOLSTALE", output_hash="hur-volume-stale")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLSTALE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLSTALE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", status="stale")
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["quote_replay_complete"] is True
+    assert report["predecision_volume_tradeability_skip_reason_counts"] == {
+        "entry_quote_stale": 2,
+    }
+    assert report["predecision_volume_tradeability_metrics"]["same_day_exit"][
+        "tradeable_volume_count"
+    ] == 0
+
+
+def test_report_predecision_volume_tradeability_requires_volume_evidence(db_session):
+    _add_hur(db_session, "VOLMISS", output_hash="hur-volume-missing")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLMISS",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLMISS"),
+        feature_json={},
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=1_000, ask_size=1_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["predecision_volume_tradeability_skip_reason_counts"] == {
+        "volume_missing": 2
+    }
+    assert report["predecision_volume_tradeability_evidence"][
+        "volume_evidence_missing_count"
+    ] == 2
+    assert report["predecision_volume_tradeability_metrics"]["same_day_exit"][
+        "volume_evidence_missing_count"
+    ] == 1
+
+
+def test_report_predecision_volume_tradeability_does_not_use_projected_volume(db_session):
+    _add_hur(db_session, "VOLLEAK", output_hash="hur-volume-leak")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLLEAK",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLLEAK"),
+        feature_json=_volume_feature_payload(
+            early_cumulative_volume=500_000,
+            observed_cumulative_volume_before_decision=0,
+            projected_volume_at_decision=1_000_000_000,
+            projected_volume_ratio_at_decision=9999,
+            zero_fill_projected_volume_at_decision=1_000_000_000,
+            zero_fill_projected_volume_ratio=9999,
+        ),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 0
+    assert metrics["volume_tradeability_skip_reason_counts"] == {"volume_missing": 1}
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "observed_cumulative_volume_before_decision": 1,
+    }
+    assert not any(
+        "projected" in key
+        for key in metrics["predecision_window_denominator_basis_counts"]
+    )
+
+
+def test_report_predecision_volume_fails_closed_on_unsafe_source_max_timestamp(db_session):
+    _add_hur(db_session, "VOLTIME1", output_hash="hur-volume-time1")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLTIME1",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLTIME1"),
+        feature_json=_volume_feature_payload(
+            early_cumulative_volume=500_000,
+            source_minute_bars_max_start_ts=DECISION_TS.isoformat(),
+        ),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 0
+    assert metrics["volume_tradeability_skip_reason_counts"] == {"volume_missing": 1}
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "source_minute_bars_max_start_ts_at_or_after_decision_ts": 1,
+    }
+    assert metrics["predecision_window_basis_counts"] == {
+        "unsafe_predecision_timestamp": 1,
+    }
+
+
+def test_report_predecision_volume_fails_closed_on_future_completed_through(db_session):
+    _add_hur(db_session, "VOLTIME2", output_hash="hur-volume-time2")
+    candidate = _persist_candidate(
+        db_session,
+        "VOLTIME2",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "VOLTIME2"),
+        feature_json=_volume_feature_payload(
+            early_cumulative_volume=500_000,
+            completed_through_ts=(DECISION_TS + timedelta(seconds=1)).isoformat(),
+        ),
+    )
+    entry = _persist_quote(db_session, candidate, role="entry", bid_size=10_000, ask_size=10_000)
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit", bid_size=10_000, ask_size=10_000)
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit", bid_size=10_000, ask_size=10_000)
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    metrics = report["predecision_volume_tradeability_metrics"]["same_day_exit"]
+    assert metrics["tradeable_volume_count"] == 0
+    assert metrics["predecision_window_denominator_basis_counts"] == {
+        "completed_through_ts_after_decision_ts": 1,
+    }
+
+
+def test_report_execution_window_volume_tradeability_uses_persisted_execution_volume(db_session):
+    _add_hur(db_session, "EXEVOL", output_hash="hur-execution-volume")
+    candidate = _persist_candidate(
+        db_session,
+        "EXEVOL",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "EXEVOL"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=1),
+    )
+    _attach_execution_window_volume(candidate, dollar_volume=20_000)
+    entry = _persist_quote(
+        db_session,
+        candidate,
+        role="entry",
+        bid=10.00,
+        ask=10.05,
+        bid_size=1,
+        ask_size=1,
+    )
+    same_day = _persist_quote(
+        db_session,
+        candidate,
+        role="same_day_exit",
+        bid=10.50,
+        ask=10.55,
+        bid_size=1,
+        ask_size=1,
+    )
+    next_open = _persist_quote(
+        db_session,
+        candidate,
+        role="next_open_exit",
+        bid=10.20,
+        ask=10.25,
+        bid_size=1,
+        ask_size=1,
+    )
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+                slippage_bps=0,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["exit_metrics"]["same_day_exit"]["skipped_cash_by_reason"] == {
+        "size": 1,
+    }
+    execution = report["execution_window_volume_tradeability_metrics"]["same_day_exit"]
+    assert execution["tradeable_volume_count"] == 1
+    assert execution["volume_tradeability_rate"] == 1.0
+    assert execution["execution_window_dollar_volume"]["p50"] == 20_000
+    assert execution["intended_order_participation_rate"]["p50"] == pytest.approx(
+        250 / 20_000
+    )
+
+
+def test_report_execution_window_volume_keeps_wide_spread_skipped(db_session):
+    _add_hur(db_session, "EXEWIDE", output_hash="hur-execution-wide")
+    candidate = _persist_candidate(
+        db_session,
+        "EXEWIDE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "EXEWIDE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    _attach_execution_window_volume(candidate, dollar_volume=20_000)
+    entry = _persist_quote(
+        db_session,
+        candidate,
+        role="entry",
+        bid=9.00,
+        ask=10.05,
+        bid_size=1_000,
+        ask_size=1_000,
+    )
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["execution_window_volume_tradeability_metrics"]["same_day_exit"][
+        "volume_tradeability_skip_reason_counts"
+    ] == {"spread": 1}
+
+
+def test_report_execution_window_volume_keeps_stale_quote_skipped(db_session):
+    _add_hur(db_session, "EXESTALE", output_hash="hur-execution-stale")
+    candidate = _persist_candidate(
+        db_session,
+        "EXESTALE",
+        source_hur_identity_hash=_hur_identity_hash(db_session, "EXESTALE"),
+        feature_json=_volume_feature_payload(early_cumulative_volume=10_000),
+    )
+    _attach_execution_window_volume(candidate, dollar_volume=20_000)
+    entry = _persist_quote(db_session, candidate, role="entry", status="stale")
+    same_day = _persist_quote(db_session, candidate, role="same_day_exit")
+    next_open = _persist_quote(db_session, candidate, role="next_open_exit")
+    for exit_role, exit_quote in {
+        "same_day_exit": same_day,
+        "next_open_exit": next_open,
+    }.items():
+        _persist_cost(
+            db_session,
+            candidate,
+            exit_role,
+            evaluate_quote_cost_replay(
+                entry_quote=entry,
+                exit_quote=exit_quote,
+                exit_role=exit_role,
+                intended_order_usd=250,
+                max_spread_bps=200,
+            ),
+        )
+
+    report = i12_pit_rebuild_report(
+        db_session,
+        source_hur_schema="public",
+        start_date=DAY,
+        end_date=DAY,
+        decision_time_labels=["09:40"],
+    )
+
+    assert report["execution_window_volume_tradeability_skip_reason_counts"] == {
+        "entry_quote_stale": 2,
+    }
+
+
 def test_report_blocks_unknown_quote_coverage_status_as_integrity_error(db_session):
     _add_hur(db_session, "WEIRDQ", output_hash="hur-weird-quote")
     candidate = _persist_candidate(
@@ -5585,6 +6625,267 @@ def _provider_error_response(provider, ticker, error_type):
     )
 
 
+def _legacy_report_aggregate_snapshot(db_session, *, decision_time_labels):
+    base_candidates = (
+        db_session.query(I12PitCandidate)
+        .filter(I12PitCandidate.decision_date >= DAY)
+        .filter(I12PitCandidate.decision_date <= DAY)
+    )
+    unfiltered_scoped_candidates = base_candidates.all()
+    scoped_candidates = base_candidates.filter(
+        I12PitCandidate.decision_time_label.in_(decision_time_labels)
+    ).all()
+    candidates = [row for row in scoped_candidates if row.is_active]
+    candidate_ids = [row.i12_pit_candidate_id for row in candidates]
+    quotes = _legacy_child_rows(db_session, I12PitQuoteReplay, candidate_ids)
+    costs = _legacy_child_rows(db_session, I12PitCostReplay, candidate_ids)
+    historical_quote_replay_row_count = _legacy_child_row_count(
+        db_session,
+        I12PitQuoteReplay,
+        [row.i12_pit_candidate_id for row in scoped_candidates],
+    )
+    historical_cost_replay_row_count = _legacy_child_row_count(
+        db_session,
+        I12PitCostReplay,
+        [row.i12_pit_candidate_id for row in scoped_candidates],
+    )
+    return {
+        "available_path_modes": sorted(
+            {row.path_mode for row in unfiltered_scoped_candidates}
+        ),
+        "available_decision_time_labels": sorted(
+            {row.decision_time_label for row in unfiltered_scoped_candidates}
+        ),
+        "available_decision_time_labels_for_report_scope": sorted(
+            {row.decision_time_label for row in scoped_candidates}
+        ),
+        "mixed_path_modes_present": (
+            len({row.path_mode for row in unfiltered_scoped_candidates}) > 1
+        ),
+        "mixed_decision_times_present": (
+            len({row.decision_time_label for row in unfiltered_scoped_candidates}) > 1
+        ),
+        "candidate_row_count": len(candidates),
+        "actual_candidate_row_count": len(candidates),
+        "active_candidate_row_count": len(candidates),
+        "historical_candidate_row_count": len(scoped_candidates),
+        "candidate_status_counts": dict(
+            Counter(row.candidate_status for row in candidates)
+        ),
+        "candidate_coverage_status_counts": dict(
+            Counter(row.coverage_status for row in candidates)
+        ),
+        "candidate_counts_by_path_mode": dict(
+            Counter(row.path_mode for row in candidates)
+        ),
+        "coverage_status_by_path_mode": _legacy_coverage_status_by_path_mode(
+            candidates
+        ),
+        "daily_source_hash_basis_counts": (
+            i12_pit_rebuild._daily_source_hash_basis_counts(candidates)
+        ),
+        "daily_source_hash_reuse_status_counts": (
+            i12_pit_rebuild._daily_source_hash_reuse_status_counts(candidates)
+        ),
+        "quote_replay_row_count": len(quotes),
+        "historical_quote_replay_row_count": historical_quote_replay_row_count,
+        "cost_replay_row_count": len(costs),
+        "historical_cost_replay_row_count": historical_cost_replay_row_count,
+        "strict_partial_rows_that_would_pass_sparse_zero_fill": (
+            _legacy_strict_partial_rows_that_would_pass_sparse_zero_fill(candidates)
+        ),
+        "decision_time_buckets": _legacy_decision_time_buckets(candidates, costs),
+        "path_mode_metrics": {
+            mode: _legacy_path_mode_aggregate_snapshot(candidates, mode)
+            for mode in i12_pit_rebuild.MINUTE_PATH_MODES
+        },
+    }
+
+
+def _legacy_child_rows(db_session, model, candidate_ids):
+    if not candidate_ids:
+        return []
+    return (
+        db_session.query(model)
+        .filter(model.i12_pit_candidate_id.in_(candidate_ids))
+        .filter(model.is_active.is_(True))
+        .all()
+    )
+
+
+def _legacy_child_row_count(db_session, model, candidate_ids):
+    if not candidate_ids:
+        return 0
+    return (
+        db_session.query(model)
+        .filter(model.i12_pit_candidate_id.in_(candidate_ids))
+        .count()
+    )
+
+
+def _legacy_coverage_status_by_path_mode(candidates):
+    out: dict[str, Counter[str]] = {}
+    for candidate in candidates:
+        out.setdefault(candidate.path_mode, Counter())[candidate.coverage_status] += 1
+    return {mode: dict(counter) for mode, counter in sorted(out.items())}
+
+
+def _legacy_strict_partial_rows_that_would_pass_sparse_zero_fill(candidates):
+    sparse_pass_keys = {
+        _legacy_candidate_attempt_comparison_key(row)
+        for row in candidates
+        if row.path_mode == "sparse_zero_fill" and row.candidate_status == "passed"
+    }
+    return sum(
+        1
+        for row in candidates
+        if row.path_mode == "strict_contiguous"
+        and row.coverage_status == "partial_minute_path"
+        and _legacy_candidate_attempt_comparison_key(row) in sparse_pass_keys
+    )
+
+
+def _legacy_candidate_attempt_comparison_key(candidate):
+    source_bars = json.loads(candidate.source_bars_json or "{}")
+    return (
+        candidate.ticker,
+        candidate.decision_date,
+        candidate.decision_time_label,
+        source_bars.get("source_hur_identity_hash"),
+    )
+
+
+def _legacy_decision_time_buckets(candidates, costs):
+    costs_by_candidate: dict[str, list[I12PitCostReplay]] = {}
+    for row in costs:
+        costs_by_candidate.setdefault(row.i12_pit_candidate_id, []).append(row)
+    buckets = {}
+    for label in sorted({row.decision_time_label for row in candidates}):
+        rows = [row for row in candidates if row.decision_time_label == label]
+        passed = [row for row in rows if row.candidate_status == "passed"]
+        bucket = {
+            "candidate_count": len(rows),
+            "passed_count": len(passed),
+            "candidate_status_counts": dict(
+                Counter(row.candidate_status for row in rows)
+            ),
+            "coverage_status_counts": dict(
+                Counter(row.coverage_status for row in rows)
+            ),
+        }
+        for exit_role in i12_pit_rebuild.EXIT_ROLES:
+            role_costs = [
+                cost
+                for candidate in passed
+                for cost in costs_by_candidate.get(candidate.i12_pit_candidate_id, [])
+                if cost.exit_role == exit_role
+            ]
+            tradeable = [
+                cost for cost in role_costs
+                if cost.tradeability_status == "tradeable"
+            ]
+            bucket[exit_role] = {
+                "cost_row_count": len(role_costs),
+                "tradeable_count": len(tradeable),
+                "tradeable_rate": len(tradeable) / len(passed) if passed else None,
+                "skipped_cash_by_reason": dict(
+                    Counter(cost.skipped_reason for cost in role_costs)
+                ),
+                "mean_modeled_return_skips_as_cash": i12_pit_rebuild._mean(
+                    cost.modeled_return for cost in role_costs
+                ),
+            }
+        buckets[label] = bucket
+    return buckets
+
+
+def _legacy_path_mode_aggregate_snapshot(candidates, mode):
+    mode_candidates = [row for row in candidates if row.path_mode == mode]
+    return {
+        "candidate_count": len(mode_candidates),
+        "candidate_status_counts": dict(
+            Counter(row.candidate_status for row in mode_candidates)
+        ),
+        "coverage_status_counts": dict(
+            Counter(row.coverage_status for row in mode_candidates)
+        ),
+        "daily_source_hash_basis_counts": (
+            i12_pit_rebuild._daily_source_hash_basis_counts(mode_candidates)
+        ),
+        "daily_source_hash_reuse_status_counts": (
+            i12_pit_rebuild._daily_source_hash_reuse_status_counts(mode_candidates)
+        ),
+    }
+
+
+def _volume_feature_payload(
+    *,
+    early_cumulative_volume=10_000,
+    observed_cumulative_volume_before_decision=None,
+    projected_volume_at_decision=None,
+    projected_volume_ratio_at_decision=None,
+    zero_fill_projected_volume_at_decision=None,
+    zero_fill_projected_volume_ratio=None,
+    source_minute_bars_max_start_ts=None,
+    completed_through_ts=None,
+):
+    if observed_cumulative_volume_before_decision is None:
+        observed_cumulative_volume_before_decision = early_cumulative_volume
+    if source_minute_bars_max_start_ts is None:
+        source_minute_bars_max_start_ts = (
+            DECISION_TS - timedelta(minutes=1)
+        ).isoformat()
+    if completed_through_ts is None:
+        completed_through_ts = DECISION_TS.isoformat()
+    payload = {
+        "prior_close": 10.0,
+        "gap": 0.0,
+        "early_return": 0.0,
+        "early_cumulative_volume": early_cumulative_volume,
+        "observed_cumulative_volume_before_decision": (
+            observed_cumulative_volume_before_decision
+        ),
+        "completed_through_ts": completed_through_ts,
+        "source_minute_bars_max_start_ts": source_minute_bars_max_start_ts,
+    }
+    optional = {
+        "projected_volume_at_decision": projected_volume_at_decision,
+        "projected_volume_ratio_at_decision": projected_volume_ratio_at_decision,
+        "zero_fill_projected_volume_at_decision": zero_fill_projected_volume_at_decision,
+        "zero_fill_projected_volume_ratio": zero_fill_projected_volume_ratio,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    return payload
+
+
+def _attach_execution_window_volume(candidate, *, dollar_volume=20_000, share_volume=2_000):
+    source_bars = json.loads(candidate.source_bars_json)
+    source_bars["execution_window_volume_evidence"] = {
+        "execution_window_basis": "persisted_execution_window_minute_bars",
+        "execution_window_start_ts": candidate.decision_ts.isoformat(),
+        "execution_window_end_ts": (
+            candidate.decision_ts + timedelta(minutes=1)
+        ).isoformat(),
+        "execution_window_minutes": 1,
+        "execution_window_dollar_volume": dollar_volume,
+        "execution_window_share_volume": share_volume,
+        "price_basis": "minute_vwap",
+    }
+    candidate.source_bars_json = json.dumps(source_bars)
+
+
+def _set_source_bar_timestamp_proof(
+    candidate,
+    *,
+    source_max_ts,
+    completed_through_ts,
+):
+    source_bars = json.loads(candidate.source_bars_json)
+    source_bars["source_minute_bars_max_start_ts"] = source_max_ts
+    source_bars["completed_through_ts"] = completed_through_ts
+    candidate.source_bars_json = json.dumps(source_bars)
+
+
 def _candidate_row(
     ticker="PIT",
     *,
@@ -5593,6 +6894,7 @@ def _candidate_row(
     decision_time_label="09:40",
     candidate_status="passed",
     coverage_status="ok",
+    feature_json=None,
 ):
     source_hur_identity_hash = source_hur_identity_hash or f"hur-{ticker}"
     identity_hash = (
@@ -5614,7 +6916,7 @@ def _candidate_row(
         feature_asof_ts=DECISION_TS,
         candidate_status=candidate_status,
         coverage_status=coverage_status,
-        feature_json="{}",
+        feature_json=json.dumps(feature_json or {}),
         gate_values_json="{}",
         leakage_guard_json="{}",
         source_bars_json=json.dumps({
