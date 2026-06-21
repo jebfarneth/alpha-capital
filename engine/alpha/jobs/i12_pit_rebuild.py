@@ -3976,21 +3976,25 @@ def _expected_source_attempt_hashes_for_mode(
     path_mode: str,
 ) -> set[str]:
     hashes: set[str] = set()
-    for trading_date in _session_dates(start_date, end_date):
-        for hur_row in _load_hur_source_rows_for_report(
-            session,
-            source_hur_schema=source_hur_schema,
-            trading_date=trading_date,
-        ):
-            for label in decision_time_labels:
-                hashes.add(_candidate_attempt_hash(
-                    ticker=hur_row.ticker,
-                    trading_date=trading_date,
-                    decision_ts=_decision_timestamp(trading_date, label),
-                    decision_time_label=label,
-                    source_hur_identity_hash=hur_row.source_hur_identity_hash,
-                    path_mode=path_mode,
-                ))
+    session_dates = set(_session_dates(start_date, end_date))
+    for hur_row in _load_hur_source_rows_for_report_range(
+        session,
+        source_hur_schema=source_hur_schema,
+        start_date=start_date,
+        end_date=end_date,
+    ):
+        trading_date = hur_row.trading_date
+        if trading_date not in session_dates:
+            continue
+        for label in decision_time_labels:
+            hashes.add(_candidate_attempt_hash(
+                ticker=hur_row.ticker,
+                trading_date=trading_date,
+                decision_ts=_decision_timestamp(trading_date, label),
+                decision_time_label=label,
+                source_hur_identity_hash=hur_row.source_hur_identity_hash,
+                path_mode=path_mode,
+            ))
     return hashes
 
 
@@ -4039,6 +4043,64 @@ def _load_hur_source_rows_for_report(
     )
     return [
         _hur_source_row_from_model(row, source_schema=source_hur_schema)
+        for row in rows
+    ]
+
+
+def _load_hur_source_rows_for_report_range(
+    session: Session,
+    *,
+    source_hur_schema: str,
+    start_date: date,
+    end_date: date,
+) -> list[HurSourceRow]:
+    if _should_schema_qualify_hur(session, source_hur_schema):
+        rows = session.execute(
+            text(
+                "SELECT normalized_symbol, replay_date, input_hash, output_hash, "
+                "reconstruction_method, source, pit_filter_status_json "
+                f"FROM {_quote_ident(source_hur_schema)}."
+                "historical_universe_reconstructions "
+                "WHERE replay_date >= :start_date "
+                "AND replay_date <= :end_date "
+                "AND inclusion_status = 'included'"
+            ),
+            {
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        ).all()
+        return [
+            _hur_source_row_from_mapping(
+                row._mapping,
+                source_schema=source_hur_schema,
+                fallback_date=start_date,
+            )
+            for row in rows
+        ]
+    rows = (
+        session.query(
+            HistoricalUniverseReconstruction.normalized_symbol,
+            HistoricalUniverseReconstruction.replay_date,
+            HistoricalUniverseReconstruction.input_hash,
+            HistoricalUniverseReconstruction.output_hash,
+            HistoricalUniverseReconstruction.reconstruction_method,
+            HistoricalUniverseReconstruction.source,
+            HistoricalUniverseReconstruction.pit_filter_status_json,
+        )
+        .filter(
+            HistoricalUniverseReconstruction.replay_date >= start_date,
+            HistoricalUniverseReconstruction.replay_date <= end_date,
+            HistoricalUniverseReconstruction.inclusion_status == "included",
+        )
+        .all()
+    )
+    return [
+        _hur_source_row_from_mapping(
+            row._mapping,
+            source_schema=source_hur_schema,
+            fallback_date=start_date,
+        )
         for row in rows
     ]
 
