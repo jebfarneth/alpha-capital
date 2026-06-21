@@ -12,21 +12,42 @@ import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
-try:
-    from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import Session
-except ModuleNotFoundError as exc:  # pragma: no cover - exercised by direct invocation.
-    if exc.name == "sqlalchemy":
-        venv_python = Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
-        if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
-            os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
-    raise
+
+def _parse_dependency_light_help() -> None:
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        return
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot", action="append", metavar="SNAPSHOT", required=True)
+    parser.add_argument("--start-date", required=True)
+    parser.add_argument("--end-date", required=True)
+    parser.add_argument(
+        "--minute-path-mode",
+        required=True,
+        choices=["strict_contiguous", "sparse_zero_fill"],
+    )
+    parser.add_argument("--format", choices=["text", "json", "jsonl", "csv"], default="json")
+    parser.add_argument("--scope", choices=["passed", "all-source-attempts"], default="passed")
+    parser.add_argument("--max-json-rows", type=int, default=100_000)
+    parser.add_argument("--max-event-rows", type=int, default=100_000)
+    parser.add_argument("--allow-large-source-attempts", action="store_true")
+    parser.add_argument("--output")
+    parser.add_argument("--require-final", action="store_true")
+    parser.add_argument("--strict-predictor-guards", action="store_true")
+    parser.add_argument("--database-url")
+    parser.parse_args()
+
+
+_parse_dependency_light_help()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+ENGINE_DIR = SCRIPT_DIR.parent
+if str(ENGINE_DIR) not in sys.path:
+    sys.path.insert(0, str(ENGINE_DIR))
 
 from compare_i12_pit_snapshots import (  # noqa: E402
     _first_present,
@@ -36,6 +57,12 @@ from compare_i12_pit_snapshots import (  # noqa: E402
     _validate_decision_time,
     _validate_final_report,
     _validate_scratch_schema,
+)
+from alpha.jobs.i12_pit_volume_participation import (  # noqa: E402
+    DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+    VOLUME_TRADEABILITY_OK_STATUS,
+    predecision_volume_evidence,
+    volume_tradeability_for_cost,
 )
 
 
@@ -137,7 +164,7 @@ def build_event_tape(
         url = database_url or os.environ.get("DATABASE_URL")
         if not url:
             raise RuntimeError("DATABASE_URL is required unless db_session is provided")
-        session = Session(bind=create_engine(url))
+        session = _create_session(url)
         owns_session = True
     assert session is not None
     try:
@@ -197,7 +224,8 @@ def build_event_tape(
             warnings.append("diagnostic_partial_tape_finality_not_required")
         if scope == "all-source-attempts":
             warnings.append("source_attempt_tape_not_ml_event_tape")
-        warnings.append("volume_participation_labels_unavailable_displayed_size_only")
+        warnings.append("displayed_size_economics_diagnostic_only")
+        warnings.append("volume_participation_inferred_fillability_not_guaranteed")
         _annotate_membership(rows, [snapshot.label for snapshot in normalized], scope=scope)
         summary = _summary(
             rows,
@@ -486,9 +514,11 @@ def _event_rows_for_snapshot(
           c.coverage_status,
           c.fail_reason,
           c.feature_json,
+          c.source_bars_json,
           c.leakage_guard_json,
           c.candidate_attempt_hash,
           c.content_hash,
+          eq.i12_pit_quote_replay_id AS entry_quote_replay_id,
           eq.coverage_status AS entry_quote_status,
           eq.quote_ts AS entry_quote_ts,
           eq.quote_age_seconds AS entry_quote_age_seconds,
@@ -496,9 +526,36 @@ def _event_rows_for_snapshot(
           eq.ask AS entry_ask,
           eq.spread_bps AS entry_spread_bps,
           eq.executable_notional AS entry_executable_notional,
+          eq.raw_json AS entry_quote_raw_json,
+          sdq.i12_pit_quote_replay_id AS same_day_exit_quote_replay_id,
           sdq.coverage_status AS same_day_exit_quote_status,
+          sdq.bid AS same_day_exit_bid,
+          sdq.ask AS same_day_exit_ask,
+          sdq.spread_bps AS same_day_exit_spread_bps,
+          sdq.raw_json AS same_day_exit_quote_raw_json,
+          noq.i12_pit_quote_replay_id AS next_open_exit_quote_replay_id,
           noq.coverage_status AS next_open_exit_quote_status,
+          noq.bid AS next_open_exit_bid,
+          noq.ask AS next_open_exit_ask,
+          noq.spread_bps AS next_open_exit_spread_bps,
+          noq.raw_json AS next_open_exit_quote_raw_json,
+          sdc.i12_pit_cost_replay_id AS same_day_cost_replay_id,
+          sdc.entry_quote_replay_id AS same_day_entry_quote_replay_id,
+          sdc.exit_quote_replay_id AS same_day_cost_exit_quote_replay_id,
+          sdc.intended_order_usd AS same_day_intended_order_usd,
+          sdc.max_spread_bps AS same_day_max_spread_bps,
+          sdc.slippage_bps AS same_day_slippage_bps,
+          sdc.quote_cost_return AS same_day_quote_cost_return_displayed_size,
+          sdc.slippage_return AS same_day_slippage_return_displayed_size,
           sdc.modeled_return AS same_day_modeled_return_displayed_size,
+          noc.i12_pit_cost_replay_id AS next_open_cost_replay_id,
+          noc.entry_quote_replay_id AS next_open_entry_quote_replay_id,
+          noc.exit_quote_replay_id AS next_open_cost_exit_quote_replay_id,
+          noc.intended_order_usd AS next_open_intended_order_usd,
+          noc.max_spread_bps AS next_open_max_spread_bps,
+          noc.slippage_bps AS next_open_slippage_bps,
+          noc.quote_cost_return AS next_open_quote_cost_return_displayed_size,
+          noc.slippage_return AS next_open_slippage_return_displayed_size,
           noc.modeled_return AS next_open_modeled_return_displayed_size,
           sdc.tradeability_status AS same_day_tradeability_status,
           noc.tradeability_status AS next_open_tradeability_status,
@@ -542,6 +599,7 @@ def _event_rows_for_snapshot(
     rows: list[dict[str, Any]] = []
     for raw in raw_rows:
         feature_json = _json_loads(raw.get("feature_json"))
+        source_bars_json = _json_loads(raw.get("source_bars_json"))
         leakage_guard_json = _json_loads(raw.get("leakage_guard_json"))
         predictor_status, predictor_reason, predictors = _extract_predictors(
             raw,
@@ -554,8 +612,7 @@ def _event_rows_for_snapshot(
                 f"{raw.get('ticker')} {raw.get('decision_date')}: {predictor_reason}"
             )
         entry_mid = _mid(raw.get("entry_bid"), raw.get("entry_ask"))
-        rows.append(
-            {
+        row = {
                 "ticker": raw.get("ticker"),
                 "decision_date": _str_or_none(raw.get("decision_date")),
                 "decision_time_label": raw.get("decision_time_label"),
@@ -594,13 +651,270 @@ def _event_rows_for_snapshot(
                 "next_open_tradeability_status": raw.get("next_open_tradeability_status"),
                 "same_day_skipped_reason": raw.get("same_day_skipped_reason"),
                 "next_open_skipped_reason": raw.get("next_open_skipped_reason"),
-                "same_day_modeled_return_volume_participation": None,
-                "next_open_modeled_return_volume_participation": None,
-                "volume_tradeability_status": "unavailable",
-                "volume_skip_reason": "volume_participation_not_materialized",
+            }
+        row.update(
+            _volume_participation_fields_for_raw_row(
+                raw,
+                feature_json=feature_json,
+                source_bars_json=source_bars_json,
+            )
+        )
+        rows.append(row)
+    return rows
+
+
+def _volume_participation_fields_for_raw_row(
+    raw: Mapping[str, Any],
+    *,
+    feature_json: Mapping[str, Any],
+    source_bars_json: Mapping[str, Any],
+) -> dict[str, Any]:
+    if raw.get("candidate_status") != "passed":
+        return _empty_volume_participation_fields()
+
+    candidate = SimpleNamespace(
+        i12_pit_candidate_id=raw.get("i12_pit_candidate_id"),
+        feature_json=json.dumps(feature_json, sort_keys=True, default=str),
+        source_bars_json=json.dumps(source_bars_json, sort_keys=True, default=str),
+        decision_ts=_parse_aware_timestamp(raw.get("decision_ts")),
+    )
+    entry_quote = _quote_namespace(
+        raw,
+        role="entry",
+        id_key="entry_quote_replay_id",
+        status_key="entry_quote_status",
+        bid_key="entry_bid",
+        ask_key="entry_ask",
+        spread_key="entry_spread_bps",
+        raw_json_key="entry_quote_raw_json",
+    )
+    outputs: dict[str, Any] = {}
+    evidence_values: dict[str, Any] | None = None
+    for prefix, role, exit_quote, cost in (
+        (
+            "same_day",
+            "same_day_exit",
+            _quote_namespace(
+                raw,
+                role="same_day_exit",
+                id_key="same_day_exit_quote_replay_id",
+                status_key="same_day_exit_quote_status",
+                bid_key="same_day_exit_bid",
+                ask_key="same_day_exit_ask",
+                spread_key="same_day_exit_spread_bps",
+                raw_json_key="same_day_exit_quote_raw_json",
+            ),
+            _cost_namespace(raw, prefix="same_day", role="same_day_exit"),
+        ),
+        (
+            "next_open",
+            "next_open_exit",
+            _quote_namespace(
+                raw,
+                role="next_open_exit",
+                id_key="next_open_exit_quote_replay_id",
+                status_key="next_open_exit_quote_status",
+                bid_key="next_open_exit_bid",
+                ask_key="next_open_exit_ask",
+                spread_key="next_open_exit_spread_bps",
+                raw_json_key="next_open_exit_quote_raw_json",
+            ),
+            _cost_namespace(raw, prefix="next_open", role="next_open_exit"),
+        ),
+    ):
+        _validate_cost_quote_links(
+            raw,
+            role=role,
+            entry_quote=entry_quote,
+            exit_quote=exit_quote,
+            cost=cost,
+        )
+        result = _volume_result(candidate, entry_quote, exit_quote, cost)
+        outputs.update(_prefixed_volume_result(prefix, result))
+        if evidence_values is None:
+            evidence_values = result
+    evidence_values = evidence_values or {}
+    outputs.update(
+        {
+            "entry_window_dollar_volume": _float_or_none(
+                evidence_values.get("entry_window_dollar_volume")
+            ),
+            "entry_window_share_volume": _float_or_none(
+                evidence_values.get("entry_window_share_volume")
+            ),
+            "intended_order_participation_rate": _float_or_none(
+                evidence_values.get("intended_order_participation_rate")
+            ),
+            "intended_order_share_participation_rate": _float_or_none(
+                evidence_values.get("intended_order_share_participation_rate")
+            ),
+            "volume_denominator_basis": evidence_values.get("denominator_basis"),
+            "volume_price_basis": evidence_values.get("window_price_basis"),
+            "volume_timestamp_proof_status": _volume_timestamp_proof_status(evidence_values),
+            "volume_participation_threshold": DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+        }
+    )
+    return outputs
+
+
+def _empty_volume_participation_fields() -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "entry_window_dollar_volume": None,
+        "entry_window_share_volume": None,
+        "intended_order_participation_rate": None,
+        "intended_order_share_participation_rate": None,
+        "volume_denominator_basis": None,
+        "volume_price_basis": None,
+        "volume_timestamp_proof_status": "not_applicable_nonpassed",
+        "volume_participation_threshold": DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+    }
+    for prefix in ("same_day", "next_open"):
+        output.update(
+            {
+                f"{prefix}_modeled_return_volume_participation": None,
+                f"{prefix}_volume_tradeability_status": None,
+                f"{prefix}_volume_skipped_reason": None,
+                f"{prefix}_volume_quote_cost_return": None,
+                f"{prefix}_volume_slippage_return": None,
             }
         )
-    return rows
+    return output
+
+
+def _volume_result(
+    candidate: Any,
+    entry_quote: Any,
+    exit_quote: Any,
+    cost: Any | None,
+) -> dict[str, Any]:
+    if cost is None:
+        return {
+            "volume_tradeability_status": "skipped_cash",
+            "volume_skipped_reason": "cost_replay_missing",
+            "entry_window_share_volume": None,
+            "intended_order_share_participation_rate": None,
+            "entry_window_dollar_volume": None,
+            "intended_order_usd": None,
+            "intended_order_participation_rate": None,
+            "quote_cost_return": None,
+            "slippage_return": None,
+            "modeled_return": 0.0,
+            "volume_evidence_available": False,
+            "window_basis": "missing",
+            "window_price_basis": None,
+            "denominator_basis": "missing",
+        }
+    return volume_tradeability_for_cost(
+        candidate=candidate,
+        entry_quote=entry_quote,
+        exit_quote=exit_quote,
+        cost=cost,
+        threshold=DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+        evidence_getter=predecision_volume_evidence,
+    )
+
+
+def _quote_namespace(
+    raw: Mapping[str, Any],
+    *,
+    role: str,
+    id_key: str,
+    status_key: str,
+    bid_key: str,
+    ask_key: str,
+    spread_key: str,
+    raw_json_key: str,
+) -> Any | None:
+    if raw.get(status_key) is None and raw.get(id_key) is None:
+        return None
+    return SimpleNamespace(
+        i12_pit_quote_replay_id=raw.get(id_key),
+        i12_pit_candidate_id=raw.get("i12_pit_candidate_id"),
+        quote_role=role,
+        coverage_status=raw.get(status_key),
+        bid=_float_or_none(raw.get(bid_key)),
+        ask=_float_or_none(raw.get(ask_key)),
+        spread_bps=_float_or_none(raw.get(spread_key)),
+        raw_json=raw.get(raw_json_key),
+    )
+
+
+def _cost_namespace(raw: Mapping[str, Any], *, prefix: str, role: str) -> Any | None:
+    if raw.get(f"{prefix}_cost_replay_id") is None:
+        return None
+    return SimpleNamespace(
+        i12_pit_cost_replay_id=raw.get(f"{prefix}_cost_replay_id"),
+        i12_pit_candidate_id=raw.get("i12_pit_candidate_id"),
+        exit_role=role,
+        entry_quote_replay_id=raw.get(f"{prefix}_entry_quote_replay_id"),
+        exit_quote_replay_id=raw.get(f"{prefix}_cost_exit_quote_replay_id"),
+        intended_order_usd=float(raw.get(f"{prefix}_intended_order_usd") or 0.0),
+        max_spread_bps=float(raw.get(f"{prefix}_max_spread_bps") or 0.0),
+        slippage_bps=float(raw.get(f"{prefix}_slippage_bps") or 0.0),
+    )
+
+
+def _validate_cost_quote_links(
+    raw: Mapping[str, Any],
+    *,
+    role: str,
+    entry_quote: Any | None,
+    exit_quote: Any | None,
+    cost: Any | None,
+) -> None:
+    if cost is None:
+        return
+    mismatches: list[str] = []
+    if entry_quote is not None and entry_quote.i12_pit_quote_replay_id:
+        if not cost.entry_quote_replay_id:
+            mismatches.append("missing entry_quote_replay_id")
+        elif cost.entry_quote_replay_id != entry_quote.i12_pit_quote_replay_id:
+            mismatches.append(
+                "entry_quote_replay_id="
+                f"{cost.entry_quote_replay_id!r} active_entry_quote_id="
+                f"{entry_quote.i12_pit_quote_replay_id!r}"
+            )
+    if exit_quote is not None and exit_quote.i12_pit_quote_replay_id:
+        if not cost.exit_quote_replay_id:
+            mismatches.append("missing exit_quote_replay_id")
+        elif cost.exit_quote_replay_id != exit_quote.i12_pit_quote_replay_id:
+            mismatches.append(
+                "exit_quote_replay_id="
+                f"{cost.exit_quote_replay_id!r} active_{role}_quote_id="
+                f"{exit_quote.i12_pit_quote_replay_id!r}"
+            )
+    if mismatches:
+        raise RuntimeError(
+            "I12 PIT event tape cost/quote evidence mismatch for "
+            f"candidate_id={raw.get('i12_pit_candidate_id')!r} "
+            f"exit_role={role!r}: {', '.join(mismatches)}"
+        )
+
+
+def _prefixed_volume_result(prefix: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        f"{prefix}_modeled_return_volume_participation": _float_or_none(
+            result.get("modeled_return")
+        ),
+        f"{prefix}_volume_tradeability_status": result.get("volume_tradeability_status"),
+        f"{prefix}_volume_skipped_reason": result.get("volume_skipped_reason"),
+        f"{prefix}_volume_quote_cost_return": _float_or_none(
+            result.get("quote_cost_return")
+        ),
+        f"{prefix}_volume_slippage_return": _float_or_none(
+            result.get("slippage_return")
+        ),
+    }
+
+
+def _volume_timestamp_proof_status(result: Mapping[str, Any]) -> str:
+    if result.get("window_basis") == "unsafe_predecision_timestamp":
+        return str(result.get("denominator_basis") or "unsafe_predecision_timestamp")
+    if result.get("volume_evidence_available") is True:
+        return "ok"
+    if result.get("denominator_basis") == "missing":
+        return "not_applicable_volume_missing"
+    return str(result.get("denominator_basis") or "unknown")
 
 
 def _annotate_source_presence(
@@ -846,6 +1160,27 @@ def _summary(
         field: sum(1 for row in rows if _mapping(row.get("predictors")).get(field) is None)
         for field in PREDICTOR_ALLOWLIST
     }
+    missing_quote_count = sum(int(item.get("missing_quote_role_count") or 0) for item in integrity.values())
+    missing_cost_count = sum(int(item.get("missing_cost_role_count") or 0) for item in integrity.values())
+    duplicate_candidate_count = sum(int(item.get("duplicate_active_candidate_count") or 0) for item in integrity.values())
+    duplicate_quote_count = sum(int(item.get("duplicate_quote_role_count") or 0) for item in integrity.values())
+    duplicate_cost_count = sum(int(item.get("duplicate_cost_role_count") or 0) for item in integrity.values())
+    volume_status_counts = _volume_tradeability_status_counts(rows)
+    volume_skip_counts = _volume_skip_reason_counts(rows)
+    displayed_status_counts = _displayed_size_tradeability_status_counts(rows)
+    displayed_size_skip_ignored = _displayed_size_skip_ignored_counts(rows)
+    training_ready = (
+        scope == "passed"
+        and require_final
+        and missing_quote_count == 0
+        and missing_cost_count == 0
+        and duplicate_candidate_count == 0
+        and duplicate_quote_count == 0
+        and duplicate_cost_count == 0
+        and predictor_blocked == 0
+        and bool(rows)
+        and _volume_labels_complete(rows)
+    )
     summary = {
         "snapshots": [
             {"label": snapshot.label, "schema": snapshot.schema, "report": str(snapshot.report) if snapshot.report else None}
@@ -862,14 +1197,27 @@ def _summary(
         "unique_ticker_date_count": len(ticker_dates),
         "passed_count_by_decision_time": dict(passed_by_time),
         "bucket_counts": dict(bucket_counts),
-        "missing_quote_role_count": sum(int(item.get("missing_quote_role_count") or 0) for item in integrity.values()),
-        "missing_cost_role_count": sum(int(item.get("missing_cost_role_count") or 0) for item in integrity.values()),
+        "missing_quote_role_count": missing_quote_count,
+        "missing_cost_role_count": missing_cost_count,
         "predictor_blocked_count": predictor_blocked,
         "predictor_missing_counts": predictor_missing_counts,
         "integrity": integrity,
         "warnings": list(dict.fromkeys(warnings)),
-        "volume_participation_labels": "unavailable_displayed_size_label_only_not_training_ready",
-        "training_tape_status": "blocked_volume_participation_labels_not_materialized",
+        "economic_headline_basis": "volume_participation",
+        "displayed_size_economics": "diagnostic_displayed_top_of_book_size_only",
+        "volume_participation_labels": "present_predecision_volume_participation",
+        "volume_participation_semantics": (
+            "inferred_fillability_for_250_usd_orders_not_guaranteed_fill"
+        ),
+        "volume_tradeability_status_counts": volume_status_counts,
+        "volume_skip_reason_counts": volume_skip_counts,
+        "displayed_size_tradeability_status_counts": displayed_status_counts,
+        "displayed_size_skip_ignored_count": displayed_size_skip_ignored,
+        "training_tape_status": (
+            "eligible_for_volume_participation_ranker_dataset"
+            if training_ready
+            else "diagnostic_not_training_ready"
+        ),
     }
     if len(snapshots) == 2:
         left, right = snapshots
@@ -887,10 +1235,22 @@ def _summary(
             f"{right.label}_passed_total": right_total,
             "overlap_rate_left_to_right": shared / left_total if left_total else None,
             "overlap_rate_right_to_left": shared / right_total if right_total else None,
-            "same_day_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
+            "same_day_volume_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
+                rows, "same_day_modeled_return_volume_participation"
+            ),
+            "next_open_volume_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
+                rows, "next_open_modeled_return_volume_participation"
+            ),
+            "same_day_volume_return_by_fire_pattern_decision_time": _metric_summary_by_fire_pattern_decision_time(
+                rows, "same_day_modeled_return_volume_participation"
+            ),
+            "next_open_volume_return_by_fire_pattern_decision_time": _metric_summary_by_fire_pattern_decision_time(
+                rows, "next_open_modeled_return_volume_participation"
+            ),
+            "diagnostic_displayed_size_same_day_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
                 rows, "same_day_modeled_return_displayed_size"
             ),
-            "next_open_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
+            "diagnostic_displayed_size_next_open_return_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
                 rows, "next_open_modeled_return_displayed_size"
             ),
             "entry_spread_bps_by_bucket_decision_time": _metric_summary_by_bucket_decision_time(
@@ -926,6 +1286,88 @@ def _metric_summary_by_bucket_decision_time(rows: Sequence[Mapping[str, Any]], f
     }
 
 
+def _metric_summary_by_fire_pattern_decision_time(rows: Sequence[Mapping[str, Any]], field: str) -> dict[str, Any]:
+    values: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        if not row.get("is_passed"):
+            continue
+        value = _float_or_none(row.get(field))
+        if value is None:
+            continue
+        pattern = "->".join(str(item) for item in row.get("passed_decision_times") or [])
+        if not pattern:
+            pattern = "nonpassed"
+        values[pattern][str(row.get("decision_time_label"))].append(value)
+    return {
+        pattern: {
+            decision_time: _numeric_summary(numbers)
+            for decision_time, numbers in sorted(decision_values.items())
+        }
+        for pattern, decision_values in sorted(values.items())
+    }
+
+
+def _volume_tradeability_status_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    return {
+        "same_day_exit": _field_counter(rows, "same_day_volume_tradeability_status"),
+        "next_open_exit": _field_counter(rows, "next_open_volume_tradeability_status"),
+    }
+
+
+def _volume_skip_reason_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    return {
+        "same_day_exit": _field_counter(rows, "same_day_volume_skipped_reason"),
+        "next_open_exit": _field_counter(rows, "next_open_volume_skipped_reason"),
+    }
+
+
+def _displayed_size_tradeability_status_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    return {
+        "same_day_exit": _field_counter(rows, "same_day_tradeability_status"),
+        "next_open_exit": _field_counter(rows, "next_open_tradeability_status"),
+    }
+
+
+def _displayed_size_skip_ignored_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    return {
+        "same_day_exit": sum(
+            1
+            for row in rows
+            if row.get("same_day_skipped_reason") == "size"
+            and row.get("same_day_volume_tradeability_status") == VOLUME_TRADEABILITY_OK_STATUS
+        ),
+        "next_open_exit": sum(
+            1
+            for row in rows
+            if row.get("next_open_skipped_reason") == "size"
+            and row.get("next_open_volume_tradeability_status") == VOLUME_TRADEABILITY_OK_STATUS
+        ),
+    }
+
+
+def _volume_labels_complete(rows: Sequence[Mapping[str, Any]]) -> bool:
+    required_fields = (
+        "same_day_modeled_return_volume_participation",
+        "same_day_volume_tradeability_status",
+        "same_day_volume_skipped_reason",
+        "next_open_modeled_return_volume_participation",
+        "next_open_volume_tradeability_status",
+        "next_open_volume_skipped_reason",
+    )
+    for row in rows:
+        if not row.get("is_passed"):
+            continue
+        for field in required_fields:
+            if row.get(field) is None:
+                return False
+    return True
+
+
+def _field_counter(rows: Sequence[Mapping[str, Any]], field: str) -> dict[str, int]:
+    counter = Counter(str(row.get(field)) for row in rows if row.get(field) is not None)
+    return dict(sorted(counter.items()))
+
+
 def _shared_timing_deltas(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -934,6 +1376,8 @@ def _shared_timing_deltas(
     shared_bucket: str,
 ) -> dict[str, Any]:
     fields = (
+        "same_day_modeled_return_volume_participation",
+        "next_open_modeled_return_volume_participation",
         "same_day_modeled_return_displayed_size",
         "next_open_modeled_return_displayed_size",
         "entry_spread_bps",
@@ -1122,12 +1566,38 @@ def _one(session: Session, sql: str, params: Mapping[str, Any]) -> dict[str, Any
 
 
 def _all(session: Session, sql: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
-    result = session.execute(text(sql), dict(params))
+    result = session.execute(_sql_text(sql), dict(params))
     return [dict(row._mapping) for row in result]
 
 
 def _scalar(session: Session, sql: str, params: Mapping[str, Any]) -> Any:
-    return session.execute(text(sql), dict(params)).scalar()
+    return session.execute(_sql_text(sql), dict(params)).scalar()
+
+
+def _create_session(url: str):
+    create_engine, _, session_cls = _sqlalchemy()
+    return session_cls(bind=create_engine(url))
+
+
+def _sql_text(sql: str):
+    _, text, _ = _sqlalchemy()
+    return text(sql)
+
+
+def _sqlalchemy():
+    try:
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.orm import Session
+    except ModuleNotFoundError as exc:  # pragma: no cover - DB execution dependency.
+        if exc.name == "sqlalchemy":
+            venv_python = Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
+            if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+                os.execv(
+                    str(venv_python),
+                    [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+                )
+        raise
+    return create_engine, text, Session
 
 
 def _json_loads(value: Any) -> Mapping[str, Any]:
@@ -1149,6 +1619,17 @@ def _parse_timestamp(value: Any) -> datetime | None:
         return _utc_naive(value)
     try:
         return _utc_naive(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _parse_aware_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
 

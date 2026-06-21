@@ -1066,6 +1066,7 @@ class I12PitRebuildJob(BaseJob):
                 quote_role=window.quote_role,
                 job_run_id=job_run_id,
             )
+            breaker_payload = _watchdog_timeout_breaker_payload(resp)
             result = replay_quote_window(
                 ticker=ticker,
                 window=window,
@@ -1086,6 +1087,8 @@ class I12PitRebuildJob(BaseJob):
             )
             rows[result.quote_role] = row
             self._session.commit()
+            if breaker_payload is not None:
+                raise ProviderOutageCircuitBreaker(breaker_payload)
         return rows
 
     def _fetch_alpaca_quotes_with_deadline(
@@ -4410,6 +4413,24 @@ def _breaker_opened_by_current_watchdog_timeout(
         payload.get("breaker_opened_by_current_call") is True
         and reason.startswith("watchdog_timeout")
     )
+
+
+def _watchdog_timeout_breaker_payload(resp: AdapterResponse[Any]) -> dict[str, Any] | None:
+    if resp.error is None or resp.error.error_type != "watchdog_timeout":
+        return None
+    flags = getattr(resp.lineage, "data_quality_flags", None)
+    if not isinstance(flags, Mapping):
+        return None
+    breaker = flags.get("provider_outage_circuit_breaker")
+    if not isinstance(breaker, Mapping):
+        return None
+    reason = str(breaker.get("circuit_reason") or "")
+    if (
+        breaker.get("breaker_opened_by_current_call") is True
+        and reason.startswith("watchdog_timeout")
+    ):
+        return dict(breaker)
+    return None
 
 
 def _provider_watchdog_timeout_response(

@@ -19,16 +19,6 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any, Mapping, Sequence
 
-try:
-    from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import Session
-except ModuleNotFoundError as exc:  # pragma: no cover - exercised by direct script invocation.
-    if exc.name == "sqlalchemy":
-        venv_python = Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
-        if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
-            os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
-    raise
-
 
 EXIT_ROLES = ("same_day_exit", "next_open_exit")
 QUOTE_ROLES = ("entry", "same_day_exit", "next_open_exit")
@@ -93,7 +83,7 @@ def compare_snapshots(
         url = database_url or os.environ.get("DATABASE_URL")
         if not url:
             raise RuntimeError("DATABASE_URL is required unless db_session is provided")
-        session = Session(bind=create_engine(url))
+        session = _create_session(url)
         owns_session = True
     assert session is not None
     dialect = getattr(getattr(session.get_bind(), "dialect", None), "name", "")
@@ -175,6 +165,13 @@ def compare_snapshots(
             "overlap": overlap,
             "transitions": transitions,
             "economics": economics,
+            "economics_basis": {
+                "headline": "diagnostic_displayed_size_cost_replay_only",
+                "volume_participation": (
+                    "use build_i12_pit_event_tape.py for volume-participation "
+                    "economics from persisted candidate/quote/cost evidence"
+                ),
+            },
             "liquidity_deltas": liquidity,
             "edge_timing": edge_timing,
             "samples": samples,
@@ -276,6 +273,9 @@ def render_text(analysis: Mapping[str, Any]) -> str:
     )
     lines.append("")
     lines.append("Economics")
+    basis = _mapping(analysis.get("economics_basis"))
+    if basis:
+        lines.append(f"basis={basis.get('headline')}")
     econ_rows = []
     for role, role_metrics in _mapping(analysis.get("economics")).items():
         for group, metrics in _mapping(role_metrics).items():
@@ -1043,7 +1043,10 @@ def _warnings(
     liquidity: Mapping[str, Any],
     require_final: bool,
 ) -> list[str]:
-    warnings: list[str] = []
+    warnings: list[str] = [
+        "snapshot_compare_economics_displayed_size_diagnostic_only",
+        "use_event_tape_for_volume_participation_economics",
+    ]
     for side, integrity in (("left", left_integrity), ("right", right_integrity)):
         if integrity.get("missing_days"):
             warnings.append(f"{side}_missing_calendar_days")
@@ -1343,16 +1346,42 @@ def _one(session: Session, sql: str, params: Mapping[str, Any]) -> dict[str, Any
 
 
 def _all(session: Session, sql: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
-    result = session.execute(text(sql), dict(params))
+    result = session.execute(_sql_text(sql), dict(params))
     return [dict(row._mapping) for row in result]
 
 
 def _scalar(session: Session, sql: str, params: Mapping[str, Any]) -> Any:
-    return session.execute(text(sql), dict(params)).scalar()
+    return session.execute(_sql_text(sql), dict(params)).scalar()
 
 
 def _list_values(session: Session, sql: str, params: Mapping[str, Any]) -> list[str]:
-    return [str(row[0]) for row in session.execute(text(sql), dict(params)).all() if row[0] is not None]
+    return [str(row[0]) for row in session.execute(_sql_text(sql), dict(params)).all() if row[0] is not None]
+
+
+def _create_session(url: str):
+    create_engine, _, session_cls = _sqlalchemy()
+    return session_cls(bind=create_engine(url))
+
+
+def _sql_text(sql: str):
+    _, text, _ = _sqlalchemy()
+    return text(sql)
+
+
+def _sqlalchemy():
+    try:
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.orm import Session
+    except ModuleNotFoundError as exc:  # pragma: no cover - DB execution dependency.
+        if exc.name == "sqlalchemy":
+            venv_python = Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
+            if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolve():
+                os.execv(
+                    str(venv_python),
+                    [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+                )
+        raise
+    return create_engine, text, Session
 
 
 def _distribution(values: Sequence[Any]) -> dict[str, Any]:

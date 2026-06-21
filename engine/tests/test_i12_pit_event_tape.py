@@ -3,7 +3,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -47,6 +50,7 @@ def _create_schema_tables(db_session, schema: str) -> None:
               coverage_status TEXT NOT NULL,
               fail_reason TEXT,
               feature_json TEXT NOT NULL,
+              source_bars_json TEXT NOT NULL,
               leakage_guard_json TEXT,
               candidate_attempt_hash TEXT,
               content_hash TEXT,
@@ -69,6 +73,7 @@ def _create_schema_tables(db_session, schema: str) -> None:
               spread_bps REAL,
               executable_notional REAL,
               quote_age_seconds REAL,
+              raw_json TEXT,
               is_active INTEGER NOT NULL
             )
             """
@@ -81,8 +86,15 @@ def _create_schema_tables(db_session, schema: str) -> None:
               i12_pit_cost_replay_id TEXT PRIMARY KEY,
               i12_pit_candidate_id TEXT NOT NULL,
               exit_role TEXT NOT NULL,
+              entry_quote_replay_id TEXT,
+              exit_quote_replay_id TEXT,
               tradeability_status TEXT NOT NULL,
               skipped_reason TEXT NOT NULL,
+              intended_order_usd REAL NOT NULL,
+              max_spread_bps REAL NOT NULL,
+              slippage_bps REAL NOT NULL,
+              quote_cost_return REAL,
+              slippage_return REAL,
               modeled_return REAL NOT NULL,
               is_active INTEGER NOT NULL
             )
@@ -91,36 +103,40 @@ def _create_schema_tables(db_session, schema: str) -> None:
     )
 
 
-def _feature_json(volume: float = 1000, projected: float = 999999) -> str:
-    return json.dumps(
-        {
-            "prior_close": 10.0,
-            "distance_from_max252": -0.6,
-            "drawdown_from_max252": -0.6,
-            "off_low252": 0.2,
-            "mom20": 0.1,
-            "sigma20": 0.05,
-            "prev_day_return": -0.03,
-            "prev_day_green": False,
-            "gap": 0.02,
-            "early_return": 0.04,
-            "early_high_return": 0.05,
-            "early_low_return": -0.01,
-            "observed_open_to_decision_return": 0.04,
-            "observed_cumulative_volume_before_decision": volume,
-            "observed_minute_count_before_decision": 5,
-            "opening_bar_present": True,
-            "path_coverage_ratio": 1.0,
-            "completed_minute_count": 5,
-            "zero_fill_imputed_minute_count": 0,
-            "zero_fill_imputed_minute_ratio": 0.0,
-            "projected_volume_at_decision": projected,
-            "zero_fill_projected_volume_ratio": projected,
-            "same_day_close": 99,
-            "same_day_exit_return": 10,
-        },
-        sort_keys=True,
-    )
+def _feature_json(
+    volume: float | None = 1000,
+    projected: float = 999999,
+    early_volume: float | None = None,
+) -> str:
+    payload = {
+        "prior_close": 10.0,
+        "distance_from_max252": -0.6,
+        "drawdown_from_max252": -0.6,
+        "off_low252": 0.2,
+        "mom20": 0.1,
+        "sigma20": 0.05,
+        "prev_day_return": -0.03,
+        "prev_day_green": False,
+        "gap": 0.02,
+        "early_return": 0.04,
+        "early_high_return": 0.05,
+        "early_low_return": -0.01,
+        "observed_open_to_decision_return": 0.04,
+        "observed_cumulative_volume_before_decision": volume,
+        "observed_minute_count_before_decision": 5,
+        "opening_bar_present": True,
+        "path_coverage_ratio": 1.0,
+        "completed_minute_count": 5,
+        "zero_fill_imputed_minute_count": 0,
+        "zero_fill_imputed_minute_ratio": 0.0,
+        "projected_volume_at_decision": projected,
+        "zero_fill_projected_volume_ratio": projected,
+        "same_day_close": 99,
+        "same_day_exit_return": 10,
+    }
+    if early_volume is not None:
+        payload["early_cumulative_volume"] = early_volume
+    return json.dumps(payload, sort_keys=True)
 
 
 def _guard_json(decision_time: str, *, leaky: bool = False) -> str:
@@ -140,6 +156,17 @@ def _guard_json(decision_time: str, *, leaky: bool = False) -> str:
     )
 
 
+def _source_bars_json(decision_time: str) -> str:
+    max_start = "09:34" if decision_time == "09:35" else "09:39"
+    return json.dumps(
+        {
+            "source_minute_bars_max_start_ts": f"{DAY}T{max_start}:00Z",
+            "completed_through_ts": f"{DAY}T{decision_time}:00Z",
+        },
+        sort_keys=True,
+    )
+
+
 def _insert_candidate(
     db_session,
     schema: str,
@@ -150,6 +177,8 @@ def _insert_candidate(
     status: str,
     fail_reason: str | None = None,
     leaky: bool = False,
+    feature_json: str | None = None,
+    source_bars_json: str | None = None,
 ) -> None:
     db_session.execute(
         text(
@@ -157,12 +186,12 @@ def _insert_candidate(
             INSERT INTO {_q(schema, 'i12_pit_candidates')} (
               i12_pit_candidate_id, ticker, decision_date, decision_ts,
               decision_time_label, path_mode, candidate_status, coverage_status,
-              fail_reason, feature_json, leakage_guard_json, candidate_attempt_hash,
-              content_hash, is_active
+              fail_reason, feature_json, source_bars_json, leakage_guard_json,
+              candidate_attempt_hash, content_hash, is_active
             ) VALUES (
               :id, :ticker, :day, :decision_ts, :decision_time, 'strict_contiguous',
-              :status, 'ok', :fail_reason, :feature_json, :guard_json, :attempt_hash,
-              :content_hash, 1
+              :status, 'ok', :fail_reason, :feature_json, :source_bars_json,
+              :guard_json, :attempt_hash, :content_hash, 1
             )
             """
         ),
@@ -174,7 +203,8 @@ def _insert_candidate(
             "decision_time": decision_time,
             "status": status,
             "fail_reason": fail_reason,
-            "feature_json": _feature_json(),
+            "feature_json": feature_json or _feature_json(),
+            "source_bars_json": source_bars_json or _source_bars_json(decision_time),
             "guard_json": _guard_json(decision_time, leaky=leaky),
             "attempt_hash": f"attempt-{candidate_id}",
             "content_hash": f"content-{candidate_id}",
@@ -192,6 +222,8 @@ def _insert_quote(
     status: str = "ok",
     spread: float = 100,
     notional: float = 250,
+    bid: float = 10.0,
+    ask: float = 10.1,
 ) -> None:
     db_session.execute(
         text(
@@ -199,10 +231,10 @@ def _insert_quote(
             INSERT INTO {_q(schema, 'i12_pit_quote_replays')} (
               i12_pit_quote_replay_id, i12_pit_candidate_id, quote_role,
               coverage_status, quote_ts, bid, ask, spread_bps,
-              executable_notional, quote_age_seconds, is_active
+              executable_notional, quote_age_seconds, raw_json, is_active
             ) VALUES (
-              :id, :candidate_id, :role, :status, :quote_ts, 10.0, 10.1,
-              :spread, :notional, 1.5, 1
+              :id, :candidate_id, :role, :status, :quote_ts, :bid, :ask,
+              :spread, :notional, 1.5, '{{}}', 1
             )
             """
         ),
@@ -212,6 +244,8 @@ def _insert_quote(
             "role": role,
             "status": status,
             "quote_ts": f"{DAY}T13:40:00Z",
+            "bid": bid,
+            "ask": ask,
             "spread": spread,
             "notional": notional,
         },
@@ -228,15 +262,27 @@ def _insert_cost(
     modeled_return: float = 0.0,
     status: str = "tradeable",
     reason: str = "none",
+    intended_order_usd: float = 250.0,
+    max_spread_bps: float = 200.0,
+    slippage_bps: float = 0.0,
+    entry_quote_replay_id: str | None = None,
+    exit_quote_replay_id: str | None = None,
 ) -> None:
+    entry_quote_replay_id = entry_quote_replay_id or f"q-{candidate_id}-entry"
+    role_suffix = "sd" if role == "same_day_exit" else "no"
+    exit_quote_replay_id = exit_quote_replay_id or f"q-{candidate_id}-{role_suffix}"
     db_session.execute(
         text(
             f"""
             INSERT INTO {_q(schema, 'i12_pit_cost_replays')} (
               i12_pit_cost_replay_id, i12_pit_candidate_id, exit_role,
-              tradeability_status, skipped_reason, modeled_return, is_active
+              entry_quote_replay_id, exit_quote_replay_id, tradeability_status,
+              skipped_reason, intended_order_usd, max_spread_bps, slippage_bps,
+              quote_cost_return, slippage_return, modeled_return, is_active
             ) VALUES (
-              :id, :candidate_id, :role, :status, :reason, :modeled_return, 1
+              :id, :candidate_id, :role, :entry_quote_replay_id, :exit_quote_replay_id,
+              :status, :reason, :intended_order_usd, :max_spread_bps, :slippage_bps,
+              :modeled_return, :modeled_return, :modeled_return, 1
             )
             """
         ),
@@ -244,8 +290,13 @@ def _insert_cost(
             "id": cost_id,
             "candidate_id": candidate_id,
             "role": role,
+            "entry_quote_replay_id": entry_quote_replay_id,
+            "exit_quote_replay_id": exit_quote_replay_id,
             "status": status,
             "reason": reason,
+            "intended_order_usd": intended_order_usd,
+            "max_spread_bps": max_spread_bps,
+            "slippage_bps": slippage_bps,
             "modeled_return": modeled_return,
         },
     )
@@ -279,6 +330,97 @@ def _seed_fixture(db_session, *, missing_right_evidence: bool = False, leaky_lef
     else:
         _insert_complete_evidence(db_session, RIGHT_SCHEMA, "right-c", ret=0.30)
     db_session.flush()
+
+
+def _seed_single_volume_case(
+    db_session,
+    *,
+    volume: float | None = 1000,
+    projected: float = 999999,
+    early_volume: float | None = None,
+    entry_status: str = "ok",
+    exit_status: str = "ok",
+    entry_spread: float = 100,
+    exit_spread: float = 100,
+    source_bars_json: str | None = None,
+    displayed_status: str = "skipped_cash",
+    displayed_reason: str = "size",
+) -> None:
+    _create_schema_tables(db_session, LEFT_SCHEMA)
+    _insert_candidate(
+        db_session,
+        LEFT_SCHEMA,
+        "left-volume",
+        "VOL",
+        decision_time="09:35",
+        status="passed",
+        feature_json=_feature_json(
+            volume=volume,
+            projected=projected,
+            early_volume=early_volume,
+        ),
+        source_bars_json=source_bars_json,
+    )
+    _insert_quote(
+        db_session,
+        LEFT_SCHEMA,
+        "q-left-volume-entry",
+        "left-volume",
+        "entry",
+        status=entry_status,
+        spread=entry_spread,
+    )
+    _insert_quote(
+        db_session,
+        LEFT_SCHEMA,
+        "q-left-volume-sd",
+        "left-volume",
+        "same_day_exit",
+        status=exit_status,
+        spread=exit_spread,
+    )
+    _insert_quote(
+        db_session,
+        LEFT_SCHEMA,
+        "q-left-volume-no",
+        "left-volume",
+        "next_open_exit",
+        status=exit_status,
+        spread=exit_spread,
+    )
+    _insert_cost(
+        db_session,
+        LEFT_SCHEMA,
+        "c-left-volume-sd",
+        "left-volume",
+        "same_day_exit",
+        modeled_return=0.0,
+        status=displayed_status,
+        reason=displayed_reason,
+    )
+    _insert_cost(
+        db_session,
+        LEFT_SCHEMA,
+        "c-left-volume-no",
+        "left-volume",
+        "next_open_exit",
+        modeled_return=0.0,
+        status=displayed_status,
+        reason=displayed_reason,
+    )
+    db_session.flush()
+
+
+def _build_single(db_session, **kwargs):
+    tape = _load_tape()
+    return tape.build_event_tape(
+        snapshots=[tape.SnapshotSpec("09:35", LEFT_SCHEMA)],
+        start_date=DAY,
+        end_date=DAY,
+        minute_path_mode="strict_contiguous",
+        db_session=db_session,
+        **kwargs,
+    )
 
 
 def _snapshot(label: str, schema: str, report: Path | None = None):
@@ -434,6 +576,62 @@ def test_event_tape_require_final_accepts_covering_reports(db_session, tmp_path)
 
     assert result["summary"]["require_final"] is True
     assert result["summary"]["row_count"] == 4
+    assert result["summary"]["training_tape_status"] == (
+        "eligible_for_volume_participation_ranker_dataset"
+    )
+
+
+def test_event_tape_all_source_attempts_require_final_is_not_training_ready(db_session, tmp_path):
+    _seed_fixture(db_session)
+    tape = _load_tape()
+    left_report = tmp_path / "left.json"
+    right_report = tmp_path / "right.json"
+    left_report.write_text(json.dumps(_final_report(LEFT_SCHEMA, "09:35")))
+    right_report.write_text(json.dumps(_final_report(RIGHT_SCHEMA, "09:40")))
+
+    result = tape.build_event_tape(
+        snapshots=[
+            tape.SnapshotSpec("09:35", LEFT_SCHEMA, left_report),
+            tape.SnapshotSpec("09:40", RIGHT_SCHEMA, right_report),
+        ],
+        start_date=DAY,
+        end_date=DAY,
+        minute_path_mode="strict_contiguous",
+        db_session=db_session,
+        require_final=True,
+        scope="all-source-attempts",
+    )
+
+    assert result["summary"]["scope"] == "all-source-attempts"
+    assert result["summary"]["training_tape_status"] == "diagnostic_not_training_ready"
+
+
+def test_event_tape_missing_volume_label_blocks_training_ready(db_session, tmp_path, monkeypatch):
+    _seed_fixture(db_session)
+    tape = _load_tape()
+    left_report = tmp_path / "left.json"
+    right_report = tmp_path / "right.json"
+    left_report.write_text(json.dumps(_final_report(LEFT_SCHEMA, "09:35")))
+    right_report.write_text(json.dumps(_final_report(RIGHT_SCHEMA, "09:40")))
+
+    monkeypatch.setattr(
+        tape,
+        "_volume_participation_fields_for_raw_row",
+        lambda *args, **kwargs: tape._empty_volume_participation_fields(),
+    )
+    result = tape.build_event_tape(
+        snapshots=[
+            tape.SnapshotSpec("09:35", LEFT_SCHEMA, left_report),
+            tape.SnapshotSpec("09:40", RIGHT_SCHEMA, right_report),
+        ],
+        start_date=DAY,
+        end_date=DAY,
+        minute_path_mode="strict_contiguous",
+        db_session=db_session,
+        require_final=True,
+    )
+
+    assert result["summary"]["training_tape_status"] == "diagnostic_not_training_ready"
 
 
 def test_event_tape_builds_rows_and_buckets(db_session):
@@ -517,13 +715,252 @@ def test_event_tape_shared_bucket_metrics_are_split_by_decision_time(db_session)
     _seed_fixture(db_session)
     two = _build(db_session)["summary"]["two_snapshot_summary"]
 
-    shared = two["same_day_return_by_bucket_decision_time"]["shared_0935_0940"]
-    assert shared["09:35"]["mean"] == pytest.approx(0.10)
-    assert shared["09:40"]["mean"] == pytest.approx(0.08)
+    volume_shared = two["same_day_volume_return_by_bucket_decision_time"]["shared_0935_0940"]
+    assert volume_shared["09:35"]["mean"] == pytest.approx(10.0 / 10.1 - 1.0)
+    assert volume_shared["09:40"]["mean"] == pytest.approx(10.0 / 10.1 - 1.0)
+    diagnostic_shared = two[
+        "diagnostic_displayed_size_same_day_return_by_bucket_decision_time"
+    ]["shared_0935_0940"]
+    assert diagnostic_shared["09:35"]["mean"] == pytest.approx(0.10)
+    assert diagnostic_shared["09:40"]["mean"] == pytest.approx(0.08)
     assert two["shared_timing_deltas_right_minus_left"]["same_day_modeled_return_displayed_size"][
         "mean"
     ] == pytest.approx(-0.02)
     assert "same_day_return_by_bucket" not in two
+
+
+def test_event_tape_volume_label_ignores_displayed_size_skip_when_volume_sufficient(db_session):
+    _seed_single_volume_case(db_session, volume=1000)
+
+    result = _build_single(db_session)
+    row = result["events"][0]
+
+    assert row["same_day_tradeability_status"] == "skipped_cash"
+    assert row["same_day_skipped_reason"] == "size"
+    assert row["same_day_volume_tradeability_status"] == "tradeable_volume"
+    assert row["same_day_volume_skipped_reason"] == "none"
+    assert row["same_day_modeled_return_volume_participation"] == pytest.approx(
+        10.0 / 10.1 - 1.0
+    )
+    assert row["same_day_volume_quote_cost_return"] == pytest.approx(10.0 / 10.1 - 1.0)
+    assert row["same_day_volume_slippage_return"] == pytest.approx(10.0 / 10.1 - 1.0)
+    assert row["entry_window_dollar_volume"] == pytest.approx(1000 * 10.05)
+    assert row["entry_window_share_volume"] == pytest.approx(1000)
+    assert row["intended_order_participation_rate"] == pytest.approx(250 / (1000 * 10.05))
+    assert row["volume_denominator_basis"] == "observed_cumulative_volume_before_decision"
+    assert row["volume_price_basis"] == "entry_quote_mid"
+    assert row["volume_timestamp_proof_status"] == "ok"
+    assert result["summary"]["displayed_size_skip_ignored_count"]["same_day_exit"] == 1
+    assert result["summary"]["volume_tradeability_status_counts"]["same_day_exit"] == {
+        "tradeable_volume": 1
+    }
+
+
+def test_event_tape_volume_label_matches_train_model_shared_helper(db_session):
+    from alpha.jobs import train_model
+
+    _seed_single_volume_case(db_session, volume=1000)
+
+    row = _build_single(db_session)["events"][0]
+    candidate = SimpleNamespace(
+        i12_pit_candidate_id="left-volume",
+        feature_json=_feature_json(volume=1000),
+        source_bars_json=_source_bars_json("09:35"),
+        decision_ts=datetime.fromisoformat(f"{DAY}T09:35:00+00:00"),
+    )
+    entry_quote = SimpleNamespace(
+        coverage_status="ok",
+        bid=10.0,
+        ask=10.1,
+        spread_bps=100.0,
+        raw_json="{}",
+    )
+    exit_quote = SimpleNamespace(
+        coverage_status="ok",
+        bid=10.0,
+        ask=10.1,
+        spread_bps=100.0,
+        raw_json="{}",
+    )
+    cost = SimpleNamespace(
+        i12_pit_candidate_id="left-volume",
+        exit_role="same_day_exit",
+        intended_order_usd=250.0,
+        max_spread_bps=200.0,
+        slippage_bps=0.0,
+    )
+
+    expected = train_model.volume_tradeability_for_cost(
+        candidate=candidate,
+        entry_quote=entry_quote,
+        exit_quote=exit_quote,
+        cost=cost,
+        threshold=train_model.DEFAULT_VOLUME_PARTICIPATION_THRESHOLD,
+        evidence_getter=train_model.predecision_volume_evidence,
+    )
+
+    assert row["same_day_modeled_return_volume_participation"] == pytest.approx(
+        expected["modeled_return"]
+    )
+    assert row["same_day_volume_tradeability_status"] == expected["volume_tradeability_status"]
+    assert row["same_day_volume_skipped_reason"] == expected["volume_skipped_reason"]
+
+
+def test_event_tape_volume_label_skips_when_volume_too_thin(db_session):
+    _seed_single_volume_case(db_session, volume=10)
+
+    row = _build_single(db_session)["events"][0]
+
+    assert row["same_day_volume_tradeability_status"] == "skipped_cash"
+    assert row["same_day_volume_skipped_reason"] == "volume_too_thin"
+    assert row["same_day_modeled_return_volume_participation"] == 0.0
+
+
+def test_event_tape_volume_label_missing_volume_ignores_projected_volume(db_session):
+    _seed_single_volume_case(db_session, volume=0, projected=999999999)
+
+    row = _build_single(db_session)["events"][0]
+
+    assert row["same_day_volume_tradeability_status"] == "skipped_cash"
+    assert row["same_day_volume_skipped_reason"] == "volume_missing"
+    assert row["same_day_modeled_return_volume_participation"] == 0.0
+    assert row["volume_denominator_basis"] == "missing"
+
+
+def test_event_tape_volume_label_missing_observed_volume_ignores_early_volume(db_session):
+    _seed_single_volume_case(
+        db_session,
+        volume=None,
+        early_volume=999999999,
+        projected=999999999,
+    )
+
+    row = _build_single(db_session)["events"][0]
+
+    assert row["same_day_volume_tradeability_status"] == "skipped_cash"
+    assert row["same_day_volume_skipped_reason"] == "volume_missing"
+    assert row["next_open_volume_tradeability_status"] == "skipped_cash"
+    assert row["next_open_volume_skipped_reason"] == "volume_missing"
+    assert row["entry_window_dollar_volume"] is None
+    assert row["volume_denominator_basis"] == "missing"
+
+
+@pytest.mark.parametrize(
+    ("role", "field", "bad_quote_id", "message"),
+    [
+        ("same_day_exit", "entry_quote_replay_id", "q-other-entry", "entry_quote_replay_id"),
+        ("next_open_exit", "exit_quote_replay_id", "q-other-exit", "exit_quote_replay_id"),
+    ],
+)
+def test_event_tape_cost_quote_id_mismatch_fails_closed(
+    db_session,
+    role,
+    field,
+    bad_quote_id,
+    message,
+):
+    _seed_single_volume_case(db_session, volume=1000)
+    db_session.execute(
+        text(
+            f"""
+            UPDATE {_q(LEFT_SCHEMA, 'i12_pit_cost_replays')}
+            SET {field} = :bad_quote_id
+            WHERE exit_role = :role
+            """
+        ),
+        {"bad_quote_id": bad_quote_id, "role": role},
+    )
+    db_session.flush()
+
+    with pytest.raises(RuntimeError, match=message):
+        _build_single(db_session)
+
+
+@pytest.mark.parametrize(
+    ("role", "field", "message"),
+    [
+        ("same_day_exit", "entry_quote_replay_id", "missing entry_quote_replay_id"),
+        ("next_open_exit", "exit_quote_replay_id", "missing exit_quote_replay_id"),
+    ],
+)
+def test_event_tape_cost_quote_id_null_fails_closed(
+    db_session,
+    role,
+    field,
+    message,
+):
+    _seed_single_volume_case(db_session, volume=1000)
+    db_session.execute(
+        text(
+            f"""
+            UPDATE {_q(LEFT_SCHEMA, 'i12_pit_cost_replays')}
+            SET {field} = NULL
+            WHERE exit_role = :role
+            """
+        ),
+        {"role": role},
+    )
+    db_session.flush()
+
+    with pytest.raises(RuntimeError, match=message):
+        _build_single(db_session)
+
+
+@pytest.mark.parametrize(
+    ("entry_status", "exit_status", "entry_spread", "exit_spread", "expected_reason"),
+    [
+        ("stale", "ok", 100, 100, "entry_quote_stale"),
+        ("missing", "ok", 100, 100, "entry_quote_missing"),
+        ("error", "ok", 100, 100, "halt_or_bad_quote"),
+        ("ok", "stale", 100, 100, "same_day_exit_quote_stale"),
+        ("ok", "missing", 100, 100, "same_day_exit_quote_missing"),
+        ("ok", "error", 100, 100, "halt_or_bad_quote"),
+        ("ok", "ok", 250, 100, "spread"),
+        ("ok", "ok", 100, 250, "spread"),
+    ],
+)
+def test_event_tape_volume_label_quote_frictions_skip_cash(
+    db_session,
+    entry_status,
+    exit_status,
+    entry_spread,
+    exit_spread,
+    expected_reason,
+):
+    _seed_single_volume_case(
+        db_session,
+        volume=1000,
+        entry_status=entry_status,
+        exit_status=exit_status,
+        entry_spread=entry_spread,
+        exit_spread=exit_spread,
+    )
+
+    row = _build_single(db_session)["events"][0]
+
+    assert row["same_day_volume_tradeability_status"] == "skipped_cash"
+    assert row["same_day_volume_skipped_reason"] == expected_reason
+    assert row["same_day_modeled_return_volume_participation"] == 0.0
+
+
+def test_event_tape_volume_label_unsafe_timestamp_proof_fails_closed(db_session):
+    unsafe_source_bars = json.dumps(
+        {
+            "source_minute_bars_max_start_ts": f"{DAY}T09:35:00Z",
+            "completed_through_ts": f"{DAY}T09:35:00Z",
+        },
+        sort_keys=True,
+    )
+    _seed_single_volume_case(db_session, volume=1000, source_bars_json=unsafe_source_bars)
+
+    row = _build_single(db_session)["events"][0]
+
+    assert row["same_day_volume_tradeability_status"] == "skipped_cash"
+    assert row["same_day_volume_skipped_reason"] == "volume_missing"
+    assert row["same_day_modeled_return_volume_participation"] == 0.0
+    assert row["volume_timestamp_proof_status"] == (
+        "source_minute_bars_max_start_ts_at_or_after_decision_ts"
+    )
 
 
 def test_event_tape_predictors_exclude_projected_and_outcome_fields(db_session):
@@ -640,3 +1077,16 @@ def test_event_tape_direct_help_works():
     assert "--snapshot" in result.stdout
     assert "--scope" in result.stdout
     assert "--allow-large-source-attempts" in result.stdout
+
+
+def test_event_tape_direct_help_works_without_sqlalchemy_site_packages():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "build_i12_pit_event_tape.py"
+    result = subprocess.run(
+        [sys.executable, "-S", str(script), "--help"],
+        cwd=script.parents[1],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--snapshot" in result.stdout
