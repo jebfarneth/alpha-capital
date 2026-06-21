@@ -23,7 +23,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import func, text
+from sqlalchemy import cast, func, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -3667,25 +3668,54 @@ def _daily_source_hash_counts_from_query(
     reuse_counts: Counter[str] = Counter()
     basis_by_mode: dict[str, Counter[str]] = defaultdict(Counter)
     reuse_by_mode: dict[str, Counter[str]] = defaultdict(Counter)
-    rows = candidate_query.with_entities(
-        I12PitCandidate.path_mode,
-        I12PitCandidate.source_bars_json,
-    ).yield_per(1000)
-    for path_mode, source_bars_json in rows:
-        source_bars = _json_loads(source_bars_json)
-        basis = str(source_bars.get("daily_source_hash_basis") or "unknown")
-        reuse_status = str(
-            source_bars.get("daily_source_hash_reuse_status") or "unknown"
+
+    dialect_name = getattr(candidate_query.session.get_bind().dialect, "name", "")
+    basis_expr = _source_bars_json_text_expr(
+        "daily_source_hash_basis",
+        dialect_name=dialect_name,
+    )
+    reuse_expr = _source_bars_json_text_expr(
+        "daily_source_hash_reuse_status",
+        dialect_name=dialect_name,
+    )
+    basis_value = func.coalesce(func.nullif(basis_expr, ""), "unknown")
+    reuse_value = func.coalesce(func.nullif(reuse_expr, ""), "unknown")
+    rows = (
+        candidate_query.with_entities(
+            I12PitCandidate.path_mode,
+            basis_value,
+            reuse_value,
+            func.count(I12PitCandidate.i12_pit_candidate_id),
         )
-        basis_counts[basis] += 1
-        reuse_counts[reuse_status] += 1
-        basis_by_mode[path_mode][basis] += 1
-        reuse_by_mode[path_mode][reuse_status] += 1
+        .group_by(I12PitCandidate.path_mode, basis_value, reuse_value)
+        .all()
+    )
+    for path_mode, basis, reuse_status, count in rows:
+        row_count = int(count or 0)
+        basis = str(basis or "unknown")
+        reuse_status = str(reuse_status or "unknown")
+        basis_counts[basis] += row_count
+        reuse_counts[reuse_status] += row_count
+        basis_by_mode[path_mode][basis] += row_count
+        reuse_by_mode[path_mode][reuse_status] += row_count
     return (
         dict(basis_counts),
         dict(reuse_counts),
         {mode: dict(counter) for mode, counter in sorted(basis_by_mode.items())},
         {mode: dict(counter) for mode, counter in sorted(reuse_by_mode.items())},
+    )
+
+
+def _source_bars_json_text_expr(key: str, *, dialect_name: str) -> Any:
+    if dialect_name == "postgresql":
+        return func.jsonb_extract_path_text(
+            cast(I12PitCandidate.source_bars_json, postgresql.JSONB),
+            key,
+        )
+    if dialect_name == "sqlite":
+        return func.json_extract(I12PitCandidate.source_bars_json, f"$.{key}")
+    raise RuntimeError(
+        f"I12 PIT report JSON aggregation is unsupported for dialect {dialect_name!r}"
     )
 
 
@@ -3873,7 +3903,7 @@ def _source_attempt_identity_audit(
             I12PitCandidate.path_mode,
             I12PitCandidate.candidate_attempt_hash,
         )
-        .yield_per(1000)
+        .all()
     )
     for path_mode, candidate_attempt_hash in actual_rows:
         if path_mode in actual_by_mode and candidate_attempt_hash is not None:
@@ -4027,7 +4057,7 @@ def _strict_partial_rows_that_would_pass_sparse_zero_fill(
             I12PitCandidate.decision_time_label,
             I12PitCandidate.source_bars_json,
         )
-        .yield_per(1000)
+        .all()
     )
     sparse_pass_keys = {
         _candidate_attempt_comparison_key_from_values(
@@ -4038,6 +4068,8 @@ def _strict_partial_rows_that_would_pass_sparse_zero_fill(
         )
         for ticker, decision_date, decision_time_label, source_bars_json in sparse_pass_rows
     }
+    if not sparse_pass_keys:
+        return 0
     strict_partial_rows = (
         candidate_query.filter(
             I12PitCandidate.path_mode == STRICT_MINUTE_PATH_MODE,
@@ -4049,7 +4081,7 @@ def _strict_partial_rows_that_would_pass_sparse_zero_fill(
             I12PitCandidate.decision_time_label,
             I12PitCandidate.source_bars_json,
         )
-        .yield_per(1000)
+        .all()
     )
     return sum(
         1
@@ -4105,7 +4137,7 @@ def _sparse_imputation_distributions(
             I12PitCandidate.source_bars_json,
             I12PitCandidate.feature_json,
         )
-        .yield_per(1000)
+        .all()
     ]
     return {
         "candidate_count": len(sparse_values),
